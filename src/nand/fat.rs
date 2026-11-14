@@ -1,0 +1,1564 @@
+//! FAT volumes laid out the way the console's filesystem process formats
+//! its built-in partitions, and a writer for the FAT32 ones.
+//!
+//! The filesystem process carries a formatter for these partitions; all
+//! offsets below are into its image. It chooses cluster size and FAT type
+//! from the partition size (`0x118d40`, table at `0x1f1848`), sizes the
+//! FATs and the reserved area (`0x1190d0`), and writes the boot sector
+//! (`0x119b30`, serialized by `0xf7090`) with, on FAT32, its copy at sector
+//! 6, the information sector at 1 and 7, a sector holding only the boot
+//! signature at 2 and 8 and a zero sector at 3 and 9 (`0x1197e0`). Its FAT
+//! driver then clears the FATs, marks entries 0 and 1 (`0xfd840`, markers at
+//! `0x1ed418`), clears the root directory and ends its chain (`0x1137d0`).
+//! [`format()`] produces the same volume. What it cannot reproduce is the
+//! volume serial number, which the formatter takes from the clock.
+//!
+//! Two properties matter beyond a valid volume. Partitions whose driver
+//! instance runs in "FAT safe" mode (`0xe2020` enables it for the safe
+//! mode, user and system partitions) get their FATs rounded up to 32
+//! sectors. And when such a volume is first mounted, the driver looks
+//! through the reserved sectors for one that is all zero to keep the
+//! location of its recovery file `PRF2SAFE.RCV` in (`0x11ecb0`, requests 1
+//! and 4, reached from `safe_backup_on` at `0xe4e00`); the mount fails if
+//! there is none. On storage that decrypts to noise where nothing was
+//! written, that sector has to be written, so the whole reserved area is.
+//! Booted on volumes from [`format()`], the driver put its record in sector
+//! 3 and the recovery file in the root directory.
+//!
+//! [`Fat32`] adds directories and files to a volume no console has mounted
+//! yet. It refuses one that holds the recovery file: after an unclean stop
+//! the driver repairs the volume from that file (`safe_recover`, same
+//! routine), and how that treats changes it did not make itself has not
+//! been established. Names are stored the VFAT way, a long name in front of
+//! a generated `BASIS~N.EXT` alias, unless a name already is an upper-case
+//! 8.3 name.
+
+use std::{
+    collections::BTreeMap,
+    fmt,
+    io::{self, Read},
+    ops::Range,
+};
+
+pub const SECTOR_SIZE: usize = 512;
+
+/// Storage addressed in sectors of [`SECTOR_SIZE`] bytes; buffers are whole
+/// sectors.
+pub trait Sectors {
+    fn read(&mut self, sector: u64, data: &mut [u8]) -> io::Result<()>;
+    fn write(&mut self, sector: u64, data: &[u8]) -> io::Result<()>;
+}
+
+impl<S: Sectors + ?Sized> Sectors for &mut S {
+    fn read(&mut self, sector: u64, data: &mut [u8]) -> io::Result<()> {
+        (**self).read(sector, data)
+    }
+
+    fn write(&mut self, sector: u64, data: &[u8]) -> io::Result<()> {
+        (**self).write(sector, data)
+    }
+}
+
+#[derive(Debug)]
+pub enum FatError {
+    Io(io::Error),
+    /// The console's formatter has no parameters for a partition of this
+    /// many bytes.
+    UnsupportedSize(u64),
+    /// The partition does not hold a FAT32 volume of 512-byte sectors.
+    NotFat32(&'static str),
+    /// The volume contradicts itself.
+    Corrupt(&'static str),
+    /// A console has mounted the volume and keeps a recovery file on it.
+    Journaled,
+    /// Not a name this writer stores: empty, longer than 255 characters,
+    /// outside printable ASCII, or with a character FAT forbids.
+    InvalidName(String),
+    NotFound(String),
+    NotADirectory(String),
+    Exists(String),
+    /// A file of 4 GiB or more.
+    TooLarge(String),
+    /// A directory at the size limit of 65536 entries.
+    DirectoryFull(String),
+    NoSpace,
+}
+
+impl fmt::Display for FatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "{error}"),
+            Self::UnsupportedSize(size) => {
+                write!(
+                    f,
+                    "the console has no FAT format for a partition of {size:#x} bytes"
+                )
+            }
+            Self::NotFat32(why) => write!(f, "not a FAT32 volume: {why}"),
+            Self::Corrupt(what) => write!(f, "corrupt volume: {what}"),
+            Self::Journaled => write!(
+                f,
+                "the volume has been mounted by a console (PRF2SAFE.RCV exists); \
+                 writing behind its recovery file would corrupt it"
+            ),
+            Self::InvalidName(name) => write!(f, "{name:?} is not a storable name"),
+            Self::NotFound(path) => write!(f, "{path} does not exist"),
+            Self::NotADirectory(path) => write!(f, "{path} is not a directory"),
+            Self::Exists(path) => write!(f, "{path} already exists"),
+            Self::TooLarge(path) => write!(f, "{path} is too large for FAT32"),
+            Self::DirectoryFull(path) => write!(f, "the directory of {path} is full"),
+            Self::NoSpace => write!(f, "no space left"),
+        }
+    }
+}
+
+impl std::error::Error for FatError {}
+
+impl From<io::Error> for FatError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FatType {
+    Fat12,
+    Fat32,
+}
+
+const FAT_COUNT: u32 = 2;
+/// Root directory entries of a FAT12 volume.
+const ROOT_ENTRIES: u32 = 512;
+const ENTRY_SIZE: usize = 32;
+/// Reserved sectors before the formatter aligns the data area: the boot
+/// sectors it writes, 0 to 8.
+const MINIMUM_RESERVED: u32 = 9;
+/// Granularity of the FATs of a FAT-safe volume, in sectors.
+const SAFE_FAT_ALIGNMENT: u32 = 32;
+
+/// Rows of the formatter's table for built-in partitions: largest partition
+/// in bytes, sectors per cluster, alignment of the data area in sectors,
+/// FAT type. A row without type is a range the formatter rejects.
+const SIZE_CLASSES: [(u64, u32, u32, Option<FatType>); 8] = [
+    (0x210_0000, 32, 32, Some(FatType::Fat12)),
+    (0x4010_0000, 1, 32, Some(FatType::Fat32)),
+    (0x8000_0000, 32, 32, Some(FatType::Fat32)),
+    (0x8287_FFFF, 0, 0, None),
+    (0x8_0000_0000, 32, 32, Some(FatType::Fat32)),
+    (0x8_07FF_FFFF, 0, 0, None),
+    (0x10_0000_0000, 32, 32, Some(FatType::Fat32)),
+    (0x40_0000_0000, 128, 32, Some(FatType::Fat32)),
+];
+
+/// The disk geometry the formatter declares (table at `0x1f1908`): largest
+/// partition in bytes, heads, sectors per track. The ranges
+/// [`SIZE_CLASSES`] rejects have no row here.
+const GEOMETRIES: [(u64, u8, u8); 12] = [
+    (0x20_0000, 2, 16),
+    (0x100_0000, 2, 32),
+    (0x200_0000, 4, 32),
+    (0x800_0000, 8, 32),
+    (0x1000_0000, 16, 32),
+    (0x1F80_0000, 16, 63),
+    (0x3F00_0000, 32, 63),
+    (0x7E00_0000, 64, 63),
+    (0x8000_0000, 128, 63),
+    (0xFC00_0000, 128, 63),
+    (0x8_0000_0000, 255, 63),
+    (0x8000_0000_0000, 255, 63),
+];
+
+/// Where the parts of a volume lie, in sectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    pub fat_type: FatType,
+    pub total_sectors: u32,
+    pub sectors_per_cluster: u32,
+    pub reserved_sectors: u32,
+    /// Sectors of one of the two FATs.
+    pub fat_sectors: u32,
+    heads: u8,
+    sectors_per_track: u8,
+}
+
+impl Layout {
+    /// What the formatter computes for a partition of `sectors` sectors.
+    pub fn for_partition(sectors: u64, fat_safe: bool) -> Result<Self, FatError> {
+        let size = sectors * SECTOR_SIZE as u64;
+        let unsupported = || FatError::UnsupportedSize(size);
+        let &(_, sectors_per_cluster, alignment, fat_type) = SIZE_CLASSES
+            .iter()
+            .find(|class| size <= class.0)
+            .ok_or_else(unsupported)?;
+        let fat_type = fat_type.ok_or_else(unsupported)?;
+        let &(_, heads, sectors_per_track) = GEOMETRIES
+            .iter()
+            .find(|geometry| size <= geometry.0)
+            .ok_or_else(unsupported)?;
+        let total = u32::try_from(sectors).map_err(|_| unsupported())?;
+
+        let (entry_bits, root_sectors) = match fat_type {
+            FatType::Fat12 => (12, ROOT_ENTRIES * ENTRY_SIZE as u32 / SECTOR_SIZE as u32),
+            FatType::Fat32 => (32, 0),
+        };
+        let fat_alignment = if fat_safe { SAFE_FAT_ALIGNMENT } else { 1 };
+        // Sectors of a FAT with entries for the clusters of `data` sectors
+        // and the two entries before them.
+        let fat_for = |data: u32| {
+            ((data / sectors_per_cluster + 2) * entry_bits)
+                .div_ceil(8 * SECTOR_SIZE as u32)
+                .next_multiple_of(fat_alignment)
+        };
+        // The formatter starts from a FAT for nearly the whole partition
+        // and shrinks it for as long as a smaller one still covers what the
+        // FATs themselves leave over.
+        let (reserved_sectors, fat_sectors) = match fat_type {
+            FatType::Fat12 => {
+                let reserved = 1;
+                let available = total
+                    .checked_sub(reserved + root_sectors)
+                    .ok_or_else(unsupported)?;
+                let mut fat = fat_for(available);
+                while fat != 0 && fat_for(available.saturating_sub(fat * FAT_COUNT)) < fat {
+                    fat -= fat_alignment;
+                }
+                (reserved, fat)
+            }
+            FatType::Fat32 => {
+                let mut reserved = MINIMUM_RESERVED;
+                let mut fat = fat_for(total.checked_sub(reserved).ok_or_else(unsupported)?);
+                while fat != 0 {
+                    // The data area starts on a multiple of the alignment;
+                    // the reserved area takes up the slack.
+                    reserved =
+                        (reserved + fat * FAT_COUNT).next_multiple_of(alignment) - fat * FAT_COUNT;
+                    let needed = fat_for(
+                        total
+                            .checked_sub(reserved + fat * FAT_COUNT)
+                            .ok_or_else(unsupported)?,
+                    );
+                    if needed == fat {
+                        break;
+                    }
+                    if needed < fat {
+                        fat -= fat_alignment;
+                    } else {
+                        reserved += alignment;
+                    }
+                }
+                (reserved, fat)
+            }
+        };
+        if fat_sectors == 0 {
+            return Err(unsupported());
+        }
+        Ok(Self {
+            fat_type,
+            total_sectors: total,
+            sectors_per_cluster,
+            reserved_sectors,
+            fat_sectors,
+            heads,
+            sectors_per_track,
+        })
+    }
+
+    fn root_sectors(&self) -> u32 {
+        match self.fat_type {
+            FatType::Fat12 => ROOT_ENTRIES * ENTRY_SIZE as u32 / SECTOR_SIZE as u32,
+            FatType::Fat32 => 0,
+        }
+    }
+
+    /// First sector of cluster 2.
+    pub fn data_start(&self) -> u32 {
+        self.reserved_sectors + self.fat_sectors * FAT_COUNT + self.root_sectors()
+    }
+
+    pub fn cluster_count(&self) -> u32 {
+        (self.total_sectors - self.data_start()) / self.sectors_per_cluster
+    }
+}
+
+const BOOT_SIGNATURE: [u8; 2] = [0x55, 0xAA];
+const MEDIA_FIXED: u8 = 0xF8;
+/// Root directory cluster of a freshly formatted FAT32 volume.
+const ROOT_CLUSTER: u32 = 2;
+const INFORMATION_SECTOR: u16 = 1;
+const BACKUP_BOOT_SECTOR: u16 = 6;
+const END_OF_CHAIN: u32 = 0x0FFF_FFFF;
+const ENTRY_MASK: u32 = 0x0FFF_FFFF;
+
+fn put16(sector: &mut [u8], offset: usize, value: u16) {
+    sector[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put32(sector: &mut [u8], offset: usize, value: u32) {
+    sector[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn get16(data: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([data[offset], data[offset + 1]])
+}
+
+fn get32(data: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ])
+}
+
+/// The boot sector as the formatter fills it in: no OEM name, the label
+/// `NO NAME`, and a jump that leads nowhere.
+fn boot_sector(layout: &Layout, serial: u32) -> [u8; SECTOR_SIZE] {
+    let mut sector = [0; SECTOR_SIZE];
+    sector[..3].copy_from_slice(&[0xEB, 0xE9, 0x90]);
+    put16(&mut sector, 11, SECTOR_SIZE as u16);
+    sector[13] = layout.sectors_per_cluster as u8;
+    put16(&mut sector, 14, layout.reserved_sectors as u16);
+    sector[16] = FAT_COUNT as u8;
+    sector[21] = MEDIA_FIXED;
+    put16(&mut sector, 24, layout.sectors_per_track.into());
+    put16(&mut sector, 26, layout.heads.into());
+    // What follows the parameter block: drive number, extended signature,
+    // serial, label and type name.
+    let (extension, type_name) = match layout.fat_type {
+        FatType::Fat12 => {
+            put16(&mut sector, 17, ROOT_ENTRIES as u16);
+            match u16::try_from(layout.total_sectors) {
+                Ok(total) => put16(&mut sector, 19, total),
+                Err(_) => put32(&mut sector, 32, layout.total_sectors),
+            }
+            put16(&mut sector, 22, layout.fat_sectors as u16);
+            (36, b"FAT12   ")
+        }
+        FatType::Fat32 => {
+            put32(&mut sector, 32, layout.total_sectors);
+            put32(&mut sector, 36, layout.fat_sectors);
+            put32(&mut sector, 44, ROOT_CLUSTER);
+            put16(&mut sector, 48, INFORMATION_SECTOR);
+            put16(&mut sector, 50, BACKUP_BOOT_SECTOR);
+            (64, b"FAT32   ")
+        }
+    };
+    sector[extension] = 0x80;
+    sector[extension + 2] = 0x29;
+    put32(&mut sector, extension + 3, serial);
+    sector[extension + 7..extension + 18].copy_from_slice(b"NO NAME    ");
+    sector[extension + 18..extension + 26].copy_from_slice(type_name);
+    sector[510..].copy_from_slice(&BOOT_SIGNATURE);
+    sector
+}
+
+/// The FAT32 information sector, with free space and allocation hint both
+/// "unknown", which is how the formatter leaves them.
+fn information_sector() -> [u8; SECTOR_SIZE] {
+    let mut sector = [0; SECTOR_SIZE];
+    sector[..4].copy_from_slice(b"RRaA");
+    sector[484..488].copy_from_slice(b"rrAa");
+    put32(&mut sector, 488, u32::MAX);
+    put32(&mut sector, 492, u32::MAX);
+    sector[510..].copy_from_slice(&BOOT_SIGNATURE);
+    sector
+}
+
+/// Makes the `sectors` sectors of `storage` an empty volume. `serial` is
+/// the volume serial number, for which the console would use its clock.
+pub fn format(
+    storage: &mut impl Sectors,
+    sectors: u64,
+    fat_safe: bool,
+    serial: u32,
+) -> Result<Layout, FatError> {
+    let layout = Layout::for_partition(sectors, fat_safe)?;
+    let sector_bytes = |sectors: u32| sectors as usize * SECTOR_SIZE;
+
+    let mut reserved = vec![0; sector_bytes(layout.reserved_sectors)];
+    let mut put = |sector: u16, contents: &[u8; SECTOR_SIZE]| {
+        reserved[sector_bytes(sector.into())..][..SECTOR_SIZE].copy_from_slice(contents);
+    };
+    let boot = boot_sector(&layout, serial);
+    put(0, &boot);
+    let mut fat = vec![0; sector_bytes(layout.fat_sectors)];
+    let root_sectors = match layout.fat_type {
+        FatType::Fat12 => {
+            fat[..3].copy_from_slice(&[MEDIA_FIXED, 0xFF, 0xFF]);
+            layout.root_sectors()
+        }
+        FatType::Fat32 => {
+            let information = information_sector();
+            let mut signature = [0; SECTOR_SIZE];
+            signature[510..].copy_from_slice(&BOOT_SIGNATURE);
+            put(BACKUP_BOOT_SECTOR, &boot);
+            for copy in [0, BACKUP_BOOT_SECTOR] {
+                put(copy + INFORMATION_SECTOR, &information);
+                put(copy + INFORMATION_SECTOR + 1, &signature);
+            }
+            put32(&mut fat, 0, 0x0FFF_FF00 | u32::from(MEDIA_FIXED));
+            put32(&mut fat, 4, END_OF_CHAIN);
+            put32(&mut fat, 4 * ROOT_CLUSTER as usize, END_OF_CHAIN);
+            layout.sectors_per_cluster
+        }
+    };
+    storage.write(0, &reserved)?;
+    for copy in 0..FAT_COUNT {
+        let sector = layout.reserved_sectors + copy * layout.fat_sectors;
+        storage.write(sector.into(), &fat)?;
+    }
+    // On FAT12 the root directory precedes the clusters; on FAT32 it is the
+    // first of them.
+    let root = layout.reserved_sectors + layout.fat_sectors * FAT_COUNT;
+    storage.write(root.into(), &vec![0; sector_bytes(root_sectors)])?;
+    Ok(layout)
+}
+
+const ATTRIBUTE_VOLUME: u8 = 0x08;
+const ATTRIBUTE_DIRECTORY: u8 = 0x10;
+const ATTRIBUTE_ARCHIVE: u8 = 0x20;
+const ATTRIBUTE_LONG_NAME: u8 = 0x0F;
+const DELETED: u8 = 0xE5;
+const LAST_LONG_ENTRY: u8 = 0x40;
+/// UTF-16 units of a long name one directory entry holds.
+const LONG_UNITS: usize = 13;
+const LONG_UNIT_OFFSETS: [usize; LONG_UNITS] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+const MAXIMUM_NAME: usize = 255;
+const MAXIMUM_DIRECTORY: usize = 65536 * ENTRY_SIZE;
+/// Date of every entry this writer makes, 1 January 1980: an image is the
+/// same whenever it is built.
+const DATE: u16 = 1 << 5 | 1;
+/// The driver's recovery file, in the root directory.
+const RECOVERY_FILE: &str = "PRF2SAFE.RCV";
+/// Bytes of file data handed to the storage at once.
+const WRITE_CHUNK: usize = 1 << 20;
+
+type ShortName = [u8; 11];
+
+fn is_short_character(character: u8) -> bool {
+    character.is_ascii_uppercase()
+        || character.is_ascii_digit()
+        || b"!#$%&'()-@^_`{}~".contains(&character)
+}
+
+/// `name` as the 11 bytes of a directory entry, if it is an upper-case 8.3
+/// name.
+fn pack_short(name: &str) -> Option<ShortName> {
+    let (base, extension) = name.rsplit_once('.').unwrap_or((name, ""));
+    let fits = (1..=8).contains(&base.len())
+        && extension.len() <= 3
+        && (extension.is_empty() != name.contains('.'))
+        && base
+            .bytes()
+            .chain(extension.bytes())
+            .all(is_short_character);
+    fits.then(|| {
+        let mut short = [b' '; 11];
+        short[..base.len()].copy_from_slice(base.as_bytes());
+        short[8..8 + extension.len()].copy_from_slice(extension.as_bytes());
+        short
+    })
+}
+
+/// The 8.3 alias of a long name: what is left of its first six characters
+/// and of its extension, and the first numeric tail that is `free`.
+fn alias(name: &str, free: impl Fn(&ShortName) -> bool) -> ShortName {
+    let (base, extension) = match name.rfind('.') {
+        Some(dot) if dot > 0 => (&name[..dot], &name[dot + 1..]),
+        _ => (name, ""),
+    };
+    let squeeze = |part: &str, length: usize| {
+        let mut kept = [0; 8];
+        let characters = part
+            .bytes()
+            .filter(|character| !b" .".contains(character))
+            .map(|character| character.to_ascii_uppercase())
+            .map(|character| {
+                if is_short_character(character) {
+                    character
+                } else {
+                    b'_'
+                }
+            });
+        let mut count = 0;
+        for (slot, character) in kept[..length].iter_mut().zip(characters) {
+            *slot = character;
+            count += 1;
+        }
+        (kept, count)
+    };
+    let (base, base_length) = squeeze(base, 6);
+    let (extension, extension_length) = squeeze(extension, 3);
+    (1..=MAXIMUM_DIRECTORY / ENTRY_SIZE)
+        .find_map(|number| {
+            let tail = format!("~{number}");
+            let kept = base_length.min(8 - tail.len());
+            let mut short = [b' '; 11];
+            short[..kept].copy_from_slice(&base[..kept]);
+            short[kept..kept + tail.len()].copy_from_slice(tail.as_bytes());
+            short[8..8 + extension_length].copy_from_slice(&extension[..extension_length]);
+            free(&short).then_some(short)
+        })
+        .expect("a directory has fewer entries than there are numeric tails")
+}
+
+/// Checksum that ties the entries of a long name to their short entry.
+fn short_checksum(short: &ShortName) -> u8 {
+    short.iter().fold(0, |sum: u8, &character| {
+        sum.rotate_right(1).wrapping_add(character)
+    })
+}
+
+fn validate_name(name: &str) -> Result<(), FatError> {
+    let valid = !name.is_empty()
+        && name.len() <= MAXIMUM_NAME
+        && name.bytes().all(|character| {
+            (0x20..0x7F).contains(&character) && !b"\"*/:<>?\\|".contains(&character)
+        })
+        && !name.starts_with(' ')
+        && !name.ends_with([' ', '.']);
+    if valid {
+        Ok(())
+    } else {
+        Err(FatError::InvalidName(name.into()))
+    }
+}
+
+fn short_record(short: &ShortName, attributes: u8, cluster: u32, size: u32) -> [u8; ENTRY_SIZE] {
+    let mut record = [0; ENTRY_SIZE];
+    record[..11].copy_from_slice(short);
+    record[11] = attributes;
+    for date in [16, 18, 24] {
+        put16(&mut record, date, DATE);
+    }
+    put16(&mut record, 20, (cluster >> 16) as u16);
+    put16(&mut record, 26, cluster as u16);
+    put32(&mut record, 28, size);
+    record
+}
+
+/// The directory entries of `name`: its long name, last part first, in
+/// front of the short entry, or the short entry alone when `long` is not
+/// needed.
+fn records(name: &str, short: &ShortName, long: bool, tail: [u8; ENTRY_SIZE]) -> Vec<u8> {
+    let mut records = Vec::new();
+    if long {
+        let mut units: Vec<u16> = name.encode_utf16().collect();
+        if !units.len().is_multiple_of(LONG_UNITS) {
+            units.push(0);
+            units.resize(units.len().next_multiple_of(LONG_UNITS), 0xFFFF);
+        }
+        let checksum = short_checksum(short);
+        let parts = units.as_chunks::<LONG_UNITS>().0;
+        for (index, part) in parts.iter().enumerate().rev() {
+            let mut record = [0; ENTRY_SIZE];
+            record[0] = index as u8 + 1;
+            if index + 1 == parts.len() {
+                record[0] |= LAST_LONG_ENTRY;
+            }
+            record[11] = ATTRIBUTE_LONG_NAME;
+            record[13] = checksum;
+            for (&unit, offset) in part.iter().zip(LONG_UNIT_OFFSETS) {
+                put16(&mut record, offset, unit);
+            }
+            records.extend_from_slice(&record);
+        }
+    }
+    records.extend_from_slice(&tail);
+    records
+}
+
+struct Entry {
+    long_name: Option<String>,
+    short_name: ShortName,
+    directory: bool,
+    cluster: u32,
+}
+
+struct Directory {
+    clusters: Vec<u32>,
+    /// Contents of `clusters`.
+    data: Vec<u8>,
+    /// Offset of the first entry that was never used, where the directory
+    /// ends.
+    end: usize,
+    entries: Vec<Entry>,
+    dirty: bool,
+}
+
+/// The entries of a directory's `data` and where they end.
+fn parse_directory(data: &[u8]) -> (Vec<Entry>, usize) {
+    let mut entries = Vec::new();
+    // Parts of a long name seen since the last short entry, in disk order,
+    // with the checksum each claims.
+    let mut long: Vec<(u8, [u16; LONG_UNITS], u8)> = Vec::new();
+    let (records, _) = data.as_chunks::<ENTRY_SIZE>();
+    for (index, record) in records.iter().enumerate() {
+        let attributes = record[11];
+        if record[0] == 0 {
+            return (entries, index * ENTRY_SIZE);
+        } else if record[0] == DELETED {
+            long.clear();
+        } else if attributes & 0x3F == ATTRIBUTE_LONG_NAME {
+            long.push((
+                record[0],
+                LONG_UNIT_OFFSETS.map(|offset| get16(record, offset)),
+                record[13],
+            ));
+        } else {
+            let short_name: ShortName = record[..11].try_into().expect("11 of 32 bytes");
+            let checksum = short_checksum(&short_name);
+            // A long name counts when its parts are numbered down to one
+            // from a marked last part and all carry this entry's checksum.
+            let complete = long
+                .first()
+                .is_some_and(|part| part.0 & LAST_LONG_ENTRY != 0)
+                && long.iter().rev().enumerate().all(|(index, part)| {
+                    usize::from(part.0 & !LAST_LONG_ENTRY) == index + 1 && part.2 == checksum
+                });
+            let long_name = complete
+                .then(|| {
+                    let units: Vec<u16> = long
+                        .iter()
+                        .rev()
+                        .flat_map(|part| part.1)
+                        .take_while(|&unit| unit != 0)
+                        .collect();
+                    String::from_utf16(&units).ok()
+                })
+                .flatten();
+            long.clear();
+            if attributes & ATTRIBUTE_VOLUME == 0 && short_name[0] != b'.' {
+                entries.push(Entry {
+                    long_name,
+                    short_name,
+                    directory: attributes & ATTRIBUTE_DIRECTORY != 0,
+                    cluster: u32::from(get16(record, 20)) << 16 | u32::from(get16(record, 26)),
+                });
+            }
+        }
+    }
+    (entries, records.len() * ENTRY_SIZE)
+}
+
+/// A FAT32 volume being added to. Nothing but file contents reaches the
+/// storage before [`Fat32::finish`].
+pub struct Fat32<S> {
+    storage: S,
+    sectors_per_cluster: u32,
+    fat_start: u32,
+    fat_sectors: u32,
+    fat_count: u32,
+    data_start: u32,
+    /// Clusters are numbered from 2 to this, exclusive.
+    cluster_end: u32,
+    root: u32,
+    /// The first FAT, of which the others are copies.
+    fat: Vec<u8>,
+    fat_changed: bool,
+    free_clusters: u32,
+    /// Where the search for a free cluster resumes.
+    next: u32,
+    /// Directories read or made so far, by first cluster.
+    directories: BTreeMap<u32, Directory>,
+}
+
+impl<S: Sectors> Fat32<S> {
+    pub fn open(mut storage: S) -> Result<Self, FatError> {
+        let mut boot = [0; SECTOR_SIZE];
+        storage.read(0, &mut boot)?;
+        let not = FatError::NotFat32;
+        if boot[510..] != BOOT_SIGNATURE {
+            return Err(not("no boot signature"));
+        }
+        if usize::from(get16(&boot, 11)) != SECTOR_SIZE {
+            return Err(not("sectors are not 512 bytes"));
+        }
+        let sectors_per_cluster = u32::from(boot[13]);
+        let (reserved, fat_count) = (u32::from(get16(&boot, 14)), u32::from(boot[16]));
+        let (total, fat_sectors, root) = (get32(&boot, 32), get32(&boot, 36), get32(&boot, 44));
+        if get16(&boot, 17) != 0 || get16(&boot, 22) != 0 {
+            return Err(not("it has a FAT12 or FAT16 root directory"));
+        }
+        if !sectors_per_cluster.is_power_of_two() || reserved == 0 || fat_count == 0 {
+            return Err(not("impossible parameters"));
+        }
+        let data_start = fat_sectors
+            .checked_mul(fat_count)
+            .and_then(|fats| fats.checked_add(reserved))
+            .filter(|&start| start < total)
+            .ok_or(not("the FATs do not fit"))?;
+        let clusters = (total - data_start) / sectors_per_cluster;
+        if clusters < 65525 {
+            return Err(not("too few clusters"));
+        }
+        let cluster_end = clusters + 2;
+        let fat_bytes = fat_sectors as usize * SECTOR_SIZE;
+        if fat_bytes / 4 < cluster_end as usize {
+            return Err(not("the FAT is shorter than the clusters"));
+        }
+        let mut fat = vec![0; fat_bytes];
+        storage.read(reserved.into(), &mut fat)?;
+        let mut volume = Self {
+            storage,
+            sectors_per_cluster,
+            fat_start: reserved,
+            fat_sectors,
+            fat_count,
+            data_start,
+            cluster_end,
+            root,
+            fat,
+            fat_changed: false,
+            free_clusters: 0,
+            next: 2,
+            directories: BTreeMap::new(),
+        };
+        volume.free_clusters = (2..cluster_end)
+            .filter(|&cluster| volume.entry(cluster) == 0)
+            .count() as u32;
+        if volume.find(root, RECOVERY_FILE)?.is_some() {
+            return Err(FatError::Journaled);
+        }
+        Ok(volume)
+    }
+
+    fn entry(&self, cluster: u32) -> u32 {
+        get32(&self.fat, cluster as usize * 4) & ENTRY_MASK
+    }
+
+    /// The four bits above an entry are not part of it and stay.
+    fn set_entry(&mut self, cluster: u32, value: u32) {
+        let offset = cluster as usize * 4;
+        let kept = get32(&self.fat, offset) & !ENTRY_MASK;
+        put32(&mut self.fat, offset, kept | value);
+        self.fat_changed = true;
+    }
+
+    fn cluster_bytes(&self) -> usize {
+        self.sectors_per_cluster as usize * SECTOR_SIZE
+    }
+
+    fn cluster_sector(&self, cluster: u32) -> u64 {
+        u64::from(self.data_start) + u64::from(cluster - 2) * u64::from(self.sectors_per_cluster)
+    }
+
+    fn chain(&self, first: u32) -> Result<Vec<u32>, FatError> {
+        let mut clusters = Vec::new();
+        let mut cluster = first;
+        while cluster < 0x0FFF_FFF8 {
+            if !(2..self.cluster_end).contains(&cluster) {
+                return Err(FatError::Corrupt("a chain leaves the volume"));
+            }
+            if clusters.len() as u32 >= self.cluster_end {
+                return Err(FatError::Corrupt("a chain loops"));
+            }
+            clusters.push(cluster);
+            cluster = self.entry(cluster);
+        }
+        Ok(clusters)
+    }
+
+    /// Takes at least one and up to `most` free clusters that follow one
+    /// another, chains them, and appends them to the chain ending in
+    /// `previous`.
+    fn allocate(&mut self, previous: Option<u32>, most: u32) -> Result<Range<u32>, FatError> {
+        let first = (self.next..self.cluster_end)
+            .chain(2..self.next)
+            .find(|&cluster| self.entry(cluster) == 0)
+            .ok_or(FatError::NoSpace)?;
+        let limit = self.cluster_end.min(first.saturating_add(most));
+        let end = (first + 1..limit)
+            .find(|&cluster| self.entry(cluster) != 0)
+            .unwrap_or(limit);
+        for cluster in first..end - 1 {
+            self.set_entry(cluster, cluster + 1);
+        }
+        self.set_entry(end - 1, END_OF_CHAIN);
+        if let Some(previous) = previous {
+            self.set_entry(previous, first);
+        }
+        self.free_clusters -= end - first;
+        self.next = end;
+        Ok(first..end)
+    }
+
+    /// Frees the chain from `first`, which nothing refers to.
+    fn release(&mut self, first: u32) -> Result<(), FatError> {
+        for cluster in self.chain(first)? {
+            self.set_entry(cluster, 0);
+            self.free_clusters += 1;
+        }
+        self.next = self.next.min(first);
+        Ok(())
+    }
+
+    /// Reads the directory at `first` unless it is at hand already.
+    fn load(&mut self, first: u32) -> Result<(), FatError> {
+        if self.directories.contains_key(&first) {
+            return Ok(());
+        }
+        let clusters = self.chain(first)?;
+        if clusters.is_empty() {
+            return Err(FatError::Corrupt("a directory without clusters"));
+        }
+        let cluster_bytes = self.cluster_bytes();
+        let mut data = vec![0; clusters.len() * cluster_bytes];
+        for (&cluster, contents) in clusters.iter().zip(data.chunks_mut(cluster_bytes)) {
+            self.storage.read(self.cluster_sector(cluster), contents)?;
+        }
+        let (entries, end) = parse_directory(&data);
+        let directory = Directory {
+            clusters,
+            data,
+            end,
+            entries,
+            dirty: false,
+        };
+        self.directories.insert(first, directory);
+        Ok(())
+    }
+
+    /// Whether `name` in the directory at `directory` is a directory, and
+    /// its first cluster.
+    fn find(&mut self, directory: u32, name: &str) -> Result<Option<(bool, u32)>, FatError> {
+        self.load(directory)?;
+        let short = pack_short(&name.to_ascii_uppercase());
+        let entries = &self.directories[&directory].entries;
+        let entry = entries.iter().find(|entry| {
+            let long = entry.long_name.as_deref();
+            long.is_some_and(|long| long.eq_ignore_ascii_case(name))
+                || short == Some(entry.short_name)
+        });
+        Ok(entry.map(|entry| (entry.directory, entry.cluster)))
+    }
+
+    /// Adds `name` to the directory at `parent`. `path` names the entry in
+    /// errors.
+    fn add_entry(
+        &mut self,
+        parent: u32,
+        name: &str,
+        path: &str,
+        attributes: u8,
+        cluster: u32,
+        size: u32,
+    ) -> Result<(), FatError> {
+        validate_name(name)?;
+        if self.find(parent, name)?.is_some() {
+            return Err(FatError::Exists(path.into()));
+        }
+        let mut directory = self.directories.remove(&parent).expect("find loaded it");
+        let exact = pack_short(name);
+        let short_name = exact.unwrap_or_else(|| {
+            alias(name, |short| {
+                directory
+                    .entries
+                    .iter()
+                    .all(|entry| entry.short_name != *short)
+            })
+        });
+        let tail = short_record(&short_name, attributes, cluster, size);
+        let records = records(name, &short_name, exact.is_none(), tail);
+        let grown = self.grow(&mut directory, records.len(), path);
+        if grown.is_ok() {
+            directory.data[directory.end..][..records.len()].copy_from_slice(&records);
+            directory.end += records.len();
+            directory.dirty = true;
+            directory.entries.push(Entry {
+                long_name: exact.is_none().then(|| name.into()),
+                short_name,
+                directory: attributes & ATTRIBUTE_DIRECTORY != 0,
+                cluster,
+            });
+        }
+        self.directories.insert(parent, directory);
+        grown
+    }
+
+    /// Makes room for `length` more bytes of entries.
+    fn grow(
+        &mut self,
+        directory: &mut Directory,
+        length: usize,
+        path: &str,
+    ) -> Result<(), FatError> {
+        let needed = directory.end + length;
+        if needed > MAXIMUM_DIRECTORY {
+            return Err(FatError::DirectoryFull(path.into()));
+        }
+        while needed > directory.data.len() {
+            let last = *directory
+                .clusters
+                .last()
+                .expect("a directory has a cluster");
+            let cluster = self.allocate(Some(last), 1)?.start;
+            directory.clusters.push(cluster);
+            directory
+                .data
+                .resize(directory.data.len() + self.cluster_bytes(), 0);
+            directory.dirty = true;
+        }
+        Ok(())
+    }
+
+    /// Follows the directories of `path`, making those that are missing if
+    /// it is to `create`, and returns the first cluster of the last.
+    fn walk<'a>(
+        &mut self,
+        path: &str,
+        components: impl Iterator<Item = &'a str>,
+        create: bool,
+    ) -> Result<u32, FatError> {
+        let mut directory = self.root;
+        for name in components {
+            directory = match self.find(directory, name)? {
+                Some((true, cluster)) => cluster,
+                Some((false, _)) => return Err(FatError::NotADirectory(path.into())),
+                None if create => self.make_directory(directory, name, path)?,
+                None => return Err(FatError::NotFound(path.into())),
+            };
+        }
+        Ok(directory)
+    }
+
+    fn make_directory(&mut self, parent: u32, name: &str, path: &str) -> Result<u32, FatError> {
+        let cluster = self.allocate(None, 1)?.start;
+        let added = self.add_entry(parent, name, path, ATTRIBUTE_DIRECTORY, cluster, 0);
+        if let Err(error) = added {
+            self.release(cluster)?;
+            return Err(error);
+        }
+        let mut data = vec![0; self.cluster_bytes()];
+        // The root directory is cluster 0 to its children, wherever it is.
+        let above = if parent == self.root { 0 } else { parent };
+        let links = [(b".          ", cluster), (b"..         ", above)];
+        for ((short, target), record) in links.into_iter().zip(data.chunks_mut(ENTRY_SIZE)) {
+            record.copy_from_slice(&short_record(short, ATTRIBUTE_DIRECTORY, target, 0));
+        }
+        let directory = Directory {
+            clusters: vec![cluster],
+            data,
+            end: links.len() * ENTRY_SIZE,
+            entries: Vec::new(),
+            dirty: true,
+        };
+        self.directories.insert(cluster, directory);
+        Ok(cluster)
+    }
+
+    /// Makes the directory `path`, components separated by `/`, and those
+    /// above it that do not exist.
+    pub fn create_dir_all(&mut self, path: &str) -> Result<(), FatError> {
+        let components = path.split('/').filter(|component| !component.is_empty());
+        self.walk(path, components, true).map(drop)
+    }
+
+    /// Makes the file `path` of the `size` bytes that `contents` yields. The
+    /// directory it goes into has to exist.
+    pub fn write_file(
+        &mut self,
+        path: &str,
+        contents: &mut dyn Read,
+        size: u64,
+    ) -> Result<(), FatError> {
+        let mut components = path.split('/').filter(|component| !component.is_empty());
+        let name = components
+            .next_back()
+            .ok_or_else(|| FatError::InvalidName(path.into()))?;
+        let parent = self.walk(path, components, false)?;
+        validate_name(name)?;
+        if self.find(parent, name)?.is_some() {
+            return Err(FatError::Exists(path.into()));
+        }
+        let size32 = u32::try_from(size).map_err(|_| FatError::TooLarge(path.into()))?;
+        if size.div_ceil(self.cluster_bytes() as u64) > self.free_clusters.into() {
+            return Err(FatError::NoSpace);
+        }
+        let mut first = None;
+        let written = self
+            .write_contents(contents, size, &mut first)
+            .and_then(|()| {
+                let cluster = first.unwrap_or(0);
+                self.add_entry(parent, name, path, ATTRIBUTE_ARCHIVE, cluster, size32)
+            });
+        if let (Err(_), Some(first)) = (&written, first) {
+            self.release(first)?;
+        }
+        written
+    }
+
+    /// Chains clusters for `size` bytes of `contents` and fills them,
+    /// storing the first in `first` as soon as there is one.
+    fn write_contents(
+        &mut self,
+        contents: &mut dyn Read,
+        size: u64,
+        first: &mut Option<u32>,
+    ) -> Result<(), FatError> {
+        let cluster_bytes = self.cluster_bytes();
+        let chunk_clusters = (WRITE_CHUNK / cluster_bytes).max(1) as u64;
+        let mut buffer = Vec::new();
+        let (mut remaining, mut previous) = (size, None);
+        while remaining != 0 {
+            let wanted = remaining.div_ceil(cluster_bytes as u64).min(chunk_clusters);
+            let run = self.allocate(previous, wanted as u32)?;
+            first.get_or_insert(run.start);
+            previous = Some(run.end - 1);
+            let run_bytes = run.len() * cluster_bytes;
+            let length = usize::try_from(remaining).map_or(run_bytes, |rest| rest.min(run_bytes));
+            // The last cluster is whole on the storage, zero after the
+            // end of the file.
+            buffer.clear();
+            buffer.resize(run_bytes, 0);
+            contents.read_exact(&mut buffer[..length])?;
+            self.storage
+                .write(self.cluster_sector(run.start), &buffer)?;
+            remaining -= length as u64;
+        }
+        Ok(())
+    }
+
+    /// Writes the directories and FATs that changed and hands the storage
+    /// back.
+    pub fn finish(mut self) -> Result<S, FatError> {
+        let cluster_bytes = self.cluster_bytes();
+        for directory in self
+            .directories
+            .values()
+            .filter(|directory| directory.dirty)
+        {
+            let contents = directory.data.chunks(cluster_bytes);
+            for (&cluster, contents) in directory.clusters.iter().zip(contents) {
+                let sector = self.cluster_sector(cluster);
+                self.storage.write(sector, contents)?;
+            }
+        }
+        if self.fat_changed {
+            for copy in 0..self.fat_count {
+                let sector = self.fat_start + copy * self.fat_sectors;
+                self.storage.write(sector.into(), &self.fat)?;
+            }
+        }
+        Ok(self.storage)
+    }
+}
+
+/// A second, read-only implementation of the on-disk format, for tests to
+/// check volumes against.
+#[cfg(test)]
+pub(crate) mod reader {
+    use super::{SECTOR_SIZE, Sectors};
+
+    pub(crate) struct Reader<S> {
+        storage: S,
+        sectors_per_cluster: u64,
+        reserved: u64,
+        fat_sectors: u64,
+        data_start: u64,
+        pub(crate) clusters: u32,
+        root: u32,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct Item {
+        pub(crate) name: String,
+        pub(crate) short: String,
+        pub(crate) directory: bool,
+        pub(crate) cluster: u32,
+        pub(crate) size: u32,
+    }
+
+    fn le(bytes: &[u8]) -> u64 {
+        bytes
+            .iter()
+            .rev()
+            .fold(0, |value, &byte| value << 8 | u64::from(byte))
+    }
+
+    impl<S: Sectors> Reader<S> {
+        /// Checks the boot sector, its copy, the information sectors and
+        /// that both FATs agree.
+        pub(crate) fn open(mut storage: S) -> Self {
+            let mut boot = [0; SECTOR_SIZE * 9];
+            storage.read(0, &mut boot).unwrap();
+            assert_eq!(boot[510..512], [0x55, 0xAA]);
+            assert_eq!(le(&boot[11..13]), 512);
+            assert_eq!(boot[16], 2, "two FATs");
+            assert_eq!(le(&boot[17..19]), 0, "FAT32 has no fixed root");
+            assert_eq!(&boot[82..90], b"FAT32   ");
+            assert_eq!(boot[..512], boot[6 * 512..7 * 512], "backup boot sector");
+            assert_eq!((le(&boot[48..50]), le(&boot[50..52])), (1, 6));
+            for information in [1, 7] {
+                let sector = &boot[information * 512..][..512];
+                assert_eq!(&sector[..4], b"RRaA");
+                assert_eq!(&sector[484..488], b"rrAa");
+                assert_eq!(sector[508..], [0, 0, 0x55, 0xAA]);
+            }
+            let (reserved, fat_sectors) = (le(&boot[14..16]), le(&boot[36..40]));
+            let sectors_per_cluster = u64::from(boot[13]);
+            let data_start = reserved + 2 * fat_sectors;
+            let clusters = ((le(&boot[32..36]) - data_start) / sectors_per_cluster) as u32;
+            assert!(clusters >= 65525, "a FAT32 cluster count");
+            assert!(fat_sectors * 128 >= u64::from(clusters) + 2);
+            let mut reader = Self {
+                storage,
+                sectors_per_cluster,
+                reserved,
+                fat_sectors,
+                data_start,
+                clusters,
+                root: le(&boot[44..48]) as u32,
+            };
+            assert_eq!(reader.fat(0), reader.fat(1), "the FATs are copies");
+            assert_eq!(reader.fat(0)[..2], [0x0FFF_FFF8, 0x0FFF_FFFF]);
+            reader
+        }
+
+        pub(crate) fn sector(&mut self, sector: u64) -> [u8; SECTOR_SIZE] {
+            let mut data = [0; SECTOR_SIZE];
+            self.storage.read(sector, &mut data).unwrap();
+            data
+        }
+
+        pub(crate) fn fat(&mut self, copy: u64) -> Vec<u32> {
+            let mut raw = vec![0; self.fat_sectors as usize * SECTOR_SIZE];
+            self.storage
+                .read(self.reserved + copy * self.fat_sectors, &mut raw)
+                .unwrap();
+            raw.chunks(4).map(|entry| le(entry) as u32).collect()
+        }
+
+        pub(crate) fn chain(&mut self, first: u32) -> Vec<u32> {
+            let fat = self.fat(0);
+            let mut chain = Vec::new();
+            let mut cluster = first;
+            while cluster < 0x0FFF_FFF8 {
+                assert!(
+                    (2..self.clusters + 2).contains(&cluster),
+                    "chain within the volume"
+                );
+                chain.push(cluster);
+                cluster = fat[cluster as usize];
+            }
+            chain
+        }
+
+        fn contents(&mut self, first: u32) -> Vec<u8> {
+            let cluster_bytes = self.sectors_per_cluster as usize * SECTOR_SIZE;
+            let mut data = Vec::new();
+            for cluster in self.chain(first) {
+                let start = data.len();
+                data.resize(start + cluster_bytes, 0);
+                let sector = self.data_start + u64::from(cluster - 2) * self.sectors_per_cluster;
+                self.storage.read(sector, &mut data[start..]).unwrap();
+            }
+            data
+        }
+
+        /// The entries of the directory at `cluster`, long names put
+        /// together and checked against their short entries.
+        pub(crate) fn directory(&mut self, cluster: u32) -> Vec<Item> {
+            let data = self.contents(cluster);
+            let mut items = Vec::new();
+            let mut long: Vec<u16> = Vec::new();
+            let mut expected = None;
+            for record in data.chunks(32) {
+                if record[0] == 0 {
+                    break;
+                }
+                if record[11] == 0x0F {
+                    let number = record[0] & 0x3F;
+                    if record[0] & 0x40 != 0 {
+                        long.clear();
+                    } else {
+                        assert_eq!(expected, Some((number + 1, record[13])), "parts count down");
+                    }
+                    expected = Some((number, record[13]));
+                    let units = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30]
+                        .map(|offset| le(&record[offset..offset + 2]) as u16);
+                    long.splice(0..0, units);
+                    continue;
+                }
+                let mut sum = 0u8;
+                for &character in &record[..11] {
+                    sum = sum.rotate_right(1).wrapping_add(character);
+                }
+                let base = String::from_utf8_lossy(&record[..8]).trim_end().to_string();
+                let extension = String::from_utf8_lossy(&record[8..11])
+                    .trim_end()
+                    .to_string();
+                let short = if extension.is_empty() {
+                    base
+                } else {
+                    format!("{base}.{extension}")
+                };
+                let name = match expected.take() {
+                    Some((number, checksum)) => {
+                        assert_eq!((number, checksum), (1, sum), "long name belongs to entry");
+                        let end = long
+                            .iter()
+                            .position(|&unit| unit == 0)
+                            .unwrap_or(long.len());
+                        assert!(long[end..].iter().skip(1).all(|&unit| unit == 0xFFFF));
+                        String::from_utf16(&long[..end]).unwrap()
+                    }
+                    None => short.clone(),
+                };
+                items.push(Item {
+                    name,
+                    short,
+                    directory: record[11] & 0x10 != 0,
+                    cluster: (le(&record[20..22]) << 16 | le(&record[26..28])) as u32,
+                    size: le(&record[28..32]) as u32,
+                });
+            }
+            items
+        }
+
+        fn resolve(&mut self, path: &str) -> Item {
+            let mut item = Item {
+                name: String::new(),
+                short: String::new(),
+                directory: true,
+                cluster: self.root,
+                size: 0,
+            };
+            for name in path.split('/').filter(|name| !name.is_empty()) {
+                assert!(item.directory, "{path}: a file on the way");
+                item = self
+                    .directory(item.cluster)
+                    .into_iter()
+                    .find(|item| item.name == name)
+                    .unwrap_or_else(|| panic!("{path}: no {name}"));
+            }
+            item
+        }
+
+        /// Names in the directory `path`, without the two links every
+        /// directory but the root starts with.
+        pub(crate) fn names(&mut self, path: &str) -> Vec<String> {
+            let cluster = self.resolve(path).cluster;
+            let items = self.directory(cluster);
+            items
+                .into_iter()
+                .map(|item| item.name)
+                .filter(|name| !name.starts_with('.'))
+                .collect()
+        }
+
+        pub(crate) fn item(&mut self, path: &str) -> Item {
+            self.resolve(path)
+        }
+
+        pub(crate) fn file(&mut self, path: &str) -> Vec<u8> {
+            let item = self.resolve(path);
+            assert!(!item.directory, "{path} is a directory");
+            let mut data = if item.size == 0 {
+                Vec::new()
+            } else {
+                self.contents(item.cluster)
+            };
+            assert!(
+                data[item.size as usize..].iter().all(|&byte| byte == 0),
+                "{path}: zero after the end"
+            );
+            data.truncate(item.size as usize);
+            data
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::{reader::Reader, *};
+
+    /// Storage in memory that remembers which sectors were written.
+    pub(crate) struct Memory {
+        data: Vec<u8>,
+        written: Vec<bool>,
+    }
+
+    impl Memory {
+        pub(crate) fn new(sectors: usize) -> Self {
+            Self {
+                data: vec![0; sectors * SECTOR_SIZE],
+                written: vec![false; sectors],
+            }
+        }
+    }
+
+    impl Sectors for Memory {
+        fn read(&mut self, sector: u64, data: &mut [u8]) -> io::Result<()> {
+            let start = sector as usize * SECTOR_SIZE;
+            data.copy_from_slice(&self.data[start..start + data.len()]);
+            Ok(())
+        }
+
+        fn write(&mut self, sector: u64, data: &[u8]) -> io::Result<()> {
+            let start = sector as usize * SECTOR_SIZE;
+            self.data[start..start + data.len()].copy_from_slice(data);
+            self.written[sector as usize..][..data.len() / SECTOR_SIZE].fill(true);
+            Ok(())
+        }
+    }
+
+    /// The smallest partition the console formats as FAT32 is just above 33
+    /// MiB; its clusters are single sectors.
+    const SECTORS: usize = 0x220_0000 / SECTOR_SIZE;
+
+    fn pattern(length: usize, seed: u8) -> Vec<u8> {
+        (0..length)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    #[test]
+    fn the_console_partitions_get_the_fat_type_their_cluster_count_implies() {
+        // Sectors and FAT safe; then type, sectors per cluster, reserved
+        // sectors and FAT sectors.
+        for (sectors, fat_safe, fat_type, per_cluster, reserved, fat) in [
+            (0x2000, false, FatType::Fat12, 32, 1, 1),
+            (0x2_0000, true, FatType::Fat32, 1, 32, 1024),
+            (0x50_0000, true, FatType::Fat32, 32, 32, 1280),
+            (0x340_0000, true, FatType::Fat32, 32, 32, 13312),
+        ] {
+            let layout = Layout::for_partition(sectors, fat_safe).unwrap();
+            assert_eq!(
+                (
+                    layout.fat_type,
+                    layout.sectors_per_cluster,
+                    layout.reserved_sectors,
+                    layout.fat_sectors
+                ),
+                (fat_type, per_cluster, reserved, fat)
+            );
+            // A driver tells the types apart by the cluster count alone, and
+            // every cluster needs its entry.
+            let clusters = layout.cluster_count();
+            let entry_bits = match fat_type {
+                FatType::Fat12 => {
+                    assert!(clusters < 4085);
+                    12
+                }
+                FatType::Fat32 => {
+                    assert!(clusters >= 65525);
+                    assert_eq!(layout.data_start() % 32, 0, "clusters on cipher sectors");
+                    32
+                }
+            };
+            assert!(u64::from(fat) * 4096 >= (u64::from(clusters) + 2) * entry_bits);
+        }
+        // Two gigabytes and a bit: a range the formatter rejects.
+        assert!(matches!(
+            Layout::for_partition(0x8100_0000 / 512, true),
+            Err(FatError::UnsupportedSize(0x8100_0000))
+        ));
+    }
+
+    #[test]
+    fn format_writes_every_sector_a_mount_reads_and_leaves_the_clusters_alone() {
+        let mut memory = Memory::new(SECTORS);
+        let layout = format(&mut memory, SECTORS as u64, true, 0x1234_5678).unwrap();
+        let data_start = layout.data_start() as usize;
+        // Reserved area and FATs, then the root directory's cluster.
+        assert!(memory.written[..=data_start].iter().all(|&written| written));
+        assert!(
+            memory.written[data_start + 1..]
+                .iter()
+                .all(|&written| !written)
+        );
+
+        let mut reader = Reader::open(&mut memory);
+        assert_eq!(reader.names("/"), [""; 0]);
+        assert_eq!(
+            reader.sector(3),
+            [0; SECTOR_SIZE],
+            "free for the recovery file's location"
+        );
+        let fat = reader.fat(0);
+        assert_eq!(fat[2], 0x0FFF_FFFF, "the root directory is one cluster");
+        assert!(fat[3..].iter().all(|&entry| entry == 0));
+    }
+
+    #[test]
+    fn an_empty_fat12_volume_is_its_boot_sector_fats_and_root_directory() {
+        let mut memory = Memory::new(0x2000);
+        let layout = format(&mut memory, 0x2000, false, 1).unwrap();
+        assert_eq!(layout.data_start(), 35);
+        assert!(memory.written[..35].iter().all(|&written| written));
+        let boot = &memory.data[..SECTOR_SIZE];
+        assert_eq!(&boot[54..62], b"FAT12   ");
+        assert_eq!(
+            (get16(boot, 17), get16(boot, 19), get16(boot, 22)),
+            (512, 0x2000, 1)
+        );
+        for fat in [1, 2] {
+            assert_eq!(memory.data[fat * SECTOR_SIZE..][..4], [0xF8, 0xFF, 0xFF, 0]);
+        }
+    }
+
+    #[test]
+    fn nested_directories_and_long_named_files_read_back_through_another_parser() {
+        let mut memory = Memory::new(SECTORS);
+        format(&mut memory, SECTORS as u64, true, 7).unwrap();
+        let mut volume = Fat32::open(&mut memory).unwrap();
+        volume.create_dir_all("/Contents/registered").unwrap();
+        volume.create_dir_all("Contents/placehld/").unwrap();
+        volume.create_dir_all("/SAVE").unwrap();
+        // Enough long names that the directory outgrows its first cluster,
+        // and names that share their first six characters.
+        let files: Vec<(String, Vec<u8>)> = (0..40u8)
+            .map(|index| {
+                let name = format!("/Contents/registered/00e7f53a{index:024x}.nca");
+                (name, pattern(usize::from(index) * 300, index))
+            })
+            .collect();
+        for (path, contents) in &files {
+            volume
+                .write_file(path, &mut contents.as_slice(), contents.len() as u64)
+                .unwrap();
+        }
+        volume
+            .write_file("/SAVE/A.BIN", &mut &[1u8, 2, 3][..], 3)
+            .unwrap();
+        volume.finish().unwrap();
+
+        let mut reader = Reader::open(&mut memory);
+        assert_eq!(reader.names("/"), ["Contents", "SAVE"]);
+        assert_eq!(reader.names("/Contents"), ["registered", "placehld"]);
+        assert_eq!(reader.names("/Contents/placehld"), [""; 0]);
+        for (path, contents) in &files {
+            assert_eq!(reader.file(path), *contents, "{path}");
+        }
+        assert_eq!(reader.file("/SAVE/A.BIN"), [1, 2, 3]);
+
+        // A name that is 8.3 as it stands has no long name; the others have
+        // distinct aliases.
+        assert_eq!(reader.item("/SAVE").short, "SAVE");
+        assert_eq!(reader.item("/Contents").short, "CONTEN~1");
+        let registered = reader.item("/Contents/registered");
+        let mut aliases: Vec<String> = reader
+            .directory(registered.cluster)
+            .into_iter()
+            .map(|item| item.short)
+            .collect();
+        assert_eq!(aliases[..3], [".", "..", "00E7F5~1.NCA"]);
+        assert!(aliases.contains(&"00E7F~10.NCA".to_string()));
+        aliases.sort();
+        aliases.dedup();
+        assert_eq!(aliases.len(), 42);
+        assert!(
+            reader.chain(registered.cluster).len() > 1,
+            "the directory grew"
+        );
+
+        // Every directory but the root links to itself and to its parent,
+        // the root being cluster 0 there.
+        let links = reader.directory(registered.cluster);
+        let contents = reader.item("/Contents").cluster;
+        assert_eq!(
+            (links[0].cluster, links[1].cluster),
+            (registered.cluster, contents)
+        );
+        assert_eq!(reader.directory(contents)[1].cluster, 0);
+
+        // No cluster is marked used that nothing reaches: the root, the
+        // three directories of one cluster, the one that grew, the files
+        // in it and the one cluster of the file beside them.
+        let used = reader.fat(0)[2..]
+            .iter()
+            .filter(|&&entry| entry != 0)
+            .count();
+        let file_clusters: usize = files.iter().map(|file| file.1.len().div_ceil(512)).sum();
+        let directories = 4 + reader.chain(registered.cluster).len();
+        assert_eq!(used, file_clusters + 1 + directories);
+    }
+
+    #[test]
+    fn a_volume_can_be_added_to_again_and_keeps_what_it_had() {
+        let mut memory = Memory::new(SECTORS);
+        format(&mut memory, SECTORS as u64, true, 7).unwrap();
+        let mut volume = Fat32::open(&mut memory).unwrap();
+        volume.create_dir_all("/a/Long Directory Name").unwrap();
+        let first = pattern(5000, 1);
+        volume
+            .write_file(
+                "/a/Long Directory Name/one.bin",
+                &mut first.as_slice(),
+                5000,
+            )
+            .unwrap();
+        volume.finish().unwrap();
+
+        let mut volume = Fat32::open(&mut memory).unwrap();
+        // Found again by long name, in any case, and by alias.
+        volume.create_dir_all("/A/long directory name/sub").unwrap();
+        volume.create_dir_all("/a/LONGDI~1/sub").unwrap();
+        let second = pattern(700, 2);
+        volume
+            .write_file(
+                "/a/Long Directory Name/two.bin",
+                &mut second.as_slice(),
+                700,
+            )
+            .unwrap();
+        let error = volume.write_file("/a/long directory name/ONE.BIN", &mut &[][..], 0);
+        assert!(matches!(error, Err(FatError::Exists(_))));
+        let error = volume.write_file("/a/missing/x", &mut &[][..], 0);
+        assert!(matches!(error, Err(FatError::NotFound(_))));
+        let error = volume.create_dir_all("/a/Long Directory Name/one.bin/x");
+        assert!(matches!(error, Err(FatError::NotADirectory(_))));
+        let error = volume.create_dir_all("/a/b:c");
+        assert!(matches!(error, Err(FatError::InvalidName(_))));
+        volume.finish().unwrap();
+
+        let mut reader = Reader::open(&mut memory);
+        assert_eq!(
+            reader.names("/a/Long Directory Name"),
+            ["one.bin", "sub", "two.bin"]
+        );
+        assert_eq!(reader.file("/a/Long Directory Name/one.bin"), first);
+        assert_eq!(reader.file("/a/Long Directory Name/two.bin"), second);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_completed_leaves_no_trace() {
+        let mut memory = Memory::new(SECTORS);
+        format(&mut memory, SECTORS as u64, true, 7).unwrap();
+        let mut volume = Fat32::open(&mut memory).unwrap();
+        // The contents end before the size they were announced with.
+        let error = volume.write_file("/short.bin", &mut &[0u8; 100][..], 4000);
+        assert!(matches!(error, Err(FatError::Io(_))));
+        let error = volume.write_file("/huge.bin", &mut io::empty(), 1 << 30);
+        assert!(matches!(error, Err(FatError::NoSpace)));
+        volume
+            .write_file("/kept.bin", &mut &[9u8; 600][..], 600)
+            .unwrap();
+        volume.finish().unwrap();
+
+        let mut reader = Reader::open(&mut memory);
+        assert_eq!(reader.names("/"), ["kept.bin"]);
+        let used = reader.fat(0)[2..]
+            .iter()
+            .filter(|&&entry| entry != 0)
+            .count();
+        assert_eq!(
+            used,
+            1 + 2,
+            "the root directory and the two clusters of the file"
+        );
+    }
+
+    #[test]
+    fn a_volume_with_the_drivers_recovery_file_is_refused() {
+        let mut memory = Memory::new(SECTORS);
+        format(&mut memory, SECTORS as u64, true, 7).unwrap();
+        let mut volume = Fat32::open(&mut memory).unwrap();
+        volume
+            .write_file("/PRF2SAFE.RCV", &mut &[0u8; 16][..], 16)
+            .unwrap();
+        volume.finish().unwrap();
+        assert!(matches!(Fat32::open(&mut memory), Err(FatError::Journaled)));
+    }
+}

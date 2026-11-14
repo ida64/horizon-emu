@@ -1,0 +1,5 @@
+# Hypervisor.framework refuses hv_vm_create (HV_DENIED) unless the executable
+# carries the com.apple.security.hypervisor entitlement, so every cargo-built
+# binary (run, test) is ad-hoc signed before it starts.
+[target.aarch64-apple-darwin]
+runner = "tools/hvf-run.sh"

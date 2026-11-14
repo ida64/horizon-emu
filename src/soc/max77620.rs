@@ -1,0 +1,456 @@
+//! MAX77620 power management IC on I2C5: the regulator and power-key block
+//! at address 0x3C and its real-time clock at 0x68.
+//!
+//! The console was switched on with its power button, runs from the
+//! battery with no adapter attached, and nothing has gone wrong: that is
+//! what the event and status registers say. Registers the driver programs
+//! hold what was written.
+//!
+//! What the earlier boot stages left in the configuration registers is not
+//! known here. The firmware's power driver reads each one once, to change
+//! some of its bits, when it sets the regulators up from its own tables
+//! (pcv text `0x1cce0`); those registers start at zero, an assumption about
+//! the bits it keeps (registers `0x16` to `0x57`). Event masks start with
+//! everything masked (`0x0D` to `0x12`). Any other register refuses to be
+//! read.
+
+use std::{
+    collections::BTreeMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use super::i2c::RegisterMap;
+
+pub const PMIC_ADDRESS: u8 = 0x3C;
+pub const RTC_ADDRESS: u8 = 0x68;
+
+/// Last register of the power block (`CID5`).
+const PMIC_LAST_REGISTER: u8 = 0x5D;
+
+/// The 32 kHz oscillator: bit 7 says it runs, bit 2 drives its output
+/// pin, which is the SoC's 32 kHz clock (bit meanings recalled from
+/// open-source drivers). Both hold on a running console. The clock driver
+/// rewrites bits 5:4 and 1:0 when it starts (pcv text `0x16850`), so their
+/// factory settings, not known here, do not matter; bits 6 and 3 read
+/// zero, which is an assumption.
+const CNFG1_32K: u8 = 0x03;
+const CNFG1_32K_AT_START: u8 = 1 << 7 | 1 << 2;
+/// Mask of the chip's interrupt sources by block. Everything masked.
+const IRQTOPM: u8 = 0x0D;
+const IRQTOPM_AT_START: u8 = 0xFF;
+/// Mask of the chip's own events (low battery, two temperature alarms)
+/// and, in bit 0, of its interrupt line as a whole (recalled). Everything
+/// masked.
+const INTENLBT: u8 = 0x0E;
+const INTENLBT_AT_START: u8 = 0x0F;
+/// Power key and adapter events since they were last read; reading clears
+/// them. Bit 3: the power key went down.
+const ONOFFIRQ: u8 = 0x0B;
+const ONOFFIRQ_POWER_KEY_PRESSED: u8 = 1 << 3;
+/// Why the previous power-down happened, if it was forced. Nothing was.
+const NVERC: u8 = 0x0C;
+/// Present levels of the power key, adapter detection and lid inputs. All
+/// inactive: the key was let go, no adapter.
+const ONOFFSTAT: u8 = 0x15;
+/// The version of the chip's factory programming. The firmware knows two,
+/// and with this one it uses the regulator table of the original console:
+/// 1.125 V memory, 1.35 V pre-regulator (pcv text `0x195d0`, tables at
+/// `0x9e350` and `0x9f790`).
+const CID4: u8 = 0x5C;
+const CID4_ORIGINAL_CONSOLE: u8 = 0x35;
+/// Regulator voltages and modes, the chip's pins, the power-key behavior
+/// and the power sequencers (`SD0` to `FPS_RSO`).
+const CONFIGURATION: std::ops::RangeInclusive<u8> = 0x16..=0x57;
+/// Masks of the regulator and power-key events (`IRQMASKSD` to `ONOFFIRQM`).
+const EVENT_MASKS: std::ops::RangeInclusive<u8> = 0x0F..=0x12;
+/// One bit per step-down regulator whose output has failed. None has.
+const STATSD: u8 = 0x14;
+/// Each of the nine linear regulators has a pair of registers from here:
+/// voltage and, in the top two bits, power mode (zero: off); then options
+/// and [`LDO_CFG2_POWER_OK`].
+const LDO0_CFG: u8 = 0x23;
+const LDO_COUNT: u8 = 9;
+const LDO_CFG_POWER_MODE: u8 = 0b11 << 6;
+/// The regulator's output has reached its voltage. The driver waits for
+/// this after switching one on (pcv text `0x1c4c0`); outputs settle at
+/// once here.
+const LDO_CFG2_POWER_OK: u8 = 1 << 3;
+/// Each linear regulator's place in the power sequences, one register per
+/// regulator from here. The top two bits name the sequencer that switches
+/// it; with [`FPS_SOURCE_NONE`] only its power mode does.
+const FPS_LDO0: u8 = 0x46;
+const FPS_SOURCE: u8 = 0b11 << 6;
+const FPS_SOURCE_NONE: u8 = 0b11 << 6;
+
+/// The power block of the PMIC.
+pub struct Pmic {
+    registers: BTreeMap<u8, u8>,
+}
+
+impl Pmic {
+    pub fn new() -> Self {
+        let mut registers: BTreeMap<u8, u8> = CONFIGURATION
+            .map(|register| (register, 0))
+            .chain(EVENT_MASKS.map(|register| (register, 0xFF)))
+            .collect();
+        registers.extend([
+            (CNFG1_32K, CNFG1_32K_AT_START),
+            (IRQTOPM, IRQTOPM_AT_START),
+            (INTENLBT, INTENLBT_AT_START),
+            (ONOFFIRQ, ONOFFIRQ_POWER_KEY_PRESSED),
+            (NVERC, 0),
+            (ONOFFSTAT, 0),
+            (CID4, CID4_ORIGINAL_CONSOLE),
+            (STATSD, 0),
+        ]);
+        Self { registers }
+    }
+}
+
+impl Default for Pmic {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RegisterMap for Pmic {
+    fn read(&mut self, register: u8) -> Option<u8> {
+        let value = *self.registers.get(&register)?;
+        if register == ONOFFIRQ {
+            self.registers.insert(register, 0);
+        }
+        let ldo = register.wrapping_sub(LDO0_CFG) / 2;
+        if register > LDO0_CFG && ldo < LDO_COUNT && (register - LDO0_CFG) % 2 == 1 {
+            // The sequencers have all run: the console is up.
+            let mode = self.registers[&(LDO0_CFG + 2 * ldo)] & LDO_CFG_POWER_MODE;
+            let sequenced = self.registers[&(FPS_LDO0 + ldo)] & FPS_SOURCE != FPS_SOURCE_NONE;
+            let ok = mode != 0 || sequenced;
+            return Some(value & !LDO_CFG2_POWER_OK | if ok { LDO_CFG2_POWER_OK } else { 0 });
+        }
+        Some(value)
+    }
+
+    fn write(&mut self, register: u8, value: u8) -> Option<()> {
+        match register {
+            // Event and status registers follow the inputs, not the bus.
+            ONOFFIRQ | NVERC | ONOFFSTAT => {}
+            _ if register <= PMIC_LAST_REGISTER => {
+                self.registers.insert(register, value);
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+}
+
+/// Pending clock events; reading clears them. None: no alarm woke the
+/// console.
+const RTCINT: u8 = 0x00;
+/// Event mask, all six events masked as after power-on.
+const RTCINTM: u8 = 0x01;
+const RTCINTM_AT_POWER_ON: u8 = 0x3F;
+/// Which bits of a write to [`RTCCNTL`] take effect.
+const RTCCNTLM: u8 = 0x02;
+/// How the time and alarm registers count: [`RTCCNTL_BCD`],
+/// [`RTCCNTL_24_HOUR`].
+const RTCCNTL: u8 = 0x03;
+const RTCCNTL_BCD: u8 = 1 << 0;
+const RTCCNTL_24_HOUR: u8 = 1 << 1;
+/// Requests a transfer between the clock and the registers the bus sees:
+/// [`RTCUPDATE0_WRITE`] makes what was written take effect,
+/// [`RTCUPDATE0_READ`] captures the clock for reading. The bits clear
+/// themselves; transfers here take no time.
+const RTCUPDATE0: u8 = 0x04;
+const RTCUPDATE0_WRITE: u8 = 1 << 0;
+const RTCUPDATE0_READ: u8 = 1 << 4;
+/// Which transfers have completed since this was last read (clearing on
+/// read is recalled, like the bit positions): the driver looks here after
+/// requesting one.
+const RTCUPDATE1: u8 = 0x05;
+const RTCUPDATE1_WRITE_DONE: u8 = 1 << 0;
+const RTCUPDATE1_READ_DONE: u8 = 1 << 1;
+/// Seconds, minutes, hours, day of week (one bit per day, Sunday first),
+/// month, year (two digits) and day of month follow one another.
+const RTCSEC: u8 = 0x07;
+const RTCDOM: u8 = 0x0D;
+/// In 12-hour mode the hour register counts 1 to 12 and this bit says "PM".
+const RTCHOUR_PM: u8 = 1 << 6;
+/// The two alarms, each with the layout of the time registers plus an
+/// enable bit in every register.
+const ALARM1_SEC: u8 = 0x0E;
+const ALARM2_DOM: u8 = 0x1B;
+const ALARM_ENABLE: u8 = 1 << 7;
+
+/// The year the two-digit year register counts from.
+const RTC_EPOCH_YEAR: i64 = 2000;
+
+/// The real-time clock of the PMIC, a clock running on its own battery.
+///
+/// It shows the host's time until the guest sets it, and keeps the
+/// difference afterwards: a console that has been keeping time, which is
+/// what the battery is for. The register layout and the transfer protocol
+/// are recalled from the chip's Linux driver, not read off a datasheet;
+/// the firmware's driver agreeing with them is the evidence. Alarms are
+/// kept but never go off, so enabling one is refused.
+pub struct Rtc {
+    /// Seconds since the Unix epoch, on the host.
+    host_time: Box<dyn Fn() -> i64 + Send>,
+    /// What the guest's setting of the clock added to the host's time.
+    offset: i64,
+    event_mask: u8,
+    control: u8,
+    control_mask: u8,
+    /// Registers written since the last write transfer.
+    written: BTreeMap<u8, u8>,
+    /// Time registers captured by the last read transfer.
+    captured: Option<[u8; 7]>,
+    transfers_done: u8,
+    alarms: BTreeMap<u8, u8>,
+}
+
+impl Rtc {
+    /// A clock following `host_time`, which gives seconds since the Unix
+    /// epoch. It counts in binary with a 24-hour day: the setting the
+    /// firmware's driver takes as the sign of a clock that has not lost its
+    /// time (pcv text `0x16850`, `RTCCNTL & 3 == 2`).
+    pub fn new(host_time: impl Fn() -> i64 + Send + 'static) -> Self {
+        Self {
+            host_time: Box::new(host_time),
+            offset: 0,
+            event_mask: RTCINTM_AT_POWER_ON,
+            control: RTCCNTL_24_HOUR,
+            control_mask: 0,
+            written: BTreeMap::new(),
+            captured: None,
+            transfers_done: 0,
+            // No alarm is set, and none ever was.
+            alarms: (ALARM1_SEC..=ALARM2_DOM)
+                .map(|register| (register, 0))
+                .collect(),
+        }
+    }
+
+    /// A clock following the host's.
+    pub fn following_host() -> Self {
+        Self::new(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64)
+        })
+    }
+
+    fn encode(&self, value: u8) -> u8 {
+        if self.control & RTCCNTL_BCD != 0 {
+            ((value / 10) << 4) | (value % 10)
+        } else {
+            value
+        }
+    }
+
+    fn decode(&self, value: u8) -> u8 {
+        if self.control & RTCCNTL_BCD != 0 {
+            (value >> 4) * 10 + (value & 0xF)
+        } else {
+            value
+        }
+    }
+
+    /// The time registers for the clock's current time.
+    fn time_registers(&self) -> [u8; 7] {
+        let now = (self.host_time)() + self.offset;
+        let (days, second_of_day) = (now.div_euclid(86_400), now.rem_euclid(86_400));
+        let (year, month, day) = civil_from_days(days);
+        let hour = (second_of_day / 3600) as u8;
+        let hour = if self.control & RTCCNTL_24_HOUR != 0 {
+            self.encode(hour)
+        } else {
+            let pm = if hour >= 12 { RTCHOUR_PM } else { 0 };
+            self.encode((hour + 11) % 12 + 1) | pm
+        };
+        [
+            self.encode((second_of_day % 60) as u8),
+            self.encode((second_of_day / 60 % 60) as u8),
+            hour,
+            // 1970-01-01 was a Thursday.
+            1 << (days + 4).rem_euclid(7),
+            self.encode(month),
+            self.encode((year - RTC_EPOCH_YEAR).rem_euclid(100) as u8),
+            self.encode(day),
+        ]
+    }
+
+    /// Sets the clock from a full set of time registers.
+    fn set_time(&mut self, registers: [u8; 7]) {
+        let [second, minute, hour, _day_of_week, month, year, day] = registers;
+        let hour = if self.control & RTCCNTL_24_HOUR != 0 {
+            self.decode(hour)
+        } else {
+            let pm = if hour & RTCHOUR_PM != 0 { 12 } else { 0 };
+            self.decode(hour & !RTCHOUR_PM) % 12 + pm
+        };
+        let days = days_from_civil(
+            RTC_EPOCH_YEAR + i64::from(self.decode(year)),
+            self.decode(month),
+            self.decode(day),
+        );
+        let time = days * 86_400
+            + i64::from(hour) * 3600
+            + i64::from(self.decode(minute)) * 60
+            + i64::from(self.decode(second));
+        self.offset = time - (self.host_time)();
+    }
+
+    /// Makes what was written since the last transfer take effect.
+    fn commit(&mut self) -> Option<()> {
+        let written = std::mem::take(&mut self.written);
+        if let Some(&control) = written.get(&RTCCNTL) {
+            self.control = self.control & !self.control_mask | control & self.control_mask;
+        }
+        let time: Vec<u8> = written
+            .range(RTCSEC..=RTCDOM)
+            .map(|(_, &value)| value)
+            .collect();
+        match <[u8; 7]>::try_from(time) {
+            Ok(time) => self.set_time(time),
+            // Setting part of the time: what the rest becomes is not known.
+            Err(time) if !time.is_empty() => return None,
+            Err(_) => {}
+        }
+        for (&register, &value) in written.range(ALARM1_SEC..=ALARM2_DOM) {
+            if value & ALARM_ENABLE != 0 {
+                return None;
+            }
+            self.alarms.insert(register, value);
+        }
+        Some(())
+    }
+}
+
+/// Year, month and day of the given day since 1970-01-01, in the Gregorian
+/// calendar (the usual era-based conversion).
+fn civil_from_days(days: i64) -> (i64, u8, u8) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month as u8, day as u8)
+}
+
+/// The inverse of [`civil_from_days`].
+fn days_from_civil(year: i64, month: u8, day: u8) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let shifted_month = (i64::from(month) + 9) % 12;
+    let day_of_year = (153 * shifted_month + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+impl RegisterMap for Rtc {
+    fn read(&mut self, register: u8) -> Option<u8> {
+        match register {
+            RTCINT | RTCUPDATE0 => Some(0),
+            RTCINTM => Some(self.event_mask),
+            RTCCNTLM => Some(self.control_mask),
+            RTCCNTL => Some(self.control),
+            RTCUPDATE1 => Some(std::mem::take(&mut self.transfers_done)),
+            RTCSEC..=RTCDOM => Some(self.captured?[usize::from(register - RTCSEC)]),
+            ALARM1_SEC..=ALARM2_DOM => self.alarms.get(&register).copied(),
+            _ => None,
+        }
+    }
+
+    fn write(&mut self, register: u8, value: u8) -> Option<()> {
+        match register {
+            RTCINT => {}
+            RTCINTM => self.event_mask = value,
+            RTCCNTLM => self.control_mask = value,
+            RTCUPDATE0 => {
+                if value & RTCUPDATE0_WRITE != 0 {
+                    self.commit()?;
+                    self.transfers_done |= RTCUPDATE1_WRITE_DONE;
+                }
+                if value & RTCUPDATE0_READ != 0 {
+                    self.captured = Some(self.time_registers());
+                    self.transfers_done |= RTCUPDATE1_READ_DONE;
+                }
+            }
+            RTCCNTL | RTCSEC..=ALARM2_DOM => {
+                self.written.insert(register, value);
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn power_key_event_is_reported_once_and_unknown_state_is_refused() {
+        let mut pmic = Pmic::new();
+        assert_eq!(pmic.read(ONOFFIRQ), Some(ONOFFIRQ_POWER_KEY_PRESSED));
+        assert_eq!(pmic.read(ONOFFIRQ), Some(0));
+        pmic.write(ONOFFSTAT, 0xFF).unwrap();
+        assert_eq!(pmic.read(ONOFFSTAT), Some(0));
+
+        // A status nothing here has a value for.
+        assert_eq!(pmic.read(0x13), None);
+        assert_eq!(pmic.read(0x23), Some(0));
+        pmic.write(0x23, 0xD0).unwrap();
+        assert_eq!(pmic.read(0x23), Some(0xD0));
+        assert_eq!(pmic.write(0x5E, 0), None);
+    }
+
+    #[test]
+    fn clock_reads_in_the_mode_set_and_keeps_what_it_is_set_to() {
+        // 2024-02-29 15:04:05 UTC, a Thursday.
+        let mut rtc = Rtc::new(|| 1_709_219_045);
+        assert_eq!(rtc.read(RTCSEC), None);
+        let time = |rtc: &mut Rtc| {
+            rtc.write(RTCUPDATE0, RTCUPDATE0_READ).unwrap();
+            [0, 1, 2, 3, 4, 5, 6].map(|index| rtc.read(RTCSEC + index).unwrap())
+        };
+        assert_eq!(time(&mut rtc), [5, 4, 15, 1 << 4, 2, 24, 29]);
+
+        // A control write only changes the bits the mask names.
+        rtc.write(RTCCNTLM, RTCCNTL_BCD).unwrap();
+        rtc.write(RTCCNTL, RTCCNTL_BCD).unwrap();
+        assert_eq!(rtc.read(RTCCNTL), Some(RTCCNTL_24_HOUR));
+        rtc.write(RTCUPDATE0, RTCUPDATE0_WRITE).unwrap();
+        assert_eq!(time(&mut rtc), [0x05, 0x04, 0x15, 1 << 4, 0x02, 0x24, 0x29]);
+        rtc.write(RTCCNTLM, RTCCNTL_24_HOUR).unwrap();
+        rtc.write(RTCCNTL, 0).unwrap();
+        rtc.write(RTCUPDATE0, RTCUPDATE0_WRITE).unwrap();
+        assert_eq!(time(&mut rtc)[2], 0x03 | RTCHOUR_PM);
+        rtc.write(RTCCNTL, RTCCNTL_24_HOUR).unwrap();
+        rtc.write(RTCUPDATE0, RTCUPDATE0_WRITE).unwrap();
+
+        // 2031-12-31 23:59:58: the clock runs on from what it was set to.
+        for (index, value) in [0x58, 0x59, 0x23, 1 << 3, 0x12, 0x31, 0x31]
+            .into_iter()
+            .enumerate()
+        {
+            rtc.write(RTCSEC + index as u8, value).unwrap();
+        }
+        rtc.write(RTCUPDATE0, RTCUPDATE0_WRITE).unwrap();
+        assert_eq!(time(&mut rtc), [0x58, 0x59, 0x23, 1 << 3, 0x12, 0x31, 0x31]);
+
+        // An alarm that would have to go off.
+        rtc.write(ALARM1_SEC, ALARM_ENABLE).unwrap();
+        assert_eq!(rtc.write(RTCUPDATE0, RTCUPDATE0_WRITE), None);
+    }
+}

@@ -1,0 +1,186 @@
+//! Host-engine Falcon boot interface, not a Falcon instruction emulator.
+//!
+//! nvservices 23.5.0 `0x809e0` loads 256-byte DMEM/IMEM blocks through
+//! 0x1110..0x111c, starts CPUCTL, and requires IDLESTATE == 0 (spec §5.2).
+//! Firmware bytes are fetched through the engine SMMU and retained; completing
+//! boot means the modeled service is ready, not that firmware was executed.
+//! pcv `0x39450`, partition table `0xb1b18`, workaround table `0xab40c`,
+//! sets then clears VIC SLCG override 0x8c mask 0x010000dd for MBIST.
+//!
+//! The THI method port at +0x40/+0x44 is THI words 0x10/0x11, the registers
+//! host1x channels reach as class methods; both go to the [`Vic`] engine.
+use super::{
+    Notes,
+    mc::DeviceMemory,
+    vic::{self, Vic},
+};
+use crate::bus::MmioDevice;
+use std::sync::{Arc, Mutex};
+
+pub const VIC_BASE: u64 = 0x5434_0000;
+pub const SIZE: u64 = 0x40000;
+
+struct State {
+    regs: [u32; 0x1610 / 4],
+    imem: [u8; 0x10000],
+    dmem: [u8; 0x10000],
+}
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            regs: [0; 0x1610 / 4],
+            imem: [0; 0x10000],
+            dmem: [0; 0x10000],
+        }
+    }
+}
+
+pub struct HostFalcon {
+    state: Mutex<State>,
+    memory: DeviceMemory,
+    engine: Vic,
+    notes: Arc<Notes>,
+}
+impl HostFalcon {
+    /// `memory` is memory as the VIC's SMMU client reaches it.
+    pub fn new(memory: DeviceMemory, engine: Vic, notes: Arc<Notes>) -> Self {
+        Self {
+            state: Mutex::new(State::default()),
+            memory,
+            engine,
+            notes,
+        }
+    }
+    /// A host1x channel method: THI register `offset` (in words) of `class`.
+    pub fn method(&self, class: u32, offset: u32, value: u32) -> Option<()> {
+        if class != vic::CLASS {
+            return self.refuse(format!("class {class:#x} method {offset:#x}={value:#x}"));
+        }
+        self.engine.thi_write(offset, value)
+    }
+    fn known(offset: u64) -> bool {
+        matches!(
+            offset,
+            0x8c | 0x1010
+                | 0x101c
+                | 0x1048
+                | 0x104c
+                | 0x1100
+                | 0x1104
+                | 0x110c
+                | 0x1110
+                | 0x1114
+                | 0x1118
+                | 0x111c
+                | 0x1604
+        )
+    }
+    fn refuse(&self, reason: String) -> Option<()> {
+        self.notes.add(format!("VIC: {reason}"));
+        None
+    }
+}
+impl MmioDevice for HostFalcon {
+    fn read(&self, _core: usize, offset: u64, size: u8) -> Option<u64> {
+        if size == 4 && offset == 0x40 {
+            return Some(self.engine.method_offset().into());
+        }
+        if size != 4 || !Self::known(offset) {
+            self.refuse(format!("unmodeled read +{offset:#x}/{size}"))?;
+        }
+        Some(u64::from(
+            self.state.lock().unwrap().regs[offset as usize / 4],
+        ))
+    }
+    fn write(&self, _core: usize, offset: u64, size: u8, value: u64) -> Option<()> {
+        // nvservices writes CPUCTL and the adjacent zero BOOTVEC together.
+        if offset == 0x1100 && size == 8 {
+            self.write(_core, 0x1104, 4, value >> 32)?;
+            return self.write(_core, 0x1100, 4, value as u32 as u64);
+        }
+        if size == 4 && matches!(offset, 0x40 | 0x44) {
+            return self.engine.thi_write(offset as u32 / 4, value as u32);
+        }
+        if size != 4 || !Self::known(offset) {
+            return self.refuse(format!("unmodeled write +{offset:#x}/{size}={value:#x}"));
+        }
+        let mut s = self.state.lock().unwrap();
+        let v = value as u32;
+        match offset {
+            0x1118 => {
+                if !matches!(v, 0x600 | 0x610) {
+                    return self.refuse(format!("DMA command {v:#x}"));
+                }
+                let address = (u64::from(s.regs[0x1110 / 4]) << 8) + u64::from(s.regs[0x111c / 4]);
+                let at = s.regs[0x1114 / 4] as usize;
+                let target = if v & 0x10 != 0 {
+                    &mut s.imem
+                } else {
+                    &mut s.dmem
+                };
+                let Some(block) = target.get_mut(at..at.saturating_add(256)) else {
+                    return self.refuse(format!("DMA local offset {at:#x}"));
+                };
+                if self.memory.read(address, block).is_none() {
+                    return self.refuse(format!("DMA unmapped IOVA {address:#x}"));
+                }
+                s.regs[0x1118 / 4] = v | 2;
+                return Some(());
+            }
+            0x1100 if v != 2 => return self.refuse(format!("CPUCTL {v:#x}")),
+            _ => {}
+        }
+        s.regs[offset as usize / 4] = v;
+        Some(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        boot::DramSize,
+        memory::GuestRam,
+        soc::mc::{Mc, SMMU_VIC_ASID},
+    };
+
+    #[test]
+    fn firmware_dma_and_start_handshake() {
+        let ram = Arc::new(GuestRam::new(0x8000_0000, 0x4000).unwrap());
+        let mc = Arc::new(Mc::new(DramSize::Gb4));
+        mc.write(0, 0x1c, 4, 1).unwrap();
+        mc.write(0, 0x20, 4, 0xe0080000).unwrap();
+        mc.write(0, SMMU_VIC_ASID, 4, 0x80000001).unwrap();
+        ram.write(0x8000_0000, &0xd0080001u32.to_le_bytes())
+            .unwrap();
+        ram.write(0x8000_1000, &0xc0080002u32.to_le_bytes())
+            .unwrap();
+        ram.write(0x8000_2000, &[0xa5; 256]).unwrap();
+        let memory = || DeviceMemory::new(&mc, &ram, SMMU_VIC_ASID);
+        let vic = Vic::new(memory(), Arc::default(), Arc::default());
+        let engine = HostFalcon::new(memory(), vic, Arc::default());
+        assert_eq!(engine.read(0, 0x110c, 4), Some(0));
+        engine.write(0, 0x1110, 4, 0).unwrap();
+        engine.write(0, 0x1114, 4, 0).unwrap();
+        engine.write(0, 0x111c, 4, 0).unwrap();
+        engine.write(0, 0x1118, 4, 0x610).unwrap();
+        assert_eq!(engine.read(0, 0x1118, 4), Some(0x612));
+        assert_eq!(&engine.state.lock().unwrap().imem[..256], &[0xa5; 256]);
+        engine.write(0, 0x1100, 8, 2).unwrap();
+        assert_eq!(engine.read(0, 0x104c, 4), Some(0));
+        assert_eq!(engine.write(0, 0x1118, 4, 0xdead), None);
+        assert_eq!(engine.read(0, 0x1234, 4), None);
+        engine.write(0, 0x8c, 4, 0x010000dd).unwrap();
+        assert_eq!(engine.read(0, 0x8c, 4), Some(0x010000dd));
+        engine.write(0, 0x8c, 4, 0).unwrap();
+        // The boot methods nvservices sends through the THI port (survey
+        // run: 0x80 = 1, 0x1c7 = 0x3c0, 0x1cb = 0xe0043d).
+        for (method, value) in [(0x80, 1), (0x1c7, 0x3c0), (0x1cb, 0xe0043d)] {
+            engine.write(0, 0x40, 4, method).unwrap();
+            engine.write(0, 0x44, 4, value).unwrap();
+        }
+        assert_eq!(engine.read(0, 0x40, 4), Some(0x1cb));
+        engine.write(0, 0x40, 4, 0x80).unwrap();
+        assert_eq!(engine.write(0, 0x44, 4, 2), None);
+    }
+}
