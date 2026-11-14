@@ -332,7 +332,7 @@ impl Context {
 
     /// Executes until the channel is idle, waits, or is asked to stop.
     /// The engines' work need not be in memory when the turn ends: no one
-    /// may look at it before a signal says it is done ([`signals`]).
+    /// may look at it before a signal says it is done (`signals`).
     pub fn run(&mut self, env: &Env) -> Result<Outcome, Unmodeled> {
         let memory = ChannelMemory::new(self.space, env.bus);
         self.turn(env, &memory)
