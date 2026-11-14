@@ -81,9 +81,10 @@ options:
   --screenshot-at SECONDS:FILE
                       save what the screen shows as a PNG SECONDS after the
                       machine starts; may be given more than once
-  --renderer NAME     draw the GPU's 3D work with `software` (the reference,
-                      default) or `metal` (the host GPU; what it cannot do
-                      falls back to software per draw)
+  --renderer NAME     draw the GPU's 3D work with `metal` (the host GPU, the
+                      default when there is one; what it cannot do falls
+                      back to software per draw) or `software` (the
+                      reference, the default without a Metal device)
   --gpu-capture FILE  record every GPU channel's method calls and the guest
                       memory its engines read, for replay
                       (horizon_emu::maxwell::capture)
@@ -273,6 +274,9 @@ fn boot(image: KernelImage, flags: &[String]) -> Result<(), String> {
     let mut screenshot = None;
     let mut inputs = Vec::new();
     let mut timed_screenshots = Vec::new();
+    if maxwell::metal::available() {
+        maxwell::select_renderer(maxwell::RendererKind::Metal);
+    }
 
     let mut flags = flags.iter();
     while let Some(flag) = flags.next() {
