@@ -146,6 +146,18 @@ struct Frame {
     pass: Option<(Retained<Encoder>, Attachments)>,
 }
 
+impl Drop for Frame {
+    /// A frame dropped unfinished (its channel stopped, or the machine
+    /// did, between signals) ends its open pass: Metal aborts the process
+    /// when an encoder is released without `endEncoding`. The command
+    /// buffer itself is dropped uncommitted; its work was never signaled.
+    fn drop(&mut self) {
+        if let Some((encoder, _)) = self.pass.take() {
+            encoder.endEncoding();
+        }
+    }
+}
+
 struct Program2 {
     /// Keeps the program alive so its address is not reused as a key.
     _program: Arc<Program>,
@@ -705,8 +717,8 @@ impl Renderer {
 impl State {
     /// Ends recording and waits for the GPU.
     fn finish(&mut self) {
-        if let Some(frame) = self.frame.take() {
-            if let Some((encoder, _)) = frame.pass {
+        if let Some(mut frame) = self.frame.take() {
+            if let Some((encoder, _)) = frame.pass.take() {
                 encoder.endEncoding();
             }
             frame.command.commit();
