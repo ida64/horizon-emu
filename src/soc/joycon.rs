@@ -535,20 +535,36 @@ impl JoyCon {
             // address, three bytes and 21 more, which are the class and
             // name it sent of itself in the same places; from the second
             // the link key, each byte XORed with 0xAA.
+            //
+            // A console that already has this Joy-Con in its list opens
+            // with step 4 instead of 1 (`0x14C360`: for a known address
+            // and firmware above 3.3), which asks whether the pairing
+            // still stands. This Joy-Con keeps nothing from one run of
+            // the machine to the next, the console's storage does: it has
+            // no pairing to confirm. What a real one says then is not
+            // documented; `hid` takes an answer of kind 1 to either
+            // opening as the start of a fresh pairing and goes on with
+            // steps 2 and 3, and that is the answer given, which is an
+            // assumption.
             0x01 => {
                 let step = argument(0)?;
                 let side = self.side.index();
-                let mut data = vec![step];
-                match step {
-                    1 => {
+                let data = match step {
+                    1 | 4 => {
+                        let mut data = vec![1];
                         data.extend(Identity::ADDRESS[side].iter().rev());
                         data.extend(Identity::CLASS);
                         data.extend(Identity::NAME[side].bytes());
+                        data
                     }
-                    2 => data.extend(Identity::LINK_KEY[side].map(|byte| byte ^ 0xAA)),
-                    3 => {}
+                    2 => {
+                        let mut data = vec![2];
+                        data.extend(Identity::LINK_KEY[side].map(|byte| byte ^ 0xAA));
+                        data
+                    }
+                    3 => vec![3],
                     _ => return Err(()),
-                }
+                };
                 (0x81, data)
             }
             // Device information.
@@ -860,7 +876,12 @@ mod tests {
             subcommand(&mut rail, 0x01, &[3]).unwrap()[13..16],
             [0x81, 0x01, 3]
         );
-        assert!(subcommand(&mut rail, 0x01, &[4]).is_err());
+        // A console that knows the Joy-Con asks with step 4; having kept
+        // nothing, the Joy-Con starts over.
+        let report = subcommand(&mut rail, 0x01, &[4, 0x02, 0x75, 0x6D, 0x45, 0x68, 0x02]).unwrap();
+        assert_eq!(report[13..16], [0x81, 0x01, 1]);
+        assert_eq!(report[16..22], [0x10, 0x75, 0x6D, 0x45, 0x68, 0x02]);
+        assert!(subcommand(&mut rail, 0x01, &[5]).is_err());
     }
 
     #[test]
