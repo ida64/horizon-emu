@@ -634,7 +634,7 @@ impl Soc {
         let powered = self.gpio.output(BACKLIGHT_PORT, BACKLIGHT_ENABLE_PIN) == Some(true);
         let dimmer = self.pwm.get(0).unwrap_or(0);
         Ok(Screen {
-            frame: self.dc.frame(&self.display_memory)?.rotated_clockwise(),
+            frame: self.dc.frame_turned_clockwise(&self.display_memory)?,
             panel_on: self.dsi.panel_is_showing(),
             backlight_on: powered && dimmer & PWM_ENABLE != 0 && dimmer & PWM_WIDTH != 0,
         })

@@ -54,9 +54,15 @@ options:
                       host can, for the first SECONDS of the run or, without
                       SECONDS, throughout. Timers and device waits keep real
                       time either way. The console's own processor is
-                      roughly a tenth of the host's speed; this is for
-                      telling whether something the guest does depends on
-                      that (default 1)
+                      roughly a tenth of the host's speed, and its boot
+                      counts on that: while the system's programs are being
+                      launched, loading them (processor work) has to take
+                      its time next to what the first drivers wait for
+                      (real time), or three processes can end up waiting for
+                      each other and the boot stops with nothing on screen
+                      (seen in 1 of 6 boots at full speed, none of 8 with
+                      the default). Default 10:12; 1 for full speed
+                      throughout
   --symbols FILE      function names for kernel addresses (JSON export)
   --keys FILE         console keys (name = hex lines); without them the
                       secure monitor cannot derive keys for the guest
@@ -435,7 +441,7 @@ fn boot(image: KernelImage, flags: &[String]) -> Result<(), String> {
         times: (trace_times || verbose).then(Instant::now),
         overlay: window.is_some().then_some(&log),
     };
-    let cpu_slowdown = cpu_slowdown.unwrap_or((1, None));
+    let cpu_slowdown = cpu_slowdown.unwrap_or((10, Some(Duration::from_secs(12))));
     let options = RunOptions {
         timeout,
         stop: &stop,
@@ -626,7 +632,7 @@ fn write_png(file: File, frame: &Frame) -> Result<(), png::EncodingError> {
     let mut encoder = png::Encoder::new(io::BufWriter::new(file), frame.width, frame.height);
     encoder.set_color(png::ColorType::Rgb);
     encoder.set_depth(png::BitDepth::Eight);
-    encoder.write_header()?.write_image_data(&frame.rgb)
+    encoder.write_header()?.write_image_data(&frame.rgb())
 }
 
 /// Something done to the console at a moment of the run.

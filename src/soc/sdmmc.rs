@@ -19,16 +19,12 @@
 //! That wait is part of how the console's software runs. The filesystem
 //! process sleeps through it, which leaves the core to threads of lower
 //! priority; with a card that is done at once, a burst of filesystem work
-//! shuts those out for as long as it lasts. Two things were seen to go
-//! wrong with such a card, and not with one that takes its time. On a
-//! first boot `account` creates its saves and then asks `nifm` for the
-//! network interfaces, which a worker thread of `nifm` has to have opened
-//! by then (account text `0xBA770`, nifm text `0x8AEC0`); it gets to only
-//! while `account`'s saves keep the card busy, and `account` aborts if it
-//! has not. And early in the boot three processes could end up waiting
-//! for each other: settings in the filesystem process, that one for the
-//! clock driver to take over the card's clock, the clock driver for
-//! settings.
+//! shuts those out for as long as it lasts. That was seen to decide a
+//! race on a first boot: `account` creates its saves and then asks `nifm`
+//! for the network interfaces, which a worker thread of `nifm` has to
+//! have opened by then (account text `0xBA770`, nifm text `0x8AEC0`); it
+//! gets to only while `account`'s saves keep the card busy, and `account`
+//! aborts if it has not.
 //!
 //! Programmed I/O through the buffer data port and ADMA descriptor tables
 //! are not modeled; a transfer that asks for either stops the machine with

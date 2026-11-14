@@ -224,11 +224,17 @@ pub struct RunOptions<'a> {
     /// as fast as the host goes. Everything else keeps real time: timers,
     /// the clock, and the waits drivers make for their hardware. The
     /// console's software has only ever met its own processor, about a
-    /// tenth of the host's speed; this is for telling whether something
-    /// it does depends on that.
+    /// tenth of the host's speed, and its boot depends on it. The program
+    /// launcher starts some forty programs one after the other; on the
+    /// console loading each takes long enough that few are up while the
+    /// clock driver (pcv) starts, which waits on its regulators in real
+    /// time. At host speed nearly all of them are, and they keep settings
+    /// busy in the filesystem process at the moment that process hands
+    /// its card clock over to pcv, which is itself waiting for settings:
+    /// the three then wait for each other for good.
     pub cpu_slowdown: u32,
     /// For how long from the start of the run the processors are slowed;
-    /// `None` is throughout.
+    /// `None` is throughout. The launcher is done within seconds.
     pub cpu_slowdown_for: Option<Duration>,
     /// Places that stop the machine when a core is about to execute them.
     pub breakpoints: &'a [Place],

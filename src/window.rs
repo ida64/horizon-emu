@@ -163,17 +163,10 @@ impl ScreenWindow {
         }
         let problem = match machine.screen() {
             Ok(screen) if screen.panel_on && screen.backlight_on => {
-                let frame = &screen.frame;
+                let frame = screen.frame;
                 self.size = (frame.width as usize, frame.height as usize);
-                self.pixels.clear();
-                self.pixels.extend(
-                    frame
-                        .rgb
-                        .as_chunks::<3>()
-                        .0
-                        .iter()
-                        .map(|&[red, green, blue]| u32::from_be_bytes([0, red, green, blue])),
-                );
+                // Already in the window's 0x00RRGGBB words.
+                self.pixels = frame.pixels;
                 None
             }
             // A picture nobody can see.

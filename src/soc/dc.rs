@@ -227,31 +227,42 @@ const BLEND_BYPASS: u32 = 1 << 24;
 /// Largest active area [`Dc::frame`] renders; the panel's is 720x1280.
 const MAX_DIMENSION: u32 = 4096;
 
-/// A picture, eight bits each of red, green and blue per pixel, rows from
-/// the top.
+/// A picture, rows from the top, a 32-bit word per pixel: `0x00RRGGBB`,
+/// eight bits each of red, green and blue, which is what the screen
+/// window draws.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
-    pub rgb: Vec<u8>,
+    pub pixels: Vec<u32>,
 }
 
 impl Frame {
-    /// The picture turned a quarter turn clockwise.
+    /// The picture as bytes, red, green and blue per pixel.
+    pub fn rgb(&self) -> Vec<u8> {
+        self.pixels
+            .iter()
+            .flat_map(|pixel| {
+                let [_, red, green, blue] = pixel.to_be_bytes();
+                [red, green, blue]
+            })
+            .collect()
+    }
+
+    /// The picture turned a quarter turn clockwise: the reference
+    /// [`Dc::frame_turned_clockwise`] is checked against.
+    #[cfg(test)]
     pub fn rotated_clockwise(&self) -> Self {
         let (width, height) = (self.width as usize, self.height as usize);
-        let mut rgb = Vec::with_capacity(self.rgb.len());
         // Each row of the result is a column of the source, read upward.
-        for column in 0..width {
-            for row in (0..height).rev() {
-                let pixel = (row * width + column) * 3;
-                rgb.extend_from_slice(&self.rgb[pixel..pixel + 3]);
-            }
-        }
+        let pixels = (0..width)
+            .flat_map(|column| (0..height).rev().map(move |row| row * width + column))
+            .map(|at| self.pixels[at])
+            .collect();
         Self {
             width: self.height,
             height: self.width,
-            rgb,
+            pixels,
         }
     }
 }
@@ -373,6 +384,22 @@ pub struct Dc {
     clock: Clock,
     /// INTID 105 for DC0, 106 for DC1 (nvservices text `0x23634`).
     line: InterruptLine,
+    /// Buffers the picture is put together in, kept between pictures so
+    /// that showing one 60 times a second does not allocate them anew.
+    scratch: Mutex<Scratch>,
+}
+
+/// See [`Dc::scratch`].
+#[derive(Default)]
+struct Scratch {
+    /// A window's pixels as fetched from its surface.
+    fetched: Vec<[u8; 4]>,
+    /// A scaled window's pixels.
+    scaled: Vec<[u8; 4]>,
+    /// One horizontally scaled source line per source line.
+    lines: Vec<[u32; 4]>,
+    /// A block row of a block-linear surface.
+    block_row: Vec<u8>,
 }
 
 impl Dc {
@@ -384,6 +411,7 @@ impl Dc {
             syncpoints,
             clock,
             line,
+            scratch: Mutex::default(),
         }
     }
 
@@ -507,6 +535,16 @@ impl Dc {
     /// The picture being sent to the panel, with the frame buffers read
     /// through `memory`.
     pub fn frame(&self, memory: &DeviceMemory) -> Result<Frame, NoFrame> {
+        self.render(memory, false)
+    }
+
+    /// The same picture turned a quarter turn clockwise, as the console's
+    /// screen shows the panel, put together in one pass.
+    pub fn frame_turned_clockwise(&self, memory: &DeviceMemory) -> Result<Frame, NoFrame> {
+        self.render(memory, true)
+    }
+
+    fn render(&self, memory: &DeviceMemory, turned: bool) -> Result<Frame, NoFrame> {
         let mut registers = self.registers.lock().unwrap();
         self.settle(&mut registers);
         if !registers.sending() {
@@ -545,17 +583,25 @@ impl Dc {
             });
         }
         // The background is black, and opaque.
-        let mut picture = vec![[0.0f32; 3]; (width * height) as usize];
+        let mut canvas = Canvas {
+            pixels: vec![0; (width * height) as usize],
+            area: [width, height],
+            turned,
+        };
+        let scratch = &mut *self.scratch.lock().unwrap();
         for window in windows {
-            window.draw(memory, width, height, &mut picture)?;
+            window.draw(memory, scratch, &mut canvas)?;
         }
-        let rgb = picture
-            .iter()
-            .flat_map(|pixel| {
-                pixel.map(|channel| (channel * 255.0).round().clamp(0.0, 255.0) as u8)
-            })
-            .collect();
-        Ok(Frame { width, height, rgb })
+        let (width, height) = if turned {
+            (height, width)
+        } else {
+            (width, height)
+        };
+        Ok(Frame {
+            width,
+            height,
+            pixels: canvas.pixels,
+        })
     }
 }
 
@@ -575,8 +621,9 @@ impl Window<'_> {
             .copied()
     }
 
-    /// Fetches the window's pixels, red, green, blue and alpha each.
-    fn fetch(&self, memory: &DeviceMemory) -> Result<(u32, u32, Vec<[u8; 4]>), NoFrame> {
+    /// Fetches the window's pixels, red, green, blue and alpha each, into
+    /// `scratch.fetched`, and says where each pixel of the window is there.
+    fn fetch(&self, memory: &DeviceMemory, scratch: &mut Scratch) -> Result<Layout, NoFrame> {
         let halves = |value: u32| (value & 0xFFFF, value >> 16);
         let red_first = match self.value(register::WIN_COLOR_DEPTH) {
             COLOR_DEPTH_B8G8R8A8 => false,
@@ -629,18 +676,23 @@ impl Window<'_> {
         // byte or line (nvservices text 0x279d0, Linux likewise).
         let mut left = u64::from(self.value(register::WINBUF_ADDR_H_OFFSET));
         let mut top = u64::from(self.value(register::WINBUF_ADDR_V_OFFSET));
-        if options & H_DIRECTION != 0 {
+        let (reversed_across, reversed_down) =
+            (options & H_DIRECTION != 0, options & V_DIRECTION != 0);
+        if reversed_across {
             left = (left + 1)
                 .checked_sub(row_bytes)
                 .ok_or_else(|| NoFrame::Unsupported("a window left of its surface".into()))?;
         }
-        if options & V_DIRECTION != 0 {
+        if reversed_down {
             top = (top + 1)
                 .checked_sub(source_height.into())
                 .ok_or_else(|| NoFrame::Unsupported("a window above its surface".into()))?;
         }
         let kind = self.value(register::WINBUF_SURFACE_KIND);
-        let mut bytes = vec![0; (row_bytes * u64::from(source_height)) as usize];
+        let pixels = &mut scratch.fetched;
+        // Every byte is read over, so what was there stays until it is.
+        pixels.resize((source_width * source_height) as usize, [0; 4]);
+        let bytes = pixels.as_flattened_mut();
         match kind & SURFACE_KIND_MASK {
             SURFACE_KIND_PITCH => {
                 for (row, line) in bytes.chunks_mut(row_bytes as usize).enumerate() {
@@ -658,45 +710,59 @@ impl Window<'_> {
                     stride,
                     block_height,
                 };
-                layout.read(memory, left, top, row_bytes, &mut bytes)?;
+                layout.read(
+                    memory,
+                    (left, top),
+                    row_bytes,
+                    bytes,
+                    &mut scratch.block_row,
+                )?;
             }
             _ => return Err(NoFrame::Unsupported(format!("surface kind {kind:#x}"))),
         }
-        let mut pixels: Vec<[u8; 4]> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&word| {
-                let [first, green, third, alpha] = match byte_swap {
-                    BYTE_SWAP_SWAP2 => [word[1], word[0], word[3], word[2]],
-                    BYTE_SWAP_SWAP4 => [word[3], word[2], word[1], word[0]],
-                    _ => word,
-                };
-                if red_first {
-                    [first, green, third, alpha]
-                } else {
-                    [third, green, first, alpha]
-                }
-            })
-            .collect();
-        if options & H_DIRECTION != 0 {
-            pixels
-                .chunks_mut(source_width as usize)
-                .for_each(|row| row.reverse());
-        }
-        if options & V_DIRECTION != 0 {
-            let rows: Vec<&[[u8; 4]]> = pixels.chunks(source_width as usize).rev().collect();
-            pixels = rows.concat();
-        }
-        if column {
-            // Each line of the window is a column of the surface, taken from
-            // the top: the surface transposed.
-            let (across, down) = (source_width as usize, source_height as usize);
-            pixels = (0..across)
-                .flat_map(|column| (0..down).map(move |row| (row, column)))
-                .map(|(row, column)| pixels[row * across + column])
-                .collect();
-        }
+        // Which byte of a pixel as fetched is red, green, blue and alpha.
+        let swapped = match byte_swap {
+            BYTE_SWAP_SWAP2 => [1, 0, 3, 2],
+            BYTE_SWAP_SWAP4 => [3, 2, 1, 0],
+            _ => [0, 1, 2, 3],
+        };
+        let order = if red_first {
+            swapped
+        } else {
+            [swapped[2], swapped[1], swapped[0], swapped[3]]
+        };
+        // Where pixel (x, y) of the source, as the window scans it, is in
+        // the surface's rectangle: the directions reverse the surface's
+        // axes, and scanning by columns swaps them.
+        let (surface_width, surface_height) = (source_width as isize, source_height as isize);
+        let (step_x, step_y) = (
+            if reversed_across { -1 } else { 1 },
+            if reversed_down {
+                -surface_width
+            } else {
+                surface_width
+            },
+        );
+        let origin = if reversed_across {
+            surface_width - 1
+        } else {
+            0
+        } + if reversed_down {
+            (surface_height - 1) * surface_width
+        } else {
+            0
+        };
+        let source = Layout {
+            width: across,
+            height: down,
+            origin: origin as usize,
+            steps: if column {
+                [step_y, step_x]
+            } else {
+                [step_x, step_y]
+            },
+            order,
+        };
         let scaling = Scaling {
             increments: self.value(register::WIN_DDA_INC),
             initial: [
@@ -705,37 +771,157 @@ impl Window<'_> {
             ],
             filters: [options & H_FILTER != 0, options & V_FILTER != 0],
         };
-        let pixels = scaling.apply(&pixels, [across, down], [width, height]);
-        Ok((width, height, pixels))
+        if scaling.is_identity([across, down], [width, height]) {
+            return Ok(source);
+        }
+        scaling.apply(
+            &scratch.fetched,
+            &source,
+            [width, height],
+            &mut scratch.lines,
+            &mut scratch.scaled,
+        );
+        std::mem::swap(&mut scratch.fetched, &mut scratch.scaled);
+        // Scaling works on each byte alike, so the order stays.
+        Ok(Layout {
+            width,
+            height,
+            origin: 0,
+            steps: [1, width as isize],
+            order,
+        })
     }
 
-    /// Lays the window over `picture`, the active area so far.
+    /// Lays the window over `canvas`, the active area so far.
     fn draw(
         &self,
         memory: &DeviceMemory,
-        area_width: u32,
-        area_height: u32,
-        picture: &mut [[f32; 3]],
+        scratch: &mut Scratch,
+        canvas: &mut Canvas,
     ) -> Result<(), NoFrame> {
         let (left, top) = {
             let position = self.value(register::WIN_POSITION);
             (position & 0xFFFF, position >> 16)
         };
-        let (width, height, pixels) = self.fetch(memory)?;
-        if left + width > area_width || top + height > area_height {
+        let layout = self.fetch(memory, scratch)?;
+        let [area_width, area_height] = canvas.area;
+        if left + layout.width > area_width || top + layout.height > area_height {
             return Err(NoFrame::Unsupported(
                 "a window reaching outside the active area".into(),
             ));
         }
         let blend = Blend::of(self)?;
-        for row in 0..height {
-            let source = &pixels[(row * width) as usize..][..width as usize];
-            let offset = ((top + row) * area_width + left) as usize;
-            for (below, &pixel) in picture[offset..].iter_mut().zip(source) {
-                *below = blend.apply(pixel, *below);
+        let pixels = &scratch.fetched;
+        let (width, height) = (layout.width as usize, layout.height as usize);
+        let (left, top) = (left as usize, top as usize);
+        let (area_width, area_height) = (area_width as usize, area_height as usize);
+        // Visit the window in the order the canvas is laid out: lines of
+        // the canvas one after the other, and the window's pixels along a
+        // canvas line as a start and a step in `pixels`.
+        let lines: Box<dyn Iterator<Item = (usize, isize, isize)>> = if canvas.turned {
+            // Canvas line `left + x` holds window column `x`, bottom up.
+            Box::new((0..width).map(move |x| {
+                let start = layout.at(x, height - 1);
+                let canvas_start = (left + x) * area_height + (area_height - top - height);
+                (canvas_start, start, -layout.steps[1])
+            }))
+        } else {
+            Box::new((0..height).map(move |y| {
+                let start = layout.at(0, y);
+                ((top + y) * area_width + left, start, layout.steps[0])
+            }))
+        };
+        let length = if canvas.turned { height } else { width };
+        for (canvas_start, start, step) in lines {
+            let line = &mut canvas.pixels[canvas_start..][..length];
+            match &blend {
+                // The two orders the firmware's 32-bit formats come in get a
+                // copy of their own, which the compiler can make tight:
+                // red first (`R8G8B8A8`) needs the word's bytes reversed,
+                // blue first only alpha cleared.
+                Blend::Opaque => match layout.order {
+                    [0, 1, 2, _] => copy(line, pixels, start, step, |pixel| {
+                        u32::from_le_bytes(*pixel).swap_bytes() >> 8
+                    }),
+                    [2, 1, 0, _] => copy(line, pixels, start, step, |pixel| {
+                        u32::from_le_bytes(*pixel) & 0x00FF_FFFF
+                    }),
+                    [red, green, blue, _] => copy(line, pixels, start, step, |pixel| {
+                        u32::from_be_bytes([0, pixel[red], pixel[green], pixel[blue]])
+                    }),
+                },
+                blend => {
+                    let mut at = start;
+                    for out in line {
+                        let pixel = pixels[at as usize];
+                        *out = blend.apply(layout.order.map(|byte| pixel[byte]), *out);
+                        at += step;
+                    }
+                }
             }
         }
         Ok(())
+    }
+}
+
+/// Copies `line.len()` pixels from `pixels`, starting at `start` and
+/// stepping by `step`, into `line`, each as `convert` takes it.
+fn copy(
+    line: &mut [u32],
+    pixels: &[[u8; 4]],
+    start: isize,
+    step: isize,
+    convert: impl Fn(&[u8; 4]) -> u32,
+) {
+    let length = line.len();
+    match step {
+        // Pixels next to each other, forwards or backwards: a straight copy.
+        1 => {
+            let source = &pixels[start as usize..][..length];
+            for (out, pixel) in line.iter_mut().zip(source) {
+                *out = convert(pixel);
+            }
+        }
+        -1 => {
+            let source = &pixels[start as usize + 1 - length..][..length];
+            for (out, pixel) in line.iter_mut().zip(source.iter().rev()) {
+                *out = convert(pixel);
+            }
+        }
+        _ => {
+            let mut at = start;
+            for out in line {
+                *out = convert(&pixels[at as usize]);
+                at += step;
+            }
+        }
+    }
+}
+
+/// The picture being put together, a line after the other, the active
+/// area as it is or turned a quarter turn clockwise; see [`Frame`].
+struct Canvas {
+    pixels: Vec<u32>,
+    /// The active area's width and height, unturned.
+    area: [u32; 2],
+    turned: bool,
+}
+
+/// Where a window's pixels are in a buffer: pixel `(x, y)` is at
+/// `origin + x * steps[0] + y * steps[1]`, its red, green, blue and alpha
+/// the bytes `order` names.
+#[derive(Clone, Copy)]
+struct Layout {
+    width: u32,
+    height: u32,
+    origin: usize,
+    steps: [isize; 2],
+    order: [usize; 4],
+}
+
+impl Layout {
+    fn at(&self, x: usize, y: usize) -> isize {
+        self.origin as isize + x as isize * self.steps[0] + y as isize * self.steps[1]
     }
 }
 
@@ -760,48 +946,75 @@ struct Scaling {
 }
 
 impl Scaling {
-    /// Scales `pixels`, `source` wide and high, to `destination`.
-    fn apply(&self, pixels: &[[u8; 4]], source: [u32; 2], destination: [u32; 2]) -> Vec<[u8; 4]> {
-        let steps = [self.increments & 0xFFFF, self.increments >> 16];
-        if source == destination && steps == [DDA_ONE; 2] && self.initial == [0; 2] {
-            return pixels.to_vec();
-        }
+    /// The steps across and down.
+    fn steps(&self) -> [u32; 2] {
+        [self.increments & 0xFFFF, self.increments >> 16]
+    }
+
+    /// Whether `source` comes out at `destination` pixel for pixel.
+    fn is_identity(&self, source: [u32; 2], destination: [u32; 2]) -> bool {
+        source == destination && self.steps() == [DDA_ONE; 2] && self.initial == [0; 2]
+    }
+
+    /// Scales the window's source, laid out in `pixels` as `source` says,
+    /// to `destination` in `out`, a line after the other. `lines` holds the
+    /// source's lines scaled across on the way. Weights have the
+    /// analyzer's 12 fractional bits; results are rounded.
+    fn apply(
+        &self,
+        pixels: &[[u8; 4]],
+        source: &Layout,
+        destination: [u32; 2],
+        lines: &mut Vec<[u32; 4]>,
+        out: &mut Vec<[u8; 4]>,
+    ) {
+        const ONE: u32 = 1 << 12;
+        let steps = self.steps();
+        let size = [source.width, source.height];
         // Per direction and destination position: the two source pixels
         // and the weight of the second.
-        let taps = |axis: usize| -> Vec<(usize, usize, f32)> {
-            let last = source[axis].saturating_sub(1) as usize;
+        let taps = |axis: usize| -> Vec<(usize, usize, u32)> {
+            let last = size[axis].saturating_sub(1) as usize;
             (0..u64::from(destination[axis]))
                 .map(|position| {
                     let at = u64::from(self.initial[axis]) + position * u64::from(steps[axis]);
                     let whole = ((at >> 12) as usize).min(last);
                     let weight = if self.filters[axis] && whole < last {
-                        (at & 0xFFF) as f32 / 4096.0
+                        (at & 0xFFF) as u32
                     } else {
-                        0.0
+                        0
                     };
                     (whole, (whole + 1).min(last), weight)
                 })
                 .collect()
         };
         let (columns, rows) = (taps(0), taps(1));
-        let width = source[0] as usize;
-        let mix = |a: [u8; 4], b: [u8; 4], weight: f32| -> [f32; 4] {
-            std::array::from_fn(|channel| {
-                f32::from(a[channel]) * (1.0 - weight) + f32::from(b[channel]) * weight
-            })
-        };
-        rows.iter()
-            .flat_map(|&(top, bottom, down)| {
-                columns.iter().map(move |&(left, right, across)| {
-                    let at = |row: usize, column: usize| pixels[row * width + column];
-                    let upper = mix(at(top, left), at(top, right), across);
-                    let lower = mix(at(bottom, left), at(bottom, right), across);
-                    std::array::from_fn(|channel| {
-                        (upper[channel] * (1.0 - down) + lower[channel] * down).round() as u8
-                    })
+        let width = destination[0] as usize;
+        // Every source line scaled across, in 12 fractional bits.
+        lines.clear();
+        for y in 0..source.height as usize {
+            lines.extend(columns.iter().map(|&(left, right, weight)| {
+                let (a, b) = (
+                    pixels[source.at(left, y) as usize],
+                    pixels[source.at(right, y) as usize],
+                );
+                std::array::from_fn(|channel| {
+                    u32::from(a[channel]) * (ONE - weight) + u32::from(b[channel]) * weight
                 })
-            })
-            .collect()
+            }));
+        }
+        out.clear();
+        for &(top, bottom, weight) in &rows {
+            let (upper, lower) = (
+                &lines[top * width..][..width],
+                &lines[bottom * width..][..width],
+            );
+            out.extend(upper.iter().zip(lower).map(|(a, b)| {
+                std::array::from_fn(|channel| {
+                    ((a[channel] * (ONE - weight) + b[channel] * weight + (1 << 23)) >> 24) as u8
+                })
+            }));
+        }
     }
 }
 
@@ -844,12 +1057,16 @@ impl Blend {
         })
     }
 
-    fn apply(&self, [red, green, blue, alpha]: [u8; 4], below: [f32; 3]) -> [f32; 3] {
-        let source = [red, green, blue].map(|channel| f32::from(channel) / 255.0);
+    /// `below` and the result are `0x00RRGGBB` words.
+    fn apply(&self, [red, green, blue, alpha]: [u8; 4], below: u32) -> u32 {
         let Self::Factors { select, k1, k2 } = *self else {
-            return source;
+            return u32::from_be_bytes([0, red, green, blue]);
         };
-        let alpha = f32::from(alpha) / 255.0;
+        let unit = |channel: u8| f32::from(channel) / 255.0;
+        let source = [red, green, blue].map(unit);
+        let [_, below @ ..] = below.to_be_bytes();
+        let below = below.map(unit);
+        let alpha = unit(alpha);
         // Linux's `BLEND_FACTOR_*_COLOR_*` encodings, where "DST" is the
         // alpha below, one, and "SRC" the window's.
         let source_factor = match select & 7 {
@@ -867,9 +1084,11 @@ impl Blend {
             5 | 7 => 1.0 - k1,
             _ => 1.0 - k1 * alpha,
         };
-        std::array::from_fn(|channel| {
-            source[channel] * source_factor + below[channel] * below_factor
-        })
+        let [red, green, blue]: [u8; 3] = std::array::from_fn(|channel| {
+            let value = source[channel] * source_factor + below[channel] * below_factor;
+            (value * 255.0).round().clamp(0.0, 255.0) as u8
+        });
+        u32::from_be_bytes([0, red, green, blue])
     }
 }
 
@@ -889,7 +1108,9 @@ struct BlockLinear {
 }
 
 impl BlockLinear {
-    /// Offset of the byte `x` bytes across and `y` lines down.
+    /// Offset of the byte `x` bytes across and `y` lines down; what
+    /// [`Self::read`] works out piece by piece.
+    #[cfg(test)]
     fn offset(&self, x: u64, y: u64) -> u64 {
         let block_lines = GOB_HEIGHT * self.block_height;
         let block_size = GOB_SIZE * self.block_height;
@@ -903,14 +1124,14 @@ impl BlockLinear {
     }
 
     /// Reads `row_bytes` across of each line from (`left`, `top`) on into
-    /// `bytes`, a block row at a time.
+    /// `bytes`, a block row at a time through `block_row`.
     fn read(
         &self,
         memory: &DeviceMemory,
-        left: u64,
-        top: u64,
+        (left, top): (u64, u64),
         row_bytes: u64,
         bytes: &mut [u8],
+        block_row: &mut Vec<u8>,
     ) -> Result<(), NoFrame> {
         if !self.stride.is_multiple_of(GOB_WIDTH) || left + row_bytes > self.stride {
             return Err(NoFrame::Unsupported(format!(
@@ -919,9 +1140,10 @@ impl BlockLinear {
             )));
         }
         let block_lines = GOB_HEIGHT * self.block_height;
-        let block_row_size = (self.stride / GOB_WIDTH) * GOB_SIZE * self.block_height;
+        let block_size = GOB_SIZE * self.block_height;
+        let block_row_size = (self.stride / GOB_WIDTH) * block_size;
         let lines = bytes.len() as u64 / row_bytes;
-        let mut block_row = vec![0; block_row_size as usize];
+        block_row.resize(block_row_size as usize, 0);
         let mut loaded = None;
         for line in 0..lines {
             let y = top + line;
@@ -929,16 +1151,23 @@ impl BlockLinear {
             if loaded != Some(block) {
                 let address = self.start + block * block_row_size;
                 memory
-                    .read(address, &mut block_row)
+                    .read(address, block_row)
                     .ok_or(NoFrame::BufferUnmapped { address })?;
                 loaded = Some(block);
             }
-            let base = block * block_row_size;
+            // [`Self::offset`] less the block row's start, with the part
+            // that depends on the line worked out once.
+            let in_line =
+                (y % block_lines / GOB_HEIGHT) * GOB_SIZE + (y % 8 / 2) * 64 + (y % 2) * 16;
             let out = &mut bytes[(line * row_bytes) as usize..][..row_bytes as usize];
             // Sixteen bytes at a time stay together.
             for (piece, chunk) in out.chunks_mut(16).enumerate() {
                 let x = left + piece as u64 * 16;
-                let at = (self.offset(x, y) - base) as usize;
+                let at = (x / GOB_WIDTH * block_size
+                    + (x % 64 / 32) * 256
+                    + (x % 32 / 16) * 32
+                    + x % 16
+                    + in_line) as usize;
                 chunk.copy_from_slice(&block_row[at..at + chunk.len()]);
             }
         }
@@ -1287,19 +1516,106 @@ mod tests {
         dc
     }
 
+    /// DRAM with 8 MiB mapped for the controller at [`BUFFER`] in two 4 MiB
+    /// sections, for full-screen windows.
+    fn screen_memory() -> (Arc<GuestRam>, DeviceMemory) {
+        let ram = Arc::new(GuestRam::new(RAM_BASE, 0xC0_0000).unwrap());
+        let controller = Arc::new(Mc::new(DramSize::Gb4));
+        let set =
+            |register: u64, value: u32| controller.write(0, register, 4, value.into()).unwrap();
+        set(0x1C, 7);
+        set(0x20, 0xE000_0000 | (RAM_BASE >> 12) as u32);
+        set(mc::SMMU_DC_ASID, 0x8404_0407);
+        for section in 0..2 {
+            let physical = RAM_BASE + 0x40_0000 * (section + 1);
+            let entry = 0xC000_0000 | (physical >> 12) as u32;
+            ram.write(
+                RAM_BASE + ((BUFFER >> 22) + section) * 4,
+                &entry.to_le_bytes(),
+            )
+            .unwrap();
+        }
+        let memory = DeviceMemory::new(&controller, &ram, mc::SMMU_DC_ASID);
+        (ram, memory)
+    }
+
+    /// Programs `window` of the panel's 720x1280 head as nvnflinger's flips
+    /// do (`/tmp/main/h5.log` at 15.98 s and 16.06 s): a 1280x720 surface
+    /// shown through scan columns with horizontal reversal, filters on.
+    fn full_screen_window(dc: &Dc, window: u32, source: (u32, u32), surface: (u32, u32)) {
+        let (across, down) = source;
+        let (kind, stride) = surface;
+        write(dc, register::DISPLAY_WINDOW_HEADER, 0x10 << window);
+        for (number, value) in [
+            (register::WIN_COLOR_DEPTH, COLOR_DEPTH_R8G8B8A8),
+            (register::WIN_POSITION, 0),
+            (register::WIN_SIZE, 1280 << 16 | 720),
+            (register::WIN_PRESCALED_SIZE, (down << 16) | (across * 4)),
+            (
+                register::WIN_DDA_INC,
+                (((down << 12) / 1280) << 16) | ((across << 12) / 720),
+            ),
+            (register::WIN_LINE_STRIDE, stride),
+            (register::WINBUF_SURFACE_KIND, kind),
+            (register::WINBUF_START_ADDR, BUFFER as u32),
+            (register::WINBUF_ADDR_H_OFFSET, down * 4 - 1),
+            (register::WIN_OPTIONS, 0xC000_0511),
+        ] {
+            write(dc, number, value);
+        }
+    }
+
+    /// Time `Soc::screen` spends on the panel's picture, per kind of window
+    /// nvnflinger flips. A measurement, not a check: run with
+    /// `cargo test --release --lib soc::dc::tests::screen_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn screen_timing() {
+        let (ram, memory) = screen_memory();
+        let pattern: Vec<u8> = (0..0x80_0000u32)
+            .map(|byte| ((byte * 7) >> 3) as u8)
+            .collect();
+        ram.write(BUFFER_PHYSICAL - 0x4000 + 0x40_0000, &pattern)
+            .unwrap();
+        let cases = [
+            ("pitch-linear 1280x720", (720, 1280), (0, 0x1400)),
+            ("block-linear 1280x720", (720, 1280), (0x42, 0x1400)),
+            ("2x2 blank fill scaled up", (2, 2), (0, 8)),
+        ];
+        for (name, source, surface) in cases {
+            let dc = controller();
+            write(&dc, register::DISP_ACTIVE, 1280 << 16 | 720);
+            full_screen_window(&dc, 1, source, surface);
+            write(&dc, register::DISPLAY_COMMAND, DISPLAY_MODE_CONTINUOUS);
+            write(&dc, register::STATE_CONTROL, 0x0F);
+            // The best and the median of many, the machine being shared.
+            let mut times: Vec<_> = (0..50)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    let frame = dc.frame_turned_clockwise(&memory).unwrap();
+                    assert_eq!((frame.width, frame.height), (1280, 720));
+                    start.elapsed()
+                })
+                .collect();
+            times.sort();
+            println!(
+                "{name}: best {:?}, median {:?} per picture",
+                times[0], times[25]
+            );
+        }
+    }
+
     #[test]
     fn clockwise_rotation_puts_the_bottom_left_pixel_at_the_top_left() {
         // Two wide, three high: pixels numbered by row, then column.
-        let rgb = (0..6).flat_map(|pixel| [pixel, pixel, pixel]).collect();
         let rotated = Frame {
             width: 2,
             height: 3,
-            rgb,
+            pixels: (0..6).collect(),
         }
         .rotated_clockwise();
         assert_eq!((rotated.width, rotated.height), (3, 2));
-        let pixels: Vec<u8> = rotated.rgb.chunks(3).map(|pixel| pixel[0]).collect();
-        assert_eq!(pixels, [4, 2, 0, 5, 3, 1]);
+        assert_eq!(rotated.pixels, [4, 2, 0, 5, 3, 1]);
     }
 
     #[test]
@@ -1321,16 +1637,16 @@ mod tests {
             0, 0, 0,  3, 2, 1,   6, 5, 4,    0, 0, 0,
             0, 0, 0,  9, 8, 7,   12, 11, 10, 0, 0, 0,
         ];
-        assert_eq!(frame.rgb, expected);
+        assert_eq!(frame.rgb(), expected);
 
         // What is in the assembly copy is not shown until activated.
         write(&dc, register::WIN_COLOR_DEPTH, COLOR_DEPTH_R8G8B8A8);
-        assert_eq!(dc.frame(&memory).unwrap().rgb[15..18], [3, 2, 1]);
+        assert_eq!(dc.frame(&memory).unwrap().rgb()[15..18], [3, 2, 1]);
         write(&dc, register::STATE_CONTROL, 0x200);
         write(&dc, register::STATE_CONTROL, 0x002);
         // The controller is running and its clock stands still: the
         // activation waits for a frame boundary that never comes.
-        assert_eq!(dc.frame(&memory).unwrap().rgb[15..18], [3, 2, 1]);
+        assert_eq!(dc.frame(&memory).unwrap().rgb()[15..18], [3, 2, 1]);
 
         // Stopped, activations take effect at once. The horizontal offset
         // counts bytes: one pixel to the right, red first.
@@ -1339,7 +1655,7 @@ mod tests {
         write(&stopped, register::WINBUF_ADDR_H_OFFSET, 4);
         write(&stopped, register::DISPLAY_COMMAND, DISPLAY_MODE_CONTINUOUS);
         write(&stopped, register::STATE_CONTROL, 0x003);
-        assert_eq!(stopped.frame(&memory).unwrap().rgb[15..18], [4, 5, 6]);
+        assert_eq!(stopped.frame(&memory).unwrap().rgb()[15..18], [4, 5, 6]);
 
         let unmapped = configured();
         write(&unmapped, register::WINBUF_START_ADDR, 0x1000);
@@ -1381,8 +1697,22 @@ mod tests {
         ram.write(BUFFER_PHYSICAL, &surface).unwrap();
         let seen = dc.frame(&memory).unwrap().rotated_clockwise();
         assert_eq!((seen.width, seen.height), (4, 2));
-        let blues: Vec<u8> = seen.rgb.chunks(3).map(|pixel| pixel[2]).collect();
+        let blues: Vec<u8> = seen.rgb().chunks(3).map(|pixel| pixel[2]).collect();
         assert_eq!(blues, [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    /// `pixels`, `size` wide and high a line after the other, scaled.
+    fn scaled(scaling: &Scaling, pixels: &[[u8; 4]], size: [u32; 2], to: [u32; 2]) -> Vec<[u8; 4]> {
+        let layout = Layout {
+            width: size[0],
+            height: size[1],
+            origin: 0,
+            steps: [1, size[0] as isize],
+            order: [0, 1, 2, 3],
+        };
+        let mut out = Vec::new();
+        scaling.apply(pixels, &layout, to, &mut Vec::new(), &mut out);
+        out
     }
 
     #[test]
@@ -1395,8 +1725,8 @@ mod tests {
                 initial: [0; 2],
                 filters,
             };
-            let scaled = scaling.apply(&black_white, [2, 1], [4, 1]);
-            scaled.iter().map(|pixel| pixel[2]).collect::<Vec<_>>()
+            let out = scaled(&scaling, &black_white, [2, 1], [4, 1]);
+            out.iter().map(|pixel| pixel[2]).collect::<Vec<_>>()
         };
         assert_eq!(blues([false, false]), [0, 0, 255, 255]);
         assert_eq!(blues([true, false]), [0, 128, 255, 255]);
@@ -1406,9 +1736,72 @@ mod tests {
             initial: [0; 2],
             filters: [true; 2],
         };
-        let scaled = scaling.apply(&[[9, 9, 9, 9]; 4], [2, 2], [720, 1280]);
-        assert_eq!(scaled.len(), 720 * 1280);
-        assert!(scaled.iter().all(|&pixel| pixel == [9, 9, 9, 9]));
+        let out = scaled(&scaling, &[[9, 9, 9, 9]; 4], [2, 2], [720, 1280]);
+        assert_eq!(out.len(), 720 * 1280);
+        assert!(out.iter().all(|&pixel| pixel == [9, 9, 9, 9]));
+    }
+
+    #[test]
+    fn the_direct_path_matches_the_general_one_and_the_turned_picture_the_rotation() {
+        let (ram, memory) = memory();
+        let dc = configured();
+        // A 5x3 surface, pixel n blue n, shown through columns with both
+        // directions reversed: a 3x5 window at (1, 0) of a 4x5 area.
+        let surface: Vec<u8> = (0..15).flat_map(|n| [n, 2 * n, 3 * n, 0xFF]).collect();
+        ram.write(BUFFER_PHYSICAL, &surface).unwrap();
+        for (number, value) in [
+            (register::WIN_POSITION, 1),
+            (register::WIN_SIZE, 5 << 16 | 3),
+            (register::WIN_PRESCALED_SIZE, 5 << 16 | 12),
+            (register::WIN_LINE_STRIDE, 20),
+            (register::WINBUF_ADDR_H_OFFSET, 19),
+            (register::WINBUF_ADDR_V_OFFSET, 2),
+            (
+                register::WIN_OPTIONS,
+                WIN_ENABLE | SCAN_COLUMN | H_DIRECTION | V_DIRECTION,
+            ),
+        ] {
+            write(&dc, number, value);
+        }
+        write(&dc, register::DISP_ACTIVE, 5 << 16 | 4);
+        write(&dc, register::DISPLAY_COMMAND, DISPLAY_MODE_CONTINUOUS);
+        write(&dc, register::STATE_CONTROL, 0x003);
+        let portrait = dc.frame(&memory).unwrap();
+        // Window pixel (x, y) is surface pixel (4 − y, 2 − x).
+        for y in 0..5 {
+            for x in 0..3 {
+                let at = (y * 4 + 1 + x) * 3;
+                let n = ((2 - x) * 5 + 4 - y) as u8;
+                assert_eq!(portrait.rgb()[at..at + 3], [3 * n, 2 * n, n], "{x},{y}");
+            }
+        }
+        assert_eq!(
+            dc.frame_turned_clockwise(&memory).unwrap(),
+            portrait.rotated_clockwise()
+        );
+
+        // The general path, given the same layout and no scaling, takes the
+        // same pixels.
+        let pixels: Vec<[u8; 4]> = (0..15).map(|n| [n, 0, 0, 0]).collect();
+        let layout = Layout {
+            width: 3,
+            height: 5,
+            origin: 14,
+            steps: [-5, -1],
+            order: [0, 1, 2, 3],
+        };
+        let identity = Scaling {
+            increments: DDA_ONE << 16 | DDA_ONE,
+            initial: [0; 2],
+            filters: [true; 2],
+        };
+        let mut out = Vec::new();
+        identity.apply(&pixels, &layout, [3, 5], &mut Vec::new(), &mut out);
+        for y in 0..5 {
+            for x in 0..3 {
+                assert_eq!(out[y * 3 + x], pixels[layout.at(x, y) as usize]);
+            }
+        }
     }
 
     #[test]
@@ -1459,7 +1852,7 @@ mod tests {
         let frame = dc.frame(&memory).unwrap();
         for (y, x) in [(0, 0), (1, 4), (7, 15), (8, 3), (15, 15)] {
             let pixel = (y * 16 + x) * 3;
-            assert_eq!(frame.rgb[pixel..pixel + 3], [0, y as u8, x as u8]);
+            assert_eq!(frame.rgb()[pixel..pixel + 3], [0, y as u8, x as u8]);
         }
     }
 
@@ -1491,8 +1884,8 @@ mod tests {
         ram.write(BUFFER_PHYSICAL, &[200; 16]).unwrap();
         ram.write(BUFFER_PHYSICAL + 0x100, &[0, 0, 100, 0x80, 0, 0, 0, 0])
             .unwrap();
-        let frame = dc.frame(&memory).unwrap();
-        let pixel = |x: usize, y: usize| &frame.rgb[(y * 4 + x) * 3..][..3];
+        let rgb = dc.frame(&memory).unwrap().rgb();
+        let pixel = |x: usize, y: usize| &rgb[(y * 4 + x) * 3..][..3];
         assert_eq!(pixel(1, 1), [200, 200, 200]);
         // 200 * (1 - 128/255) + 100 * 128/255 = 149.8 for blue.
         assert_eq!(pixel(2, 1), [100, 100, 150]);
