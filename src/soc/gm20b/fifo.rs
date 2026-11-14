@@ -311,7 +311,8 @@ impl Context {
         )
     }
 
-    /// Makes the engines' work visible in memory (`Engines::flush`).
+    /// Makes the engines' work visible in memory before the channel
+    /// signals (`Engines::flush`).
     fn flush(&mut self, memory: &ChannelMemory) -> Result<(), Unmodeled> {
         self.engines
             .flush(memory)
@@ -329,14 +330,12 @@ impl Context {
         Ok(put)
     }
 
-    /// Executes until the channel is idle, waits, or is asked to stop. Its
-    /// engines' work is visible in memory when the turn ends: others may
-    /// look at it while the channel does not run.
+    /// Executes until the channel is idle, waits, or is asked to stop.
+    /// The engines' work need not be in memory when the turn ends: no one
+    /// may look at it before a signal says it is done ([`signals`]).
     pub fn run(&mut self, env: &Env) -> Result<Outcome, Unmodeled> {
         let memory = ChannelMemory::new(self.space, env.bus);
-        let outcome = self.turn(env, &memory)?;
-        self.flush(&memory)?;
-        Ok(outcome)
+        self.turn(env, &memory)
     }
 
     fn turn(&mut self, env: &Env, memory: &ChannelMemory) -> Result<Outcome, Unmodeled> {
@@ -452,7 +451,7 @@ impl Context {
             }
             return Ok(None);
         }
-        if makes_work_visible(method, argument) {
+        if signals(method, argument) {
             self.flush(memory)?;
         }
         let host = &mut self.host;
@@ -586,11 +585,11 @@ fn with_fault(memory: &ChannelMemory, Unmodeled(what): Unmodeled) -> Unmodeled {
 }
 
 /// Host methods after which others may observe what the channel's engines
-/// wrote: semaphore releases, syncpoint increments (fences), wait for idle,
-/// and the explicit flushes and barriers (`FB_FLUSH`, `MEM_OP_B`/`D`).
-fn makes_work_visible(method: u32, argument: u32) -> bool {
+/// wrote: semaphore releases and syncpoint increments (fences). Wait for
+/// idle and the explicit flushes and barriers (`FB_FLUSH`, `MEM_OP_B`/`D`)
+/// let no one observe anything until a signal follows.
+fn signals(method: u32, argument: u32) -> bool {
     match method {
-        method::FB_FLUSH | method::WFI | method::MEM_OP_B | method::MEM_OP_D => true,
         method::SEMAPHORE_D => argument & SEMAPHORE_OPERATION == SEMAPHORE_RELEASE,
         method::SYNCPOINT_B => argument & SYNCPOINT_OPERATION == SYNCPOINT_INCREMENT,
         _ => false,
@@ -1094,10 +1093,10 @@ mod tests {
             ],
         );
         assert_eq!(run(&mut context, &bus, &syncpoints), Outcome::Idle);
-        // Flushed before the fence (WFI, two increments) and at the end.
+        // Flushed before each increment of the fence.
         assert_eq!(
             *engines.0.lock().unwrap(),
-            [(0, 0, 0xB197), (0, 0x40, 7), FLUSH, FLUSH, FLUSH, FLUSH]
+            [(0, 0, 0xB197), (0, 0x40, 7), FLUSH, FLUSH]
         );
         assert_eq!(syncpoints.get(0x19), Some(2));
         assert_eq!(bus.get(USERD + USERD_GP_GET), 2);
@@ -1248,10 +1247,10 @@ mod tests {
         assert_eq!(context.run(&env).unwrap(), Outcome::Interrupted);
         attention.store(false, Ordering::SeqCst);
         assert_eq!(context.run(&env).unwrap(), Outcome::Idle);
-        // Both methods, and a flush at the end of each turn.
+        // Both methods; nothing signals, so nothing is flushed.
         assert_eq!(
             *engines.0.lock().unwrap(),
-            [FLUSH, (0, 0x40, 1), (0, 0x41, 2), FLUSH]
+            [(0, 0x40, 1), (0, 0x41, 2)]
         );
     }
 

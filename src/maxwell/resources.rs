@@ -1,12 +1,28 @@
 //! What draws read from memory besides vertices: shader programs and
 //! textures, cached by content.
 //!
-//! Every cache entry keeps the raw bytes it was built from and is reused
-//! only after the bytes in memory compare equal, once per draw. The
-//! hardware's own caches (`INVALIDATE_SHADER_CACHES`,
+//! Every cache entry keeps the raw bytes it was built from. A program is
+//! reused only after the bytes in memory compare equal, at every draw. A
+//! texture is compared at most once per *epoch* of its channel ([`Writes`]):
+//! once its bytes compared equal, it is reused without reading memory
+//! again until the channel signals (a semaphore release, report or
+//! syncpoint increment) or one of the channel's own engines writes memory
+//! overlapping it. The hardware's own caches (`INVALIDATE_SHADER_CACHES`,
 //! `INVALIDATE_TEXTURE_HEADER_CACHE`, ...) therefore have no counterpart
-//! here, and their invalidation methods have no effect: memory is always
-//! read as it is at the draw.
+//! here, and their invalidation methods have no effect.
+//!
+//! # The staleness an epoch allows
+//!
+//! Within an epoch, a write to a validated texture by anything but the
+//! channel's own engines (the guest CPU, another channel) is not seen
+//! until the next signal. No correct guest makes one: the texture was
+//! validated because a draw of this channel read it, and memory a
+//! submitted draw reads may only be overwritten once that draw is known
+//! to be complete. NVN learns that only from a sync object, a semaphore
+//! or syncpoint the channel releases after the draw (`nvnQueueFenceSync`,
+//! `nvnSyncWait`, `nvnQueueFinish` [public: NVN API as documented by the
+//! Switch homebrew headers]), and every such release starts a new epoch.
+//! On hardware the same race reads stale texture cache lines.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -16,6 +32,104 @@ use super::sampling::{FetchRequest, GatherRequest, Query, SampleRequest, Target,
 use super::shader::Program;
 use super::texture::{Texture, Tic, Tsc};
 use super::{GpuMemory, Unmodeled};
+
+/// The guest memory a channel's engines wrote in the current epoch: since
+/// the channel's last signal ([`Writes::signal`]). Caches of guest memory
+/// stamp what they last compared ([`Writes::stamp`]) and need not read
+/// memory again while [`Writes::unchanged`] holds.
+#[derive(Default)]
+pub struct Writes(Mutex<WriteLog>);
+
+#[derive(Default)]
+struct WriteLog {
+    epoch: u64,
+    /// Written ranges, `start..end`, in order of writing.
+    ranges: Vec<(u64, u64)>,
+    /// Whether a stamp counts the last range: it may not grow then.
+    stamped: bool,
+}
+
+/// When a copy of guest memory was last known to be equal to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamp {
+    epoch: u64,
+    writes: usize,
+}
+
+/// Ranges an epoch holds before it is ended early (everything is compared
+/// again then, which is always allowed): keeps [`Writes::unchanged`]
+/// short.
+const MOST_RANGES: usize = 1024;
+
+impl Writes {
+    /// Notes a write of `length` bytes at `address`. Consecutive writes
+    /// (constant buffer uploads, a surface stored band by band) extend one
+    /// range.
+    pub fn record(&self, address: u64, length: u64) {
+        let mut log = self.0.lock().unwrap();
+        let end = address.saturating_add(length);
+        if !log.stamped
+            && let Some(last) = log.ranges.last_mut()
+            && address <= last.1
+            && end >= last.0
+        {
+            *last = (last.0.min(address), last.1.max(end));
+            return;
+        }
+        if log.ranges.len() == MOST_RANGES {
+            log.epoch += 1;
+            log.ranges.clear();
+        }
+        log.ranges.push((address, end));
+        log.stamped = false;
+    }
+
+    /// The channel signaled: a new epoch starts, in which every cached
+    /// copy is compared with memory again before it is used.
+    pub fn signal(&self) {
+        let mut log = self.0.lock().unwrap();
+        log.epoch += 1;
+        log.ranges.clear();
+        log.stamped = false;
+    }
+
+    /// Now, for a copy that was just compared with (or written to) memory.
+    pub fn stamp(&self) -> Stamp {
+        let mut log = self.0.lock().unwrap();
+        log.stamped = true;
+        Stamp {
+            epoch: log.epoch,
+            writes: log.ranges.len(),
+        }
+    }
+
+    /// Whether `start..end` may be taken as unchanged since `stamp`: same
+    /// epoch, and no write of the channel's engines overlapped it since.
+    pub fn unchanged(&self, stamp: Stamp, start: u64, end: u64) -> bool {
+        let log = self.0.lock().unwrap();
+        log.epoch == stamp.epoch
+            && log.ranges[stamp.writes..]
+                .iter()
+                .all(|&(a, b)| b <= start || end <= a)
+    }
+}
+
+/// Engine memory that notes every write in [`Writes`].
+pub struct Tracked<'a> {
+    pub memory: &'a dyn GpuMemory,
+    pub writes: &'a Writes,
+}
+
+impl GpuMemory for Tracked<'_> {
+    fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
+        self.memory.read(address, buffer)
+    }
+
+    fn write(&self, address: u64, data: &[u8]) -> Option<()> {
+        self.writes.record(address, data.len() as u64);
+        self.memory.write(address, data)
+    }
+}
 
 fn read(memory: &dyn GpuMemory, address: u64, length: usize) -> Result<Vec<u8>, Unmodeled> {
     let mut bytes = vec![0; length];
@@ -49,8 +163,9 @@ impl ProgramCache {
     }
 }
 
-/// A decoded texture and the raw bytes it was decoded from.
-type CachedTexture = (Vec<u8>, Arc<Texture>);
+/// A decoded texture, the raw bytes it was decoded from, and when they
+/// last compared equal to memory.
+type CachedTexture = (Vec<u8>, Arc<Texture>, Stamp);
 
 /// Decoded textures by TIC contents, kept across draws.
 #[derive(Default)]
@@ -77,16 +192,23 @@ pub struct DrawTextures<'a> {
     memory: &'a dyn GpuMemory,
     pools: Pools,
     cache: &'a TextureCache,
+    writes: &'a Writes,
     /// Textures resolved during this draw, by TIC index.
     resolved: Mutex<HashMap<u32, Arc<Texture>>>,
 }
 
 impl<'a> DrawTextures<'a> {
-    pub fn new(memory: &'a dyn GpuMemory, pools: Pools, cache: &'a TextureCache) -> Self {
+    pub fn new(
+        memory: &'a dyn GpuMemory,
+        pools: Pools,
+        cache: &'a TextureCache,
+        writes: &'a Writes,
+    ) -> Self {
         Self {
             memory,
             pools,
             cache,
+            writes,
             resolved: Default::default(),
         }
     }
@@ -111,25 +233,35 @@ impl<'a> DrawTextures<'a> {
         let words = self.words(self.pools.header_pool, index)?;
         let tic = Tic::parse(words)?;
         let (address, length) = Texture::footprint(&tic)?;
-        let raw = read(self.memory, address, length as usize)?;
-        let cached = self
+        let end = address.saturating_add(length);
+        let fresh = self
             .cache
             .entries
             .lock()
             .unwrap()
             .get(&words)
-            .filter(|(cached_raw, _)| *cached_raw == raw)
-            .map(|(_, texture)| texture.clone());
-        let texture = match cached {
+            .filter(|(_, _, stamp)| self.writes.unchanged(*stamp, address, end))
+            .map(|(_, texture, _)| texture.clone());
+        let texture = match fresh {
             Some(texture) => texture,
             None => {
-                let texture = Arc::new(Texture::decode(self.memory, &tic)?);
-                self.cache
-                    .entries
-                    .lock()
-                    .unwrap()
-                    .insert(words, (raw, texture.clone()));
-                texture
+                let raw = read(self.memory, address, length as usize)?;
+                let mut entries = self.cache.entries.lock().unwrap();
+                match entries.get_mut(&words) {
+                    Some((cached_raw, texture, stamp)) if *cached_raw == raw => {
+                        *stamp = self.writes.stamp();
+                        texture.clone()
+                    }
+                    _ => {
+                        drop(entries);
+                        let texture = Arc::new(Texture::decode(self.memory, &tic)?);
+                        self.cache.entries.lock().unwrap().insert(
+                            words,
+                            (raw, texture.clone(), self.writes.stamp()),
+                        );
+                        texture
+                    }
+                }
             }
         };
         self.resolved.lock().unwrap().insert(index, texture.clone());

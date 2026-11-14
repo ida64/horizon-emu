@@ -72,11 +72,11 @@ pub trait Engines: Send {
         memory: &dyn GpuMemory,
     ) -> Result<(), Unmodeled>;
 
-    /// Makes everything earlier calls wrote visible in guest memory. The
-    /// pushbuffer executor calls it before host work that lets other
-    /// agents observe the channel's progress (semaphore releases,
-    /// syncpoint increments, wait-for-idle, interrupts); engines that
-    /// write memory as they go have nothing to do.
+    /// Makes everything earlier calls wrote visible in guest memory, as
+    /// the channel is about to signal: the pushbuffer executor calls it
+    /// before its own semaphore releases and syncpoint increments, the
+    /// host work that lets other agents observe the channel's progress.
+    /// Engines that write memory as they go have nothing to do.
     fn flush(&mut self, _memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
         Ok(())
     }
@@ -92,19 +92,24 @@ pub struct Hooks {
     /// Increments a host1x syncpoint by one (3D `INCREMENT_SYNC_POINT`).
     pub syncpoint_increment: Option<Box<dyn Fn(u32) + Send>>,
     /// The Metal renderer of the channel, if it renders with Metal: every
-    /// completion the engines signal (semaphore release, report,
+    /// completion the channel signals (semaphore release, report,
     /// syncpoint increment) first writes its pending work back to guest
     /// memory ([`metal::Renderer::flush`]).
     pub metal: Option<std::sync::Arc<metal::Renderer>>,
+    /// What the engines wrote since the channel last signaled.
+    pub writes: resources::Writes,
 }
 
 impl Hooks {
-    /// Makes all rendering so far visible in guest memory.
-    pub fn flush(&self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
-        match &self.metal {
-            Some(renderer) => renderer.flush(memory),
-            None => Ok(()),
+    /// The channel is about to signal (release a semaphore or report,
+    /// increment a syncpoint): makes all rendering so far visible in guest
+    /// memory and starts a new epoch of [`resources::Writes`].
+    pub fn signal(&self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+        if let Some(renderer) = &self.metal {
+            renderer.flush(memory, &self.writes)?;
         }
+        self.writes.signal();
+        Ok(())
     }
 }
 
@@ -281,13 +286,21 @@ impl Engines for Channel {
         argument: u32,
         memory: &dyn GpuMemory,
     ) -> Result<(), Unmodeled> {
+        let tracked = resources::Tracked {
+            memory,
+            writes: &self.hooks.writes,
+        };
         let coherent;
         let memory: &dyn GpuMemory = match &self.hooks.metal {
             Some(renderer) => {
-                coherent = metal::Coherent { memory, renderer };
+                coherent = metal::Coherent {
+                    memory: &tracked,
+                    renderer,
+                    writes: &self.hooks.writes,
+                };
                 &coherent
             }
-            None => memory,
+            None => &tracked,
         };
         let slot = self
             .subchannels
@@ -353,7 +366,11 @@ impl Engines for Channel {
     }
 
     fn flush(&mut self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
-        self.hooks.flush(memory)
+        let tracked = resources::Tracked {
+            memory,
+            writes: &self.hooks.writes,
+        };
+        self.hooks.signal(&tracked)
     }
 }
 

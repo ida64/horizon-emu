@@ -7,6 +7,8 @@
 //! `BlockLinearLayout.cs`]), for pitch-linear surfaces 8 consecutive rows.
 //! Bands are disjoint in memory, so they can be split across threads.
 
+use std::ops::Range;
+
 use super::texture::layout::{BlockLinear, block_linear_offset};
 use super::{GpuMemory, Unmodeled};
 
@@ -228,32 +230,63 @@ impl Window {
 
     /// Copies the pixels of `rect` (inside the window) to `out`, row after
     /// row, `bytes_per_pixel * (x1 - x0)` bytes per row.
-    pub fn read_pixels(&mut self, rect: Rect, out: &mut [u8]) {
-        let bpp = self.surface.bytes_per_pixel as usize;
-        let row = (rect.x1 - rect.x0) as usize * bpp;
-        for y in rect.y0..rect.y1 {
-            let Some(band) = self.band_mut(y) else {
-                continue;
-            };
-            let line = &mut out[(y - rect.y0) as usize * row..][..row];
-            for x in rect.x0..rect.x1 {
-                line[(x - rect.x0) as usize * bpp..][..bpp].copy_from_slice(band.pixel(x, y));
-            }
-        }
+    pub fn read_pixels(&self, rect: Rect, out: &mut [u8]) {
+        let data = &self.data;
+        self.runs(rect, |window, linear| {
+            out[linear].copy_from_slice(&data[window]);
+        });
     }
 
     /// The inverse of [`Window::read_pixels`].
-    pub fn write_pixels(&mut self, rect: Rect, data: &[u8]) {
+    pub fn write_pixels(&mut self, rect: Rect, pixels: &[u8]) {
+        // `runs` looks only at the window's geometry.
+        let mut data = std::mem::take(&mut self.data);
+        self.runs(rect, |window, linear| {
+            data[window].copy_from_slice(&pixels[linear]);
+        });
+        self.data = data;
+    }
+
+    /// Walks `rect` (inside the window) in runs of bytes contiguous both in
+    /// the window's data and in a row-major buffer of the rectangle:
+    /// `run(window range, buffer range)`. Within a GOB, 16-byte units
+    /// are contiguous in x ([`Band::offset`]); pitch rows are contiguous.
+    fn runs(&self, rect: Rect, mut run: impl FnMut(Range<usize>, Range<usize>)) {
         let bpp = self.surface.bytes_per_pixel as usize;
         let row = (rect.x1 - rect.x0) as usize * bpp;
+        let (xb0, xb1) = (rect.x0 as usize * bpp, rect.x1 as usize * bpp);
         for y in rect.y0..rect.y1 {
-            let Some(mut band) = self.band_mut(y) else {
+            let Some(index) = (y / BAND_ROWS).checked_sub(self.band0) else {
                 continue;
             };
-            let line = &data[(y - rect.y0) as usize * row..][..row];
-            for x in rect.x0..rect.x1 {
-                band.pixel_mut(x, y)
-                    .copy_from_slice(&line[(x - rect.x0) as usize * bpp..][..bpp]);
+            if index >= self.bands {
+                continue;
+            }
+            let band = index as usize * self.band_bytes;
+            let line = (y - rect.y0) as usize * row;
+            let r = (y % BAND_ROWS) as usize;
+            match self.surface.layout {
+                Layout::BlockLinear(_) => {
+                    let mut xb = xb0;
+                    while xb < xb1 {
+                        let gob = xb / GOB_WIDTH as usize - self.column0 as usize;
+                        let x = xb % GOB_WIDTH as usize;
+                        let n = (16 - x % 16).min(xb1 - xb);
+                        let inner = ((x & 0x20) << 3)
+                            | ((r & 0x6) << 5)
+                            | ((x & 0x10) << 1)
+                            | ((r & 1) << 4)
+                            | (x & 0xF);
+                        let at = band + gob * GOB_BYTES + inner;
+                        let to = line + xb - xb0;
+                        run(at..at + n, to..to + n);
+                        xb += n;
+                    }
+                }
+                Layout::Pitch { .. } => {
+                    let at = band + r * self.row_bytes + xb0 - self.column0 as usize;
+                    run(at..at + row, line..line + row);
+                }
             }
         }
     }
@@ -344,5 +377,117 @@ impl Band<'_> {
         let offset = self.offset(x, y);
         let bpp = self.surface.bytes_per_pixel as usize;
         &mut self.data[offset..offset + bpp]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Memory that holds `byte(address)` everywhere.
+    struct Pattern;
+
+    fn byte(address: u64) -> u8 {
+        (address.wrapping_mul(0x9E37_79B9) >> 13) as u8
+    }
+
+    impl GpuMemory for Pattern {
+        fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
+            for (i, b) in buffer.iter_mut().enumerate() {
+                *b = byte(address + i as u64);
+            }
+            Some(())
+        }
+
+        fn write(&self, _: u64, _: &[u8]) -> Option<()> {
+            None
+        }
+    }
+
+    /// The run-wise copies agree with [`Band::pixel`] pixel by pixel, for
+    /// both layouts, several pixel sizes and unaligned rectangles, and
+    /// writing leaves the bytes outside the rectangle alone.
+    #[test]
+    fn pixel_copies_match_band_pixels() {
+        let layouts = [
+            Layout::Pitch { pitch: 0x400 },
+            Layout::BlockLinear(BlockLinear {
+                block_height_log2: 1,
+                block_depth_log2: 0,
+            }),
+            Layout::BlockLinear(BlockLinear {
+                block_height_log2: 4,
+                block_depth_log2: 0,
+            }),
+        ];
+        let rects = [
+            Rect { x0: 0, y0: 0, x1: 100, y1: 70 },
+            Rect { x0: 3, y0: 5, x1: 61, y1: 37 },
+            Rect { x0: 17, y0: 9, x1: 18, y1: 10 },
+            Rect { x0: 31, y0: 0, x1: 97, y1: 69 },
+        ];
+        for layout in layouts {
+            for bpp in [1, 2, 4, 8, 16] {
+                let surface = Surface {
+                    address: 0x10000,
+                    width: 100,
+                    height: 70,
+                    bytes_per_pixel: bpp,
+                    layout,
+                };
+                for window_rect in rects {
+                    let mut window = Window::load(&Pattern, surface, window_rect).unwrap();
+                    for rect in rects.map(|r| r.intersect(&window_rect)) {
+                        if rect.is_empty() {
+                            continue;
+                        }
+                        let bpp = bpp as usize;
+                        let row = (rect.x1 - rect.x0) as usize * bpp;
+                        let mut out = vec![0; row * (rect.y1 - rect.y0) as usize];
+                        window.read_pixels(rect, &mut out);
+                        for y in rect.y0..rect.y1 {
+                            let band = window.band_mut(y).unwrap();
+                            for x in rect.x0..rect.x1 {
+                                let at = (y - rect.y0) as usize * row
+                                    + (x - rect.x0) as usize * bpp;
+                                assert_eq!(&out[at..at + bpp], band.pixel(x, y), "{layout:?}");
+                            }
+                        }
+                        let before = window.data().to_vec();
+                        let pixels: Vec<u8> = (0..out.len()).map(|i| !out[i] ^ i as u8).collect();
+                        window.write_pixels(rect, &pixels);
+                        let mut expected = before;
+                        let mut reference = Window {
+                            data: std::mem::take(&mut expected),
+                            ..window.clone_geometry()
+                        };
+                        for y in rect.y0..rect.y1 {
+                            let mut band = reference.band_mut(y).unwrap();
+                            for x in rect.x0..rect.x1 {
+                                let at = (y - rect.y0) as usize * row
+                                    + (x - rect.x0) as usize * bpp;
+                                band.pixel_mut(x, y).copy_from_slice(&pixels[at..at + bpp]);
+                            }
+                        }
+                        assert_eq!(window.data(), reference.data(), "{layout:?} {rect:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    impl Window {
+        /// A window of the same geometry without data.
+        fn clone_geometry(&self) -> Window {
+            Window {
+                surface: self.surface,
+                band0: self.band0,
+                bands: self.bands,
+                column0: self.column0,
+                band_bytes: self.band_bytes,
+                row_bytes: self.row_bytes,
+                data: Vec::new(),
+            }
+        }
     }
 }

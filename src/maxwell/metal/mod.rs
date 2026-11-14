@@ -18,30 +18,45 @@
 //! after the render targets it touches are written back; the reason is
 //! counted ([`Renderer::fallbacks`]).
 //!
-//! # Guest memory stays truthful
+//! # Guest memory stays truthful where the guest can look
 //!
 //! A render target used by Metal is *resident*: a Metal texture holding
 //! the surface, plus a mirror of the surface's bytes as guest memory had
 //! them when the two were last made equal. Rendering makes the resident
 //! *dirty* (the Metal texture is newer than guest memory, over a known
-//! rectangle). Dirty pixels are written back to guest memory, in the
-//! surface's own layout:
+//! rectangle). Draws and clears are recorded into one command buffer that
+//! stays open until the next write-back, which ends it, waits for the GPU
+//! and stores the dirty pixels in guest memory, in the surface's own
+//! layout. That happens:
 //!
-//! - before anything the channel does can let another agent observe its
-//!   progress: semaphore releases, reports and syncpoint increments of the
-//!   engines (they call [`Renderer::flush`]), and every host point the
-//!   pushbuffer executor calls [`super::Engines::flush`] for;
+//! - when the channel signals: semaphore releases, reports and syncpoint
+//!   increments of its engines and of the pushbuffer executor
+//!   ([`super::Hooks::signal`], [`super::Engines::flush`]);
 //! - before any other access of the channel's engines to memory that
 //!   overlaps a dirty target: all engine memory accesses go through
-//!   [`Coherent`], which flushes first. That covers the software
-//!   renderer's own reads, copies, 2D blits, inline uploads, texture
-//!   sampling of a render target, and constant and vertex data.
+//!   [`Coherent`], which writes back first. That covers copies, 2D blits,
+//!   inline uploads, texture sampling of a render target, and constant
+//!   and vertex data;
+//! - before a draw or clear Metal cannot express runs in the software
+//!   renderer.
 //!
-//! Before a resident is rendered to again after a write-back, its mirror
-//! is compared with guest memory; if anything (the CPU, another channel,
-//! an engine of this one) changed the surface, the Metal texture is
-//! reloaded. Between write-backs, a guest CPU writing to a surface the
-//! GPU is rendering to races with the GPU, as on hardware.
+//! Between signals the dirty pixels exist only on the host GPU. Nothing
+//! outside the channel can tell: the guest CPU, other channels and the
+//! display learn that rendering finished only from a signal (NVN fences
+//! are syncpoint increments or semaphore releases the CPU, nvservices or
+//! another channel waits on; the compositor flips a buffer once its fence
+//! passed), and on hardware too, memory written by work not yet followed
+//! by a signal may or may not hold the result. Ends of a channel's turn,
+//! wait-for-idle, `FB_FLUSH` and L2 flushes are not signals: they let no
+//! one observe anything until a signal follows.
+//!
+//! Before a resident is used, its mirror is compared with guest memory
+//! (and the Metal texture reloaded if they differ) at most once per epoch
+//! of [`Writes`]: after each signal of the channel, and after the
+//! channel's own engines wrote memory overlapping it. Anything else (the
+//! CPU, another channel) may only write a surface the channel rendered or
+//! read once a signal told it the GPU is done with it; between, such a
+//! write races with the GPU, as on hardware.
 
 mod format;
 
@@ -65,7 +80,7 @@ use objc2_metal::{
 
 use super::blend::{Blend, Factor, Operation};
 use super::raster::{ColorOutput, Triangle};
-use super::resources::DrawTextures;
+use super::resources::{DrawTextures, Stamp, Writes};
 use super::shader::Program;
 use super::shader::msl::{self, Translated};
 use super::surface::{Rect, Surface, Window};
@@ -81,6 +96,7 @@ type Pipeline = ProtocolObject<dyn MTLRenderPipelineState>;
 type Sampler = ProtocolObject<dyn MTLSamplerState>;
 type CommandBuffer = ProtocolObject<dyn MTLCommandBuffer>;
 type Encoder = ProtocolObject<dyn MTLRenderCommandEncoder>;
+type Library = ProtocolObject<dyn MTLLibrary>;
 
 /// The host GPU, shared by all channels.
 struct Gpu {
@@ -115,10 +131,10 @@ struct Resident {
     mirror: Window,
     /// Pixels rendered since the last write-back.
     dirty: Option<Rect>,
-    /// Whether `mirror` was compared with guest memory since the last
-    /// write-back.
-    checked: bool,
+    /// When `mirror` was last known to equal guest memory.
+    stamp: Option<Stamp>,
 }
+
 /// The attachments of a render pass: resident index and whether the sRGB
 /// view is used.
 type Attachments = Vec<(usize, bool)>;
@@ -141,9 +157,13 @@ struct State {
     residents: Vec<Resident>,
     frame: Option<Frame>,
     programs: HashMap<usize, Program2>,
+    /// Compiled MSL by source: programs drawn with different attachment
+    /// formats or blending share their functions.
+    libraries: HashMap<String, Retained<Library>>,
     pipelines: HashMap<PipelineKey, Retained<Pipeline>>,
     clear_pipelines: HashMap<(usize, u8), Retained<Pipeline>>,
-    /// Uploaded textures by decoded texture (kept alive with it).
+    /// Uploaded textures by decoded texture (kept alive with it while the
+    /// texture cache holds it too).
     textures: HashMap<usize, (Arc<Texture>, Retained<MetalTexture>)>,
     samplers: HashMap<[u32; 8], Retained<Sampler>>,
     fallbacks: HashMap<String, u64>,
@@ -231,11 +251,23 @@ impl Renderer {
         let _ = self.fall_back(reason.to_string());
     }
 
-    /// Writes every dirty target back to guest memory.
-    pub fn flush(&self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+    /// Ends the command buffer, waits for the GPU and writes every dirty
+    /// target back to guest memory (through `memory`, which notes the
+    /// writes in `writes`).
+    pub fn flush(&self, memory: &dyn GpuMemory, writes: &Writes) -> Result<(), Unmodeled> {
         use std::sync::atomic::Ordering;
         let mut state = self.state.lock().unwrap();
         state.finish();
+        // Residents whose mirror still equals memory do after their own
+        // write-back too (residents do not overlap).
+        let current: Vec<bool> = state
+            .residents
+            .iter()
+            .map(|r| {
+                let (start, end) = r.extent();
+                r.stamp.is_some_and(|s| writes.unchanged(s, start, end))
+            })
+            .collect();
         self.writing_back.store(true, Ordering::Relaxed);
         let mut result = Ok(());
         for resident in &mut state.residents {
@@ -244,9 +276,16 @@ impl Renderer {
             {
                 result = resident.write_back(rect, memory);
             }
-            resident.checked = false;
         }
         self.writing_back.store(false, Ordering::Relaxed);
+        let stamp = writes.stamp();
+        for (resident, current) in state.residents.iter_mut().zip(current) {
+            resident.stamp = current.then_some(stamp);
+        }
+        // Uploads of textures the texture cache dropped are dropped too.
+        state
+            .textures
+            .retain(|_, (texture, _)| Arc::strong_count(texture) > 1);
         result
     }
 
@@ -254,6 +293,7 @@ impl Renderer {
     fn before_access(
         &self,
         memory: &dyn GpuMemory,
+        writes: &Writes,
         address: u64,
         length: usize,
     ) -> Result<(), Unmodeled> {
@@ -267,14 +307,19 @@ impl Renderer {
             })
         };
         if overlaps {
-            self.flush(memory)?;
+            self.flush(memory, writes)?;
         }
         Ok(())
     }
 
     /// A draw on Metal; `Ok(false)` if Metal cannot do it (nothing was
     /// changed then).
-    pub fn draw(&self, memory: &dyn GpuMemory, draw: &Draw<'_>) -> Result<bool, Unmodeled> {
+    pub fn draw(
+        &self,
+        memory: &dyn GpuMemory,
+        writes: &Writes,
+        draw: &Draw<'_>,
+    ) -> Result<bool, Unmodeled> {
         // Inputs that come from memory are gathered before the state is
         // locked: reading them may flush.
         let translated = {
@@ -294,6 +339,9 @@ impl Renderer {
             Ok(t) => t,
             Err(reason) => return self.fall_back(format!("pixel program: {reason}")),
         };
+        if draw.program.header().ps_writes_depth() {
+            return self.fall_back("pixel program writes depth".into());
+        }
         // Constant buffer words read statically must be readable.
         let mut constants: HashMap<u32, Vec<u8>> = HashMap::new();
         for &(slot, offset) in &translated.constants {
@@ -349,6 +397,7 @@ impl Renderer {
         }
         let residents = self.residents(
             memory,
+            writes,
             &attachments
                 .iter()
                 .map(|a| (a.0, a.1.format))
@@ -382,7 +431,8 @@ impl Renderer {
             None => {
                 let outputs: Vec<usize> = key.attachments.iter().map(|a| a.3).collect();
                 let source = translated.source(draw.program, &outputs);
-                let pipeline = build_pipeline(gpu, &source, "fragment_main", &key.attachments)?;
+                let library = state.library(gpu, source)?;
+                let pipeline = build_pipeline(gpu, &library, "fragment_main", &key.attachments)?;
                 state.pipelines.insert(key.clone(), pipeline.clone());
                 pipeline
             }
@@ -466,18 +516,15 @@ impl Renderer {
         });
         let [r, g, b, a] = draw.blend_constant;
         encoder.setBlendColorRed_green_blue_alpha(r, g, b, a);
-        let vertex_buffer = buffer(gpu, bytes_of(&positions))?;
-        let plane_buffer = buffer(gpu, bytes_of(&planes))?;
-        let bias_buffer = buffer(gpu, bytes_of(&biases))?;
         // SAFETY: buffers and textures outlive the command buffer (Metal
-        // retains them), indices are within the function's bindings.
+        // retains them, and copies bytes), indices are within the
+        // function's bindings.
         unsafe {
-            encoder.setVertexBuffer_offset_atIndex(Some(&vertex_buffer), 0, 0);
-            encoder.setFragmentBuffer_offset_atIndex(Some(&plane_buffer), 0, 0);
-            encoder.setFragmentBuffer_offset_atIndex(Some(&bias_buffer), 0, 1);
+            bind(gpu, &encoder, Stage::Vertex, bytes_of(&positions), 0)?;
+            bind(gpu, &encoder, Stage::Fragment, bytes_of(&planes), 0)?;
+            bind(gpu, &encoder, Stage::Fragment, bytes_of(&biases), 1)?;
             for (slot, data) in &constants {
-                let b = buffer(gpu, data)?;
-                encoder.setFragmentBuffer_offset_atIndex(Some(&b), 0, 2 + *slot as usize);
+                bind(gpu, &encoder, Stage::Fragment, data, 2 + *slot as usize)?;
             }
             for (i, (texture, sampler)) in gpu_textures.iter().enumerate() {
                 encoder.setFragmentTexture_atIndex(Some(texture), i);
@@ -490,11 +537,7 @@ impl Renderer {
             );
         }
         for &index in &residents {
-            let resident = &mut state.residents[index];
-            resident.dirty = Some(match resident.dirty {
-                Some(d) => union(d, scissor),
-                None => scissor,
-            });
+            state.rendered(index, scissor, writes);
         }
         state.draws += 1;
         Ok(true)
@@ -506,6 +549,7 @@ impl Renderer {
     pub fn clear(
         &self,
         memory: &dyn GpuMemory,
+        writes: &Writes,
         surface: Surface,
         format: ColorFormat,
         rect: Rect,
@@ -524,16 +568,17 @@ impl Renderer {
         if rect.is_empty() {
             return Ok(true);
         }
-        let residents = self.residents(memory, &[(surface, format)])?;
+        let residents = self.residents(memory, writes, &[(surface, format)])?;
         let mut state = self.state.lock().unwrap();
         let gpu = Self::gpu();
         let key = (pixel_format.0, components);
         let pipeline = match state.clear_pipelines.get(&key) {
             Some(p) => p.clone(),
             None => {
+                let library = state.library(gpu, CLEAR_SOURCE.to_string())?;
                 let p = build_pipeline(
                     gpu,
-                    CLEAR_SOURCE,
+                    &library,
                     "clear_main",
                     &[(pixel_format.0, None, components, 0)],
                 )?;
@@ -557,17 +602,12 @@ impl Renderer {
             width: (rect.x1 - rect.x0) as usize,
             height: (rect.y1 - rect.y0) as usize,
         });
-        let color_buffer = buffer(gpu, bytes_of(&color))?;
         // SAFETY: as in `draw`.
         unsafe {
-            encoder.setFragmentBuffer_offset_atIndex(Some(&color_buffer), 0, 0);
+            bind(gpu, &encoder, Stage::Fragment, bytes_of(&color), 0)?;
             encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
         }
-        let resident = &mut state.residents[residents[0]];
-        resident.dirty = Some(match resident.dirty {
-            Some(d) => union(d, rect),
-            None => rect,
-        });
+        state.rendered(residents[0], rect, writes);
         Ok(true)
     }
 
@@ -576,12 +616,12 @@ impl Renderer {
     fn residents(
         &self,
         memory: &dyn GpuMemory,
+        writes: &Writes,
         targets: &[(Surface, ColorFormat)],
     ) -> Result<Vec<usize>, Unmodeled> {
-        let mut indices = Vec::new();
+        // A resident of other dimensions or format at overlapping memory is
+        // written back and dropped, before any index is taken.
         for &(surface, format) in targets {
-            // A resident of other dimensions or format at overlapping
-            // memory is written back and dropped.
             let stale: bool = {
                 let state = self.state.lock().unwrap();
                 state.residents.iter().any(|r| {
@@ -590,13 +630,20 @@ impl Renderer {
                 })
             };
             if stale {
-                self.flush(memory)?;
+                self.flush(memory, writes)?;
                 let mut state = self.state.lock().unwrap();
                 state.residents.retain(|r| {
                     !((r.surface != surface || r.format != format)
                         && overlap(r.extent(), extent(&surface)))
                 });
             }
+        }
+        let mut indices = Vec::new();
+        for &(surface, format) in targets {
+            // A dirty resident is current: anything else of the channel
+            // that wrote its memory wrote it back first ([`Coherent`]),
+            // and a signal writes it back too. A clean one has no work
+            // pending on the GPU, so it may be reloaded.
             let found = {
                 let state = self.state.lock().unwrap();
                 state
@@ -604,10 +651,11 @@ impl Renderer {
                     .iter()
                     .position(|r| r.surface == surface && r.format == format)
                     .map(|i| {
-                        (
-                            i,
-                            state.residents[i].checked || state.residents[i].dirty.is_some(),
-                        )
+                        let r = &state.residents[i];
+                        let (start, end) = r.extent();
+                        let current = r.dirty.is_some()
+                            || r.stamp.is_some_and(|s| writes.unchanged(s, start, end));
+                        (i, current)
                     })
             };
             let full = Rect {
@@ -621,18 +669,20 @@ impl Renderer {
                 Some((index, false)) => {
                     // Compare with guest memory; reload what changed.
                     let mut window = Window::load(memory, surface, full)?;
+                    let stamp = writes.stamp();
                     let mut state = self.state.lock().unwrap();
                     let resident = &mut state.residents[index];
                     if window.data() != resident.mirror.data() {
                         upload_surface(&resident.texture, &mut window, full);
                         resident.mirror = window;
                     }
-                    resident.checked = true;
+                    resident.stamp = Some(stamp);
                     indices.push(index);
                 }
                 None => {
                     let pixel_format = format::pixel_format(format).expect("checked by the caller");
                     let mut window = Window::load(memory, surface, full)?;
+                    let stamp = writes.stamp();
                     let texture =
                         new_target(Self::gpu(), pixel_format, surface.width, surface.height)?;
                     upload_surface(&texture, &mut window, full);
@@ -643,7 +693,7 @@ impl Renderer {
                         texture,
                         mirror: window,
                         dirty: None,
-                        checked: true,
+                        stamp: Some(stamp),
                     });
                     indices.push(state.residents.len() - 1);
                 }
@@ -663,6 +713,34 @@ impl State {
             frame.command.commit();
             frame.command.waitUntilCompleted();
         }
+    }
+
+    /// Resident `index` got `rect` rendered by the GPU. The first draw
+    /// after a write-back notes the whole surface as written, so that
+    /// caches of its memory (a texture sampling it) look again, through
+    /// [`Coherent`], which writes it back; the resident itself stays
+    /// current.
+    fn rendered(&mut self, index: usize, rect: Rect, writes: &Writes) {
+        let resident = &mut self.residents[index];
+        match resident.dirty {
+            Some(dirty) => resident.dirty = Some(union(dirty, rect)),
+            None => {
+                let (start, end) = resident.extent();
+                writes.record(start, end - start);
+                resident.dirty = Some(rect);
+                resident.stamp = Some(writes.stamp());
+            }
+        }
+    }
+
+    /// The compiled library of `source`, compiled once.
+    fn library(&mut self, gpu: &Gpu, source: String) -> Result<Retained<Library>, Unmodeled> {
+        if let Some(library) = self.libraries.get(&source) {
+            return Ok(library.clone());
+        }
+        let library = compile_library(gpu, &source)?;
+        self.libraries.insert(source, library.clone());
+        Ok(library)
     }
 
     /// The render pass encoder for `residents` as attachments (in order,
@@ -761,18 +839,20 @@ vertex Vertex vertex_main(uint id [[vertex_id]]) {
 fragment float4 clear_main(const device float4* color [[buffer(0)]]) { return color[0]; }
 "#;
 
+fn compile_library(gpu: &Gpu, source: &str) -> Result<Retained<Library>, Unmodeled> {
+    let options = MTLCompileOptions::new();
+    options.setMathMode(MTLMathMode::Safe);
+    gpu.device
+        .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&options))
+        .map_err(|e| Unmodeled(format!("Metal: shader compilation failed: {e}\n{source}")))
+}
+
 fn build_pipeline(
     gpu: &Gpu,
-    source: &str,
+    library: &Library,
     fragment: &str,
     attachments: &[(usize, Option<Blend>, u8, usize)],
 ) -> Result<Retained<Pipeline>, Unmodeled> {
-    let options = MTLCompileOptions::new();
-    options.setMathMode(MTLMathMode::Safe);
-    let library = gpu
-        .device
-        .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&options))
-        .map_err(|e| Unmodeled(format!("Metal: shader compilation failed: {e}\n{source}")))?;
     let vertex = library
         .newFunctionWithName(&NSString::from_str("vertex_main"))
         .ok_or_else(|| Unmodeled("Metal: no vertex function".into()))?;
@@ -988,7 +1068,8 @@ pub(crate) fn compile(source: &str, outputs: usize) -> Result<(), String> {
     let attachments: Vec<_> = (0..outputs)
         .map(|i| (MTLPixelFormat::RGBA8Unorm.0, None, 15, i))
         .collect();
-    build_pipeline(gpu, source, "fragment_main", &attachments)
+    let library = compile_library(gpu, source).map_err(|e| e.0)?;
+    build_pipeline(gpu, &library, "fragment_main", &attachments)
         .map(drop)
         .map_err(|e| e.0)
 }
@@ -1011,6 +1092,52 @@ fn buffer(gpu: &Gpu, data: &[u8]) -> Result<Retained<MetalBuffer>, Unmodeled> {
         )
     }
     .ok_or_else(|| Unmodeled("Metal: buffer allocation failed".into()))
+}
+
+/// A shader stage to bind data for.
+#[derive(Clone, Copy)]
+enum Stage {
+    Vertex,
+    Fragment,
+}
+
+/// Binds `data` at buffer `index` of `stage`: copied into the command
+/// stream when small (no allocation, as Metal advises below 4 KiB), as a
+/// buffer of its own otherwise.
+///
+/// # Safety
+///
+/// `index` is within the stage function's buffer bindings.
+unsafe fn bind(
+    gpu: &Gpu,
+    encoder: &Encoder,
+    stage: Stage,
+    data: &[u8],
+    index: usize,
+) -> Result<(), Unmodeled> {
+    const INLINE: usize = 4096;
+    if !data.is_empty() && data.len() <= INLINE {
+        let bytes = NonNull::new(data.as_ptr() as *mut _).expect("non-null");
+        // SAFETY: `data` is valid for its length; Metal copies it.
+        unsafe {
+            match stage {
+                Stage::Vertex => encoder.setVertexBytes_length_atIndex(bytes, data.len(), index),
+                Stage::Fragment => {
+                    encoder.setFragmentBytes_length_atIndex(bytes, data.len(), index)
+                }
+            }
+        }
+        return Ok(());
+    }
+    let buffer = buffer(gpu, data)?;
+    // SAFETY: Metal retains the buffer; `index` per the caller.
+    unsafe {
+        match stage {
+            Stage::Vertex => encoder.setVertexBuffer_offset_atIndex(Some(&buffer), 0, index),
+            Stage::Fragment => encoder.setFragmentBuffer_offset_atIndex(Some(&buffer), 0, index),
+        }
+    }
+    Ok(())
 }
 
 fn bytes_of(values: &[f32]) -> &[u8] {
@@ -1067,19 +1194,20 @@ fn overlap(a: (u64, u64), b: (u64, u64)) -> bool {
 pub struct Coherent<'a> {
     pub memory: &'a dyn GpuMemory,
     pub renderer: &'a Renderer,
+    pub writes: &'a Writes,
 }
 
 impl GpuMemory for Coherent<'_> {
     fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
         self.renderer
-            .before_access(self.memory, address, buffer.len())
+            .before_access(self.memory, self.writes, address, buffer.len())
             .ok()?;
         self.memory.read(address, buffer)
     }
 
     fn write(&self, address: u64, data: &[u8]) -> Option<()> {
         self.renderer
-            .before_access(self.memory, address, data.len())
+            .before_access(self.memory, self.writes, address, data.len())
             .ok()?;
         self.memory.write(address, data)
     }

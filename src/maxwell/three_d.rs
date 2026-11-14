@@ -180,7 +180,7 @@ pub fn release_semaphore(
     payload: u32,
     four_words: bool,
 ) -> Result<(), Unmodeled> {
-    hooks.flush(memory)?;
+    hooks.signal(memory)?;
     if !four_words {
         return write_words(memory, address, &[payload]);
     }
@@ -362,7 +362,7 @@ impl ThreeD {
                         "syncpoint increment without host1x connected",
                     )
                 })?;
-                hooks.flush(memory)?;
+                hooks.signal(memory)?;
                 increment(argument & 0xFFF);
             }
             SET_GLOBAL_RENDER_ENABLE_C => {
@@ -772,6 +772,7 @@ impl ThreeD {
             bindings: &self.bindings,
             memory,
             metal: hooks.metal.as_deref(),
+            writes: &hooks.writes,
         };
         pipeline::draw(&context, &mut self.caches, &batch)
     }
@@ -846,7 +847,15 @@ impl ThreeD {
                     f32::from_bits(r.get(SET_COLOR_CLEAR_VALUE * 4 + 4 * i as u32))
                 });
                 if let Some(metal) = &hooks.metal
-                    && metal.clear(memory, surface, format, rect, color, components as u8)?
+                    && metal.clear(
+                        memory,
+                        &hooks.writes,
+                        surface,
+                        format,
+                        rect,
+                        color,
+                        components as u8,
+                    )?
                 {
                     // Done on the GPU.
                 } else {

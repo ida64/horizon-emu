@@ -140,6 +140,8 @@ pub struct Context<'a> {
     pub memory: &'a dyn GpuMemory,
     /// The channel's Metal renderer, which draws what it can express.
     pub metal: Option<&'a super::metal::Renderer>,
+    /// What the channel's engines wrote since it last signaled.
+    pub writes: &'a super::resources::Writes,
 }
 
 const SET_COLOR_TARGET_A: u32 = 0x0800;
@@ -842,7 +844,7 @@ pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result
         sampler_maximum: r.get(SET_TEX_SAMPLER_POOL_C) & 0xF_FFFF,
         sampler_from_header: r.get(SET_SAMPLER_BINDING) & 1 != 0,
     };
-    let textures = DrawTextures::new(context.memory, pools, &caches.textures);
+    let textures = DrawTextures::new(context.memory, pools, &caches.textures, context.writes);
 
     // Vertex shading, once per distinct vertex of the batch.
     let vertex_buffers = constant_buffers(context, VERTEX_PIPELINE, &vertex)?;
@@ -1054,13 +1056,13 @@ fn rasterize(
                 textures,
                 texture_buffer_index: r.get(SET_BINDLESS_TEXTURE) & 0x1F,
             };
-            if metal.draw(context.memory, &draw)? {
+            if metal.draw(context.memory, context.writes, &draw)? {
                 return Ok(());
             }
         }
         // The software renderer reads memory from several threads; all
         // of Metal's work is made visible before it starts.
-        metal.flush(context.memory)?;
+        metal.flush(context.memory, context.writes)?;
     }
     for (surface, _) in &targets {
         windows.push(Window::load(context.memory, *surface, bounds)?);
