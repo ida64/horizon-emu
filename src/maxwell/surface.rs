@@ -421,10 +421,30 @@ mod tests {
             }),
         ];
         let rects = [
-            Rect { x0: 0, y0: 0, x1: 100, y1: 70 },
-            Rect { x0: 3, y0: 5, x1: 61, y1: 37 },
-            Rect { x0: 17, y0: 9, x1: 18, y1: 10 },
-            Rect { x0: 31, y0: 0, x1: 97, y1: 69 },
+            Rect {
+                x0: 0,
+                y0: 0,
+                x1: 100,
+                y1: 70,
+            },
+            Rect {
+                x0: 3,
+                y0: 5,
+                x1: 61,
+                y1: 37,
+            },
+            Rect {
+                x0: 17,
+                y0: 9,
+                x1: 18,
+                y1: 10,
+            },
+            Rect {
+                x0: 31,
+                y0: 0,
+                x1: 97,
+                y1: 69,
+            },
         ];
         for layout in layouts {
             for bpp in [1, 2, 4, 8, 16] {
@@ -448,8 +468,8 @@ mod tests {
                         for y in rect.y0..rect.y1 {
                             let band = window.band_mut(y).unwrap();
                             for x in rect.x0..rect.x1 {
-                                let at = (y - rect.y0) as usize * row
-                                    + (x - rect.x0) as usize * bpp;
+                                let at =
+                                    (y - rect.y0) as usize * row + (x - rect.x0) as usize * bpp;
                                 assert_eq!(&out[at..at + bpp], band.pixel(x, y), "{layout:?}");
                             }
                         }
@@ -464,8 +484,8 @@ mod tests {
                         for y in rect.y0..rect.y1 {
                             let mut band = reference.band_mut(y).unwrap();
                             for x in rect.x0..rect.x1 {
-                                let at = (y - rect.y0) as usize * row
-                                    + (x - rect.x0) as usize * bpp;
+                                let at =
+                                    (y - rect.y0) as usize * row + (x - rect.x0) as usize * bpp;
                                 band.pixel_mut(x, y).copy_from_slice(&pixels[at..at + bpp]);
                             }
                         }

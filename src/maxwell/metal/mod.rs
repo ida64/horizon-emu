@@ -544,14 +544,13 @@ impl Renderer {
     }
 
     /// A color clear on Metal: `components` (bit i: component i) of
-    /// `rect` set to `color`, encoded as the format stores it (no sRGB
-    /// conversion, as `CLEAR_SURFACE` writes the value raw).
+    /// `rect` of the target set to `color`, encoded as the format stores
+    /// it (no sRGB conversion, as `CLEAR_SURFACE` writes the value raw).
     pub fn clear(
         &self,
         memory: &dyn GpuMemory,
         writes: &Writes,
-        surface: Surface,
-        format: ColorFormat,
+        (surface, format): (Surface, ColorFormat),
         rect: Rect,
         color: [f32; 4],
         components: u8,

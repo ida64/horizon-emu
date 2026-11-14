@@ -255,10 +255,11 @@ impl<'a> DrawTextures<'a> {
                     _ => {
                         drop(entries);
                         let texture = Arc::new(Texture::decode(self.memory, &tic)?);
-                        self.cache.entries.lock().unwrap().insert(
-                            words,
-                            (raw, texture.clone(), self.writes.stamp()),
-                        );
+                        self.cache
+                            .entries
+                            .lock()
+                            .unwrap()
+                            .insert(words, (raw, texture.clone(), self.writes.stamp()));
                         texture
                     }
                 }

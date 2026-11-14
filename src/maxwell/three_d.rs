@@ -850,8 +850,7 @@ impl ThreeD {
                     && metal.clear(
                         memory,
                         &hooks.writes,
-                        surface,
-                        format,
+                        (surface, format),
                         rect,
                         color,
                         components as u8,

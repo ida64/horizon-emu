@@ -1248,10 +1248,7 @@ mod tests {
         attention.store(false, Ordering::SeqCst);
         assert_eq!(context.run(&env).unwrap(), Outcome::Idle);
         // Both methods; nothing signals, so nothing is flushed.
-        assert_eq!(
-            *engines.0.lock().unwrap(),
-            [(0, 0x40, 1), (0, 0x41, 2)]
-        );
+        assert_eq!(*engines.0.lock().unwrap(), [(0, 0x40, 1), (0, 0x41, 2)]);
     }
 
     #[test]

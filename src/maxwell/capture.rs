@@ -138,13 +138,33 @@ struct Page {
     known: [u64; PAGE as usize / 64],
 }
 
+impl Page {
+    /// The known bits of bytes `start..end` by word: (word, mask).
+    fn masks(start: usize, end: usize) -> impl Iterator<Item = (usize, u64)> {
+        (start / 64..end.div_ceil(64)).map(move |word| {
+            let low = start.max(word * 64) - word * 64;
+            let high = end.min(word * 64 + 64) - word * 64;
+            let ones = if high - low == 64 {
+                u64::MAX
+            } else {
+                (1 << (high - low)) - 1
+            };
+            (word, ones << low)
+        })
+    }
+
+    fn known(&self, start: usize, end: usize) -> bool {
+        Self::masks(start, end).all(|(word, mask)| self.known[word] & mask == mask)
+    }
+}
+
 impl Shadow {
     /// Whether `data` at `address` is what the shadow holds, every byte
     /// known.
     fn matches(&self, address: u64, data: &[u8]) -> bool {
         spans(address, data.len()).all(|(page, offset, range)| {
             self.pages.get(&page).is_some_and(|p| {
-                (offset..offset + range.len()).all(|i| p.known[i / 64] >> (i % 64) & 1 != 0)
+                p.known(offset, offset + range.len())
                     && p.bytes[offset..offset + range.len()] == data[range]
             })
         })
@@ -158,8 +178,8 @@ impl Shadow {
                     known: [0; PAGE as usize / 64],
                 })
             });
-            for i in offset..offset + range.len() {
-                p.known[i / 64] |= 1 << (i % 64);
+            for (word, mask) in Page::masks(offset, offset + range.len()) {
+                p.known[word] |= mask;
             }
             p.bytes[offset..offset + range.len()].copy_from_slice(&data[range]);
         }
@@ -169,7 +189,7 @@ impl Shadow {
     fn load(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
         for (page, offset, range) in spans(address, buffer.len()) {
             let p = self.pages.get(&page)?;
-            if !(offset..offset + range.len()).all(|i| p.known[i / 64] >> (i % 64) & 1 != 0) {
+            if !p.known(offset, offset + range.len()) {
                 return None;
             }
             buffer[range.clone()].copy_from_slice(&p.bytes[offset..offset + range.len()]);
