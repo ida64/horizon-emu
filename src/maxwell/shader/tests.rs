@@ -178,9 +178,13 @@ fn environment(textures: &Textures) -> Env<'_> {
 /// Instruction bit layouts [public: Ryujinx Decoders/InstDecoders.cs].
 /// The scheduling word is deliberately zero: it does not affect values.
 fn assembled(words: &[u64]) -> Program {
-    let mut bytes = vec![0; 0x50];
-    bytes[..4].copy_from_slice(&0x1402u32.to_le_bytes());
-    bytes[0x48] = 15;
+    let mut header = [0; 0x50];
+    header[..4].copy_from_slice(&0x1402u32.to_le_bytes());
+    header[0x48] = 15;
+    with_header(&header, words)
+}
+fn with_header(header: &[u8; 0x50], words: &[u64]) -> Program {
+    let mut bytes = header.to_vec();
     for chunk in words.chunks(3) {
         bytes.extend_from_slice(&0u64.to_le_bytes());
         for i in 0..3 {
@@ -570,4 +574,92 @@ fn firmware_pixel_programs_translate_and_compile() {
         programs.len()
     );
     assert!(compiled > 0);
+}
+/// A geometry shader header: VTG, shader type 4, one thread per
+/// primitive, TRIANGLESTRIP output of at most `max` vertices.
+fn geometry_header(max: u8) -> [u8; 0x50] {
+    let mut header = [0; 0x50];
+    header[..4].copy_from_slice(&0x1001u32.to_le_bytes());
+    header[0x0b] = 1;
+    header[0x0f] = 7;
+    header[0x10] = max;
+    header
+}
+/// `ALD a[offset]` / `AST a[offset]` of one word with vertex register
+/// `vertex` (encodings as the NVN compiler emits them; see the ocean
+/// archive's geometry shaders).
+fn ald(rd: u64, offset: u64, vertex: u64) -> u64 {
+    0xefd8_0000_0007_ff00 | (offset << 20) | (vertex << 39) | rd
+}
+fn ast(rs: u64, offset: u64, vertex: u64) -> u64 {
+    0xeff0_0000_0007_ff00 | (offset << 20) | (vertex << 39) | rs
+}
+/// `OUT` (register form, stream RZ): `kind` 1 EMIT, 2 CUT, 3 both.
+fn out(rd: u64, ra: u64, kind: u64) -> u64 {
+    0xfbe0_0000_0ff7_0000 | (kind << 39) | (ra << 8) | rd
+}
+/// The input-handle and output-handle protocol of geometry shaders:
+/// `SR_INVOCATION_INFO` carries the vertices per primitive, `ISBERD`
+/// turns an ISBE entry into the handle `ALD` takes, `OUT` returns the
+/// next output handle, emits past `MaxOutputVertexCount` are dropped, and
+/// a handle the program was not given is refused.
+#[test]
+fn geometry_handles_emit_and_cut() {
+    const S2R_INVOCATION_INFO: u64 = 0xf0c8_0000_01d7_0000;
+    const ISBERD: u64 = 0xefd0_0000_0007_0000;
+    let p = with_header(
+        &geometry_header(2),
+        &[
+            S2R_INVOCATION_INFO,
+            mov(2, 2),
+            ISBERD | (2 << 8) | 1,
+            ald(4, 0x80, 1),
+            ast(4, 0x80, 5),
+            ast(0, 0x84, 5),
+            out(5, 5, 1),
+            ISBERD | (0xff << 8) | 1,
+            ald(4, 0x80, 1),
+            ast(4, 0x80, 5),
+            out(5, 5, 3),
+            out(5, 5, 1),
+            ast(5, 0x88, 5),
+            0xe30000000007000f,
+        ],
+    );
+    let inputs: Vec<Attributes> = (0..3)
+        .map(|i| {
+            let mut a = Attributes::default();
+            a.0[0x80 / 4] = 10 + i;
+            a
+        })
+        .collect();
+    let refs: Vec<&Attributes> = inputs.iter().collect();
+    let t = Textures::default();
+    let env = environment(&t);
+    let mut emitted = Vec::new();
+    p.run_geometry(&env, &refs, &mut emitted).unwrap();
+    assert_eq!(emitted.len(), 3);
+    let first = emitted[0].as_ref().unwrap();
+    assert_eq!(first.0[0x80 / 4], 12);
+    assert_eq!(first.0[0x84 / 4], 3 << 16);
+    let second = emitted[1].as_ref().unwrap();
+    assert_eq!(second.0[0x80 / 4], 10);
+    // Written before the emit only: an emitted vertex starts the next.
+    assert_eq!(second.0[0x84 / 4], 0);
+    assert!(emitted[2].is_none());
+
+    // A stale output handle.
+    let p = with_header(
+        &geometry_header(4),
+        &[out(5, 5, 1), ast(5, 0x80, 6), 0xe30000000007000f],
+    );
+    let err = p.run_geometry(&env, &refs, &mut Vec::new()).unwrap_err();
+    assert!(err.0.contains("output vertex handle 0x0"), "{}", err.0);
+    // An ISBE entry past the primitive.
+    let p = with_header(
+        &geometry_header(4),
+        &[mov(2, 3), ISBERD | (2 << 8) | 1, 0xe30000000007000f],
+    );
+    let err = p.run_geometry(&env, &refs, &mut Vec::new()).unwrap_err();
+    assert!(err.0.contains("ISBE entry 3"), "{}", err.0);
 }

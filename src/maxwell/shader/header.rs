@@ -122,6 +122,25 @@ impl Header {
         self.bit(16)
     }
 
+    /// `CommonWord2.ThreadsPerInputPrimitive` (bits 24-31 of byte 0x08):
+    /// for a geometry shader, the threads run per input primitive.
+    pub fn threads_per_input_primitive(&self) -> u32 {
+        u32::from(self.bytes[0x0b])
+    }
+
+    /// `CommonWord3.OutputTopology` (bits 24-27 of byte 0x0c): for a
+    /// geometry shader, POINTLIST (1), LINESTRIP (6) or TRIANGLESTRIP (7).
+    pub fn output_topology(&self) -> u32 {
+        u32::from(self.bytes[0x0f] & 0xf)
+    }
+
+    /// `CommonWord4.MaxOutputVertexCount` (bits 0-11 of byte 0x10): for a
+    /// geometry shader, the vertices one thread may output; `OUT`
+    /// instructions beyond it are no-ops.
+    pub fn max_output_vertex_count(&self) -> u32 {
+        u32::from(u16::from_le_bytes([self.bytes[0x10], self.bytes[0x11]]) & 0xfff)
+    }
+
     /// How a pixel shader reads attribute word `attribute_word`
     /// (attribute byte address / 4). [`Interpolation::Unused`] for words the
     /// PS Imap has no entry for, and for a VTG header.

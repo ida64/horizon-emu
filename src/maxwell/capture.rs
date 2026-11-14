@@ -729,10 +729,12 @@ mod tests {
 
     /// `MAXWELL_REPLAY=<capture> MAXWELL_PROGS=<dir> cargo test --release
     /// --lib maxwell::capture::tests::programs -- --ignored --nocapture`:
-    /// writes the vertex (`1-<address>.bin`) and pixel (`5-<address>.bin`)
-    /// programs of every draw in the capture, from their header on, and
+    /// writes the vertex (`1-<address>.bin`), geometry (`4-<address>.bin`)
+    /// and pixel (`5-<address>.bin`) programs of every draw in the
+    /// capture, from their header on, and
     /// lists each with its instructions. Draws are recognized by any
-    /// method that leaves an enabled program bound when it completes.
+    /// method that leaves an enabled program bound when it completes, and
+    /// by the call the engines refuse (where the replay stops).
     #[test]
     #[ignore]
     fn programs() {
@@ -740,13 +742,21 @@ mod tests {
         let directory = std::env::var("MAXWELL_PROGS").expect("MAXWELL_PROGS");
         let replay = Replay::load(Path::new(&path)).unwrap();
         let mut seen = std::collections::BTreeMap::new();
-        let _ = run(&replay, kind(), |call, state, _| {
+        let mut replayer = Replayer::new(&replay, kind());
+        for call in &replay.calls() {
+            let refused = replayer.step(call).is_err();
+            let Some(state) = replayer.channels.get_mut(&call.channel) else {
+                break;
+            };
             if call.subchannel != 0 {
-                return;
+                if refused {
+                    break;
+                }
+                continue;
             }
             let r = state.channel.three_d.registers();
             let base = (u64::from(r.get(0x1608) & 0xff) << 32) | u64::from(r.get(0x160c));
-            for pipeline in [1u32, 5] {
+            for pipeline in [1u32, 4, 5] {
                 let control = r.get(0x2000 + pipeline * 64);
                 if control & 1 == 0 {
                     continue;
@@ -755,9 +765,13 @@ mod tests {
                 if seen.contains_key(&(pipeline, address)) {
                     continue;
                 }
-                let Ok(program) = super::super::shader::Program::decode(&state.memory, address)
-                else {
-                    continue;
+                let program = match super::super::shader::Program::decode(&state.memory, address)
+                {
+                    Ok(program) => program,
+                    Err(error) => {
+                        seen.insert((pipeline, address), error.0);
+                        continue;
+                    }
                 };
                 let mut raw = vec![0; program.len()];
                 state.memory.read(address, &mut raw).unwrap();
@@ -767,7 +781,10 @@ mod tests {
                 ops.dedup();
                 seen.insert((pipeline, address), ops.join(" "));
             }
-        });
+            if refused {
+                break;
+            }
+        }
         for ((pipeline, address), ops) in &seen {
             println!("{pipeline} {address:#x}: {ops}");
         }

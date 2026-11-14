@@ -10,7 +10,8 @@
 //! targets. Registers, predicates and flags start at zero (hardware leaves
 //! them undefined; no firmware program reads one before writing it).
 //!
-//! A vertex runs as one lane. A fragment quad runs its four lanes in
+//! A vertex, and a geometry shader thread, run as one lane. A fragment
+//! quad runs its four lanes in
 //! lockstep: each step takes the smallest program counter among lanes
 //! still running and executes that instruction for every lane at it. For
 //! structured control flow this reproduces the hardware's reconvergence
@@ -36,6 +37,37 @@
 //! invocation, or reaches its terminating branch-to-self (it would never
 //! end on hardware), stops with [`Unmodeled`].
 //!
+//! # Geometry shaders
+//!
+//! A geometry shader thread sees one input primitive and writes output
+//! vertices through opaque handles [public: NVIDIA open-gpu-doc
+//! Shader-Program-Header, `MaxOutputVertexCount`, "ALD.O is disallowed"
+//! for geometry shaders; envytools `envydis/gm107.c` `isberd`, `out`;
+//! eden `translate/impl/output_geometry.cpp`; Ryujinx
+//! `Instructions/InstEmitAttribute.cs` `Isberd`]. As the NVN compiler
+//! uses them (ocean archive of the corpus, and the language scene of
+//! starter):
+//!
+//! * `S2R SR_INVOCATION_INFO` gives the vertices per input primitive in
+//!   bits 16-23 and the primitive's position in the internal stage buffer
+//!   (ISBE) batch in bits 0-7; the program forms `b0 * b2 + vertex` with
+//!   `VMAD.U8` and reads that ISBE entry with `ISBERD`, getting the input
+//!   vertex's handle, which `ALD`'s vertex register takes.
+//! * Output vertices are built with `AST` whose vertex register holds the
+//!   current output handle (the compiler starts it at 0); `OUT.EMIT Rd,
+//!   Ra` emits the vertex of handle `Ra` and returns the next handle in
+//!   `Rd`; `OUT.CUT` ends the strip.
+//!
+//! Handle values are the hardware's own; this model fills the ISBE with
+//! one primitive at a time (position 0, other bits of
+//! `SR_INVOCATION_INFO` 0, as Ryujinx returns), lets entry `i` hold input
+//! handle `i` (the identity eden and Ryujinx use for `ISBERD`), and
+//! numbers output handles by the vertices emitted so far. A program that
+//! uses a handle it was not given (another ISBE entry, a made-up vertex)
+//! is refused, so the choice of values cannot show. An emitted vertex
+//! starts the next one from zeros: after `OUT.EMIT` the outputs are
+//! undefined (the compiler stores every output again).
+//!
 //! # Instructions executed
 //!
 //! Float: `FADD`, `FADD32I`, `FMUL`, `FMUL32I`, `FFMA`, `FFMA32I`, `FMNMX`,
@@ -43,9 +75,10 @@
 //! Integer: `IADD`, `IADD32I`, `IADD3`, `ISCADD`, `ISCADD32I`, `IMNMX`,
 //! `ISETP`, `ISET`, `ICMP`, `LOP`, `LOP32I`, `LOP3`, `SHL`, `SHR`, `BFE`,
 //! `BFI`, `XMAD`, `SEL`, `MOV`, `MOV32I`, `VMAD`, `VSETP`.
-//! Predicates: `PSETP`, `P2R`, `R2P`. System: `S2R SR_Y_DIRECTION`.
-//! Memory: `LDC`, `LDG`, `STG`, `LD`, `ST` (global through
-//! [`super::Env::memory`]). Attributes: `ALD`, `AST` (vertex), `IPA`
+//! Predicates: `PSETP`, `P2R`, `R2P`. System: `S2R SR_Y_DIRECTION`,
+//! `S2R SR_INVOCATION_INFO` (geometry). Memory: `LDC`, `LDG`, `STG`,
+//! `LD`, `ST` (global through [`super::Env::memory`]). Attributes: `ALD`,
+//! `AST` (vertex, geometry), `ISBERD`, `OUT` (geometry), `IPA`
 //! (fragment). Textures: `TEX`, `TEX.B`, `TEXS`, `TLD`, `TLD.B`, `TLDS`,
 //! `TLD4`, `TLD4.B`, `TLD4S`, `TXQ`, `TXQ.B`, `TMML`, `TMML.B`, `TXD`,
 //! `TXD.B`. Control: `BRA`, `BRX`, `SSY`, `SYNC`, `PBK`, `BRK`, `PCNT`,
@@ -180,12 +213,26 @@ enum Io<'a> {
         input: &'a Attributes,
         output: &'a mut Attributes,
     },
+    Geometry(Geometry<'a>),
     Fragment {
         planes: &'a [Plane; 256],
         x: u32,
         y: u32,
         covered: [bool; 4],
     },
+}
+
+/// The inputs and outputs of a geometry shader thread.
+struct Geometry<'a> {
+    /// The input primitive's vertices; handle `i` is `inputs[i]`.
+    inputs: &'a [&'a Attributes],
+    /// The output vertex being written: the one of handle `handle`.
+    current: &'a mut Attributes,
+    /// Output handle: the vertices this thread has emitted.
+    handle: u32,
+    /// `MaxOutputVertexCount`.
+    max: u32,
+    emitted: &'a mut Vec<Option<Attributes>>,
 }
 
 struct Machine<'a, const L: usize> {
@@ -223,6 +270,42 @@ pub(super) fn run_vertex(
     machine.run()?;
     if machine.lanes[0].state == State::Killed {
         return Err(Unmodeled("shader: KIL in a vertex program".into()));
+    }
+    Ok(())
+}
+
+pub(super) fn run_geometry(
+    program: &Program,
+    env: &Env<'_>,
+    inputs: &[&Attributes],
+    emitted: &mut Vec<Option<Attributes>>,
+) -> Result<(), Unmodeled> {
+    let header = &program.header;
+    if header.shader_type() != ShaderType::Geometry {
+        return Err(Unmodeled(format!(
+            "shader: run_geometry on a {:?} program",
+            header.shader_type()
+        )));
+    }
+    let mut current = Attributes::default();
+    let mut machine = Machine::<1> {
+        program,
+        env,
+        lanes: [Lane::new()],
+        io: Io::Geometry(Geometry {
+            inputs,
+            current: &mut current,
+            handle: 0,
+            max: header.max_output_vertex_count(),
+            emitted,
+        }),
+        op: Op::Invalid,
+        word: 0,
+        pc: 0,
+    };
+    machine.run()?;
+    if machine.lanes[0].state == State::Killed {
+        return Err(Unmodeled("shader: KIL in a geometry program".into()));
     }
     Ok(())
 }
@@ -680,16 +763,22 @@ impl<'a, const L: usize> Machine<'a, L> {
             Op::Nop | Op::Depbar | Op::Membar | Op::Bar => Ok(()),
             Op::S2r => {
                 let sr = bits(w, 20, 8);
-                // SR_Y_DIRECTION (18) [public: eden
-                // `translate/impl/move_special_register.cpp`].
-                self.require(sr == 18, format_args!("special register {sr}"))?;
-                let value = self.env.y_direction.to_bits();
+                // SR_Y_DIRECTION (18), SR_INVOCATION_INFO (29) [public:
+                // eden `translate/impl/move_special_register.cpp`]; see the
+                // module documentation for the latter.
+                let value = match (sr, &self.io) {
+                    (18, _) => self.env.y_direction.to_bits(),
+                    (29, Io::Geometry(geometry)) => (geometry.inputs.len() as u32) << 16,
+                    _ => return self.fail(&format!("special register {sr}")),
+                };
                 let rd = bits(w, 0, 8);
                 self.each(active, |m, lane| {
                     m.set(lane, rd, value);
                     Ok(())
                 })
             }
+            Op::Isberd => self.isberd(active),
+            Op::OutR | Op::OutI | Op::OutC => self.out(active),
             Op::Ldc => self.ldc(active),
             Op::Ldg | Op::Ld => self.load_global(active),
             Op::Stg | Op::St => self.store_global(active),
@@ -853,7 +942,7 @@ impl<'a, const L: usize> Machine<'a, L> {
         let rd = bits(self.word, 0, 8);
         let helpers = match self.io {
             Io::Fragment { covered, .. } => covered,
-            Io::Vertex { .. } => [true; 4],
+            Io::Vertex { .. } | Io::Geometry(_) => [true; 4],
         };
         self.each(active, |m, lane| {
             // Helper lanes (outside the primitive) do not write memory.
@@ -886,34 +975,40 @@ impl<'a, const L: usize> Machine<'a, L> {
     /// `ALD`: dest 0-7, index register 8-15, offset 20-30, `P` (patch)
     /// bit 31, `O` (read outputs) bit 32, vertex register 39-46, size
     /// 47-48 (1-4 words) [public: eden
-    /// `translate/impl/load_store_attribute.cpp` `ALD`].
+    /// `translate/impl/load_store_attribute.cpp` `ALD`]. In a geometry
+    /// program the vertex register holds an input vertex handle.
     fn ald(&mut self, active: u8) -> Result<(), Unmodeled> {
         let w = self.word;
         self.require(!bit(w, 31), "P (patch)")?;
         self.require(bits(w, 8, 8) == RZ, "indexed address")?;
-        self.require(
-            bits(w, 39, 8) == RZ,
-            "vertex register (geometry/tessellation)",
-        )?;
         let offset = bits(w, 20, 11);
         let count = bits(w, 47, 2) + 1;
         self.require(
             offset.is_multiple_of(4) && offset / 4 + count <= 256,
             "attribute address",
         )?;
-        let rd = bits(w, 0, 8);
+        let (rd, vertex) = (bits(w, 0, 8), bits(w, 39, 8));
         let outputs = bit(w, 32);
-        let mut values = [0u32; 4];
-        match &self.io {
-            Io::Vertex { input, output } => {
-                let source = if outputs { &output.0 } else { &input.0 };
-                for (i, value) in values.iter_mut().take(count as usize).enumerate() {
-                    *value = source[(offset / 4) as usize + i];
-                }
-            }
-            Io::Fragment { .. } => return self.fail("in a fragment program"),
-        }
         self.each(active, |m, lane| {
+            let source = match &m.io {
+                Io::Vertex { input, output } => {
+                    m.require(vertex == RZ, "vertex register outside a geometry program")?;
+                    if outputs { &output.0 } else { &input.0 }
+                }
+                Io::Geometry(geometry) => {
+                    m.require(!outputs, "O (disallowed in a geometry program)")?;
+                    let handle = m.r(lane, vertex);
+                    match geometry.inputs.get(handle as usize) {
+                        Some(input) => &input.0,
+                        None => return m.fail(&format!("input vertex handle {handle:#x}")),
+                    }
+                }
+                Io::Fragment { .. } => return m.fail("in a fragment program"),
+            };
+            let mut values = [0u32; 4];
+            for (i, value) in values.iter_mut().take(count as usize).enumerate() {
+                *value = source[(offset / 4) as usize + i];
+            }
             for i in 0..count {
                 m.set(lane, rd + i, values[i as usize]);
             }
@@ -923,15 +1018,12 @@ impl<'a, const L: usize> Machine<'a, L> {
 
     /// `AST`: source 0-7, index register 8-15, offset 20-30, `P` bit 31,
     /// vertex register 39-46, size 47-48 [public: eden
-    /// `translate/impl/load_store_attribute.cpp` `AST`].
+    /// `translate/impl/load_store_attribute.cpp` `AST`]. In a geometry
+    /// program the vertex register holds the current output handle.
     fn ast(&mut self, active: u8) -> Result<(), Unmodeled> {
         let w = self.word;
         self.require(!bit(w, 31), "P (patch)")?;
         self.require(bits(w, 8, 8) == RZ, "indexed address")?;
-        self.require(
-            bits(w, 39, 8) == RZ,
-            "vertex register (geometry/tessellation)",
-        )?;
         let offset = bits(w, 20, 11);
         let count = bits(w, 47, 2) + 1;
         self.require(
@@ -939,20 +1031,105 @@ impl<'a, const L: usize> Machine<'a, L> {
             "attribute address",
         )?;
         let rs = bits(w, 0, 8);
-        // One lane in a vertex program.
+        // One lane in vertex and geometry programs.
         let values: [u32; 4] = std::array::from_fn(|i| self.r(0, rs + i as u32));
         if active & 1 == 0 {
             return Ok(());
         }
-        match &mut self.io {
-            Io::Vertex { output, .. } => {
-                for (i, value) in values.iter().take(count as usize).enumerate() {
-                    output.0[(offset / 4) as usize + i] = *value;
-                }
-                Ok(())
+        let vertex = bits(w, 39, 8);
+        let handle = self.r(0, vertex);
+        match &self.io {
+            Io::Vertex { .. } if vertex != RZ => {
+                return self.fail("vertex register outside a geometry program");
             }
-            Io::Fragment { .. } => self.fail("in a fragment program"),
+            Io::Geometry(geometry) if geometry.handle != handle => {
+                return self.fail(&format!("output vertex handle {handle:#x}"));
+            }
+            Io::Fragment { .. } => return self.fail("in a fragment program"),
+            _ => {}
         }
+        let output = match &mut self.io {
+            Io::Vertex { output, .. } => &mut **output,
+            Io::Geometry(geometry) => &mut *geometry.current,
+            Io::Fragment { .. } => unreachable!("refused above"),
+        };
+        for (i, value) in values.iter().take(count as usize).enumerate() {
+            output.0[(offset / 4) as usize + i] = *value;
+        }
+        Ok(())
+    }
+
+    /// `ISBERD`: dest 0-7, address register 8-15, `SKEW` bit 31, `O` bit
+    /// 32, mode 33-34 (default, patch, prim, attr), size 47-48 [public:
+    /// envytools `envydis/gm107.c` `isberd`]. Only the default form, which
+    /// reads the input vertex handle of an ISBE entry (see the module
+    /// documentation), is modeled.
+    fn isberd(&mut self, active: u8) -> Result<(), Unmodeled> {
+        let w = self.word;
+        let Io::Geometry(geometry) = &self.io else {
+            return self.fail("outside a geometry program");
+        };
+        let vertices = geometry.inputs.len() as u32;
+        // Bits 20-30 are no field in envytools; eden reads an offset
+        // from 24-31.
+        self.require(bits(w, 20, 11) == 0, "bits 20-30")?;
+        self.require(bits(w, 31, 4) == 0, "SKEW, O or a mode")?;
+        self.require(bits(w, 47, 2) == 0, "size")?;
+        let (rd, ra) = (bits(w, 0, 8), bits(w, 8, 8));
+        self.each(active, |m, lane| {
+            let entry = m.r(lane, ra);
+            m.require(
+                entry < vertices,
+                format_args!("ISBE entry {entry} of a {vertices}-vertex primitive"),
+            )?;
+            m.set(lane, rd, entry);
+            Ok(())
+        })
+    }
+
+    /// `OUT`: dest 0-7, handle register 8-15, stream operand B, `EMIT` bit
+    /// 39, `CUT` bit 40 [public: envytools `envydis/gm107.c` `out`, eden
+    /// `translate/impl/output_geometry.cpp`]. Emits beyond
+    /// `MaxOutputVertexCount` are no-ops (Shader-Program-Header). Only
+    /// stream 0 is modeled.
+    fn out(&mut self, active: u8) -> Result<(), Unmodeled> {
+        let w = self.word;
+        let form = match self.op {
+            Op::OutR => Form::R,
+            Op::OutI => Form::I,
+            _ => Form::C,
+        };
+        let (emit, cut) = (bit(w, 39), bit(w, 40));
+        self.require(emit || cut, "neither EMIT nor CUT")?;
+        let current = match &self.io {
+            Io::Geometry(geometry) => geometry.handle,
+            _ => return self.fail("outside a geometry program"),
+        };
+        if active & 1 == 0 {
+            return Ok(());
+        }
+        let stream = self.b(0, form)?;
+        self.require(stream == 0, format_args!("vertex stream {stream}"))?;
+        let handle = self.r(0, bits(w, 8, 8));
+        self.require(
+            handle == current,
+            format_args!("output vertex handle {handle:#x}"),
+        )?;
+        let Io::Geometry(geometry) = &mut self.io else {
+            unreachable!("checked above");
+        };
+        if emit && geometry.handle < geometry.max {
+            geometry
+                .emitted
+                .push(Some(std::mem::take(geometry.current)));
+            geometry.handle += 1;
+        }
+        if cut {
+            geometry.emitted.push(None);
+        }
+        let next = geometry.handle;
+        self.set(0, bits(w, 0, 8), next);
+        Ok(())
     }
 
     /// `IPA`: dest 0-7, index register 8-15 with `IDX` bit 38, multiplier

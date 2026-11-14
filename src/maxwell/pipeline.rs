@@ -224,6 +224,7 @@ const SET_STREAM_OUTPUT: u32 = 0x0744;
 /// 1 vertex B, 2 tessellation init, 3 tessellation, 4 geometry, 5 pixel.
 const PIPELINE_STRIDE: u32 = 64;
 const VERTEX_PIPELINE: u32 = 1;
+const GEOMETRY_PIPELINE: u32 = 4;
 const PIXEL_PIPELINE: u32 = 5;
 
 /// The geometry of a render target or depth buffer.
@@ -398,11 +399,11 @@ fn check_unmodeled_state(r: Registers<'_>) -> Result<(), Unmodeled> {
         0x7777,
         0x6420,
     )?;
-    for pipeline in [0, 2, 3, 4] {
+    for pipeline in [0, 2, 3] {
         let offset = SET_PIPELINE_SHADER + pipeline * PIPELINE_STRIDE;
         require(
             r,
-            "shader stage other than vertex B and pixel",
+            "shader stage other than vertex B, geometry and pixel",
             offset,
             1,
             0,
@@ -828,9 +829,12 @@ pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result
         )
     })?;
     let fetch = VertexFetch::new(r, &vertex)?;
-    if r.get(SET_RT_LAYER) & 0x1_0000 != 0 && vertex.header().vtg_output_used(0x64 / 4) {
+    let geometry = program(context, caches, GEOMETRY_PIPELINE)?;
+    // The last stage before the rasterizer writes the layer.
+    let last_header = geometry.as_ref().unwrap_or(&vertex).header();
+    if r.get(SET_RT_LAYER) & 0x1_0000 != 0 && last_header.vtg_output_used(0x64 / 4) {
         return Err(refuse(
-            "render target layer written by the vertex shader",
+            "render target layer written by the last vertex-pipeline shader",
             SET_RT_LAYER,
             r.get(SET_RT_LAYER),
         ));
@@ -879,6 +883,15 @@ pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result
         vertices.push(Some(done));
     }
 
+    let geometry_output;
+    let (batch, vertices, last) = match &geometry {
+        Some(program) => {
+            geometry_output = geometry_stage(context, program, &textures, batch, &vertices)?;
+            (&geometry_output.0, &geometry_output.1[..], &**program)
+        }
+        None => (batch, &vertices[..], &*vertex),
+    };
+
     if r.get(SET_RASTER_ENABLE) & 1 == 0 {
         return Ok(());
     }
@@ -889,7 +902,96 @@ pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result
             0,
         ));
     };
-    rasterize(context, &vertex, &pixel, &textures, batch, &vertices)
+    rasterize(context, last, &pixel, &textures, batch, vertices)
+}
+
+/// The geometry shader stage: one thread per input primitive of the
+/// shaded batch, the vertices of their output strips gathered into a new
+/// batch of triangle strips (a restart after each thread, and at each
+/// `OUT.CUT`), which clipping and rasterization take like a draw's own.
+fn geometry_stage(
+    context: &Context<'_>,
+    geometry: &Program,
+    textures: &DrawTextures<'_>,
+    batch: &Batch,
+    vertices: &[Option<Shaded>],
+) -> Result<(Batch, Vec<Option<Shaded>>), Unmodeled> {
+    let r = context.registers;
+    let header = geometry.header();
+    let control = SET_PIPELINE_SHADER + GEOMETRY_PIPELINE * PIPELINE_STRIDE;
+    // Input primitives: the triangles of lists, strips and fans, with
+    // their vertices in the order `assemble` gives (odd strip triangles
+    // swap their first two vertices) [public: OpenGL 4.6, 11.3.1]. OpenGL
+    // has no geometry shader input for quads and polygons; what the
+    // hardware does with them is not established.
+    if !matches!(
+        batch.topology,
+        Topology::Triangles | Topology::TriangleStrip | Topology::TriangleFan
+    ) {
+        return Err(Unmodeled(format!(
+            "3D: geometry shader with {:?} input",
+            batch.topology
+        )));
+    }
+    // Point and line output would need point and line rasterization.
+    if header.output_topology() != 7 {
+        return Err(Unmodeled(format!(
+            "3D: geometry shader output topology {} (only TRIANGLESTRIP)",
+            header.output_topology()
+        )));
+    }
+    // Several threads per primitive tell themselves apart with
+    // SR_INVOCATION_ID, which is not modeled.
+    let threads = header.threads_per_input_primitive();
+    if threads != 1 {
+        return Err(refuse(
+            "geometry shader threads per input primitive",
+            control,
+            threads,
+        ));
+    }
+    let buffers = constant_buffers(context, GEOMETRY_PIPELINE, geometry)?;
+    let unit = textures.unit();
+    let env = env(&buffers, &unit, r, context.memory);
+    let mut emitted = Vec::new();
+    for indices in assemble(batch.topology, &batch.elements) {
+        let inputs = indices.map(|i| {
+            &*vertices[i]
+                .as_ref()
+                .expect("assembly skips restarts")
+                .attributes
+        });
+        geometry.run_geometry(&env, &inputs, &mut emitted)?;
+        emitted.push(None);
+    }
+    let mut elements = Vec::with_capacity(emitted.len());
+    let mut shaded = Vec::with_capacity(emitted.len());
+    for vertex in emitted {
+        match vertex {
+            Some(attributes) => {
+                let index = shaded.len() as u32;
+                elements.push(Element::Vertex {
+                    fetch: index,
+                    id: index,
+                });
+                shaded.push(Some(Shaded {
+                    clip: std::array::from_fn(|i| f32::from_bits(attributes.0[0x70 / 4 + i])),
+                    attributes: Arc::new(attributes),
+                }));
+            }
+            None => {
+                elements.push(Element::Restart);
+                shaded.push(None);
+            }
+        }
+    }
+    let batch = Batch {
+        topology: Topology::TriangleStrip,
+        instance: batch.instance,
+        base_instance: batch.base_instance,
+        elements,
+    };
+    Ok((batch, shaded))
 }
 
 /// Attribute words the pixel shader interpolates, with their mode.

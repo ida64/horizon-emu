@@ -88,8 +88,9 @@
 //! | S2R | 2 | 0 | 2 | 0 | 0 |
 //!
 //! The ocean archive's geometry shaders (`OUT`, `ISBERD`, `S2R
-//! SR_INVOCATION_INFO`) decode but are not executable here: only vertex
-//! and fragment stages run. No program of the corpus uses `TEX`, `TLD`,
+//! SR_INVOCATION_INFO`) run as described in the interpreter's
+//! documentation (`exec`); starter's language scene draws with one.
+//! No program of the corpus uses `TEX`, `TLD`,
 //! `TLDS`, `TLD4`, `TLD4S`, `TXQ`, `TMML`, `TXD`, `LD`, `ST`, `STG`,
 //! `LOP3`, `SEL`, `PSETP`, `P2R`, `VADD`, `VSET`, `VABSDIFF`, `FSWZADD`,
 //! `SHFL`, `PCNT` or `CONT`; those are implemented from the public sources
@@ -200,6 +201,19 @@ impl Program {
         output: &mut Attributes,
     ) -> Result<(), Unmodeled> {
         exec::run_vertex(self, env, input, output)
+    }
+
+    /// Runs one geometry shader thread on an input primitive (`inputs`,
+    /// the attribute spaces of its vertices as the previous stage wrote
+    /// them) and appends what it outputs to `emitted`: each emitted
+    /// vertex, and `None` where it ended a strip.
+    pub fn run_geometry(
+        &self,
+        env: &Env<'_>,
+        inputs: &[&Attributes],
+        emitted: &mut Vec<Option<Attributes>>,
+    ) -> Result<(), Unmodeled> {
+        exec::run_geometry(self, env, inputs, emitted)
     }
 
     /// Runs one 2x2 quad of fragments and fills `quad.outputs`.
