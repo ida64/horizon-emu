@@ -146,6 +146,18 @@ impl<'a> DrawTextures<'a> {
         Tsc::parse(self.words(self.pools.sampler_pool, index)?)
     }
 
+    /// The texture and sampler of a bound-texture handle: TIC index in
+    /// bits 19:0, TSC index in bits 31:20 (see [`ThreadTextures`]).
+    pub fn resolve(&self, handle: u32) -> Result<(Arc<Texture>, Tsc), Unmodeled> {
+        let tic = handle & 0xF_FFFF;
+        let tsc = if self.pools.sampler_from_header {
+            tic
+        } else {
+            handle >> 20
+        };
+        Ok((self.texture(tic)?, self.sampler(tsc)?))
+    }
+
     /// A per-thread view with its own small lookup cache.
     pub fn unit(&'a self) -> ThreadTextures<'a> {
         ThreadTextures {

@@ -20,7 +20,7 @@ use horizon_emu::{
     ipc::{Client, ResultCode, Tracker},
     keys::KeySet,
     machine::{Caller, CodeAddress, Machine, Place, Poke, Process, RunEnd, RunOptions, TraceEvent},
-    nand,
+    maxwell, nand,
     secmon::{self, SmcEffect},
     soc::{dc::Frame, emmc::EmmcImages, joycon::Button},
     svc,
@@ -75,6 +75,12 @@ options:
   --screenshot-at SECONDS:FILE
                       save what the screen shows as a PNG SECONDS after the
                       machine starts; may be given more than once
+  --renderer NAME     draw the GPU's 3D work with `software` (the reference,
+                      default) or `metal` (the host GPU; what it cannot do
+                      falls back to software per draw)
+  --gpu-capture FILE  record every GPU channel's method calls and the guest
+                      memory its engines read, for replay
+                      (horizon_emu::maxwell::capture)
   --touch SECONDS:X,Y[:HOLD_MS]
                       put a finger on the screen at X,Y (1280x720, origin
                       top left, as the picture is seen) SECONDS after the
@@ -308,6 +314,21 @@ fn boot(image: KernelImage, flags: &[String]) -> Result<(), String> {
             }
             "--keys" => {
                 keys = KeySet::load(Path::new(value()?)).map_err(|error| error.to_string())?
+            }
+            "--renderer" => match value()?.as_str() {
+                "software" => maxwell::select_renderer(maxwell::RendererKind::Software),
+                "metal" => {
+                    if !maxwell::metal::available() {
+                        return Err("--renderer metal: no Metal device".into());
+                    }
+                    maxwell::select_renderer(maxwell::RendererKind::Metal)
+                }
+                other => return Err(format!("--renderer: unknown renderer {other}")),
+            },
+            "--gpu-capture" => {
+                let path = value()?;
+                maxwell::capture::start(Path::new(path))
+                    .map_err(|error| format!("--gpu-capture {path}: {error}"))?;
             }
             "--screenshot" => screenshot = Some(value()?),
             "--screenshot-at" => {

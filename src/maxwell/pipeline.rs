@@ -138,6 +138,8 @@ pub struct Context<'a> {
     pub registers: Registers<'a>,
     pub bindings: &'a Bindings,
     pub memory: &'a dyn GpuMemory,
+    /// The channel's Metal renderer, which draws what it can express.
+    pub metal: Option<&'a super::metal::Renderer>,
 }
 
 const SET_COLOR_TARGET_A: u32 = 0x0800;
@@ -901,7 +903,7 @@ fn varyings(pixel: &Program) -> Vec<(usize, Interpolation)> {
 fn rasterize(
     context: &Context<'_>,
     vertex: &Program,
-    pixel: &Program,
+    pixel: &Arc<Program>,
     textures: &DrawTextures<'_>,
     batch: &Batch,
     vertices: &[Option<Shaded>],
@@ -1035,6 +1037,31 @@ fn rasterize(
     if bounds.is_empty() {
         return Ok(());
     }
+    let pixel_buffers = constant_buffers(context, PIXEL_PIPELINE, pixel)?;
+    if let Some(metal) = context.metal {
+        if depth.is_some() {
+            metal.note_fallback("depth test");
+        } else {
+            let surfaces: Vec<Surface> = targets.iter().map(|(surface, _)| *surface).collect();
+            let draw = super::metal::Draw {
+                program: pixel,
+                triangles: &triangles,
+                colors: &colors,
+                surfaces: &surfaces,
+                bounds,
+                blend_constant,
+                constants: &pixel_buffers,
+                textures,
+                texture_buffer_index: r.get(SET_BINDLESS_TEXTURE) & 0x1F,
+            };
+            if metal.draw(context.memory, &draw)? {
+                return Ok(());
+            }
+        }
+        // The software renderer reads memory from several threads; all
+        // of Metal's work is made visible before it starts.
+        metal.flush(context.memory)?;
+    }
     for (surface, _) in &targets {
         windows.push(Window::load(context.memory, *surface, bounds)?);
     }
@@ -1043,7 +1070,6 @@ fn rasterize(
         None => None,
     };
 
-    let pixel_buffers = constant_buffers(context, PIXEL_PIPELINE, pixel)?;
     let backend = Backend {
         program: pixel,
         colors: &colors,

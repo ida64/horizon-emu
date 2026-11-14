@@ -49,6 +49,24 @@ pub struct Capture {
     start: Instant,
 }
 
+static ACTIVE: std::sync::OnceLock<Arc<Capture>> = std::sync::OnceLock::new();
+
+/// Starts capturing every channel created from now on into `path`.
+pub fn start(path: &Path) -> io::Result<()> {
+    let capture = Capture::create(path)?;
+    ACTIVE
+        .set(capture)
+        .map_err(|_| io::Error::other("a GPU capture is already running"))
+}
+
+/// `engines` of a new channel built from `method_init`, recorded if a
+/// capture runs ([`start`]).
+pub fn wrap(method_init: &[(u32, u32)], engines: Box<dyn Engines>) -> Box<dyn Engines> {
+    match ACTIVE.get() {
+        Some(capture) => capture.record(method_init, engines),
+        None => engines,
+    }
+}
 impl Capture {
     pub fn create(path: &Path) -> io::Result<Arc<Capture>> {
         let mut out = BufWriter::new(File::create(path)?);
@@ -443,13 +461,15 @@ pub struct ReplayChannel {
 }
 
 /// Builds the engines of captured channel from its method-init list the
-/// way the GM20B model does (`soc::gm20b::maxwell_engines`), with a timer
-/// that reads the capture's time of the call being replayed.
+/// way the GM20B model does (`soc::gm20b::maxwell_engines`), drawing with
+/// `kind`, with a timer that reads the capture's time of the call being
+/// replayed.
 pub fn replay_channel(
     method_init: &[(u32, u32)],
     clock: Arc<std::sync::atomic::AtomicU64>,
+    kind: super::RendererKind,
 ) -> Result<super::Channel, Unmodeled> {
-    let mut channel = super::Channel::new();
+    let mut channel = super::Channel::with_renderer(kind);
     for &(index, value) in method_init {
         channel.set_initial_state(index as u16, index >> 16, value)?;
     }
@@ -458,21 +478,31 @@ pub fn replay_channel(
     Ok(channel)
 }
 
-/// Replays every call of `replay` in order; `after` sees each call with
-/// its channel once it ran and how long it took. Stops at the first call
-/// the engines refuse, returning its index.
-pub fn run(
-    replay: &Replay,
-    mut after: impl FnMut(&ReplayCall<'_>, &mut ReplayChannel, std::time::Duration),
-) -> Result<(), (usize, Unmodeled)> {
-    let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let mut channels: HashMap<u32, ReplayChannel> = HashMap::new();
-    for (index, call) in replay.calls().iter().enumerate() {
-        let state = match channels.entry(call.channel) {
+/// Replays the calls of a capture, one at a time.
+pub struct Replayer<'a> {
+    replay: &'a Replay,
+    kind: super::RendererKind,
+    clock: Arc<std::sync::atomic::AtomicU64>,
+    pub channels: HashMap<u32, ReplayChannel>,
+}
+
+impl<'a> Replayer<'a> {
+    pub fn new(replay: &'a Replay, kind: super::RendererKind) -> Self {
+        Replayer {
+            replay,
+            kind,
+            clock: Default::default(),
+            channels: HashMap::new(),
+        }
+    }
+
+    /// Applies the reads of `call` and runs it; how long it took.
+    pub fn step(&mut self, call: &ReplayCall<'_>) -> Result<std::time::Duration, Unmodeled> {
+        let state = match self.channels.entry(call.channel) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let init = replay.method_init(call.channel).unwrap_or(&[]);
-                let channel = replay_channel(init, Arc::clone(&clock)).map_err(|e| (index, e))?;
+                let init = self.replay.method_init(call.channel).unwrap_or(&[]);
+                let channel = replay_channel(init, Arc::clone(&self.clock), self.kind)?;
                 entry.insert(ReplayChannel {
                     channel,
                     memory: SparseMemory::default(),
@@ -482,17 +512,35 @@ pub fn run(
         for &(address, data) in &call.reads {
             state.memory.apply(address, data);
         }
-        clock.store(call.micros * 1000, Ordering::Relaxed);
+        self.clock.store(call.micros * 1000, Ordering::Relaxed);
         let start = Instant::now();
-        let result = if call.subchannel == FLUSH {
-            state.channel.flush(&state.memory)
+        if call.subchannel == FLUSH {
+            state.channel.flush(&state.memory)?;
         } else {
             state
                 .channel
-                .call(call.subchannel, call.method, call.argument, &state.memory)
-        };
-        result.map_err(|e| (index, e))?;
-        after(call, state, start.elapsed());
+                .call(call.subchannel, call.method, call.argument, &state.memory)?;
+        }
+        Ok(start.elapsed())
+    }
+}
+
+/// Replays every call of `replay` in order with renderer `kind`; `after`
+/// sees each call with its channel once it ran and how long it took.
+/// Stops at the first call the engines refuse, returning its index.
+pub fn run(
+    replay: &Replay,
+    kind: super::RendererKind,
+    mut after: impl FnMut(&ReplayCall<'_>, &mut ReplayChannel, std::time::Duration),
+) -> Result<(), (usize, Unmodeled)> {
+    let mut replayer = Replayer::new(replay, kind);
+    for (index, call) in replay.calls().iter().enumerate() {
+        let took = replayer.step(call).map_err(|e| (index, e))?;
+        let state = replayer
+            .channels
+            .get_mut(&call.channel)
+            .expect("made by step");
+        after(call, state, took);
     }
     Ok(())
 }
@@ -518,11 +566,19 @@ mod tests {
         assert!(!shadow.matches(0xF00, &changed));
     }
 
-    /// `MAXWELL_REPLAY=<capture> [MAXWELL_DUMP=<dir>] cargo test --release
-    /// --lib maxwell::capture::tests::replay -- --ignored --nocapture`:
-    /// replays a capture, prints where the time went by method and the
-    /// time between 3D syncpoint increments per channel, and optionally
-    /// writes render target 0 at each of them.
+    /// The renderer `MAXWELL_RENDERER` names (`metal`, default software).
+    fn kind() -> super::super::RendererKind {
+        match std::env::var("MAXWELL_RENDERER").as_deref() {
+            Ok("metal") => super::super::RendererKind::Metal,
+            _ => super::super::RendererKind::Software,
+        }
+    }
+
+    /// `MAXWELL_REPLAY=<capture> [MAXWELL_RENDERER=metal] [MAXWELL_DUMP=<dir>]
+    /// cargo test --release --lib maxwell::capture::tests::replay --
+    /// --ignored --nocapture`: replays a capture, prints where the time
+    /// went by method and the time between 3D syncpoint increments per
+    /// channel, and optionally writes render target 0 at each of them.
     #[test]
     #[ignore]
     fn replay() {
@@ -533,7 +589,7 @@ mod tests {
         let mut fences: HashMap<u32, Vec<std::time::Duration>> = HashMap::new();
         let mut since: HashMap<u32, std::time::Duration> = HashMap::new();
         let mut count = 0;
-        let result = run(&replay, |call, state, took| {
+        let result = run(&replay, kind(), |call, state, took| {
             let key = if call.method >= 0xE00 {
                 (call.subchannel, 0xE00 + (call.method - 0xE00) / 2 * 2)
             } else {
@@ -571,6 +627,129 @@ mod tests {
         }
         if let Err((index, error)) = result {
             panic!("call {index}: {}", error.0);
+        }
+    }
+
+    /// `MAXWELL_REPLAY=<capture> cargo test --release --lib
+    /// maxwell::capture::tests::compare -- --ignored --nocapture`: replays
+    /// a capture with both renderers side by side and compares render
+    /// target 0 at every 3D syncpoint increment; prints the largest
+    /// per-component difference, how many pixels differ, the Metal
+    /// fallbacks, and the time each renderer took.
+    #[test]
+    #[ignore]
+    fn compare() {
+        use super::super::RendererKind;
+        let path = std::env::var("MAXWELL_REPLAY").expect("MAXWELL_REPLAY");
+        let dump = std::env::var_os("MAXWELL_DUMP").map(std::path::PathBuf::from);
+        let replay = Replay::load(Path::new(&path)).unwrap();
+        let mut software = Replayer::new(&replay, RendererKind::Software);
+        let mut metal = Replayer::new(&replay, RendererKind::Metal);
+        let (mut software_time, mut metal_time) =
+            (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let mut worst = [0u8; 4];
+        let mut frames = 0;
+        for (index, call) in replay.calls().iter().enumerate() {
+            software_time += software
+                .step(call)
+                .unwrap_or_else(|e| panic!("software, call {index}: {}", e.0));
+            metal_time += metal
+                .step(call)
+                .unwrap_or_else(|e| panic!("metal, call {index}: {}", e.0));
+            if call.subchannel != 0 || call.method != 0x2C8 / 4 {
+                continue;
+            }
+            let a = &software.channels[&call.channel];
+            let b = &metal.channels[&call.channel];
+            let (Some(x), Some(y)) = (
+                a.channel.render_target(0, &a.memory),
+                b.channel.render_target(0, &b.memory),
+            ) else {
+                continue;
+            };
+            let mut differing = 0;
+            let mut frame_worst = [0u8; 4];
+            for (p, q) in x.rgba.chunks(4).zip(y.rgba.chunks(4)) {
+                if p != q {
+                    differing += 1;
+                }
+                for c in 0..4 {
+                    frame_worst[c] = frame_worst[c].max(p[c].abs_diff(q[c]));
+                }
+            }
+            for c in 0..4 {
+                worst[c] = worst[c].max(frame_worst[c]);
+            }
+            if differing > 0 {
+                println!(
+                    "call {index} channel {}: {differing} pixels differ, max {frame_worst:?}",
+                    call.channel
+                );
+                if let Some(dir) = &dump {
+                    x.write_png(&dir.join(format!("{frames:04}-software.png")))
+                        .unwrap();
+                    y.write_png(&dir.join(format!("{frames:04}-metal.png")))
+                        .unwrap();
+                }
+            }
+            frames += 1;
+        }
+        for (id, state) in &metal.channels {
+            if let Some(renderer) = &state.channel.hooks.metal {
+                println!(
+                    "channel {id}: Metal draws and fallbacks {:?}",
+                    renderer.fallbacks()
+                );
+            }
+        }
+        println!(
+            "{frames} compared; max difference {worst:?}; software {software_time:?}, metal {metal_time:?}"
+        );
+    }
+
+    /// `MAXWELL_REPLAY=<capture> MAXWELL_PROGS=<dir> cargo test --release
+    /// --lib maxwell::capture::tests::programs -- --ignored --nocapture`:
+    /// writes the vertex (`1-<address>.bin`) and pixel (`5-<address>.bin`)
+    /// programs of every draw in the capture, from their header on, and
+    /// lists each with its instructions. Draws are recognized by any
+    /// method that leaves an enabled program bound when it completes.
+    #[test]
+    #[ignore]
+    fn programs() {
+        let path = std::env::var("MAXWELL_REPLAY").expect("MAXWELL_REPLAY");
+        let directory = std::env::var("MAXWELL_PROGS").expect("MAXWELL_PROGS");
+        let replay = Replay::load(Path::new(&path)).unwrap();
+        let mut seen = std::collections::BTreeMap::new();
+        let _ = run(&replay, kind(), |call, state, _| {
+            if call.subchannel != 0 {
+                return;
+            }
+            let r = state.channel.three_d.registers();
+            let base = (u64::from(r.get(0x1608) & 0xff) << 32) | u64::from(r.get(0x160c));
+            for pipeline in [1u32, 5] {
+                let control = r.get(0x2000 + pipeline * 64);
+                if control & 1 == 0 {
+                    continue;
+                }
+                let address = base + u64::from(r.get(0x2004 + pipeline * 64));
+                if seen.contains_key(&(pipeline, address)) {
+                    continue;
+                }
+                let Ok(program) = super::super::shader::Program::decode(&state.memory, address)
+                else {
+                    continue;
+                };
+                let mut raw = vec![0; program.len()];
+                state.memory.read(address, &mut raw).unwrap();
+                std::fs::write(format!("{directory}/{pipeline}-{address:x}.bin"), &raw).unwrap();
+                let mut ops: Vec<_> = program.mnemonics().collect();
+                ops.sort();
+                ops.dedup();
+                seen.insert((pipeline, address), ops.join(" "));
+            }
+        });
+        for ((pipeline, address), ops) in &seen {
+            println!("{pipeline} {address:#x}: {ops}");
         }
     }
 }

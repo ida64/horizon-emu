@@ -6,14 +6,20 @@ use super::{Level, Texture, Tsc, Unmodeled, unsupported};
 use crate::maxwell::sampling::{FetchRequest, GatherRequest, Lod, Query, SampleRequest, Target};
 
 impl Texture {
-    fn validate(&self, target: Target, array: bool) -> Result<(), Unmodeled> {
-        if target != self.tic.target || array != self.tic.array {
+    /// The instruction's target must be the texture's; arrayness may
+    /// differ: a non-array texture is seen as an array of one layer, and an
+    /// array texture through a non-array instruction as its layer 0
+    /// [public: eden `texture_pass.cpp` keeps the instruction's
+    /// `ColorArray2D` type and binds the 2D image as an array view;
+    /// Ryujinx `Texture.GetTargetTexture` makes a view of the shader's
+    /// target]. Layers are clamped (sample, gather) or out of range
+    /// (fetch) as for any layer index. A scene of starter's samples a 2D
+    /// texture with an array `TEXS`.
+    fn validate(&self, target: Target, _array: bool) -> Result<(), Unmodeled> {
+        if target != self.tic.target {
             return Err(unsupported(
-                "texture instruction target/array",
-                format_args!(
-                    "{target:?}/{array}, TIC {:?}/{}",
-                    self.tic.target, self.tic.array
-                ),
+                "texture instruction target",
+                format_args!("{target:?}, TIC {:?}", self.tic.target),
             ));
         }
         Ok(())

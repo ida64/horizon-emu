@@ -196,6 +196,13 @@ impl Triangle {
         self.bounds
     }
 
+    /// The snapped vertices in physical pixels (exact multiples of the
+    /// sub-pixel step).
+    pub fn vertices(&self) -> [[f32; 2]; 3] {
+        self.vertices
+            .map(|[x, y]| [(x as f64 / SUBPIXEL) as f32, (y as f64 / SUBPIXEL) as f32])
+    }
+
     /// Whether the center of pixel (`x`, `y`) is inside.
     #[inline]
     pub fn covers(&self, x: u32, y: u32) -> bool {

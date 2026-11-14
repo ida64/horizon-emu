@@ -104,7 +104,7 @@ pub fn maxwell_engines(syncpoints: Arc<Syncpoints>) -> EngineFactory {
         channel.set_timer(timer);
         let syncpoints = Arc::clone(&syncpoints);
         channel.set_syncpoint_increment(Box::new(move |index| syncpoints.add(index as usize, 1)));
-        Ok(Box::new(channel))
+        Ok(maxwell::capture::wrap(method_init, Box::new(channel)))
     })
 }
 

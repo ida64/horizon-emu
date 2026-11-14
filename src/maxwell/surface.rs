@@ -139,25 +139,47 @@ impl Window {
                 }
             }
         };
-        window.transfer(memory, false)?;
+        window.transfer(memory, false, None)?;
         Ok(window)
     }
 
     /// Writes the window back to guest memory.
     pub fn store(&mut self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
-        self.transfer(memory, true)
+        self.transfer(memory, true, None)
     }
 
-    fn transfer(&mut self, memory: &dyn GpuMemory, write: bool) -> Result<(), Unmodeled> {
+    /// Writes back only the bands and columns (GOBs, or pitch rows)
+    /// covering `rect`.
+    pub fn store_rect(&mut self, memory: &dyn GpuMemory, rect: Rect) -> Result<(), Unmodeled> {
+        self.transfer(memory, true, Some(rect))
+    }
+
+    fn transfer(
+        &mut self,
+        memory: &dyn GpuMemory,
+        write: bool,
+        only: Option<Rect>,
+    ) -> Result<(), Unmodeled> {
         let surface = self.surface;
+        let bpp = surface.bytes_per_pixel;
         for band in 0..self.bands {
             let y = (self.band0 + band) * BAND_ROWS;
+            if let Some(rect) = only
+                && (y + BAND_ROWS <= rect.y0 || y >= rect.y1)
+            {
+                continue;
+            }
             let band_data = &mut self.data[band as usize * self.band_bytes..][..self.band_bytes];
             match surface.layout {
                 Layout::BlockLinear(block) => {
-                    let width_bytes = surface.width * surface.bytes_per_pixel;
+                    let width_bytes = surface.width * bpp;
                     for (index, gob) in band_data.chunks_mut(GOB_BYTES).enumerate() {
                         let x = (self.column0 + index as u32) * GOB_WIDTH;
+                        if let Some(rect) = only
+                            && (x + GOB_WIDTH <= rect.x0 * bpp || x >= rect.x1 * bpp)
+                        {
+                            continue;
+                        }
                         let address = surface.address
                             + block_linear_offset(x, y, 0, width_bytes, surface.height, block);
                         if write {
@@ -173,6 +195,11 @@ impl Window {
                         let y = y + row as u32;
                         if y >= surface.height {
                             break;
+                        }
+                        if let Some(rect) = only
+                            && (y < rect.y0 || y >= rect.y1)
+                        {
+                            continue;
                         }
                         let address = surface.address
                             + u64::from(y) * u64::from(pitch)
@@ -192,6 +219,43 @@ impl Window {
 
     pub fn surface(&self) -> &Surface {
         &self.surface
+    }
+
+    /// The window's bytes as they are in guest memory, band after band.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Copies the pixels of `rect` (inside the window) to `out`, row after
+    /// row, `bytes_per_pixel * (x1 - x0)` bytes per row.
+    pub fn read_pixels(&mut self, rect: Rect, out: &mut [u8]) {
+        let bpp = self.surface.bytes_per_pixel as usize;
+        let row = (rect.x1 - rect.x0) as usize * bpp;
+        for y in rect.y0..rect.y1 {
+            let Some(band) = self.band_mut(y) else {
+                continue;
+            };
+            let line = &mut out[(y - rect.y0) as usize * row..][..row];
+            for x in rect.x0..rect.x1 {
+                line[(x - rect.x0) as usize * bpp..][..bpp].copy_from_slice(band.pixel(x, y));
+            }
+        }
+    }
+
+    /// The inverse of [`Window::read_pixels`].
+    pub fn write_pixels(&mut self, rect: Rect, data: &[u8]) {
+        let bpp = self.surface.bytes_per_pixel as usize;
+        let row = (rect.x1 - rect.x0) as usize * bpp;
+        for y in rect.y0..rect.y1 {
+            let Some(mut band) = self.band_mut(y) else {
+                continue;
+            };
+            let line = &data[(y - rect.y0) as usize * row..][..row];
+            for x in rect.x0..rect.x1 {
+                band.pixel_mut(x, y)
+                    .copy_from_slice(&line[(x - rect.x0) as usize * bpp..][..bpp]);
+            }
+        }
     }
 
     /// The bands as (first row, band) pairs, for processing in parallel.

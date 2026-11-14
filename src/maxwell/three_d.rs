@@ -180,6 +180,7 @@ pub fn release_semaphore(
     payload: u32,
     four_words: bool,
 ) -> Result<(), Unmodeled> {
+    hooks.flush(memory)?;
     if !four_words {
         return write_words(memory, address, &[payload]);
     }
@@ -361,6 +362,7 @@ impl ThreeD {
                         "syncpoint increment without host1x connected",
                     )
                 })?;
+                hooks.flush(memory)?;
                 increment(argument & 0xFFF);
             }
             SET_GLOBAL_RENDER_ENABLE_C => {
@@ -397,11 +399,11 @@ impl ThreeD {
             CLEAR_REPORT_VALUE => return Err(refuse(method, argument, "counter reset")),
             CLEAR_SURFACE => {
                 if self.rendering() {
-                    self.clear(argument, memory)?;
+                    self.clear(argument, memory, hooks)?;
                 }
             }
             BEGIN => self.begin(argument)?,
-            END => self.end(memory)?,
+            END => self.end(memory, hooks)?,
             DRAW_VERTEX_ARRAY => {
                 let start = self.registers[SET_VERTEX_ARRAY_START as usize];
                 self.push_array(start, argument)?;
@@ -430,7 +432,7 @@ impl ThreeD {
                 };
                 self.begin((argument >> 28) | instance << 26)?;
                 self.push_array(argument & 0xFFFF, (argument >> 16) & 0xFFF)?;
-                self.end(memory)?;
+                self.end(memory, hooks)?;
             }
             DRAW_INDEX_BUFFER32_BEGIN_END_INSTANCE_FIRST
                 ..=DRAW_INDEX_BUFFER8_BEGIN_END_INSTANCE_SUBSEQUENT => {
@@ -441,7 +443,7 @@ impl ThreeD {
                 let instance = position / 3;
                 self.begin((argument >> 28) | instance << 26)?;
                 self.push_indexed(argument & 0xFFFF, (argument >> 16) & 0xFFF, size, memory)?;
-                self.end(memory)?;
+                self.end(memory, hooks)?;
             }
             DRAW_ZERO_INDEX
             | DRAW_AUTO
@@ -756,7 +758,7 @@ impl ThreeD {
         Ok(())
     }
 
-    fn end(&mut self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+    fn end(&mut self, memory: &dyn GpuMemory, hooks: &Hooks) -> Result<(), Unmodeled> {
         let mut batch = self
             .batch
             .take()
@@ -769,6 +771,7 @@ impl ThreeD {
             registers: Registers(&self.registers),
             bindings: &self.bindings,
             memory,
+            metal: hooks.metal.as_deref(),
         };
         pipeline::draw(&context, &mut self.caches, &batch)
     }
@@ -777,7 +780,12 @@ impl ThreeD {
     /// MRT_SELECT 9:6, RT_ARRAY_INDEX 25:10. The rectangle is the surface
     /// clip, limited by `SET_CLEAR_SURFACE_CONTROL`'s USE_CLEAR_RECT (4),
     /// USE_SCISSOR0 (8) and USE_VIEWPORT_CLIP0 (12).
-    fn clear(&mut self, argument: u32, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+    fn clear(
+        &mut self,
+        argument: u32,
+        memory: &dyn GpuMemory,
+        hooks: &Hooks,
+    ) -> Result<(), Unmodeled> {
         let r = Registers(&self.registers);
         if argument & 2 != 0 {
             return Err(refuse(CLEAR_SURFACE, argument, "stencil clear"));
@@ -837,29 +845,35 @@ impl ThreeD {
                 let color: [f32; 4] = std::array::from_fn(|i| {
                     f32::from_bits(r.get(SET_COLOR_CLEAR_VALUE * 4 + 4 * i as u32))
                 });
-                let mut window = Window::load(memory, surface, rect)?;
-                let full = components == 0xF;
-                let mut packed = vec![0; surface.bytes_per_pixel as usize];
-                format.write(color, &mut packed);
-                for mut band in window.bands_mut() {
-                    for y in band.y0.max(rect.y0)..(band.y0 + 8).min(rect.y1) {
-                        for x in rect.x0..rect.x1.min(surface.width) {
-                            let texel = band.pixel_mut(x, y);
-                            if full {
-                                texel.copy_from_slice(&packed);
-                            } else {
-                                let mut value = format.read(texel);
-                                for (i, v) in value.iter_mut().enumerate() {
-                                    if components & (1 << i) != 0 {
-                                        *v = color[i];
+                if let Some(metal) = &hooks.metal
+                    && metal.clear(memory, surface, format, rect, color, components as u8)?
+                {
+                    // Done on the GPU.
+                } else {
+                    let mut window = Window::load(memory, surface, rect)?;
+                    let full = components == 0xF;
+                    let mut packed = vec![0; surface.bytes_per_pixel as usize];
+                    format.write(color, &mut packed);
+                    for mut band in window.bands_mut() {
+                        for y in band.y0.max(rect.y0)..(band.y0 + 8).min(rect.y1) {
+                            for x in rect.x0..rect.x1.min(surface.width) {
+                                let texel = band.pixel_mut(x, y);
+                                if full {
+                                    texel.copy_from_slice(&packed);
+                                } else {
+                                    let mut value = format.read(texel);
+                                    for (i, v) in value.iter_mut().enumerate() {
+                                        if components & (1 << i) != 0 {
+                                            *v = color[i];
+                                        }
                                     }
+                                    format.write(value, texel);
                                 }
-                                format.write(value, texel);
                             }
                         }
                     }
+                    window.store(memory)?;
                 }
-                window.store(memory)?;
             }
         }
         if argument & 1 != 0 {

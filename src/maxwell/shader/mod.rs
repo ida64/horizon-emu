@@ -105,6 +105,7 @@ mod decode;
 mod exec;
 mod header;
 mod metadata;
+pub mod msl;
 #[cfg(test)]
 mod tests;
 

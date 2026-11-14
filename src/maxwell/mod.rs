@@ -33,6 +33,7 @@ pub mod blend;
 pub mod capture;
 pub mod copy;
 pub mod inline;
+pub mod metal;
 pub mod mme;
 pub mod pipeline;
 pub mod raster;
@@ -90,6 +91,42 @@ pub struct Hooks {
     pub timer: Option<Box<dyn Fn() -> u64 + Send>>,
     /// Increments a host1x syncpoint by one (3D `INCREMENT_SYNC_POINT`).
     pub syncpoint_increment: Option<Box<dyn Fn(u32) + Send>>,
+    /// The Metal renderer of the channel, if it renders with Metal: every
+    /// completion the engines signal (semaphore release, report,
+    /// syncpoint increment) first writes its pending work back to guest
+    /// memory ([`metal::Renderer::flush`]).
+    pub metal: Option<std::sync::Arc<metal::Renderer>>,
+}
+
+impl Hooks {
+    /// Makes all rendering so far visible in guest memory.
+    pub fn flush(&self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+        match &self.metal {
+            Some(renderer) => renderer.flush(memory),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Which renderer new channels draw with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RendererKind {
+    /// The software renderer: the reference.
+    Software,
+    /// Metal on the host GPU ([`metal`]), falling back to the software
+    /// renderer per draw for what it cannot express.
+    Metal,
+}
+
+static RENDERER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Selects the renderer of channels created from now on. Metal needs a
+/// Metal device ([`metal::available`]).
+pub fn select_renderer(kind: RendererKind) {
+    RENDERER.store(
+        kind == RendererKind::Metal,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Class IDs.
@@ -142,7 +179,18 @@ impl Image {
 }
 
 impl Channel {
+    /// A channel drawing with the renderer chosen by [`select_renderer`].
     pub fn new() -> Channel {
+        Self::with_renderer(if RENDERER.load(std::sync::atomic::Ordering::Relaxed) {
+            RendererKind::Metal
+        } else {
+            RendererKind::Software
+        })
+    }
+
+    /// A channel drawing with `kind` (software if Metal is asked for and
+    /// no Metal device exists).
+    pub fn with_renderer(kind: RendererKind) -> Channel {
         Channel {
             subchannels: [None; 8],
             three_d: Default::default(),
@@ -151,7 +199,14 @@ impl Channel {
             compute: Default::default(),
             inline: Default::default(),
             mme: Default::default(),
-            hooks: Hooks::default(),
+            hooks: Hooks {
+                metal: if kind == RendererKind::Metal {
+                    metal::Renderer::new().map(std::sync::Arc::new)
+                } else {
+                    None
+                },
+                ..Hooks::default()
+            },
         }
     }
 
@@ -226,6 +281,14 @@ impl Engines for Channel {
         argument: u32,
         memory: &dyn GpuMemory,
     ) -> Result<(), Unmodeled> {
+        let coherent;
+        let memory: &dyn GpuMemory = match &self.hooks.metal {
+            Some(renderer) => {
+                coherent = metal::Coherent { memory, renderer };
+                &coherent
+            }
+            None => memory,
+        };
         let slot = self
             .subchannels
             .get_mut(subchannel as usize)
@@ -287,6 +350,10 @@ impl Engines for Channel {
                 ))),
             },
         }
+    }
+
+    fn flush(&mut self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+        self.hooks.flush(memory)
     }
 }
 

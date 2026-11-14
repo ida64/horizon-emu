@@ -312,6 +312,32 @@ pub struct Texture {
 }
 
 impl Texture {
+    /// The descriptor the texture was decoded from.
+    pub fn tic(&self) -> &Tic {
+        &self.tic
+    }
+
+    /// Decoded level `level`: width, height, depth and the texels (layers,
+    /// then slices, rows and columns), component swizzle and sRGB decoding
+    /// applied.
+    pub fn level(&self, level: u32) -> Option<(u32, u32, u32, &[[f32; 4]])> {
+        self.levels
+            .get(level as usize)
+            .map(|m| (m.width, m.height, m.depth, m.texels.as_slice()))
+    }
+
+    /// The level-of-detail range sampling may select, as the interpreter
+    /// clamps it (`clamp_lod`): (minimum, maximum) relative to the base
+    /// level.
+    pub fn lod_range(&self, tsc: &Tsc) -> (f32, f32) {
+        let resident = ((self.tic.words[7] >> 12) & 4095) as f32 / 256.;
+        let top = (self.tic.max_level - self.tic.base_level) as f32;
+        (
+            tsc.min_lod.max(resident).clamp(0., top),
+            tsc.max_lod.max(resident).clamp(0., top),
+        )
+    }
+
     /// Byte extent of all allocated levels and layers (including layout padding).
     pub fn footprint(tic: &Tic) -> Result<(u64, u64), Unmodeled> {
         let size = if let Some(pitch) = tic.pitch {

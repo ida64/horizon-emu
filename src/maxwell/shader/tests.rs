@@ -520,3 +520,54 @@ fn unordered_predicate_combining_and_sparse_omap_depth() {
     assert_eq!(q.outputs[0].colors[2], [0.0, 0.0, 9.0, 0.0]);
     assert_eq!(q.outputs[0].depth, Some(0.5));
 }
+
+/// Every pixel program of the corpus either translates to MSL that Metal
+/// compiles, or is refused with a reason.
+#[test]
+fn firmware_pixel_programs_translate_and_compile() {
+    let mut seen = HashSet::new();
+    let mut programs = Vec::new();
+    let mut add = |data: &[u8]| {
+        for (offset, p) in stages(data) {
+            let code = data[offset + 0x80..offset + 0x30 + p.len()].to_vec();
+            if seen.insert(code) && p.header().shader_type() == ShaderType::Pixel {
+                programs.push(p);
+            }
+        }
+    };
+    add(&elf());
+    for name in [
+        "shader/VarietyOceanShader_Nx.arc.szs",
+        "agl/agl_resource_min.Nin_Nx_NVN.release.sarc.szs",
+    ] {
+        let data = std::fs::read(format!("{ROOT}fw_dump/{TITLE}section1_romfs/common/{name}"))
+            .expect("required shader archive");
+        for member in members(&yaz0(&data)) {
+            add(member);
+        }
+    }
+    let mut refused = BTreeMap::new();
+    let mut compiled = 0;
+    for program in &programs {
+        match msl::translate(program) {
+            Ok(translated) => {
+                let outputs: Vec<usize> = (0..8)
+                    .filter(|&t| program.header().ps_color_mask(t) != 0)
+                    .collect();
+                let source = translated.source(program, &outputs);
+                crate::maxwell::metal::compile(&source, outputs.len())
+                    .unwrap_or_else(|e| panic!("{e}"));
+                compiled += 1;
+            }
+            Err(reason) => {
+                let key = reason.split(" 0x").next().unwrap_or(&reason).to_string();
+                *refused.entry(key).or_insert(0usize) += 1;
+            }
+        }
+    }
+    println!(
+        "{compiled} of {} pixel programs compiled; refused: {refused:?}",
+        programs.len()
+    );
+    assert!(compiled > 0);
+}

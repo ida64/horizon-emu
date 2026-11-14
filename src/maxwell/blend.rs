@@ -10,7 +10,7 @@
 use super::Unmodeled;
 
 /// A blend factor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Factor {
     Zero,
     One,
@@ -79,7 +79,7 @@ impl Factor {
 }
 
 /// A blend operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Operation {
     Add,
     Subtract,
@@ -103,7 +103,7 @@ impl Operation {
 }
 
 /// The blend state of one render target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Blend {
     pub color_op: Operation,
     pub color_source: Factor,
