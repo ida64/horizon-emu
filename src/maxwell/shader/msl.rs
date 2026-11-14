@@ -247,11 +247,10 @@ impl Writer<'_> {
             }
             "FMUL" | "FMUL32I" => {
                 let round = if wide { 0 } else { bits(w, 39, 2) };
-                self.require(round == 0, "rounding mode")?;
                 let mode = bits(w, if wide { 53 } else { 44 }, 2);
                 self.require(mode <= 2, "FMZ encoding")?;
                 let scale = if wide { 0 } else { bits(w, 41, 3) };
-                self.require(scale == 0, "scale")?;
+                self.require(scale < 7, "scale")?;
                 self.require(!bit(w, if wide { 52 } else { 47 }), "condition code")?;
                 let sat = bit(w, if wide { 55 } else { 50 });
                 let a = self.readf(ra);
@@ -259,10 +258,26 @@ impl Writer<'_> {
                 let x = flush(&modify(&a, false, !wide && bit(w, 48)), mode == 1);
                 let y = flush(&format!("as_type<float>({b})"), mode == 1);
                 let _ = writeln!(self.out, "    {{ float x = {x}; float y = {y};");
-                let product = if mode == 2 {
-                    "((x == 0.0f || y == 0.0f) ? as_type<float>((as_type<uint>(x) ^ as_type<uint>(y)) & 0x80000000u) : x * y)".to_string()
-                } else {
+                // The interpreter rounds the exact (binary64) product times
+                // the scale once, in direction `round` (`exec/alu.rs`
+                // `round_f64`); see `mul_round` in the prelude.
+                let product = if round == 0 && scale == 0 {
                     "(x * y)".to_string()
+                } else {
+                    let factor = ["1.0f", "0.5f", "0.25f", "0.125f", "8.0f", "4.0f", "2.0f"]
+                        [scale as usize];
+                    if round == 0 {
+                        format!("((x * y) * {factor})")
+                    } else {
+                        format!("mul_round(x, y, {factor}, {round}u)")
+                    }
+                };
+                let product = if mode == 2 {
+                    format!(
+                        "((x == 0.0f || y == 0.0f) ? as_type<float>((as_type<uint>(x) ^ as_type<uint>(y)) & 0x80000000u) : {product})"
+                    )
+                } else {
+                    product
                 };
                 let v = saturate(&flush(&product, mode == 1), sat);
                 self.set(rd, &format!("as_type<uint>({v})"));
@@ -535,6 +550,22 @@ static inline float ftz(float v) {
     return (v != 0.0f && fabs(v) < 1.17549435e-38f) ? copysign(0.0f, v) : v;
 }
 static inline float sat(float v) { return isnan(v) ? 0.0f : clamp(v, 0.0f, 1.0f); }
+/// x * y * scale (a power of two) rounded once in direction `mode` (1 down,
+/// 2 up, 3 to zero), as the interpreter's `round_f64` of the exact
+/// product: round to nearest, then step one ulp when the exact error
+/// `fma(x, y, -p)` shows the nearest value lies on the wrong side. Exact
+/// unless the product or its error is subnormal, or the scaled product
+/// leaves the normal range [assumption: not met in UI programs].
+static inline float mul_round(float x, float y, float scale, uint mode) {
+    float p = x * y;
+    float e = fma(x, y, -p);
+    float v = p * scale;
+    bool down = mode == 1u || (mode == 3u && v > 0.0f);
+    bool up = mode == 2u || (mode == 3u && v < 0.0f);
+    if (down && e < 0.0f) { v = nextafter(v, as_type<float>(0xff800000u)); }
+    else if (up && e > 0.0f) { v = nextafter(v, as_type<float>(0x7f800000u)); }
+    return v;
+}
 /// Plane `k` (dx, dy, base) at (x, y), summed in the interpreter's order.
 static inline float plane(const device float* planes, uint k, float x, float y) {
     uint i = k * 3u;
