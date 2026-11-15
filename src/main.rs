@@ -134,7 +134,11 @@ taken as it is, such as one inside a process):
   --trace-smc         print every secure monitor call
   --trace-svc         print every supervisor call and its return, with the
                       process and thread making it (threads are told apart
-                      by the address of their thread-local region)
+                      by the address of their thread-local region). With
+                      this, --trace-ipc or --verbose, the report at the end
+                      lists the calls not returned from when the machine
+                      stopped: what each waiting thread waits in, with its
+                      return addresses from the frame records on its stack
   --trace-ipc         print every request a process sends to a service and
                       the answer to it: service or session, kind and command,
                       data words (which for the spl services include key
@@ -609,6 +613,24 @@ fn boot(image: KernelImage, flags: &[String]) -> Result<(), String> {
                 process.unwrap_or_default()
             );
         }
+    }
+    if !report.calls_in_progress.is_empty() {
+        println!("supervisor calls not returned from:");
+    }
+    for call in &report.calls_in_progress {
+        let name = svc::name(call.id).unwrap_or("?");
+        let process = call.process.as_ref().map_or("?", Process::name);
+        println!(
+            "  {process} (context {:#x}) thread {:#x}: {:#04x} {name} {:x?} from {:#x}, lr {:#x}, callers {:x?}, for {:.3} s",
+            call.caller.context,
+            call.caller.thread,
+            call.id,
+            call.arguments,
+            call.pc,
+            call.lr,
+            call.callers,
+            call.waited.as_secs_f64()
+        );
     }
     println!("secure monitor calls:");
     for (name, count) in &report.smc_counts {

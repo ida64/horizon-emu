@@ -529,7 +529,39 @@ pub struct RunReport {
     pub cores: Vec<CoreReport>,
     /// Secure monitor calls served, by function name.
     pub smc_counts: BTreeMap<&'static str, u64>,
+    /// Supervisor calls made and not returned from when the machine
+    /// stopped, while they were being watched ([`RunOptions::trace_svc`]):
+    /// what each waiting thread waits in. A thread that ended in
+    /// `ExitThread` or whose process was ended is listed with its last call,
+    /// and its return addresses are read from memory that may have been
+    /// reused since.
+    pub calls_in_progress: Vec<CallInProgress>,
 }
+
+/// A supervisor call that had not returned when the machine stopped.
+#[derive(Debug, Clone)]
+pub struct CallInProgress {
+    pub caller: Caller,
+    pub process: Option<Process>,
+    /// Immediate of the `SVC` instruction.
+    pub id: u16,
+    /// `X0`-`X7` at the call.
+    pub arguments: [u64; 8],
+    /// Address of the `SVC` instruction.
+    pub pc: u64,
+    /// `X30` at the call: where the function that made it returns to.
+    pub lr: u64,
+    /// Return addresses further up, from the frame records on the
+    /// thread's stack as they are when the machine stops; code built
+    /// without frame pointers breaks the chain early.
+    pub callers: Vec<u64>,
+    /// How long before the stop the call was made.
+    pub waited: Duration,
+}
+
+/// At most this many return addresses are taken from a waiting thread's
+/// frame records.
+const FRAME_CHAIN_LIMIT: usize = 16;
 
 pub struct Machine {
     // Dropped first: the VM must be gone before the memory it maps, which
@@ -718,11 +750,56 @@ impl Machine {
             }
         });
         cores.sort_by_key(|report| report.core);
+        let stopped = Instant::now();
+        let processes = session.processes.into_inner().unwrap();
+        let mut calls_in_progress: Vec<CallInProgress> = session
+            .calls
+            .into_inner()
+            .unwrap()
+            .into_iter()
+            .map(|(caller, call)| CallInProgress {
+                caller,
+                process: processes.get(&caller.context).copied(),
+                id: call.id,
+                arguments: call.arguments,
+                pc: call.pc,
+                lr: call.lr,
+                callers: self.frame_chain(&call.regime, call.fp),
+                waited: stopped.saturating_duration_since(call.made),
+            })
+            .collect();
+        calls_in_progress.sort_by_key(|call| (call.caller.context, call.caller.thread));
         RunReport {
             ended,
             cores,
             smc_counts: session.smc_counts.into_inner().unwrap(),
+            calls_in_progress,
         }
+    }
+
+    /// Return addresses from the chain of AArch64 frame records (`X29`
+    /// pointing at the caller's `X29` and `X30`) that starts at `fp`, up to
+    /// [`FRAME_CHAIN_LIMIT`], until a record is unreadable or does not lie
+    /// above the one before it, as frames on a descending stack do.
+    fn frame_chain(&self, regime: &TranslationRegime, mut fp: u64) -> Vec<u64> {
+        let mut callers = Vec::new();
+        while fp != 0 && callers.len() < FRAME_CHAIN_LIMIT {
+            let (Some(next), Some(returns)) = (
+                self.read_virtual_u64(regime, fp),
+                self.read_virtual_u64(regime, fp.wrapping_add(8)),
+            ) else {
+                break;
+            };
+            if returns == 0 {
+                break;
+            }
+            callers.push(returns);
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
+        callers
     }
 
     fn create_vcpu(&self, core: usize, entry: CoreEntry) -> Result<Vcpu<'_>, HvError> {
@@ -1052,6 +1129,15 @@ struct Call {
     arguments: [u64; 8],
     /// Buffers of a request that its answer fills.
     filled: Vec<ipc::Buffer>,
+    /// Address of the `SVC` instruction and `X30` at it.
+    pc: u64,
+    lr: u64,
+    /// `X29` at the call and the caller's address space, from which the
+    /// chain of frame records is read if the call is still in progress
+    /// when the machine stops.
+    fp: u64,
+    regime: TranslationRegime,
+    made: Instant,
 }
 
 /// Debug state of one core: the hardware facility and what this run wants
@@ -1377,17 +1463,23 @@ impl<'env> Session<'env> {
             None => Default::default(),
         };
         let buffers = self.buffer_contents(vcpu, &given)?;
+        let pc = vcpu.sys_reg(SysReg::ELR_EL1)?.wrapping_sub(4);
         let call = Call {
             id,
             arguments,
             filled,
+            pc,
+            lr: vcpu.gpr(30)?,
+            fp: vcpu.gpr(29)?,
+            regime: self.machine.translation_regime(vcpu)?,
+            made: Instant::now(),
         };
         self.calls.lock().unwrap().insert(caller, call);
         (self.options.trace)(TraceEvent::SupervisorCall {
             core,
             id,
             arguments,
-            pc: vcpu.sys_reg(SysReg::ELR_EL1)?.wrapping_sub(4),
+            pc,
             caller,
             process,
             data: &data,
@@ -1406,6 +1498,7 @@ impl<'env> Session<'env> {
             id,
             arguments,
             mut filled,
+            ..
         }) = call
         else {
             return Ok(None);
