@@ -79,7 +79,7 @@ use objc2_metal::{
 };
 
 use super::blend::{Blend, Factor, Operation};
-use super::raster::{ColorOutput, Triangle};
+use super::raster::{ColorOutput, Compare, Triangle};
 use super::resources::{DrawTextures, Stamp, Writes};
 use super::shader::Program;
 use super::shader::msl::{self, Translated};
@@ -205,6 +205,9 @@ struct PipelineKey {
     jump_tables: Option<Vec<u8>>,
     /// Per attachment: pixel format, blend, write mask, program output.
     attachments: Vec<(usize, Option<Blend>, u8, usize)>,
+    /// Whether the function tests alpha (its function and reference are
+    /// draw-time values).
+    alpha_test: bool,
 }
 
 /// The Metal renderer of one channel.
@@ -229,6 +232,8 @@ pub struct Draw<'a> {
     pub constants: &'a [(Vec<u8>, usize)],
     pub textures: &'a DrawTextures<'a>,
     pub texture_buffer_index: u32,
+    /// The alpha test (see `raster::Backend::alpha_test`).
+    pub alpha_test: Option<(Compare, f32)>,
 }
 
 impl Renderer {
@@ -506,12 +511,13 @@ impl Renderer {
                     (format.0, color.blend, mask, color.output)
                 })
                 .collect(),
+            alpha_test: draw.alpha_test.is_some(),
         };
         let pipeline = match state.pipelines.get(&key) {
             Some(p) => p.clone(),
             None => {
                 let outputs: Vec<usize> = key.attachments.iter().map(|a| a.3).collect();
-                let source = translated.source(draw.program, &outputs);
+                let source = translated.source(draw.program, &outputs, key.alpha_test);
                 let library = state.library(gpu, source)?;
                 let pipeline = build_pipeline(gpu, &library, "fragment_main", &key.attachments)?;
                 state.pipelines.insert(key.clone(), pipeline.clone());
@@ -622,6 +628,21 @@ impl Renderer {
             }
             if !translated.indirect.is_empty() {
                 bind(gpu, &encoder, Stage::Fragment, bytes_of_u32(&sizes), 20)?;
+            }
+            if let Some((compare, reference)) = draw.alpha_test {
+                // The comparison numbering of `Translated::source`.
+                let function = match compare {
+                    Compare::Never => 0u32,
+                    Compare::Less => 1,
+                    Compare::Equal => 2,
+                    Compare::LessEqual => 3,
+                    Compare::Greater => 4,
+                    Compare::NotEqual => 5,
+                    Compare::GreaterEqual => 6,
+                    Compare::Always => 7,
+                };
+                let words = [function, reference.to_bits()];
+                bind(gpu, &encoder, Stage::Fragment, bytes_of_u32(&words), 22)?;
             }
             for (i, (texture, sampler)) in gpu_textures.iter().enumerate() {
                 encoder.setFragmentTexture_atIndex(Some(texture), i);

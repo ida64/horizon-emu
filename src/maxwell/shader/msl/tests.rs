@@ -224,7 +224,7 @@ fn corpus_translates_and_compiles() {
             Ok(t) => {
                 if let Some(gpu) = &gpu {
                     let outputs = targets(program);
-                    let source = t.source(program, &outputs);
+                    let source = t.source(program, &outputs, false);
                     let start = std::time::Instant::now();
                     if let Err(e) = gpu.pipeline(&source, outputs.len()) {
                         panic!("{name}: {e}\n{source}");
@@ -454,7 +454,7 @@ fn render(
     input: &Inputs,
 ) -> Result<Vec<Vec<[f32; 4]>>, String> {
     let outputs = targets(program);
-    let pipeline = gpu.pipeline(&t.source(program, &outputs), outputs.len())?;
+    let pipeline = gpu.pipeline(&t.source(program, &outputs, false), outputs.len())?;
     let positions: [[f32; 4]; 6] = [
         [-1.0, -1.0, 0.0, 1.0],
         [1.0, -1.0, 0.0, 1.0],

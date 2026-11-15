@@ -749,6 +749,52 @@ fn depth_test_without_depth_target_passes() {
     assert_eq!(frame.pixel(4, 4), [0, 0, 0, 255]);
 }
 
+/// The ui2d solid quad (color c3[0..0x10] = (0.25, 0.5, 1, 0.5)) drawn by
+/// `kind` with the alpha test enabled with `function` and `reference`;
+/// the pixel at the quad's inside after a write-back.
+fn alpha_tested_quad(kind: super::RendererKind, function: u32, reference: f32) -> [u8; 4] {
+    let elf = std::fs::read(STARTER).expect("starter ELF (fw_elf) must be present");
+    let mut frame = Frame::sized_with(SIZE, SIZE, kind);
+    frame.program(1, 0, starter_program(&elf, 0x4c0e00));
+    frame.program(5, 0x800, starter_program(&elf, 0x4be400));
+    frame.constants(0, 3, 0x30_0000, &ui2d_vertex_constants(&[]));
+    frame.constants(4, 3, 0x30_1000, &floats(&[0.25, 0.5, 1.0, 0.5]));
+    frame.method(0x12ec, 1); // SET_ALPHA_TEST
+    frame.method(0x1310, reference.to_bits()); // SET_ALPHA_REF
+    frame.method(0x1314, function); // SET_ALPHA_FUNC
+    let quad = [
+        -0.5, -0.5, 0.0, 0.25, -0.5, 0.0, 0.25, 0.75, 0.0, -0.5, 0.75, 0.0,
+    ];
+    frame.vertices(0x40_0000, 12, &quad, &[(0, 0x02)]);
+    frame.method(0x1618, 7);
+    frame.method(0x0d74, 0);
+    frame.method(0x0d78, 4);
+    frame.method(0x1614, 0);
+    frame.channel.flush(&frame.ram).unwrap();
+    if let Some(metal) = &frame.channel.hooks.metal {
+        assert_eq!(metal.fallbacks(), (1, vec![]));
+    }
+    frame.pixel(20, 20)
+}
+
+/// The alpha test compares output 0 alpha with the reference and drops
+/// failing fragments, in both renderers, for OpenGL and Direct3D
+/// function encodings.
+#[test]
+fn alpha_test_discards_failing_fragments() {
+    use super::RendererKind::{Metal, Software};
+    let drawn = [64, 128, 255, 128];
+    let kept = [0, 0, 0, 255];
+    for kind in [Software, Metal] {
+        // OGL_GREATER: 0.5 > 0.25 passes, 0.5 > 0.75 fails.
+        assert_eq!(alpha_tested_quad(kind, 0x204, 0.25), drawn, "{kind:?}");
+        assert_eq!(alpha_tested_quad(kind, 0x204, 0.75), kept, "{kind:?}");
+        // D3D_LESSEQUAL (4): 0.5 <= 0.5 passes; D3D_NEVER (1) fails.
+        assert_eq!(alpha_tested_quad(kind, 4, 0.5), drawn, "{kind:?}");
+        assert_eq!(alpha_tested_quad(kind, 1, 0.0), kept, "{kind:?}");
+    }
+}
+
 /// A draw whose pixel program names a texture slot the draw leaves unset
 /// (handle TIC index 0xfffff, as netConnect's uber-shader leaves on
 /// branches its draws do not take): P0 = c3[0] != 0; @P0 BRA over a TEXS

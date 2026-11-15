@@ -177,6 +177,8 @@ const SET_BLEND_STATE_PER_TARGET: u32 = 0x12e4;
 const SET_DEPTH_WRITE: u32 = 0x12e8;
 const SET_ALPHA_TEST: u32 = 0x12ec;
 const SET_DEPTH_FUNC: u32 = 0x130c;
+const SET_ALPHA_REF: u32 = 0x1310;
+const SET_ALPHA_FUNC: u32 = 0x1314;
 const SET_BLEND_CONST_RED: u32 = 0x131c;
 const SET_BLEND_SEPARATE_FOR_ALPHA: u32 = 0x133c;
 const SET_BLEND_COLOR_OP: u32 = 0x1340;
@@ -364,7 +366,6 @@ fn check_unmodeled_state(r: Registers<'_>) -> Result<(), Unmodeled> {
     require(r, "window clip", SET_WINDOW_CLIP_ENABLE, 1, 0)?;
     require(r, "stencil test", SET_STENCIL_TEST, 1, 0)?;
     require(r, "depth bounds test", SET_DEPTH_BOUNDS_TEST, 1, 0)?;
-    require(r, "alpha test", SET_ALPHA_TEST, 1, 0)?;
     require(r, "logic operation", SET_LOGIC_OP, 1, 0)?;
     // SET_USER_CLIP_ENABLE: applied in `setup` to the clip distances the
     // vertex shader writes. NVN's init blast enables all eight.
@@ -1110,6 +1111,33 @@ fn rasterize(
         None
     };
 
+    // SET_ALPHA_TEST, SET_ALPHA_REF (0x1310, a float), SET_ALPHA_FUNC
+    // (0x1314, OpenGL or Direct3D comparison encodings) [public: NVIDIA
+    // open-gpu-doc `clb197.h`]: the fragment's output 0 alpha, as the pixel
+    // program leaves it, is compared with the reference and the fragment
+    // is discarded where the comparison fails, before the depth test and
+    // blending (the OpenGL compatibility-profile alpha test NVN exposes;
+    // eden `emit_spirv_special.cpp` `AlphaTest` and Ryujinx
+    // `EmitterContext.PrepareForReturn` emit it at the end of the pixel
+    // program the same way). A program that does not write output 0 alpha
+    // is tested against nothing: Ryujinx skips the test then, eden reads
+    // an undefined output; it is refused unless the function is NEVER or
+    // ALWAYS, which do not read it.
+    let alpha_test = if r.enabled(SET_ALPHA_TEST) {
+        let compare = Compare::from_raw(r.get(SET_ALPHA_FUNC))?;
+        if !matches!(compare, Compare::Never | Compare::Always)
+            && pixel.header().ps_color_mask(0) & 8 == 0
+        {
+            return Err(refuse(
+                "alpha test of a pixel program that writes no output 0 alpha",
+                SET_ALPHA_FUNC,
+                r.get(SET_ALPHA_FUNC),
+            ));
+        }
+        (compare != Compare::Always).then(|| (compare, r.float(SET_ALPHA_REF)))
+    } else {
+        None
+    };
     // Clipping, viewport transform and triangle setup.
     let triangles = setup(r, batch, vertices, &varyings, vertex)?;
     if triangles.is_empty() || (colors.is_empty() && depth.is_none()) {
@@ -1166,6 +1194,7 @@ fn rasterize(
                 constants: &pixel_buffers,
                 textures,
                 texture_buffer_index: r.get(SET_BINDLESS_TEXTURE) & 0x1F,
+                alpha_test,
             };
             if metal.draw(context.memory, context.writes, &draw)? {
                 return Ok(());
@@ -1187,6 +1216,7 @@ fn rasterize(
         program: pixel,
         colors: &colors,
         depth: depth.map(|(_, d)| d),
+        alpha_test,
         blend_constant,
         // SET_BLEND_FLOAT_OPTION (0x19c0) ZERO_TIMES_ANYTHING_IS_ZERO.
         blend_zero_rule: r.get(0x19c0) & 1 != 0,

@@ -98,6 +98,9 @@ pub struct Backend<'a> {
     pub program: &'a Program,
     pub colors: &'a [ColorOutput],
     pub depth: Option<DepthOutput>,
+    /// The alpha test: output 0 alpha must pass `compare` against the
+    /// reference (`None`: no test).
+    pub alpha_test: Option<(Compare, f32)>,
     pub blend_constant: [f32; 4],
     /// `SET_BLEND_FLOAT_OPTION` `ZERO_TIMES_ANYTHING_IS_ZERO`.
     pub blend_zero_rule: bool,
@@ -321,6 +324,11 @@ fn shade_quad(
     backend.program.run_fragment(env, &mut quad)?;
     for (lane, output) in quad.outputs.iter().enumerate() {
         if !covered[lane] || output.discarded {
+            continue;
+        }
+        if let Some((compare, reference)) = backend.alpha_test
+            && !compare.test(output.colors[0][3], reference)
+        {
             continue;
         }
         let px = x + (lane as u32 & 1);

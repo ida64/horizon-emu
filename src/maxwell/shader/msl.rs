@@ -499,7 +499,15 @@ impl Translated {
     /// fault words: word `2i` non-zero marks texture `i` as unbound (its
     /// handle names no texture; a placeholder is bound), and a sample of
     /// such a texture sets word `2i + 1` (see `texture.rs`).
-    pub fn source(&self, program: &Program, outputs: &[usize]) -> String {
+    ///
+    /// With `alpha_test`, buffer 22 holds the alpha test as two words: the
+    /// comparison (0 never, 1 less, 2 equal, 3 less-or-equal, 4 greater, 5
+    /// not equal, 6 greater-or-equal, 7 always) and the reference float;
+    /// a fragment whose output 0 alpha fails it is discarded, after the
+    /// program and before any output (the software back end's order). The
+    /// comparison is a draw-time value, so one pipeline serves every
+    /// function and reference.
+    pub fn source(&self, program: &Program, outputs: &[usize], alpha_test: bool) -> String {
         let header = &program.header;
         let mut s = String::from(PRELUDE);
         let _ = writeln!(s, "struct Output {{");
@@ -538,6 +546,9 @@ impl Translated {
         if !self.textures.is_empty() {
             parameters.push("device atomic_uint* texture_faults [[buffer(21)]]".to_string());
         }
+        if alpha_test {
+            parameters.push("constant uint* alpha_test [[buffer(22)]]".to_string());
+        }
         let _ = writeln!(
             s,
             "fragment Output fragment_main({}) {{",
@@ -550,11 +561,23 @@ impl Translated {
         );
         s.push_str(&self.body);
         let _ = writeln!(s, "    if (killed) {{ discard_fragment(); }}");
+        let (registers, depth) = output_registers(program);
+        if alpha_test {
+            // Output 0 alpha (the draw refuses a test that needs it when
+            // the program does not write it).
+            let alpha = match registers[0] {
+                Some((base, mask)) if mask & 8 != 0 => format!("as_type<float>(r{})", base + 3),
+                _ => "0.0f".into(),
+            };
+            let _ = writeln!(
+                s,
+                "    {{ const float a = {alpha}; const uint f = alpha_test[0]; const float ref = as_type<float>(alpha_test[1]);\n      const bool pass = f == 1u ? a < ref : f == 2u ? a == ref : f == 3u ? a <= ref : f == 4u ? a > ref : f == 5u ? a != ref : f == 6u ? a >= ref : f == 7u;\n      if (!pass) {{ discard_fragment(); }} }}"
+            );
+        }
         let _ = writeln!(s, "    Output out;");
         // Outputs as the interpreter gathers them: each target with a
         // component mask takes the next four registers from R0; depth is
         // one register after the colors.
-        let (registers, depth) = output_registers(program);
         for (attachment, &target) in outputs.iter().enumerate() {
             let value = match registers.get(target).copied().flatten() {
                 Some((base, mask)) => {
