@@ -441,11 +441,14 @@ struct Association {
     authenticator: Option<wifi_ap::Authenticator>,
 }
 
+/// Takes the Ethernet frames the access point forwards from the station.
+pub type Uplink = Box<dyn Fn(&[u8]) + Send + Sync>;
+
 /// The network around the radio: the access point and where the frames
 /// it forwards from the station go (the router behind it).
 struct Network {
     ap: AccessPoint,
-    uplink: Box<dyn Fn(&[u8]) + Send + Sync>,
+    uplink: Uplink,
 }
 
 /// A firmware event to the host.
@@ -654,7 +657,7 @@ impl Bcm4356Wifi {
     /// Places the access point configured on the command line around the
     /// radio; `uplink` takes the Ethernet frames the station sends through
     /// it.
-    pub fn set_access_point(&self, ap: AccessPoint, uplink: Box<dyn Fn(&[u8]) + Send + Sync>) {
+    pub fn set_access_point(&self, ap: AccessPoint, uplink: Uplink) {
         self.state.lock().unwrap().network = Some(Network { ap, uplink });
     }
 
@@ -663,7 +666,7 @@ impl Bcm4356Wifi {
     /// network, authorized), else lost on the air.
     pub fn from_network(&self, frame: &[u8]) {
         let mut state = self.state.lock().unwrap();
-        let result = state.from_network(frame, self.upstream.as_ref());
+        let result = state.network_sent(frame, self.upstream.as_ref());
         drop(state);
         if let Err(note) = result {
             self.notes.add(format!("BCM4356 WiFi: {note}"));
@@ -1475,7 +1478,7 @@ impl State {
                             },
                         ));
                     }
-                    self.to_station(dongle, if_id, &m1, upstream)?;
+                    self.deliver(dongle, if_id, &m1, upstream)?;
                 }
             }
         }
@@ -1510,13 +1513,13 @@ impl State {
         let mut status = header(MSG_TX_STATUS, if_id, le32(item, 4));
         status[10..12].copy_from_slice(&ring.to_le_bytes());
         self.complete(dongle, RING_D2H_TX_COMPLETE, &status, upstream)?;
-        self.from_station(dongle, &frame, upstream)
+        self.station_sent(dongle, &frame, upstream)
     }
 
     /// A frame the station sends: lost without an association; EAPOL goes
     /// to the authenticator; data goes through the access point once the
     /// port is open.
-    fn from_station(
+    fn station_sent(
         &mut self,
         dongle: &mut Dongle,
         frame: &[u8],
@@ -1532,7 +1535,7 @@ impl State {
                 .as_mut()
                 .and_then(|a| a.receive(frame));
             if let Some(reply) = reply {
-                self.to_station(dongle, if_id, &reply, upstream)?;
+                self.deliver(dongle, if_id, &reply, upstream)?;
             }
             return Ok(());
         }
@@ -1547,7 +1550,7 @@ impl State {
     }
 
     /// A frame from the network for the station.
-    fn from_network(&mut self, frame: &[u8], upstream: &dyn Upstream) -> Result<(), Refusal> {
+    fn network_sent(&mut self, frame: &[u8], upstream: &dyn Upstream) -> Result<(), Refusal> {
         let Some(mut dongle) = self.dongle.take() else {
             return Ok(());
         };
@@ -1560,7 +1563,7 @@ impl State {
                         || frame.first().is_some_and(|b| b & 1 != 0)) =>
             {
                 let if_id = a.if_id;
-                self.to_station(&mut dongle, if_id, frame, upstream)
+                self.deliver(&mut dongle, if_id, frame, upstream)
             }
             _ => Ok(()),
         };
@@ -1572,7 +1575,7 @@ impl State {
     /// buffer (`msgbuf_rx_complete`: data length at 14, data offset 0,
     /// 802.3 frame). With no buffer posted the firmware has nowhere to put
     /// it and the frame is lost, as on the air.
-    fn to_station(
+    fn deliver(
         &mut self,
         dongle: &mut Dongle,
         if_id: u8,

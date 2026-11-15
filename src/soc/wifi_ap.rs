@@ -293,7 +293,7 @@ impl Authenticator {
         data.extend([0xdd, 22, 0x00, 0x0f, 0xac, 1, 1, 0]);
         data.extend(self.gtk);
         // Padding: 0xdd then zeros up to a multiple of 8 (12.7.2).
-        if data.len() % 8 != 0 {
+        if !data.len().is_multiple_of(8) {
             data.push(0xdd);
             data.resize(data.len().next_multiple_of(8), 0);
         }
