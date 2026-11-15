@@ -301,6 +301,23 @@ pub enum TraceEvent<'a> {
         /// answer brings or has filled.
         buffers: &'a [ipc::Contents],
     },
+    /// A thread took an instruction or data abort: it reached memory it
+    /// does not have. Seen where supervisor calls are (with what watches
+    /// those).
+    UserAbort {
+        core: usize,
+        /// `ESR_EL1` of the abort.
+        syndrome: u64,
+        /// The address the thread reached for.
+        address: u64,
+        /// Where it did, and its `X30` there.
+        pc: u64,
+        lr: u64,
+        caller: Caller,
+        process: Option<Process>,
+        /// Return addresses from the frame records on its stack.
+        callers: &'a [u64],
+    },
     /// A tracepoint, or a breakpoint about to be stepped from, was reached.
     Reached {
         core: usize,
@@ -1497,7 +1514,29 @@ impl<'env> Session<'env> {
     fn supervisor_call(&self, core: usize, vcpu: &Vcpu) -> Result<Option<CoreStop>, HvError> {
         // Aborts and trapped instructions from EL0 arrive here too.
         let syndrome = vcpu.sys_reg(SysReg::ESR_EL1)?;
-        if exception_class(syndrome) != exception_class::SVC64 {
+        let class = exception_class(syndrome);
+        if class != exception_class::SVC64 {
+            // The firmware maps a process's memory before the process
+            // touches it: an abort from EL0 is a crash.
+            let aborted = [
+                exception_class::INSTRUCTION_ABORT_LOWER,
+                exception_class::DATA_ABORT_LOWER,
+            ];
+            if aborted.contains(&class) {
+                let caller = Caller::current(vcpu)?;
+                let regime = self.machine.translation_regime(vcpu)?;
+                let callers = self.machine.frame_chain(&regime, vcpu.gpr(29)?);
+                (self.options.trace)(TraceEvent::UserAbort {
+                    core,
+                    syndrome,
+                    address: vcpu.sys_reg(SysReg::FAR_EL1)?,
+                    pc: vcpu.sys_reg(SysReg::ELR_EL1)?,
+                    lr: vcpu.gpr(30)?,
+                    caller,
+                    process: self.process(vcpu, caller.context)?,
+                    callers: &callers,
+                });
+            }
             return Ok(None);
         }
         let id = syndrome as u16;

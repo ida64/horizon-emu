@@ -455,6 +455,79 @@ fn dns_forwarding_keeps_id_and_ports() {
     assert!(h.traced("example.com A"));
 }
 
+/// A connection to a forwarded host port: the router opens one to the
+/// console from the gateway and carries data both ways; one the console
+/// refuses is reset on the host side.
+#[test]
+fn forwarded_port_reaches_the_console() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let host_port = listener.local_addr().unwrap();
+    let h = harness(unused_dns());
+    h.router.forward_from(listener, 5000).unwrap();
+    // The router learns the console's MAC from any frame it sends.
+    h.router.send(&arp_frame(ARP_REQUEST, CONSOLE_IP, GATEWAY));
+    let to_console = |h: &Harness, what: &str, flags: u8| {
+        h.expect(what, |f| {
+            parse_tcp(f).filter(|s| s.dst == console(5000) && s.flags & flags == flags)
+        })
+    };
+
+    let mut client = TcpStream::connect(host_port).unwrap();
+    client.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let syn = to_console(&h, "SYN", TCP_SYN);
+    assert_eq!(*syn.src.ip(), GATEWAY);
+    let gateway = syn.src;
+    let mut rcv = syn.seq.wrapping_add(1);
+    h.router.send(&tcp_frame(
+        console(5000),
+        gateway,
+        7000,
+        rcv,
+        TCP_SYN | TCP_ACK,
+        &[],
+    ));
+    assert!(h.traced("-> 10.0.2.15:5000 forwarded"));
+
+    client.write_all(b"hello").unwrap();
+    let mut data = Vec::new();
+    while data.len() < 5 {
+        let seg = to_console(&h, "data", TCP_ACK);
+        if seg.seq == rcv {
+            rcv = rcv.wrapping_add(seg.data.len() as u32);
+            data.extend(seg.data);
+        }
+    }
+    assert_eq!(data, b"hello");
+    h.router.send(&tcp_frame(
+        console(5000),
+        gateway,
+        7001,
+        rcv,
+        TCP_ACK | TCP_PSH,
+        b"world",
+    ));
+    let mut got = [0u8; 5];
+    client.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"world");
+
+    // A second connection, which the console refuses.
+    let mut refused = TcpStream::connect(host_port).unwrap();
+    refused.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let syn = h.expect("second SYN", |f| {
+        parse_tcp(f).filter(|s| s.dst == console(5000) && s.flags == TCP_SYN && s.src != gateway)
+    });
+    h.router.send(&tcp_frame(
+        console(5000),
+        syn.src,
+        0,
+        syn.seq.wrapping_add(1),
+        TCP_RST | TCP_ACK,
+        &[],
+    ));
+    let mut rest = Vec::new();
+    assert!(matches!(refused.read_to_end(&mut rest), Err(_) | Ok(0)));
+}
+
 #[test]
 fn tcp_nat_round_trip() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();

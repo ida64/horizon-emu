@@ -526,6 +526,61 @@ fn clears_respect_rectangles_and_component_masks() {
     }
 }
 
+#[test]
+fn depth_and_stencil_clear_together_or_apart() {
+    let ram = Ram::new(0x20000);
+    let mut channel = Channel::new();
+    call(&mut channel, &ram, 0, 0, 0xB197);
+    initial_state(&mut channel);
+    bind_color_target(&mut channel, &ram, 0x1000, 16, 8);
+    // A 16x8 Z24S8 depth target at 0x4000 (one block of block-linear
+    // memory), everything within the viewport clip and the clear rect.
+    for (method, value) in [
+        (0x0c00, 16 << 16),
+        (0x0c04, 8 << 16),
+        (0x0d6c, 16 << 16),
+        (0x0d70, 8 << 16),
+        (0x0fe0, 0),
+        (0x0fe4, 0x4000),
+        (0x0fe8, 0x14),
+        (0x0fec, 0),
+        (0x1228, 16),
+        (0x122c, 8),
+        (0x1230, 1),
+        (0x1538, 1),
+        (0x0d90, 1.0f32.to_bits()),
+        (0x0da0, 0x7F),
+    ] {
+        call(&mut channel, &ram, 0, method, value);
+    }
+    let words = |ram: &Ram| -> Vec<u32> {
+        ram.bytes(0x4000, 16 * 8 * 4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
+            .collect()
+    };
+    // Depth and stencil, as deko3d clears them.
+    call(&mut channel, &ram, 0, 0x19d0, 3);
+    assert!(words(&ram).iter().all(|&word| word == 0xFFFF_FF7F));
+    // Stencil alone leaves the depth.
+    call(&mut channel, &ram, 0, 0x0da0, 1);
+    call(&mut channel, &ram, 0, 0x19d0, 2);
+    assert!(words(&ram).iter().all(|&word| word == 0xFFFF_FF01));
+    // Depth alone leaves the stencil.
+    call(&mut channel, &ram, 0, 0x0d90, 0.0f32.to_bits());
+    call(&mut channel, &ram, 0, 0x19d0, 1);
+    assert!(words(&ram).iter().all(|&word| word == 0x0000_0001));
+    // Under the stencil mask (control bit 0, with the viewport clip and
+    // clear rect bits as before) only the mask's bits change.
+    call(&mut channel, &ram, 0, 0x10f8, 0x1011);
+    call(&mut channel, &ram, 0, 0x139c, 0xF0);
+    call(&mut channel, &ram, 0, 0x0da0, 0xAA);
+    call(&mut channel, &ram, 0, 0x19d0, 2);
+    assert!(words(&ram).iter().all(|&word| word == 0x0000_00A1));
+}
+
 /// The starter applet's ELF, which embeds the nn::ui2d built-in shaders
 /// (BNSH "ui2d_BuildinShader_Nvn_Binary" at file offset 0x4a0000).
 const STARTER: &str = concat!(

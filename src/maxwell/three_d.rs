@@ -43,12 +43,14 @@ const SET_VERTEX_ARRAY_START: u32 = m(0x0d74);
 const DRAW_VERTEX_ARRAY: u32 = m(0x0d78);
 const SET_COLOR_CLEAR_VALUE: u32 = m(0x0d80);
 const SET_Z_CLEAR_VALUE: u32 = m(0x0d90);
+const SET_STENCIL_CLEAR_VALUE: u32 = m(0x0da0);
 const INVALIDATE_SHADER_CACHES_NO_WFI: u32 = m(0x0da4);
 const PIXEL_SHADER_BARRIER: u32 = m(0x0de0);
 const LOAD_ITERATED_BLEND_INSTRUCTION: u32 = m(0x0df4);
 const PM_LOCAL_TRIGGER: u32 = m(0x0f18);
 const UNBIND_ALL: u32 = m(0x10f4);
 const SET_CLEAR_SURFACE_CONTROL: u32 = m(0x10f8);
+const SET_STENCIL_FRONT_MASK: u32 = m(0x139c);
 const PM_TRIGGER_END: u32 = m(0x1114);
 const FLUSH_PENDING_WRITES: u32 = m(0x1144);
 const FORCE_HEAVYWEIGHT_METHOD_SYNC: u32 = m(0x11f4);
@@ -780,7 +782,14 @@ impl ThreeD {
     /// `CLEAR_SURFACE`: Z_ENABLE 0, STENCIL_ENABLE 1, R/G/B/A_ENABLE 5:2,
     /// MRT_SELECT 9:6, RT_ARRAY_INDEX 25:10. The rectangle is the surface
     /// clip, limited by `SET_CLEAR_SURFACE_CONTROL`'s USE_CLEAR_RECT (4),
-    /// USE_SCISSOR0 (8) and USE_VIEWPORT_CLIP0 (12).
+    /// USE_SCISSOR0 (8) and USE_VIEWPORT_CLIP0 (12). A stencil clear sets
+    /// `SET_STENCIL_CLEAR_VALUE` in a target whose format has stencil (one
+    /// without has nothing to clear); with the control's bit 0 only the
+    /// bits the front stencil write mask (`0x139c`) lets through. Offsets
+    /// and that bit as in envytools' `gf100_3d.xml` (`CLEAR_STENCIL`,
+    /// `CLEAR_FLAGS.STENCIL_MASK`, `STENCIL_FRONT_MASK`). deko3d sets the
+    /// bit and clears depth and stencil together (`0x3`, ftpd's first
+    /// frame).
     fn clear(
         &mut self,
         argument: u32,
@@ -788,13 +797,14 @@ impl ThreeD {
         hooks: &Hooks,
     ) -> Result<(), Unmodeled> {
         let r = Registers(&self.registers);
-        if argument & 2 != 0 {
-            return Err(refuse(CLEAR_SURFACE, argument, "stencil clear"));
-        }
         if (argument >> 10) & 0xFFFF != 0 {
             return Err(refuse(CLEAR_SURFACE, argument, "clear of an array layer"));
         }
         let control = r.get(SET_CLEAR_SURFACE_CONTROL * 4);
+        let stencil_mask = match control & 1 {
+            0 => 0xFF,
+            _ => r.get(SET_STENCIL_FRONT_MASK * 4) as u8,
+        };
         let mut rect = pipeline::surface_clip(r);
         if control & (1 << 4) != 0 {
             let horizontal = r.get(0x0d6c);
@@ -884,20 +894,30 @@ impl ThreeD {
                 }
             }
         }
-        if argument & 1 != 0 {
+        if argument & 3 != 0 {
             let Some((surface, format)) = pipeline::depth_target(r)? else {
                 return Err(refuse(
                     CLEAR_SURFACE,
                     argument,
-                    "depth clear without a depth target",
+                    "depth or stencil clear without a depth target",
                 ));
             };
             let depth = f32::from_bits(r.get(SET_Z_CLEAR_VALUE * 4));
+            let stencil = r.get(SET_STENCIL_CLEAR_VALUE * 4) as u8;
             let mut window = Window::load(memory, surface, rect)?;
             for mut band in window.bands_mut() {
                 for y in band.y0.max(rect.y0)..(band.y0 + 8).min(rect.y1) {
                     for x in rect.x0..rect.x1.min(surface.width) {
-                        format.write_depth(depth, band.pixel_mut(x, y));
+                        let texel = band.pixel_mut(x, y);
+                        if argument & 1 != 0 {
+                            format.write_depth(depth, texel);
+                        }
+                        if argument & 2 != 0
+                            && let Some(kept) = format.read_stencil(texel)
+                        {
+                            let merged = kept & !stencil_mask | stencil & stencil_mask;
+                            format.write_stencil(merged, texel);
+                        }
                     }
                 }
             }

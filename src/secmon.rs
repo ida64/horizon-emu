@@ -167,6 +167,15 @@ pub mod config_item {
     /// the console powers off. Settable; starts out disabled \[assumption:
     /// nothing set it before the first call seen, which writes 0\].
     pub const IS_CHARGER_HI_Z_MODE_ENABLED: u32 = 13;
+    /// From here up the numbers are Atmosphère's: its monitor answers them
+    /// with its own version and settings (exosphere `secmon_smc_info.hpp`,
+    /// `ExosphereApiVersion` on), and homebrew asks for the first to learn
+    /// whether it runs under Atmosphère (libnx; NX-Shell does so when it
+    /// starts). Nintendo's monitor, which this is, has no such items: the
+    /// call fails as for any item it does not know, with the status
+    /// exosphere gives in that case \[inference: exosphere reproduces the
+    /// original's answers\].
+    pub const FIRST_OF_ATMOSPHERE: u32 = 65000;
 }
 
 /// Interrupt ID the monitor signals asynchronous completions with.
@@ -539,6 +548,10 @@ impl SecureMonitor {
             config_item::KERNEL_CONFIGURATION => self.kernel_configuration.bits(self.dram),
             config_item::IS_CHARGER_HI_Z_MODE_ENABLED => {
                 self.state.lock().unwrap().charger_hi_z_mode.into()
+            }
+            config_item::FIRST_OF_ATMOSPHERE.. => {
+                x[0] = STATUS_INVALID_ARGUMENT;
+                return SmcEffect::Resume;
             }
             _ => return SmcEffect::Unimplemented(Unimplemented::ConfigItem(item)),
         };
@@ -1155,6 +1168,11 @@ mod tests {
             SmcEffect::Unimplemented(Unimplemented::ConfigItem(4))
         );
         assert_eq!(x[..4], before);
+
+        // An item only Atmosphère's monitor has is one this monitor does
+        // not know: an answer, not a stop.
+        let (effect, x) = smc(&monitor, [function::GET_CONFIG.into(), 65000, 0, 0]);
+        assert_eq!((effect, x[0]), (SmcEffect::Resume, STATUS_INVALID_ARGUMENT));
 
         let (effect, _) = smc(&monitor, [0x8400_0009, 0, 0, 0]);
         assert_eq!(

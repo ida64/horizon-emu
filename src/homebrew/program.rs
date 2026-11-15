@@ -206,20 +206,98 @@ pub fn pfs0(files: &[(String, Vec<u8>)]) -> Vec<u8> {
 /// The pool partition bits of an ACID's flags (`0x20c`).
 const POOL_PARTITION: u32 = 0x3C;
 
-/// The pool partition the ACID of the program in `original` gives, as its
-/// flag bits: from the NPDM of its ExeFS (section 0).
-fn pool_partition(original: &Nca) -> Result<u32, ProgramError> {
+/// The NPDM of the program in `original`, from its ExeFS (section 0).
+fn original_npdm(original: &Nca) -> Result<Vec<u8>, ProgramError> {
     let exefs = original
         .partition_section(0)
         .map_err(|error| ProgramError::ExeFs(format!("the replaced program's: {error}")))?;
     let files = nca::pfs0_files(&exefs)
         .map_err(|error| ProgramError::ExeFs(format!("the replaced program's: {error}")))?;
-    let (_, npdm) = files
-        .iter()
+    files
+        .into_iter()
         .find(|(name, _)| *name == NPDM)
-        .ok_or_else(|| ProgramError::ExeFs("the replaced program's has no main.npdm".into()))?;
+        .map(|(_, npdm)| npdm.to_vec())
+        .ok_or_else(|| ProgramError::ExeFs("the replaced program's has no main.npdm".into()))
+}
+
+/// The pool partition the ACID of `npdm` gives, as its flag bits.
+fn pool_partition(npdm: &[u8]) -> Result<u32, ProgramError> {
     let acid = acid(npdm)?;
     Ok(u32_at(npdm, acid.start + 0x20C).expect("the ACID is long enough") & POOL_PARTITION)
+}
+
+/// The kernel capability that says what kind of program this is: a
+/// descriptor ending in thirteen ones, the kind in the three bits from 14
+/// (1 an application, 2 an applet; switchbrew "NPDM", and the kinds the
+/// firmware's own programs carry).
+const APPLICATION_TYPE_MARK: u32 = 0x1FFF;
+const APPLICATION_TYPE_MARK_BITS: u32 = 0x3FFF;
+const APPLICATION_TYPE: u32 = 7 << 14;
+
+/// The application type words of `npdm`'s ACI and ACID: where each is and
+/// what it holds.
+fn application_types(npdm: &[u8]) -> Result<Vec<(usize, u32)>, ProgramError> {
+    Ok(capability_ranges(npdm)?
+        .into_iter()
+        .flat_map(|range| range.step_by(4))
+        .map(|at| (at, u32_at(npdm, at).expect("within the table")))
+        .filter(|(_, word)| word & APPLICATION_TYPE_MARK_BITS == APPLICATION_TYPE_MARK)
+        .collect())
+}
+
+/// Whose program an archive's metadata says it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Identity {
+    /// The ExeFS's own: its NPDM must be for the program replaced.
+    Own,
+    /// The replaced program's: the NPDM is given its program ID (in the
+    /// ACI, and as the whole range of the ACID) and its application type
+    /// (in both capability tables). That is what Atmosphère's loader does
+    /// to hbloader's metadata when hbloader stands in for a program
+    /// (`ldr_meta.cpp`: the IDs from the location asked for, the type
+    /// through `UpdateProgramInfoFlag`), and it is what makes hbloader an
+    /// application in an application's place: the kernel tells a process
+    /// whether it is one from that capability.
+    Replaced,
+}
+
+/// Gives `npdm` the identity of the program `original` is the NPDM of,
+/// which has the ID `program_id`. Returns a line per change.
+fn take_identity(
+    npdm: &mut [u8],
+    original: &[u8],
+    program_id: u64,
+) -> Result<Vec<String>, ProgramError> {
+    let mut changes = Vec::new();
+    let own_id = npdm_program_id(npdm)?;
+    if own_id != program_id {
+        let aci = u32_at(npdm, 0x70).expect("checked with the program ID") as usize;
+        let acid = acid(npdm)?.start;
+        for at in [aci + 0x10, acid + 0x210, acid + 0x218] {
+            npdm[at..at + 8].copy_from_slice(&program_id.to_le_bytes());
+        }
+        changes.push(format!(
+            "program ID {own_id:016x} of the NPDM became {program_id:016x}"
+        ));
+    }
+    let &[(_, kind), ..] = application_types(original)?.as_slice() else {
+        return Err(ProgramError::Npdm(
+            "the replaced program's has no application type",
+        ));
+    };
+    let kind = kind & APPLICATION_TYPE;
+    for (at, word) in application_types(npdm)? {
+        if word & APPLICATION_TYPE != kind {
+            let new = word & !APPLICATION_TYPE | kind;
+            npdm[at..at + 4].copy_from_slice(&new.to_le_bytes());
+            changes.push(format!(
+                "application type {} of the NPDM became {}, the replaced program's",
+                (word & APPLICATION_TYPE) >> 14,
+                kind >> 14
+            ));
+        }
+    }
+    Ok(changes)
 }
 
 /// Region type of a map-region kernel capability (descriptor ending in
@@ -288,9 +366,9 @@ fn drop_absent_regions(npdm: &mut [u8]) -> Result<Vec<String>, ProgramError> {
     Ok(dropped)
 }
 
-/// The program archive for the ExeFS `nsp`, which must be for
-/// `program_id`, in place of `original`, and a line for each trace buffer
-/// request it dropped from the NPDM; see the module documentation.
+/// The program archive for the ExeFS `nsp` in place of `original`, the
+/// program `program_id`, and a line for each change made to the NPDM; see
+/// the module documentation and [`Identity`].
 ///
 /// The ACID's pool partition becomes that of `original`: the system
 /// starts the program as the one it replaces, and the loader refuses an
@@ -302,10 +380,16 @@ pub fn build_program_nca(
     original: &Nca,
     program_id: u64,
     nsp: &[u8],
+    identity: Identity,
 ) -> Result<(Vec<u8>, Vec<String>), ProgramError> {
-    let pool = pool_partition(original)?;
+    let original_npdm = original_npdm(original)?;
+    let pool = pool_partition(&original_npdm)?;
     let mut files = exefs_files(nsp)?;
     let npdm = &mut files.last_mut().expect("main.npdm is last").1;
+    let mut changes = match identity {
+        Identity::Own => Vec::new(),
+        Identity::Replaced => take_identity(npdm, &original_npdm, program_id)?,
+    };
     let npdm_id = npdm_program_id(npdm)?;
     if npdm_id != program_id {
         return Err(ProgramError::ProgramId {
@@ -316,10 +400,10 @@ pub fn build_program_nca(
     let flags_at = acid(npdm)?.start + 0x20C;
     let flags = u32_at(npdm, flags_at).expect("the ACID is long enough") & !POOL_PARTITION | pool;
     npdm[flags_at..flags_at + 4].copy_from_slice(&flags.to_le_bytes());
-    let dropped = drop_absent_regions(npdm)?;
+    changes.extend(drop_absent_regions(npdm)?);
     sign_npdm(npdm)?;
     let archive = seal(keys, original.header(), program_id, &pfs0(&files))?;
-    Ok((archive, dropped))
+    Ok((archive, changes))
 }
 
 /// The archive of the ExeFS `exefs`, with what its header takes over from
@@ -434,12 +518,29 @@ mod tests {
 
     /// The archive to replace: an applet's, in the applet pool.
     fn original(keys: &KeySet) -> Vec<u8> {
+        original_with(keys, npdm(PROGRAM_ID, 1 << 2))
+    }
+
+    fn original_with(keys: &KeySet, npdm: Vec<u8>) -> Vec<u8> {
         let mut template = [0u8; nca::HEADER_SIZE];
         template[0x206] = 1;
         template[0x21C..0x220].copy_from_slice(&0x1702_0300u32.to_le_bytes());
         template[0x220] = 1;
         template[0x540..0x548].copy_from_slice(&[0, 0, 0, 0, 1, 0, 0, 0]);
-        seal(keys, &template, PROGRAM_ID, &nsp_with(PROGRAM_ID, 1 << 2)).unwrap()
+        seal(keys, &template, PROGRAM_ID, &nsp_of(npdm)).unwrap()
+    }
+
+    /// Eight bytes of kernel capabilities at the end of the ACI and of
+    /// the ACID of an NPDM made by [`npdm`].
+    fn set_capabilities(npdm: &mut [u8], words: [u32; 2]) {
+        for (start, field, offset) in [(0x2C0, 0x30, 0x38usize), (0x80, 0x230, 0x238)] {
+            npdm[start + field..start + field + 4].copy_from_slice(&(offset as u32).to_le_bytes());
+            npdm[start + field + 4..start + field + 8].copy_from_slice(&8u32.to_le_bytes());
+            for (index, word) in words.into_iter().enumerate() {
+                let at = start + offset + 4 * index;
+                npdm[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
     }
 
     fn npdm(program_id: u64, acid_flags: u32) -> Vec<u8> {
@@ -464,11 +565,12 @@ mod tests {
     }
 
     fn nsp_with(program_id: u64, acid_flags: u32) -> Vec<u8> {
+        nsp_of(npdm(program_id, acid_flags))
+    }
+
+    fn nsp_of(npdm: Vec<u8>) -> Vec<u8> {
         let code: Vec<u8> = (0..0x9000u32).map(|index| index as u8).collect();
-        pfs0(&[
-            ("main".into(), code),
-            (NPDM.into(), npdm(program_id, acid_flags)),
-        ])
+        pfs0(&[("main".into(), code), (NPDM.into(), npdm)])
     }
 
     /// A production ACID in the application pool, as hbloader's.
@@ -489,8 +591,14 @@ mod tests {
         let keys = keys();
         let original = original(&keys);
         let original = Nca::open(&original, &keys).unwrap();
-        let (archive, dropped) =
-            build_program_nca(&keys, &original, PROGRAM_ID, &nsp(PROGRAM_ID)).unwrap();
+        let (archive, dropped) = build_program_nca(
+            &keys,
+            &original,
+            PROGRAM_ID,
+            &nsp(PROGRAM_ID),
+            Identity::Own,
+        )
+        .unwrap();
         assert!(dropped.is_empty());
 
         let built = Nca::open(&archive, &keys).unwrap();
@@ -531,15 +639,8 @@ mod tests {
     fn trace_buffer_requests_are_dropped_from_both_tables() {
         let mut npdm = npdm(PROGRAM_ID, 1);
         let (aci, acid) = (0x2C0, 0x80);
-        // Eight bytes of kernel capabilities at the end of each.
-        for (start, field, offset) in [(aci, 0x30, 0x38usize), (acid, 0x230, 0x238)] {
-            npdm[start + field..start + field + 4].copy_from_slice(&(offset as u32).to_le_bytes());
-            npdm[start + field + 4..start + field + 8].copy_from_slice(&8u32.to_le_bytes());
-            // Trace buffer read-only and a second region kept; program type.
-            let map = 0x3FFu32 | 0x41 << 11 | 0x02 << 18;
-            npdm[start + offset..start + offset + 4].copy_from_slice(&map.to_le_bytes());
-            npdm[start + offset + 4..start + offset + 8].copy_from_slice(&0x9FFFu32.to_le_bytes());
-        }
+        // Trace buffer read-only and a second region kept; program type.
+        set_capabilities(&mut npdm, [0x3FF | 0x41 << 11 | 0x02 << 18, 0x9FFF]);
         let mut alone = npdm.clone();
         let at = aci + 0x38;
         alone[at..at + 4].copy_from_slice(&0x20BFFu32.to_le_bytes());
@@ -559,11 +660,57 @@ mod tests {
         let original = original(&keys);
         let original = Nca::open(&original, &keys).unwrap();
         assert_eq!(
-            build_program_nca(&keys, &original, PROGRAM_ID, &nsp(PROGRAM_ID + 1)),
+            build_program_nca(
+                &keys,
+                &original,
+                PROGRAM_ID,
+                &nsp(PROGRAM_ID + 1),
+                Identity::Own
+            ),
             Err(ProgramError::ProgramId {
                 npdm: PROGRAM_ID + 1,
                 expected: PROGRAM_ID
             })
+        );
+    }
+
+    #[test]
+    fn standing_in_for_an_application_makes_the_program_one() {
+        let keys = keys();
+        // An application in the application pool, and an applet's ExeFS
+        // for another program ID.
+        let mut application = npdm(PROGRAM_ID, 1);
+        set_capabilities(&mut application, [PADDING, 0x1FFF | 1 << 14]);
+        let original = original_with(&keys, application);
+        let original = Nca::open(&original, &keys).unwrap();
+        let mut applet = npdm(PROGRAM_ID + 1, 1 | 1 << 2);
+        set_capabilities(&mut applet, [0x1FFF | 2 << 14, PADDING]);
+
+        let (archive, changes) = build_program_nca(
+            &keys,
+            &original,
+            PROGRAM_ID,
+            &nsp_of(applet),
+            Identity::Replaced,
+        )
+        .unwrap();
+        assert_eq!(changes.len(), 3, "{changes:?}");
+        let built = Nca::open(&archive, &keys).unwrap();
+        let exefs = built.partition_section(0).unwrap();
+        let files = nca::pfs0_files(&exefs).unwrap();
+        let npdm = files[1].1;
+        let (aci, acid) = (0x2C0, 0x80);
+        assert_eq!(npdm_program_id(npdm), Ok(PROGRAM_ID));
+        for at in [acid + 0x210, acid + 0x218] {
+            assert_eq!(u64_at(npdm, at), Some(PROGRAM_ID), "the ACID's range");
+        }
+        for at in [aci + 0x38, acid + 0x238] {
+            assert_eq!(u32_at(npdm, at), Some(0x1FFF | 1 << 14), "an application");
+        }
+        assert_eq!(u32_at(npdm, acid + 0x20C), Some(1), "the application pool");
+        assert!(
+            verifies(&npdm[acid + 0x100..acid + 0x240], &npdm[acid..acid + 0x100]),
+            "signed after the changes"
         );
     }
 }

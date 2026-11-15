@@ -74,6 +74,35 @@
 //! key: the NCA's signature 1 (generation 1), the NPDM's ACID (generation
 //! 1), and puts the key's public half into the ACID, which makes it the key
 //! of signature 2.
+//!
+//! # Applet or application
+//!
+//! hbloader runs in the place of a program of the firmware, started the
+//! way the firmware starts that program, and what it is there decides
+//! what homebrew gets. In the Album applet's place (`--homebrew` alone)
+//! it is a library applet: the applet pool's memory and the applet
+//! services, hbmenu's "Applet Mode". In an application's place
+//! (`--homebrew-in`) it takes that program's ID and application type
+//! ([`program::Identity::Replaced`]), the kernel tells it so, and it
+//! hands what it loads the application services. The firmware of a
+//! console with no games starts one application by itself: starter
+//! (`0100000000001012`), which the HOME menu runs as a system application
+//! on a console that has not been set up. Observed with it replaced, on a
+//! freshly formatted console: hbmenu comes up after the boot logo without
+//! its applet mode banner, and launches a program and returns from it.
+//!
+//! # Homebrew that needs Atmosphère
+//!
+//! The services here are Nintendo's. Atmosphère replaces some of them
+//! with its own, which answer extra requests, and homebrew written for
+//! it uses those: libusbhsfs asks the service manager whether a service
+//! exists (`sm:` request 65100), Nintendo's `sm` closes the session on a
+//! request it does not know, and every later look-up of a service by
+//! that program fails. NX-Shell 4.01 does this while starting, cannot
+//! reach `nvdrv:a` afterwards, and dies in Mesa's handling of the failed
+//! `eglInitialize` (a second `free` of the device, in
+//! `nouveau_device_new`'s error path). That is the program's dependence,
+//! not something missing here.
 
 pub mod firmware;
 pub mod program;

@@ -17,6 +17,7 @@ use std::{
 };
 
 use horizon_emu::{
+    arm64::{exception_class, exception_class::INSTRUCTION_ABORT_LOWER},
     boot::{BootParams, DramSize},
     image::KernelImage,
     ipc::{Client, ResultCode, Tracker},
@@ -99,6 +100,13 @@ options:
                       open network unless
   --wifi-passphrase P makes it WPA2-Personal (CCMP) with passphrase P
                       (8 to 63 printable ASCII characters)
+  --forward HOST_PORT[:CONSOLE_PORT]
+                      with --wifi-ssid: TCP connections to HOST_PORT of this
+                      machine's 127.0.0.1 reach CONSOLE_PORT (the same number
+                      unless given) of the console, which sees them come
+                      from the router. The only way in: the router lets
+                      nothing else through to the console. May be given
+                      more than once
   --window            show the console's screen in a window. Closing it
                       stops the machine and ends the program; when the
                       machine stops by itself, the window stays, showing
@@ -390,6 +398,7 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
     let mut script = None;
     let mut homebrew = HomebrewOptions::default();
     let (mut wifi_ssid, mut wifi_passphrase) = (None::<String>, None::<String>);
+    let mut forwards = Vec::new();
     if maxwell::metal::available() {
         maxwell::select_renderer(maxwell::RendererKind::Metal);
     }
@@ -499,6 +508,16 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
             "--sd-writable" => sd_writable = true,
             "--wifi-ssid" => wifi_ssid = Some(value()?.clone()),
             "--wifi-passphrase" => wifi_passphrase = Some(value()?.clone()),
+            "--forward" => {
+                let value = value()?.as_str();
+                let (host, console) = value.split_once(':').unwrap_or((value, value));
+                let ports = host.parse::<u16>().ok().zip(console.parse::<u16>().ok());
+                forwards.push(
+                    ports.ok_or_else(|| {
+                        format!("--forward {value}: not HOST_PORT[:CONSOLE_PORT]")
+                    })?,
+                );
+            }
             "--symbols" => {
                 symbols =
                     SymbolTable::load(Path::new(value()?)).map_err(|error| error.to_string())?
@@ -592,11 +611,18 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
         // One line per DHCP lease, DNS query, new flow and plain-HTTP
         // exchange: what the console does on the network, never payload.
         router.set_trace(Box::new(|line| eprintln!("net: {line}")));
+        for &(host_port, console_port) in &forwards {
+            router
+                .forward(host_port, console_port)
+                .map_err(|error| format!("--forward {host_port}: {error}"))?;
+        }
         machine
             .wifi()
             .set_access_point(ap, Box::new(move |frame| router.send(frame)));
     } else if wifi_passphrase.is_some() {
         return Err("--wifi-passphrase needs --wifi-ssid".into());
+    } else if !forwards.is_empty() {
+        return Err("--forward needs --wifi-ssid".into());
     }
     let mut window = show_window.then(ScreenWindow::open).transpose()?;
     let stop = AtomicBool::new(false);
@@ -1022,6 +1048,31 @@ fn write_event(out: &mut impl Write, event: TraceEvent, tracing: &Tracing) -> io
                 secmon::function_name(immediate, arguments[0] as u32),
                 arguments,
                 results
+            )
+        }
+        TraceEvent::UserAbort {
+            core,
+            syndrome,
+            address,
+            pc,
+            lr,
+            caller,
+            process,
+            callers,
+        } => {
+            if !(tracing.verbose || tracing.svc) {
+                return Ok(());
+            }
+            let kind = match exception_class(syndrome) {
+                INSTRUCTION_ABORT_LOWER => "an instruction abort",
+                _ if syndrome & 1 << 6 != 0 => "a data abort writing",
+                _ => "a data abort reading",
+            };
+            writeln!(
+                out,
+                "core {core}: {} took {kind} at {address:#x}, pc {pc:#x}, lr {lr:#x}, \
+                 callers {callers:x?} (syndrome {syndrome:#x})",
+                describe_caller(caller, process)
             )
         }
         TraceEvent::SupervisorCall {

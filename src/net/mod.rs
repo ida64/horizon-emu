@@ -39,6 +39,12 @@
 //! * IPv6, IPv4 fragments from the console, multicast/broadcast other than
 //!   DHCP, and traffic to the 10.0.2.0/24 subnet, loopback, link-local or
 //!   reserved addresses are dropped.
+//! * **Inbound TCP**: nothing reaches the console from outside except
+//!   through [`Router::forward`], which listens on a port of the host's
+//!   loopback address and opens, for each connection it accepts, one from
+//!   [`GATEWAY`] (an ephemeral port) to a port of [`CONSOLE_IP`], spliced
+//!   like the outbound ones. If the console refuses or has not been heard
+//!   from, the host connection is reset.
 //!
 //! All of this runs on one dedicated thread ("nat-router") that multiplexes
 //! the host sockets with `poll(2)`; [`Router::send`] only enqueues the frame
@@ -53,7 +59,7 @@ mod wire;
 mod tests;
 
 use std::io::Write;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -107,6 +113,9 @@ enum Msg {
     Frame(Vec<u8>),
     /// Install a trace callback.
     Trace(TraceFn),
+    /// Connections this host listener accepts go to that port of the
+    /// console.
+    Forward(TcpListener, u16),
 }
 
 /// Handle to the NAT router thread. Dropping the last `Arc` stops the thread
@@ -185,6 +194,24 @@ impl Router {
     pub fn set_trace(&self, f: Box<dyn Fn(&str) + Send + Sync>) {
         self.queued.fetch_add(1, Ordering::AcqRel);
         self.post(Msg::Trace(f));
+    }
+
+    /// Opens a way in: every TCP connection made to `host_port` on the
+    /// host's loopback address is carried to `console_port` of the
+    /// console, which sees it come from [`GATEWAY`]. Nothing on the
+    /// console's side of the router is reachable otherwise. Fails if the
+    /// host port cannot be listened on.
+    pub fn forward(&self, host_port: u16, console_port: u16) -> std::io::Result<()> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, host_port))?;
+        self.forward_from(listener, console_port)
+    }
+
+    /// [`Router::forward`] for a listener already bound.
+    fn forward_from(&self, listener: TcpListener, console_port: u16) -> std::io::Result<()> {
+        listener.set_nonblocking(true)?;
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        self.post(Msg::Forward(listener, console_port));
+        Ok(())
     }
 
     fn post(&self, msg: Msg) {

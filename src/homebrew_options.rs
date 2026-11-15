@@ -5,7 +5,10 @@
 use std::{fs::File, path::Path};
 
 use horizon_emu::{
-    homebrew::{self, firmware, program},
+    homebrew::{
+        self, firmware,
+        program::{self, Identity},
+    },
     image::KernelImage,
     keys::KeySet,
     nand::{self, Overlay},
@@ -38,6 +41,15 @@ running programs Nintendo did not sign (horizon_emu::homebrew):
                       from a 4 GiB microSD card made in memory (no --sd).
                       Implies --homebrew-keys, --disable-program-verification
                       and --replace-program 010000000000100D=HBL
+  --homebrew-in PROGRAM_ID
+                      with --homebrew: hbloader in place of that program
+                      instead of the Album applet, as that program (its ID
+                      and application type), the way Atmosphere overrides a
+                      title. In place of an application hbloader is one,
+                      and what it loads gets an application's memory and
+                      services. A console with no games starts one
+                      application: starter (0100000000001012), which sets
+                      up a console that has not been set up
   --hbl NSP           the hbloader ExeFS for --homebrew (default: hbl.nsp
                       next to NRO)
   --homebrew-app NRO  also put NRO on the --homebrew card, as
@@ -52,6 +64,7 @@ pub struct HomebrewOptions {
     keys: bool,
     replacements: Vec<(u64, String)>,
     homebrew: Option<String>,
+    homebrew_in: Option<u64>,
     hbl: Option<String>,
     apps: Vec<String>,
 }
@@ -64,19 +77,22 @@ impl HomebrewOptions {
         flag: &str,
         value: &mut impl FnMut() -> Result<&'a String, String>,
     ) -> Result<bool, String> {
+        let program_id = |flag: &str, id: &str| {
+            u64::from_str_radix(id.trim_start_matches("0x"), 16)
+                .map_err(|_| format!("{flag}: the program ID is in hex, not {id}"))
+        };
         match flag {
             "--homebrew-keys" => self.keys = true,
             "--replace-program" => {
                 let value = value()?;
-                let parsed = value.split_once('=').and_then(|(program, nsp)| {
-                    let program = u64::from_str_radix(program.trim_start_matches("0x"), 16).ok()?;
-                    Some((program, nsp.to_string()))
-                });
-                self.replacements.push(
-                    parsed.ok_or("--replace-program: expected PROGRAM_ID=NSP, the ID in hex")?,
-                );
+                let (program, nsp) = value
+                    .split_once('=')
+                    .ok_or("--replace-program: expected PROGRAM_ID=NSP, the ID in hex")?;
+                self.replacements
+                    .push((program_id(flag, program)?, nsp.to_string()));
             }
             "--homebrew" => self.homebrew = Some(value()?.clone()),
+            "--homebrew-in" => self.homebrew_in = Some(program_id(flag, value()?)?),
             "--hbl" => self.hbl = Some(value()?.clone()),
             "--homebrew-app" => self.apps.push(value()?.clone()),
             _ => return Ok(false),
@@ -94,18 +110,23 @@ impl HomebrewOptions {
         self.keys || self.homebrew.is_some()
     }
 
-    fn replacements(&self) -> Result<Vec<(u64, String)>, String> {
-        let mut replacements = self.replacements.clone();
-        match (&self.homebrew, &self.hbl) {
-            (Some(nro), hbl) => {
+    fn replacements(&self) -> Result<Vec<(u64, String, Identity)>, String> {
+        let mut replacements: Vec<_> = self
+            .replacements
+            .iter()
+            .map(|(program, nsp)| (*program, nsp.clone(), Identity::Own))
+            .collect();
+        match (&self.homebrew, &self.hbl, self.homebrew_in) {
+            (Some(nro), hbl, place) => {
                 let hbl = hbl.clone().unwrap_or_else(|| {
                     let directory = Path::new(nro).parent().unwrap_or(Path::new(""));
                     directory.join("hbl.nsp").to_string_lossy().into_owned()
                 });
-                replacements.push((ALBUM, hbl));
+                replacements.push((place.unwrap_or(ALBUM), hbl, Identity::Replaced));
             }
-            (None, Some(_)) => return Err("--hbl goes with --homebrew".into()),
-            (None, None) => {}
+            (None, Some(_), _) => return Err("--hbl goes with --homebrew".into()),
+            (None, None, Some(_)) => return Err("--homebrew-in goes with --homebrew".into()),
+            (None, None, None) => {}
         }
         Ok(replacements)
     }
@@ -142,14 +163,14 @@ impl HomebrewOptions {
                     .into(),
             );
         }
-        for (program_id, nsp) in replacements {
+        for (program_id, nsp, identity) in replacements {
             let failed =
                 |error: String| format!("--replace-program {program_id:016x}={nsp}: {error}");
             let exefs = std::fs::read(&nsp).map_err(|error| failed(error.to_string()))?;
             let mut dropped = Vec::new();
             let replacement = nand::replace_program(user, keys, program_id, |original| {
                 let (archive, changes) =
-                    program::build_program_nca(keys, original, program_id, &exefs)
+                    program::build_program_nca(keys, original, program_id, &exefs, identity)
                         .map_err(|error| error.to_string())?;
                 dropped = changes;
                 Ok(archive)

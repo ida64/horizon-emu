@@ -36,7 +36,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -53,7 +53,7 @@ use super::wire::{
     self, ARP_REPLY, ARP_REQUEST, Arp, ETH_HEADER, ETHERTYPE_ARP, ETHERTYPE_IPV4, Ipv4, PROTO_ICMP,
     PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_RST, TCP_SYN,
 };
-use super::{DNS, GATEWAY, Msg, ROUTER_MAC, Settings, TraceFn, dhcp, dns};
+use super::{CONSOLE_IP, DNS, GATEWAY, Msg, ROUTER_MAC, Settings, TraceFn, dhcp, dns};
 
 /// Size of each smoltcp TCP buffer (one receive, one transmit per flow).
 const TCP_BUFFER: usize = 64 * 1024;
@@ -85,6 +85,9 @@ const ARP_REFRESH: Duration = Duration::from_secs(30);
 const HTTP_HEAD_LIMIT: usize = 4096;
 /// Characters of an HTTP line put into a trace line.
 const HTTP_LINE_LIMIT: usize = 200;
+/// First of the ports [`GATEWAY`] makes forwarded connections from (the
+/// range RFC 6335 leaves for such use).
+const FIRST_FORWARD_PORT: u16 = 49152;
 
 /// A NAT flow as seen by the console.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -370,6 +373,8 @@ enum PollTarget {
     Wake,
     Udp(FlowKey),
     Tcp(FlowKey),
+    /// A listener of [`Engine::forwards`].
+    Forward(usize),
 }
 
 /// State of the router thread.
@@ -394,6 +399,10 @@ pub(super) struct Engine {
     arp_primed: Option<([u8; 6], Ipv4Addr, Instant)>,
     ip_id: u16,
     tcp: HashMap<FlowKey, TcpFlow>,
+    /// Host listeners and the console port each leads to.
+    forwards: Vec<(TcpListener, u16)>,
+    /// The port the next forwarded connection is made from.
+    forward_port: u16,
     udp: HashMap<FlowKey, UdpFlow>,
     last_expiry: Instant,
     pollfds: Vec<libc::pollfd>,
@@ -442,6 +451,8 @@ impl Engine {
             arp_primed: None,
             ip_id: 0,
             tcp: HashMap::new(),
+            forwards: Vec::new(),
+            forward_port: FIRST_FORWARD_PORT,
             udp: HashMap::new(),
             last_expiry: Instant::now(),
             pollfds: Vec::new(),
@@ -503,6 +514,15 @@ impl Engine {
                 add(sp.host.as_raw_fd(), events, PollTarget::Tcp(*key));
             }
         }
+        if self.tcp.len() < MAX_TCP_FLOWS {
+            for (index, (listener, _)) in self.forwards.iter().enumerate() {
+                add(
+                    listener.as_raw_fd(),
+                    libc::POLLIN,
+                    PollTarget::Forward(index),
+                );
+            }
+        }
 
         let mut timeout = MAX_POLL_WAIT;
         if let Some(d) = self
@@ -527,6 +547,7 @@ impl Engine {
         if ready <= 0 {
             return;
         }
+        let mut accepting = Vec::new();
         for i in 0..self.pollfds.len() {
             let revents = self.pollfds[i].revents;
             if revents == 0 {
@@ -545,7 +566,84 @@ impl Engine {
                         sp.writable |= broken || revents & libc::POLLOUT != 0;
                     }
                 }
+                PollTarget::Forward(index) => accepting.push(index),
             }
+        }
+        for index in accepting {
+            self.accept(index);
+        }
+    }
+
+    /// Takes the connections waiting at a forwarding listener and opens,
+    /// for each, one from [`GATEWAY`] to the console's port.
+    fn accept(&mut self, index: usize) {
+        let console = SocketAddrV4::new(CONSOLE_IP, self.forwards[index].1);
+        while self.tcp.len() < MAX_TCP_FLOWS {
+            let Ok((host, from)) = self.forwards[index].0.accept() else {
+                return;
+            };
+            // With the console never heard from there is nowhere to send.
+            let Some(mac) = self.console_mac else {
+                self.emit(|| format!("tcp: {from} -> {console} refused: no console on the link"));
+                reset_host(&host);
+                continue;
+            };
+            if host.set_nonblocking(true).is_err() || host.set_nodelay(true).is_err() {
+                continue;
+            }
+            let mut key = FlowKey {
+                console,
+                remote: SocketAddrV4::new(GATEWAY, self.forward_port),
+            };
+            while self.tcp.contains_key(&key) {
+                key.remote.set_port(
+                    key.remote
+                        .port()
+                        .checked_add(1)
+                        .unwrap_or(FIRST_FORWARD_PORT),
+                );
+            }
+            self.forward_port = key
+                .remote
+                .port()
+                .checked_add(1)
+                .unwrap_or(FIRST_FORWARD_PORT);
+            let mut socket = tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
+                tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
+            );
+            socket.set_nagle_enabled(false);
+            socket.set_timeout(Some(STALL_TIMEOUT));
+            let opened = socket.connect(
+                self.iface.context(),
+                (IpAddress::Ipv4(CONSOLE_IP), console.port()),
+                (IpAddress::Ipv4(GATEWAY), key.remote.port()),
+            );
+            if opened.is_err() {
+                reset_host(&host);
+                continue;
+            }
+            let handle = self.sockets.add(socket);
+            self.emit(|| format!("tcp: new flow {from} -> {console} forwarded"));
+            // smoltcp asks for the console's MAC before it sends the SYN.
+            self.arp_primed = Some((mac, CONSOLE_IP, Instant::now()));
+            self.link.rx.push_back(synthetic_arp(mac, CONSOLE_IP));
+            self.tcp.insert(
+                key,
+                TcpFlow::Open(Box::new(Splice {
+                    handle,
+                    host,
+                    readable: true,
+                    writable: true,
+                    host_eof: false,
+                    host_failed: false,
+                    host_write_shut: false,
+                    fin_queued: false,
+                    opened: Instant::now(),
+                    closing_since: None,
+                    http: None,
+                })),
+            );
         }
     }
 
@@ -558,6 +656,7 @@ impl Engine {
                     match msg {
                         Msg::Frame(frame) => self.on_frame(&frame),
                         Msg::Trace(t) => self.trace = Some(t),
+                        Msg::Forward(listener, port) => self.forwards.push((listener, port)),
                     }
                 }
                 Err(TryRecvError::Empty) => return true,
@@ -965,7 +1064,8 @@ impl Engine {
             let TcpFlow::Open(sp) = flow else { return true };
             let s = sockets.get_mut::<tcp::Socket>(sp.handle);
             let state = s.state();
-            if state == tcp::State::SynReceived && now - sp.opened > HANDSHAKE_TIMEOUT {
+            let connecting = matches!(state, tcp::State::SynReceived | tcp::State::SynSent);
+            if connecting && now - sp.opened > HANDSHAKE_TIMEOUT {
                 s.abort();
             }
             if sp.fin_queued || sp.host_write_shut {
