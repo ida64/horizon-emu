@@ -202,6 +202,11 @@ const NANOS_PER_SECOND: u128 = 1_000_000_000;
 /// in the lowest byte.
 const COLOR_DEPTH_B8G8R8A8: u32 = 12;
 const COLOR_DEPTH_R8G8B8A8: u32 = 13;
+/// 16 bits per pixel, named from the lowest bits up (Linux `dc.h`): blue in
+/// bits 4:0, green in 10:5, red in 15:11. libnx's text console draws in
+/// this format (`PIXEL_FORMAT_RGB_565`); seen for `hello-world.nro` run
+/// from hbmenu.
+const COLOR_DEPTH_B5G6R5: u32 = 6;
 
 /// Surface kinds (Linux `dc.h`): pitch-linear, or the GPU's block-linear
 /// layout with the block height in GOBs, as a power of two, in bits 6:4.
@@ -400,6 +405,8 @@ struct Scratch {
     lines: Vec<[u32; 4]>,
     /// A block row of a block-linear surface.
     block_row: Vec<u8>,
+    /// A 16-bit window's pixels as fetched, before they are widened.
+    narrow: Vec<u8>,
 }
 
 impl Dc {
@@ -625,14 +632,19 @@ impl Window<'_> {
     /// `scratch.fetched`, and says where each pixel of the window is there.
     fn fetch(&self, memory: &DeviceMemory, scratch: &mut Scratch) -> Result<Layout, NoFrame> {
         let halves = |value: u32| (value & 0xFFFF, value >> 16);
+        // Red first among the 32-bit formats; `None` for 16 bits a pixel.
         let red_first = match self.value(register::WIN_COLOR_DEPTH) {
-            COLOR_DEPTH_B8G8R8A8 => false,
-            COLOR_DEPTH_R8G8B8A8 => true,
+            COLOR_DEPTH_B8G8R8A8 => Some(false),
+            COLOR_DEPTH_R8G8B8A8 => Some(true),
+            COLOR_DEPTH_B5G6R5 => None,
             depth => return Err(NoFrame::Unsupported(format!("color depth {depth}"))),
         };
+        let pixel_bytes: u32 = if red_first.is_some() { 4 } else { 2 };
         let byte_swap = self.value(register::WIN_BYTE_SWAP);
-        if byte_swap > BYTE_SWAP_SWAP4 {
-            return Err(NoFrame::Unsupported(format!("byte swap {byte_swap}")));
+        if byte_swap > BYTE_SWAP_SWAP4 || (pixel_bytes == 2 && byte_swap > BYTE_SWAP_SWAP2) {
+            return Err(NoFrame::Unsupported(format!(
+                "byte swap {byte_swap} of {pixel_bytes}-byte pixels"
+            )));
         }
         let options = self.value(register::WIN_OPTIONS);
         // Color expansion only concerns pixels under 32 bits.
@@ -654,12 +666,12 @@ impl Window<'_> {
         // The source size counts bytes across and lines down, as the window
         // shows them.
         let (source_bytes, source_lines) = halves(self.value(register::WIN_PRESCALED_SIZE));
-        if !source_bytes.is_multiple_of(4) || source_bytes == 0 || source_lines == 0 {
+        if !source_bytes.is_multiple_of(pixel_bytes) || source_bytes == 0 || source_lines == 0 {
             return Err(NoFrame::Unsupported(format!(
                 "a source of {source_bytes} bytes by {source_lines} lines"
             )));
         }
-        let (across, down) = (source_bytes / 4, source_lines);
+        let (across, down) = (source_bytes / pixel_bytes, source_lines);
         let column = options & SCAN_COLUMN != 0;
         // The rectangle of the surface the window shows, in the surface's
         // own orientation.
@@ -670,7 +682,7 @@ impl Window<'_> {
         };
         let stride = u64::from(self.value(register::WIN_LINE_STRIDE) & 0xFFFF);
         let start = u64::from(self.value(register::WINBUF_START_ADDR));
-        let row_bytes = u64::from(source_width) * 4;
+        let row_bytes = u64::from(source_width * pixel_bytes);
         // The horizontal offset counts bytes, the vertical one lines; a
         // window scanned right to left or bottom up starts from its last
         // byte or line (nvservices text 0x279d0, Linux likewise).
@@ -689,10 +701,20 @@ impl Window<'_> {
                 .ok_or_else(|| NoFrame::Unsupported("a window above its surface".into()))?;
         }
         let kind = self.value(register::WINBUF_SURFACE_KIND);
-        let pixels = &mut scratch.fetched;
+        let Scratch {
+            fetched,
+            block_row,
+            narrow,
+            ..
+        } = &mut *scratch;
         // Every byte is read over, so what was there stays until it is.
-        pixels.resize((source_width * source_height) as usize, [0; 4]);
-        let bytes = pixels.as_flattened_mut();
+        fetched.resize((source_width * source_height) as usize, [0; 4]);
+        let bytes: &mut [u8] = if red_first.is_some() {
+            fetched.as_flattened_mut()
+        } else {
+            narrow.resize(fetched.len() * 2, 0);
+            &mut narrow[..]
+        };
         match kind & SURFACE_KIND_MASK {
             SURFACE_KIND_PITCH => {
                 for (row, line) in bytes.chunks_mut(row_bytes as usize).enumerate() {
@@ -710,13 +732,7 @@ impl Window<'_> {
                     stride,
                     block_height,
                 };
-                layout.read(
-                    memory,
-                    (left, top),
-                    row_bytes,
-                    bytes,
-                    &mut scratch.block_row,
-                )?;
+                layout.read(memory, (left, top), row_bytes, bytes, block_row)?;
             }
             _ => return Err(NoFrame::Unsupported(format!("surface kind {kind:#x}"))),
         }
@@ -726,10 +742,18 @@ impl Window<'_> {
             BYTE_SWAP_SWAP4 => [3, 2, 1, 0],
             _ => [0, 1, 2, 3],
         };
-        let order = if red_first {
-            swapped
-        } else {
-            [swapped[2], swapped[1], swapped[0], swapped[3]]
+        let order = match red_first {
+            Some(true) => swapped,
+            Some(false) => [swapped[2], swapped[1], swapped[0], swapped[3]],
+            None => {
+                widen(
+                    narrow,
+                    fetched,
+                    byte_swap == BYTE_SWAP_SWAP2,
+                    options & COLOR_EXPAND != 0,
+                );
+                [0, 1, 2, 3]
+            }
         };
         // Where pixel (x, y) of the source, as the window scans it, is in
         // the surface's rectangle: the directions reverse the surface's
@@ -895,6 +919,36 @@ fn copy(
                 at += step;
             }
         }
+    }
+}
+
+/// Widens 16-bit `B5G6R5` pixels into red, green, blue and opaque alpha
+/// bytes. With `expand` (the window's `COLOR_EXPAND` option) each
+/// component's top bits are repeated into the low bits it lacks, so white
+/// stays white; without it the low bits are zero. That is what the option's
+/// name and Linux's use of it (always set for 16-bit windows) suggest
+/// [assumption: the TRM's description of the option is not at hand].
+fn widen(narrow: &[u8], pixels: &mut [[u8; 4]], swapped: bool, expand: bool) {
+    let grow = |value: u16, bits: u32| {
+        let high = (value << (8 - bits)) as u8;
+        if expand {
+            high | (value >> (2 * bits - 8)) as u8
+        } else {
+            high
+        }
+    };
+    for (pixel, two) in pixels.iter_mut().zip(narrow.as_chunks::<2>().0) {
+        let value = if swapped {
+            u16::from_be_bytes(*two)
+        } else {
+            u16::from_le_bytes(*two)
+        };
+        *pixel = [
+            grow(value >> 11, 5),
+            grow(value >> 5 & 0x3F, 6),
+            grow(value & 0x1F, 5),
+            0xFF,
+        ];
     }
 }
 
@@ -1669,6 +1723,33 @@ mod tests {
             unmapped.frame(&memory),
             Err(NoFrame::BufferUnmapped { address: 0x1000 })
         );
+    }
+
+    #[test]
+    fn sixteen_bit_pixels_widen_with_color_expansion_and_pad_with_zeros_without() {
+        let (ram, memory) = memory();
+        // White, red; green, blue: two lines of two `B5G6R5` pixels, eight
+        // bytes apart.
+        for (line, pair) in [[0xFFFF_u16, 0xF800], [0x07E0, 0x001F]].iter().enumerate() {
+            let bytes: Vec<u8> = pair.iter().flat_map(|pixel| pixel.to_le_bytes()).collect();
+            ram.write(BUFFER_PHYSICAL + 8 * line as u64, &bytes)
+                .unwrap();
+        }
+        let shown = |options: u32| {
+            let dc = configured();
+            write(&dc, register::WIN_COLOR_DEPTH, COLOR_DEPTH_B5G6R5);
+            write(&dc, register::WIN_PRESCALED_SIZE, 2 << 16 | 4);
+            write(&dc, register::WIN_OPTIONS, WIN_ENABLE | options);
+            write(&dc, register::DISPLAY_COMMAND, DISPLAY_MODE_CONTINUOUS);
+            write(&dc, register::STATE_CONTROL, 0x003);
+            let rgb = dc.frame(&memory).unwrap().rgb();
+            [&rgb[15..21], &rgb[27..33]].concat()
+        };
+        assert_eq!(
+            shown(COLOR_EXPAND),
+            [255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255]
+        );
+        assert_eq!(shown(0), [248, 252, 248, 248, 0, 0, 0, 252, 0, 0, 0, 248]);
     }
 
     #[test]

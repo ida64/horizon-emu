@@ -190,9 +190,14 @@ fn main() -> ExitCode {
     }
 }
 
+/// The whole usage message: the general options and those of homebrew.
+fn usage() -> String {
+    format!("{USAGE}\n\n{}", homebrew_options::USAGE)
+}
+
 fn run(arguments: &[String]) -> Result<(), String> {
     let [command, path, flags @ ..] = arguments else {
-        return Err(USAGE.into());
+        return Err(usage());
     };
     if command == "format-emmc" {
         return format_emmc(path, flags).map_err(|error| format!("{path}: {error}"));
@@ -207,7 +212,7 @@ fn run(arguments: &[String]) -> Result<(), String> {
             Ok(())
         }
         "boot" => boot(image, flags),
-        _ => Err(USAGE.into()),
+        _ => Err(usage()),
     }
 }
 
@@ -215,14 +220,14 @@ fn format_sd(path: &str, flags: &[String]) -> Result<(), String> {
     let (mut size, mut files) = (None, Vec::new());
     let mut flags = flags.iter();
     while let Some(flag) = flags.next() {
-        let value = flags.next().ok_or(USAGE)?;
+        let value = flags.next().ok_or_else(usage)?;
         match flag.as_str() {
             "--size" => size = Some(parse_size(value).ok_or("--size: expected bytes, K, M or G")?),
             "--add" => {
                 let (host, card) = value.split_once('=').ok_or("--add: expected HOST=CARD")?;
                 files.push((host.to_string(), card.to_string()));
             }
-            _ => return Err(USAGE.into()),
+            _ => return Err(usage()),
         }
     }
     let size = size.ok_or("format-sd needs --size")?;
@@ -250,13 +255,13 @@ fn format_emmc(path: &str, flags: &[String]) -> Result<(), String> {
     let (mut keys, mut firmware) = (None, None);
     let mut flags = flags.iter();
     while let Some(flag) = flags.next() {
-        let value = flags.next().ok_or(USAGE)?;
+        let value = flags.next().ok_or_else(usage)?;
         match flag.as_str() {
             "--keys" => {
                 keys = Some(KeySet::load(Path::new(value)).map_err(|error| error.to_string())?)
             }
             "--firmware" => firmware = Some(Path::new(value)),
-            _ => return Err(USAGE.into()),
+            _ => return Err(usage()),
         }
     }
     if firmware.is_some() && keys.is_none() {
@@ -478,7 +483,7 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
             "--debug-mode" => params.development_function_enabled = true,
             "--disable-program-verification" => params.program_verification_disabled = true,
             other if homebrew.parse(other, &mut value)? => {}
-            _ => return Err(format!("{USAGE}\n\n{}", homebrew_options::USAGE)),
+            _ => return Err(usage()),
         }
     }
     // Names can only be looked up once every --symbols has been seen.
