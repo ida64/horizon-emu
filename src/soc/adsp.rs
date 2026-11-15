@@ -77,7 +77,8 @@
 //!   commands carry no sound here and are taken without effect.
 //! * `AudioRenderer` executes the command lists `audio`'s renderers build.
 //!   On channel 50 it answers 22 with 22 and then 32, each 42 (render) with
-//!   32 once the frame is done, and 52 (stop) with 52; on channel 51 the
+//!   32 once the frame is done, and 52 (stop) with 52, after which the
+//!   application exits (status 5 to the host); on channel 51 the
 //!   memory requests 1/3/5/7 with 2/4/6/8 (`0x80504140`, `0x80504430`).
 //!   Its shared memory holds one 40-byte descriptor per renderer session:
 //!   command list address and size at words 0 and 1, the DSP's count of
@@ -207,6 +208,8 @@ const LAUNCH_RUN: u32 = 1;
 /// only memory `gmix` and the renderer have.
 const LAUNCH_SHARED_DRAM: usize = 5;
 const STATUS_STARTED: u32 = 4;
+/// The application's main returned (`0x80524950`).
+const STATUS_EXITED: u32 = 5;
 
 /// `gmix`'s shared memory (`0x80500DB4`).
 const GMIX_SIZE: usize = 0x2_EDC8;
@@ -280,6 +283,9 @@ struct State {
     period_due: Option<Instant>,
     /// The renderer's shared memory, once launched.
     renderer: Option<u32>,
+    /// The host's pointer to its instance of the renderer, from the launch
+    /// request, which the exit status hands back.
+    renderer_instance: [u32; 2],
     opus: Opus,
     /// When the renderer's frame in progress is done.
     frame_due: Option<Instant>,
@@ -319,6 +325,7 @@ impl Adsp {
                 streams: Streams::default(),
                 period_due: None,
                 renderer: None,
+                renderer_instance: [0; 2],
                 opus: Opus::Idle,
                 frame_due: None,
                 last_frame: None,
@@ -585,7 +592,10 @@ impl Inner {
                 self.start_gmix(shared)?;
                 state.gmix = Some(shared);
             }
-            RENDERER_APP => state.renderer = Some(shared),
+            RENDERER_APP => {
+                state.renderer = Some(shared);
+                state.renderer_instance = [request[1], request[2]];
+            }
             _ => {
                 return Err(format!(
                     "launching the application at {handle:#x} is not modeled"
@@ -692,9 +702,18 @@ impl Inner {
                 state.frame_due = Some(due);
                 self.wake.notify_all();
             }
+            // The renderer's main returns after answering stop, and the OS
+            // reports the application's exit to the host: status record 5
+            // with the host's instance pointer and the result, and message
+            // 5 on the application service channel (`0x80524950`). `audio`
+            // waits for that before it lets go of the renderer driver (text
+            // `0x195b0`, from `0x67d50` when the last renderer closes).
             RENDER_STOP => {
                 state.renderer = None;
                 self.send(state, RENDERER, RENDER_STOP);
+                let [low, high] = state.renderer_instance;
+                self.enqueue(DSP_QUEUE, &[5, STATUS_EXITED, low, high, 0, 0])?;
+                self.send(state, APP_SERVICE, STATUS_EXITED);
             }
             _ => return Err(format!("renderer message {message} is not modeled")),
         }
@@ -1022,11 +1041,13 @@ mod tests {
         let mut request = [0u32; 1 + LAUNCH_WORDS];
         request[0] = LAUNCH_WORDS as u32;
         request[1] = RENDERER_APP;
+        request[2] = 0x4321;
         request[1 + LAUNCH_SHARED_DRAM] = 0x8090_0000;
         request[1 + LAUNCH_COMMAND] = LAUNCH_RUN;
         adsp.0.enqueue(HOST_QUEUE, &request).unwrap();
         send(&adsp, &agic, APP_SERVICE, 0);
         receive(&adsp, &agic);
+        while host_dequeue(&ram, DSP_QUEUE).is_some() {}
         send(&adsp, &agic, RENDERER, RENDER_INITIALIZE);
         assert_eq!(
             receive(&adsp, &agic),
@@ -1049,5 +1070,24 @@ mod tests {
         }
         assert!(started.elapsed() >= 2 * FRAME, "frames come in real time");
         assert_eq!(word_at(&ram, 0x8090_000C), 0, "no commands left");
+        // Stop: 52, then the application's exit, which `audio` waits for
+        // before closing the renderer driver.
+        send(&adsp, &agic, RENDERER, RENDER_STOP);
+        assert_eq!(receive(&adsp, &agic), FULL | RENDERER << 20 | RENDER_STOP);
+        assert_eq!(
+            receive(&adsp, &agic),
+            FULL | APP_SERVICE << 20 | STATUS_EXITED
+        );
+        assert_eq!(
+            host_dequeue(&ram, DSP_QUEUE),
+            Some(vec![STATUS_EXITED, 0x4321, 0, 0, 0])
+        );
+        // It can be launched again.
+        adsp.0.enqueue(HOST_QUEUE, &request).unwrap();
+        send(&adsp, &agic, APP_SERVICE, 0);
+        assert_eq!(
+            receive(&adsp, &agic),
+            FULL | APP_SERVICE << 20 | STATUS_STARTED
+        );
     }
 }
