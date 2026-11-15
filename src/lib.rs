@@ -13,7 +13,8 @@
 //! * [`soc`] holds the rest of the system-on-chip and the board devices
 //!   the initial processes drive; [`keys`] loads the console keys the
 //!   secure monitor derives from; [`nand`] makes the eMMC image of a
-//!   console that has the firmware installed.
+//!   console that has the firmware installed, and [`sdcard`] the image of
+//!   a microSD card with files on it.
 //! * [`machine`] ties these into a console and executes it.
 //! * [`symbols`] and [`svc`] name things for traces, and [`ipc`] decodes the
 //!   messages processes send each other.
@@ -33,6 +34,7 @@ pub mod machine;
 pub mod maxwell;
 pub mod memory;
 pub mod nand;
+pub mod sdcard;
 pub mod secmon;
 pub mod soc;
 pub mod svc;

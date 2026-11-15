@@ -36,8 +36,10 @@
 use std::{
     collections::BTreeMap,
     fmt,
+    fs::File,
     io::{self, Read},
     ops::Range,
+    os::unix::fs::FileExt,
 };
 
 pub const SECTOR_SIZE: usize = 512;
@@ -57,6 +59,42 @@ impl<S: Sectors + ?Sized> Sectors for &mut S {
     fn write(&mut self, sector: u64, data: &[u8]) -> io::Result<()> {
         (**self).write(sector, data)
     }
+}
+
+/// A raw image file.
+impl Sectors for File {
+    fn read(&mut self, sector: u64, data: &mut [u8]) -> io::Result<()> {
+        self.read_exact_at(data, sector * SECTOR_SIZE as u64)
+    }
+
+    fn write(&mut self, sector: u64, data: &[u8]) -> io::Result<()> {
+        self.write_all_at(data, sector * SECTOR_SIZE as u64)
+    }
+}
+
+/// An image in memory, whose length is that of the storage.
+impl Sectors for Vec<u8> {
+    fn read(&mut self, sector: u64, data: &mut [u8]) -> io::Result<()> {
+        let range = byte_range(self.len(), sector, data.len())?;
+        data.copy_from_slice(&self[range]);
+        Ok(())
+    }
+
+    fn write(&mut self, sector: u64, data: &[u8]) -> io::Result<()> {
+        let range = byte_range(self.len(), sector, data.len())?;
+        self[range].copy_from_slice(data);
+        Ok(())
+    }
+}
+
+/// Where `length` bytes from `sector` lie in storage of `size` bytes.
+fn byte_range(size: usize, sector: u64, length: usize) -> io::Result<Range<usize>> {
+    usize::try_from(sector)
+        .ok()
+        .and_then(|sector| sector.checked_mul(SECTOR_SIZE))
+        .and_then(|start| Some(start..start.checked_add(length)?))
+        .filter(|range| range.end <= size)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "beyond the end"))
 }
 
 #[derive(Debug)]
@@ -150,6 +188,19 @@ const SIZE_CLASSES: [(u64, u32, u32, Option<FatType>); 8] = [
     (0x40_0000_0000, 128, 32, Some(FatType::Fat32)),
 ];
 
+/// The rows of the filesystem process's formatter for microSD cards
+/// (`FS08_SelectPartitionedFatGeometry`, text `0x119c90`, table at
+/// `0x1f19e8`) for the one FAT type this writer makes: cards above
+/// 0x8287_FFFF bytes and up to 32 GiB, SDHC, get FAT32 with 64 sectors per
+/// cluster and a boundary unit of 8192 sectors (4 MiB), which is the area
+/// in front of the partition and the alignment of its data area. The table
+/// gives smaller cards FAT12 or FAT16, refuses the 40 MiB above 2 GiB and
+/// the 128 MiB above 32 GiB, and gives larger cards exFAT, which this
+/// build of the filesystem process does not format (result `0x249a02`).
+/// These are the rules of the SD Association's file system specification.
+const SD_CARD_FAT32: (std::ops::RangeInclusive<u64>, u32, u32) =
+    (0x8288_0000..=0x8_0000_0000, 64, 8192);
+
 /// The disk geometry the formatter declares (table at `0x1f1908`): largest
 /// partition in bytes, heads, sectors per track. The ranges
 /// [`SIZE_CLASSES`] rejects have no row here.
@@ -177,6 +228,9 @@ pub struct Layout {
     pub reserved_sectors: u32,
     /// Sectors of one of the two FATs.
     pub fat_sectors: u32,
+    /// Sectors in front of the volume on its medium: the partition table's
+    /// area on a microSD card, none on a built-in partition.
+    pub hidden_sectors: u32,
     heads: u8,
     sectors_per_track: u8,
 }
@@ -191,10 +245,7 @@ impl Layout {
             .find(|class| size <= class.0)
             .ok_or_else(unsupported)?;
         let fat_type = fat_type.ok_or_else(unsupported)?;
-        let &(_, heads, sectors_per_track) = GEOMETRIES
-            .iter()
-            .find(|geometry| size <= geometry.0)
-            .ok_or_else(unsupported)?;
+        let &(_, heads, sectors_per_track) = geometry(size).ok_or_else(unsupported)?;
         let total = u32::try_from(sectors).map_err(|_| unsupported())?;
 
         let (entry_bits, root_sectors) = match fat_type {
@@ -224,30 +275,8 @@ impl Layout {
                 }
                 (reserved, fat)
             }
-            FatType::Fat32 => {
-                let mut reserved = MINIMUM_RESERVED;
-                let mut fat = fat_for(total.checked_sub(reserved).ok_or_else(unsupported)?);
-                while fat != 0 {
-                    // The data area starts on a multiple of the alignment;
-                    // the reserved area takes up the slack.
-                    reserved =
-                        (reserved + fat * FAT_COUNT).next_multiple_of(alignment) - fat * FAT_COUNT;
-                    let needed = fat_for(
-                        total
-                            .checked_sub(reserved + fat * FAT_COUNT)
-                            .ok_or_else(unsupported)?,
-                    );
-                    if needed == fat {
-                        break;
-                    }
-                    if needed < fat {
-                        fat -= fat_alignment;
-                    } else {
-                        reserved += alignment;
-                    }
-                }
-                (reserved, fat)
-            }
+            FatType::Fat32 => fat32_areas(total, sectors_per_cluster, alignment, fat_alignment)
+                .ok_or_else(unsupported)?,
         };
         if fat_sectors == 0 {
             return Err(unsupported());
@@ -258,9 +287,42 @@ impl Layout {
             sectors_per_cluster,
             reserved_sectors,
             fat_sectors,
+            hidden_sectors: 0,
             heads,
             sectors_per_track,
         })
+    }
+
+    /// What the formatter computes for the partition of a microSD card of
+    /// `card_sectors` sectors (`SD_CARD_FAT32`): the volume starts one
+    /// boundary unit into the card and its data area on a multiple of one.
+    pub fn for_sd_card(card_sectors: u64) -> Result<Self, FatError> {
+        let size = card_sectors * SECTOR_SIZE as u64;
+        let unsupported = || FatError::UnsupportedSize(size);
+        let (sizes, sectors_per_cluster, boundary_unit) = SD_CARD_FAT32;
+        if !sizes.contains(&size) {
+            return Err(unsupported());
+        }
+        let &(_, heads, sectors_per_track) = geometry(size).ok_or_else(unsupported)?;
+        let total =
+            u32::try_from(card_sectors - u64::from(boundary_unit)).map_err(|_| unsupported())?;
+        let (reserved_sectors, fat_sectors) =
+            fat32_areas(total, sectors_per_cluster, boundary_unit, 1).ok_or_else(unsupported)?;
+        Ok(Self {
+            fat_type: FatType::Fat32,
+            total_sectors: total,
+            sectors_per_cluster,
+            reserved_sectors,
+            fat_sectors,
+            hidden_sectors: boundary_unit,
+            heads,
+            sectors_per_track,
+        })
+    }
+
+    /// Heads and sectors per track the volume declares.
+    pub fn geometry(&self) -> (u8, u8) {
+        (self.heads, self.sectors_per_track)
     }
 
     fn root_sectors(&self) -> u32 {
@@ -278,6 +340,47 @@ impl Layout {
     pub fn cluster_count(&self) -> u32 {
         (self.total_sectors - self.data_start()) / self.sectors_per_cluster
     }
+}
+
+/// The geometry row for a volume of `size` bytes.
+fn geometry(size: u64) -> Option<&'static (u64, u8, u8)> {
+    GEOMETRIES.iter().find(|geometry| size <= geometry.0)
+}
+
+/// Reserved sectors and sectors per FAT of a FAT32 volume of `total`
+/// sectors whose data area starts on a multiple of `alignment` sectors.
+/// The formatter starts from a FAT for nearly the whole volume and shrinks
+/// it for as long as a smaller one still covers what the FATs themselves
+/// leave over; the reserved area takes up the slack the alignment leaves.
+/// `None` if no FAT fits.
+fn fat32_areas(
+    total: u32,
+    sectors_per_cluster: u32,
+    alignment: u32,
+    fat_alignment: u32,
+) -> Option<(u32, u32)> {
+    // Sectors of a FAT with entries for the clusters of `data` sectors
+    // and the two entries before them.
+    let fat_for = |data: u32| {
+        ((data / sectors_per_cluster + 2) * 32)
+            .div_ceil(8 * SECTOR_SIZE as u32)
+            .next_multiple_of(fat_alignment)
+    };
+    let mut reserved = MINIMUM_RESERVED;
+    let mut fat = fat_for(total.checked_sub(reserved)?);
+    while fat != 0 {
+        reserved = (reserved + fat * FAT_COUNT).next_multiple_of(alignment) - fat * FAT_COUNT;
+        let needed = fat_for(total.checked_sub(reserved + fat * FAT_COUNT)?);
+        if needed == fat {
+            break;
+        }
+        if needed < fat {
+            fat -= fat_alignment;
+        } else {
+            reserved += alignment;
+        }
+    }
+    (fat != 0).then_some((reserved, fat))
 }
 
 const BOOT_SIGNATURE: [u8; 2] = [0x55, 0xAA];
@@ -322,6 +425,7 @@ fn boot_sector(layout: &Layout, serial: u32) -> [u8; SECTOR_SIZE] {
     sector[21] = MEDIA_FIXED;
     put16(&mut sector, 24, layout.sectors_per_track.into());
     put16(&mut sector, 26, layout.heads.into());
+    put32(&mut sector, 28, layout.hidden_sectors);
     // What follows the parameter block: drive number, extended signature,
     // serial, label and type name.
     let (extension, type_name) = match layout.fat_type {
@@ -373,13 +477,24 @@ pub fn format(
     serial: u32,
 ) -> Result<Layout, FatError> {
     let layout = Layout::for_partition(sectors, fat_safe)?;
+    format_volume(storage, &layout, serial)?;
+    Ok(layout)
+}
+
+/// Makes `storage`, from its first sector, the empty volume `layout`
+/// describes.
+pub fn format_volume(
+    storage: &mut impl Sectors,
+    layout: &Layout,
+    serial: u32,
+) -> Result<(), FatError> {
     let sector_bytes = |sectors: u32| sectors as usize * SECTOR_SIZE;
 
     let mut reserved = vec![0; sector_bytes(layout.reserved_sectors)];
     let mut put = |sector: u16, contents: &[u8; SECTOR_SIZE]| {
         reserved[sector_bytes(sector.into())..][..SECTOR_SIZE].copy_from_slice(contents);
     };
-    let boot = boot_sector(&layout, serial);
+    let boot = boot_sector(layout, serial);
     put(0, &boot);
     let mut fat = vec![0; sector_bytes(layout.fat_sectors)];
     let root_sectors = match layout.fat_type {
@@ -411,7 +526,7 @@ pub fn format(
     // first of them.
     let root = layout.reserved_sectors + layout.fat_sectors * FAT_COUNT;
     storage.write(root.into(), &vec![0; sector_bytes(root_sectors)])?;
-    Ok(layout)
+    Ok(())
 }
 
 const ATTRIBUTE_VOLUME: u8 = 0x08;

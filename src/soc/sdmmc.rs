@@ -1,13 +1,20 @@
 //! SD/MMC host controller: SD Host Controller specification registers plus
 //! the Tegra vendor block, and the card in its slot.
 //!
-//! The filesystem process brings up the eMMC port as soon as it starts.
-//! With a module fitted, commands reach the card and data moves by SDMA:
-//! the controller masters the bus and copies blocks between the card and
-//! the buffer the driver names, through the SMMU, pausing at every buffer
-//! boundary for the driver to confirm the next address. Without a module
+//! The filesystem process brings up the eMMC port as soon as it starts,
+//! and the microSD port once a card is detected in the slot. With a card
+//! fitted, commands reach it ([`Card`]) and data moves by SDMA: the
+//! controller masters the bus and copies blocks between the card and the
+//! buffer the driver names, through the SMMU, pausing at every buffer
+//! boundary for the driver to confirm the next address. Without a card
 //! the controller is still fully there, but no card ever answers, and every
 //! command that expects a response ends in a command timeout.
+//!
+//! The present state register shows the levels of the CMD and DAT lines.
+//! They idle high, pulled up; a microSD card drives them low while it
+//! switches its signaling to 1.8 V, which the driver checks before and
+//! after it does its own part (`FsSdmmc_SwitchSdVoltage`, FS text
+//! `0x1ba1e0`, reads bits 23:20).
 //!
 //! Clocks are stable, and resets and calibrations over, by the time the
 //! register write that starts them returns, and so is a command that moves
@@ -38,12 +45,47 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{
-    Notes,
-    emmc::{Emmc, Response},
-    mc::DeviceMemory,
-};
+use super::{Notes, mc::DeviceMemory};
 use crate::bus::MmioDevice;
+
+/// What a card answers to a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Response {
+    /// The 32-bit payload of a 48-bit response.
+    Short(u32),
+    /// Bits 127..8 of a 136-bit response, most significant byte first.
+    Long([u8; 15]),
+}
+
+/// A card on the controller's command and data lines.
+pub trait Card: Send {
+    /// Executes one command. `None` is no response: the command expects
+    /// none, or the card ignored it.
+    fn command(&mut self, index: u8, argument: u32) -> Option<Response>;
+
+    /// The next block the card sends. `None` when it is not sending, or
+    /// `block` is not the size of what it sends.
+    fn send_block(&mut self, block: &mut [u8]) -> Option<()>;
+
+    /// Takes the next block the host sends. `None` when the card is not
+    /// receiving or cannot store the block.
+    fn receive_block(&mut self, block: &[u8]) -> Option<()>;
+
+    /// Consumes the tuning block if that is what the card is sending.
+    fn take_tuning_block(&mut self) -> bool;
+
+    /// Whether the card drives its CMD and DAT lines low.
+    fn holds_lines_low(&self) -> bool {
+        false
+    }
+
+    /// The host has started the bus clock, with 1.8 V signaling enabled
+    /// or not.
+    fn clock_started(&mut self, _signaling_1v8: bool) {}
+
+    /// The card's supply was switched on or off.
+    fn power(&mut self, _on: bool) {}
+}
 
 /// Register block of one controller.
 pub const SIZE: u64 = 0x200;
@@ -74,10 +116,11 @@ const VENDOR_DLLCAL_CFG: usize = 0x1B0;
 const VENDOR_TUNING_CNTRL0: usize = 0x1C0;
 const AUTO_CAL_CONFIG: usize = 0x1E4;
 
-/// The CMD and DAT lines idle high: nothing is driving them.
+/// The CMD line (bit 24) and DAT[3:0] (bits 23:20) idle high: nothing is
+/// driving them.
 const PRESENT_STATE_IDLE: u32 = 0x01F0_0000;
 /// Command inhibit, for the command line and for the data lines.
-const PRESENT_STATE_INHIBIT: u8 = 0x03;
+const PRESENT_STATE_INHIBIT: u32 = 0x03;
 
 /// Block size register: the transfer block size, and above it the size of
 /// the SDMA buffer as a power of two times 4 KiB.
@@ -101,6 +144,7 @@ const HOST_CONTROL_DMA_SELECT: u8 = 3 << 3;
 
 const CLOCK_INTERNAL_ENABLE: u8 = 1 << 0;
 const CLOCK_INTERNAL_STABLE: u8 = 1 << 1;
+const CLOCK_SD_ENABLE: u8 = 1 << 2;
 
 const RESET_ALL: u8 = 1 << 0;
 const RESET_DATA: u8 = 1 << 2;
@@ -117,6 +161,8 @@ const NORMAL_ERROR: u16 = 1 << 15;
 const ERROR_COMMAND_TIMEOUT: u16 = 1 << 0;
 const ERROR_DATA_TIMEOUT: u16 = 1 << 4;
 
+/// The driver's side of the switch to 1.8 V signaling.
+const CONTROL_2_SIGNALING_1V8: u16 = 1 << 3;
 const CONTROL_2_EXECUTE_TUNING: u16 = 1 << 6;
 const CONTROL_2_SAMPLING_CLOCK_SELECT: u16 = 1 << 7;
 const CONTROL_2_VERSION_4: u16 = 1 << 12;
@@ -172,6 +218,18 @@ impl Timing {
         block_read: Duration::from_micros(3),
         block_write: Duration::from_micros(10),
     };
+
+    /// A microSD card of the classes [`super::sdcard`] reports (speed
+    /// class 10, UHS speed grade 1) at SDR104, scaled from [`Self::EMMC`]
+    /// by what those classes promise rather than measured on a card: an
+    /// access in the order of a millisecond (the CSD's read access time,
+    /// `TAAC`, is 1 ms), reads near the 104 MB/s of the bus, sequential
+    /// writes a few times faster than the 10 MB/s floor of the class.
+    pub const SD_CARD: Self = Self {
+        access: Duration::from_micros(500),
+        block_read: Duration::from_micros(6),
+        block_write: Duration::from_micros(17),
+    };
 }
 
 pub struct Sdmmc {
@@ -188,7 +246,7 @@ pub struct Sdmmc {
 struct Host {
     /// The register block, byte for byte.
     registers: [u8; SIZE as usize],
-    card: Option<Emmc>,
+    card: Option<Box<dyn Card>>,
     /// The data transfer in progress, waiting at a buffer boundary.
     transfer: Option<Transfer>,
     /// Tuning commands seen since tuning was started.
@@ -354,11 +412,11 @@ impl Host {
 
 impl Sdmmc {
     /// `memory` is what the controller reaches when it masters the bus;
-    /// `card` is the module in the slot, if one is fitted.
+    /// `card` is the card in the slot, if one is fitted.
     pub fn new(
         interrupt: InterruptLine,
         memory: DeviceMemory,
-        card: Option<Emmc>,
+        card: Option<Box<dyn Card>>,
         timing: Timing,
         notes: Arc<Notes>,
     ) -> Self {
@@ -396,6 +454,17 @@ impl Sdmmc {
             notes,
             waits,
         }
+    }
+
+    /// What switches the supply of the card in the slot: the board's
+    /// regulator enable, for whoever models the pin that drives it.
+    pub fn card_supply(&self) -> Box<dyn Fn(bool) + Send + Sync> {
+        let host = Arc::clone(&self.host);
+        Box::new(move |on| {
+            if let Some(card) = host.lock().unwrap().card.as_mut() {
+                card.power(on);
+            }
+        })
     }
 
     /// A command was issued. `None` if it needs something that is not
@@ -445,7 +514,11 @@ impl Sdmmc {
         if control & CONTROL_2_EXECUTE_TUNING != 0 {
             // The controller samples the tuning block itself and only tells
             // the driver that one arrived.
-            if !host.card.as_mut().is_some_and(Emmc::take_tuning_block) {
+            if !host
+                .card
+                .as_mut()
+                .is_some_and(|card| card.take_tuning_block())
+            {
                 host.raise_error(ERROR_DATA_TIMEOUT);
                 return Some(());
             }
@@ -606,9 +679,25 @@ impl MmioDevice for Sdmmc {
         let registers = &host.registers;
         let mut bytes = [0; 8];
         bytes[..size].copy_from_slice(&registers[offset..offset + size]);
-        // Neither line is free while the card is at work.
-        if offset == PRESENT_STATE && host.held.is_some() {
-            bytes[0] |= PRESENT_STATE_INHIBIT;
+        let read = offset..offset + size;
+        if offset < PRESENT_STATE + 4 && PRESENT_STATE < read.end {
+            let mut state = u32_at(registers, PRESENT_STATE);
+            // Neither line is free while the card is at work.
+            if host.held.is_some() {
+                state |= PRESENT_STATE_INHIBIT;
+            }
+            if host
+                .card
+                .as_ref()
+                .is_some_and(|card| card.holds_lines_low())
+            {
+                state &= !PRESENT_STATE_IDLE;
+            }
+            for (at, byte) in (PRESENT_STATE..).zip(state.to_le_bytes()) {
+                if read.contains(&at) {
+                    bytes[at - offset] = byte;
+                }
+            }
         }
         // The error summary bit lives in the high byte of the normal status.
         if (offset..offset + size).contains(&(NORMAL_INTERRUPT_STATUS + 1))
@@ -627,6 +716,7 @@ impl MmioDevice for Sdmmc {
         let mut guard = self.host.lock().unwrap();
         let host = &mut *guard;
         host.settle(false);
+        let clock_was_running = host.registers[CLOCK_CONTROL] & CLOCK_SD_ENABLE != 0;
         for (index, byte) in value.to_le_bytes()[..size].iter().copied().enumerate() {
             let at = offset + index;
             let registers = &mut host.registers;
@@ -663,6 +753,12 @@ impl MmioDevice for Sdmmc {
                     }
                 }
                 _ => registers[at] = byte,
+            }
+        }
+        if !clock_was_running && host.registers[CLOCK_CONTROL] & CLOCK_SD_ENABLE != 0 {
+            let signaling_1v8 = u16_at(&host.registers, HOST_CONTROL_2) & CONTROL_2_SIGNALING_1V8;
+            if let Some(card) = host.card.as_mut() {
+                card.clock_started(signaling_1v8 != 0);
             }
         }
         let written = offset..offset + size;
@@ -734,6 +830,11 @@ mod tests {
         }
 
         fn timed(card: bool, timing: Timing) -> Self {
+            let card = card.then(|| Box::new(emmc::tests::selected(0x80_0000)) as Box<dyn Card>);
+            Self::with_card(card, timing)
+        }
+
+        fn with_card(card: Option<Box<dyn Card>>, timing: Timing) -> Self {
             let ram = Arc::new(GuestRam::new(RAM_BASE, 0x2_0000).unwrap());
             let memory_controller = Arc::new(mc::Mc::new(DramSize::Gb4));
             let write = |register: u64, value: u32| {
@@ -761,7 +862,7 @@ mod tests {
             let sdmmc = Sdmmc::new(
                 Box::new(move |level| output.store(level, Ordering::SeqCst)),
                 DeviceMemory::new(&memory_controller, &ram, mc::SMMU_SDMMC4A_ASID),
-                card.then(|| emmc::tests::selected(0x80_0000)),
+                card,
                 timing,
                 Arc::default(),
             );
@@ -952,6 +1053,36 @@ mod tests {
             bench.read(ERROR_INTERRUPT_STATUS, 2),
             u64::from(ERROR_DATA_TIMEOUT)
         );
+    }
+
+    #[test]
+    fn present_state_shows_the_lines_low_through_a_voltage_switch() {
+        use super::super::sdcard::{SdCard, SdCardImage};
+        let image = SdCardImage::memory(vec![0; (0x1010 + 1) << 19]).unwrap();
+        let mut card = SdCard::new(image, Arc::default());
+        card.power(true);
+        let bench = Bench::with_card(Some(Box::new(card)), Timing::INSTANT);
+        let command = |index: u16, argument: u64| {
+            bench.write(ARGUMENT, 4, argument);
+            bench.write(COMMAND, 2, (index << 8 | 0x1A).into());
+            bench.read(RESPONSE, 4)
+        };
+        command(0, 0);
+        assert_eq!(command(8, 0x1AA), 0x1AA);
+        command(55, 0);
+        assert_eq!(command(41, 0x5110_0000) >> 24, 0xC1, "ready, S18A");
+        bench.write(CLOCK_CONTROL, 2, 0x0007);
+        command(11, 0);
+        // The driver stops the clock and finds DAT[3:0] low.
+        bench.write(CLOCK_CONTROL, 2, 0x0003);
+        assert_eq!(bench.read(PRESENT_STATE, 4) & 0x01F0_0000, 0);
+        // A clock at 3.3 V signaling leaves them low; at 1.8 V they rise.
+        bench.write(CLOCK_CONTROL, 2, 0x0007);
+        assert_eq!(bench.read(PRESENT_STATE + 2, 1), 0);
+        bench.write(CLOCK_CONTROL, 2, 0x0003);
+        bench.write(HOST_CONTROL_2, 2, CONTROL_2_SIGNALING_1V8.into());
+        bench.write(CLOCK_CONTROL, 2, 0x0007);
+        assert_eq!(bench.read(PRESENT_STATE, 4), u64::from(PRESENT_STATE_IDLE));
     }
 
     #[test]

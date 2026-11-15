@@ -1,12 +1,8 @@
 //! The eMMC module: a JEDEC eMMC 5.0 device with a user area and two boot
 //! partitions, as it answers on its command and data lines.
 //!
-//! What the module stores comes from image files; the emulator has no
-//! contents of its own to offer. Whatever an image does not cover reads as
-//! zeros, the erased state. Writes are kept in host memory and never reach
-//! the images, so every run starts from the same storage, unless the images
-//! are opened as writable: then writes go to the files and the next run
-//! finds what this one left.
+//! What the module stores comes from image files (`soc::medium`); the
+//! emulator has no contents of its own to offer.
 //!
 //! Erased boot partitions are a state `boot` accepts. Its boot image check
 //! reads 0x4000 bytes at 0xFC000 of the first one, where the system
@@ -21,11 +17,14 @@
 //! protected partition and the boot operation mode are not modeled; their
 //! commands are illegal here and leave a note.
 
-use std::{collections::HashMap, fs::File, io, os::unix::fs::FileExt, sync::Arc};
+use std::{fs::File, io, sync::Arc};
 
-use super::Notes;
+use super::{
+    Notes,
+    medium::{Medium, SECTOR_SIZE},
+    sdmmc::{Card, Response},
+};
 
-pub const SECTOR_SIZE: usize = 512;
 const EXT_CSD_SIZE: usize = 512;
 
 /// Each boot partition: 4 MiB.
@@ -110,65 +109,8 @@ mod status {
     pub const CURRENT_STATE_SHIFT: u32 = 9;
 }
 
-/// One partition's contents: an optional image, and the sectors written
-/// during this run, laid over it in memory or written into it.
-struct Storage {
-    sectors: u64,
-    image: Option<File>,
-    /// Whether writes go to the image.
-    write_through: bool,
-    written: HashMap<u64, Box<[u8; SECTOR_SIZE]>>,
-}
-
-impl Storage {
-    fn new(sectors: u64, image: Option<File>, writable: bool) -> Self {
-        Self {
-            sectors,
-            write_through: writable && image.is_some(),
-            image,
-            written: HashMap::new(),
-        }
-    }
-
-    fn read(&self, sector: u64, block: &mut [u8]) -> Option<()> {
-        if sector >= self.sectors || block.len() != SECTOR_SIZE {
-            return None;
-        }
-        if let Some(written) = self.written.get(&sector) {
-            block.copy_from_slice(&written[..]);
-            return Some(());
-        }
-        block.fill(0);
-        if let Some(image) = &self.image {
-            // A short image leaves the rest of the partition erased.
-            let mut filled = 0;
-            while filled < SECTOR_SIZE {
-                let offset = sector * SECTOR_SIZE as u64 + filled as u64;
-                match image.read_at(&mut block[filled..], offset) {
-                    Ok(0) => break,
-                    Ok(count) => filled += count,
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(error) => panic!("cannot read the eMMC image: {error}"),
-                }
-            }
-        }
-        Some(())
-    }
-
-    fn write(&mut self, sector: u64, block: &[u8]) -> Option<()> {
-        let block: &[u8; SECTOR_SIZE] = block.try_into().ok()?;
-        (sector < self.sectors).then_some(())?;
-        match &self.image {
-            Some(image) if self.write_through => image
-                .write_all_at(block, sector * SECTOR_SIZE as u64)
-                .unwrap_or_else(|error| panic!("cannot write the eMMC image: {error}")),
-            _ => {
-                self.written.insert(sector, Box::new(*block));
-            }
-        }
-        Some(())
-    }
-}
+/// The device name in messages about its image files.
+const DEVICE: &str = "eMMC";
 
 /// Image files behind the module's partitions.
 pub struct EmmcImages {
@@ -230,17 +172,9 @@ enum Data {
     Sectors { next: u64, left: Option<u32> },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Response {
-    /// The 32-bit payload of a 48-bit response.
-    Short(u32),
-    /// Bits 127..8 of a 136-bit response, most significant byte first.
-    Long([u8; 15]),
-}
-
 pub struct Emmc {
     /// User area, boot partition 1, boot partition 2.
-    partitions: [Storage; 3],
+    partitions: [Medium; 3],
     state: State,
     rca: u16,
     ext_csd: [u8; EXT_CSD_SIZE],
@@ -269,12 +203,17 @@ impl Emmc {
                     return Err(ImageError::BootPartitionSize(size));
                 }
             }
-            Ok(Storage::new(BOOT_PARTITION_SECTORS, image, images.writable))
+            Ok(Medium::new(
+                DEVICE,
+                BOOT_PARTITION_SECTORS,
+                image,
+                images.writable,
+            ))
         };
         let [boot1, boot2] = images.boot;
         Ok(Self::with_storage(
             [
-                Storage::new(sectors, Some(images.user), images.writable),
+                Medium::new(DEVICE, sectors, Some(images.user), images.writable),
                 boot(boot1)?,
                 boot(boot2)?,
             ],
@@ -282,7 +221,7 @@ impl Emmc {
         ))
     }
 
-    fn with_storage(partitions: [Storage; 3], notes: Arc<Notes>) -> Self {
+    fn with_storage(partitions: [Medium; 3], notes: Arc<Notes>) -> Self {
         let mut ext_csd = [0; EXT_CSD_SIZE];
         let mut set = |field: usize, value: u8| ext_csd[field] = value;
         // Revision 1.7 of the register: eMMC 5.0.
@@ -309,7 +248,7 @@ impl Emmc {
         set(ext_csd::PRE_EOL_INFO, 1);
         set(ext_csd::DEVICE_LIFE_TIME_EST_TYP_A, 1);
         set(ext_csd::DEVICE_LIFE_TIME_EST_TYP_B, 1);
-        let sectors = partitions[0].sectors as u32;
+        let sectors = partitions[0].sectors() as u32;
         ext_csd[ext_csd::SEC_COUNT..ext_csd::SEC_COUNT + 4].copy_from_slice(&sectors.to_le_bytes());
         Self {
             partitions,
@@ -335,14 +274,80 @@ impl Emmc {
         ))
     }
 
-    fn selected_partition(&mut self) -> Option<&mut Storage> {
+    fn selected_partition(&mut self) -> Option<&mut Medium> {
         let access = self.ext_csd[ext_csd::PARTITION_CONFIG] & ext_csd::PARTITION_ACCESS;
         self.partitions.get_mut(usize::from(access))
     }
 
+    fn start_transfer(
+        &mut self,
+        sector: u32,
+        blocks: Option<u32>,
+        state: State,
+    ) -> Option<Response> {
+        let sector = u64::from(sector);
+        let in_range = self
+            .selected_partition()
+            .is_some_and(|partition| sector < partition.sectors());
+        if !in_range {
+            self.errors |= status::ADDRESS_OUT_OF_RANGE;
+            return self.r1();
+        }
+        let response = self.r1();
+        self.data = Some(Data::Sectors {
+            next: sector,
+            left: blocks,
+        });
+        self.state = state;
+        response
+    }
+
+    /// `SWITCH`: changes one byte of the extended CSD. What goes wrong is
+    /// reported by the next status response.
+    fn switch(&mut self, argument: u32) {
+        let [_, value, index, access] = argument.to_le_bytes();
+        let index = usize::from(index);
+        let current = self.ext_csd[index];
+        let value = match access & 3 {
+            1 => current | value,
+            2 => current & !value,
+            3 => value,
+            // Command set selection; there is only the standard one.
+            _ => return self.refuse_switch(argument),
+        };
+        let acceptable = match index {
+            // The replay protected partition cannot be selected.
+            ext_csd::PARTITION_CONFIG => value & ext_csd::PARTITION_ACCESS < 3,
+            // 1, 4 or 8 lines, the wider two also at dual data rate.
+            ext_csd::BUS_WIDTH => matches!(value, 0 | 1 | 2 | 5 | 6),
+            // Backwards compatible, high speed, HS200, HS400.
+            ext_csd::HS_TIMING => value & ext_csd::TIMING_INTERFACE <= 3,
+            _ => ext_csd::WRITABLE.contains(&index),
+        };
+        if !acceptable {
+            return self.refuse_switch(argument);
+        }
+        self.ext_csd[index] = value;
+    }
+
+    fn refuse_switch(&mut self, argument: u32) {
+        self.errors |= status::SWITCH_ERROR;
+        self.notes
+            .add(format!("eMMC refused SWITCH with argument {argument:#x}"));
+    }
+
+    fn end_of_block(&mut self, left: Option<u32>) {
+        if left == Some(0) {
+            self.data = None;
+            self.state = State::Transfer;
+        }
+    }
+}
+
+impl Card for Emmc {
     /// Executes one command. `None` is no response: the command expects
     /// none, or the card ignored it.
-    pub fn command(&mut self, index: u8, argument: u32) -> Option<Response> {
+    fn command(&mut self, index: u8, argument: u32) -> Option<Response> {
         use State::*;
         let addressed = (argument >> 16) as u16 == self.rca;
         let block_count = self.block_count.take();
@@ -450,73 +455,9 @@ impl Emmc {
         }
     }
 
-    fn start_transfer(
-        &mut self,
-        sector: u32,
-        blocks: Option<u32>,
-        state: State,
-    ) -> Option<Response> {
-        let sector = u64::from(sector);
-        let in_range = self
-            .selected_partition()
-            .is_some_and(|partition| sector < partition.sectors);
-        if !in_range {
-            self.errors |= status::ADDRESS_OUT_OF_RANGE;
-            return self.r1();
-        }
-        let response = self.r1();
-        self.data = Some(Data::Sectors {
-            next: sector,
-            left: blocks,
-        });
-        self.state = state;
-        response
-    }
-
-    /// `SWITCH`: changes one byte of the extended CSD. What goes wrong is
-    /// reported by the next status response.
-    fn switch(&mut self, argument: u32) {
-        let [_, value, index, access] = argument.to_le_bytes();
-        let index = usize::from(index);
-        let current = self.ext_csd[index];
-        let value = match access & 3 {
-            1 => current | value,
-            2 => current & !value,
-            3 => value,
-            // Command set selection; there is only the standard one.
-            _ => return self.refuse_switch(argument),
-        };
-        let acceptable = match index {
-            // The replay protected partition cannot be selected.
-            ext_csd::PARTITION_CONFIG => value & ext_csd::PARTITION_ACCESS < 3,
-            // 1, 4 or 8 lines, the wider two also at dual data rate.
-            ext_csd::BUS_WIDTH => matches!(value, 0 | 1 | 2 | 5 | 6),
-            // Backwards compatible, high speed, HS200, HS400.
-            ext_csd::HS_TIMING => value & ext_csd::TIMING_INTERFACE <= 3,
-            _ => ext_csd::WRITABLE.contains(&index),
-        };
-        if !acceptable {
-            return self.refuse_switch(argument);
-        }
-        self.ext_csd[index] = value;
-    }
-
-    fn refuse_switch(&mut self, argument: u32) {
-        self.errors |= status::SWITCH_ERROR;
-        self.notes
-            .add(format!("eMMC refused SWITCH with argument {argument:#x}"));
-    }
-
-    fn end_of_block(&mut self, left: Option<u32>) {
-        if left == Some(0) {
-            self.data = None;
-            self.state = State::Transfer;
-        }
-    }
-
     /// The next block the card sends. `None` when it is not sending, or
     /// `block` is not the size of what it sends.
-    pub fn send_block(&mut self, block: &mut [u8]) -> Option<()> {
+    fn send_block(&mut self, block: &mut [u8]) -> Option<()> {
         (self.state == State::SendingData).then_some(())?;
         match self.data.as_mut()? {
             Data::Block(bytes) => {
@@ -544,7 +485,7 @@ impl Emmc {
 
     /// Takes the next block the host sends. `None` when the card is not
     /// receiving or cannot store the block.
-    pub fn receive_block(&mut self, block: &[u8]) -> Option<()> {
+    fn receive_block(&mut self, block: &[u8]) -> Option<()> {
         (self.state == State::ReceivingData).then_some(())?;
         let Data::Sectors { next, left } = self.data.as_mut()? else {
             return None;
@@ -564,7 +505,7 @@ impl Emmc {
     }
 
     /// Consumes the tuning block if that is what the card is sending.
-    pub fn take_tuning_block(&mut self) -> bool {
+    fn take_tuning_block(&mut self) -> bool {
         let tuning = self.state == State::SendingData && matches!(self.data, Some(Data::Tuning));
         if tuning {
             self.end_of_block(Some(0));
@@ -579,9 +520,9 @@ pub(crate) mod tests {
 
     /// A card with blank storage of `sectors` user sectors.
     pub(crate) fn blank(sectors: u64) -> Emmc {
-        let boot = || Storage::new(BOOT_PARTITION_SECTORS, None, false);
+        let boot = || Medium::new(DEVICE, BOOT_PARTITION_SECTORS, None, false);
         Emmc::with_storage(
-            [Storage::new(sectors, None, false), boot(), boot()],
+            [Medium::new(DEVICE, sectors, None, false), boot(), boot()],
             Arc::default(),
         )
     }

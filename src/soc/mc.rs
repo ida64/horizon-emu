@@ -35,6 +35,9 @@ pub const SMMU_SDMMC4A_ASID: u64 = 0xAA0;
 /// Address space register of the game card port's host controller (two
 /// registers below the eMMC port's, as the SDMMC ports are numbered).
 pub const SMMU_SDMMC2A_ASID: u64 = 0xA98;
+/// Address space register of the microSD port's host controller (the one
+/// below the game card port's).
+pub const SMMU_SDMMC1A_ASID: u64 = 0xA94;
 /// Address space register of the GPU: the one the kernel's device table
 /// (kernel `0x800D83B8`, indexed by device name) gives device name 25, the
 /// only one nvservices attaches the GPU's address space to

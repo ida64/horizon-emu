@@ -30,12 +30,14 @@ pub mod max17050;
 pub mod max77620;
 pub mod max77621;
 pub mod mc;
+mod medium;
 pub mod mipi_cal;
 pub mod pcie;
 pub mod bcm4356;
 pub mod pcie_endpoint;
 pub mod pmc;
 pub mod regs;
+pub mod sdcard;
 pub mod sdmmc;
 pub mod serial;
 pub mod spi;
@@ -77,7 +79,8 @@ use self::{
     mipi_cal::MipiCal,
     pmc::Pmc,
     regs::RegisterFile,
-    sdmmc::Sdmmc,
+    sdcard::{SdCard, SdCardImage},
+    sdmmc::{Card, Sdmmc},
     tmr::Timers,
 };
 
@@ -103,6 +106,18 @@ const I2C1_INTID: u32 = 32 + 38;
 const I2C5_BASE: u64 = 0x7000_D000;
 const I2C5_INTID: u32 = 32 + 53;
 
+/// SDMMC1: the microSD slot's port (base and interrupt as in the public
+/// Linux `tegra210.dtsi`). The filesystem process starts it once the
+/// slot's card detect reports a card ([`GPIO_INPUTS`], port Z).
+const SDMMC1_BASE: u64 = 0x700B_0000;
+const SDMMC1_INTID: u32 = 32 + 14;
+/// The microSD card's supply enable, GPIO E4. The clock and power driver
+/// drives it high when the filesystem process enables the card's
+/// regulator (FS `rgltr` request 0 is followed by a masked write of
+/// `0x1010` to `0x6000d1a0`) and low when it disables it.
+const SD_CARD_SUPPLY: (usize, u8) = (4, 4);
+/// The microSD slot's card detect switch, GPIO Z1; see [`GPIO_INPUTS`].
+const SD_CARD_DETECT: (usize, u8) = (25, 1);
 /// SDMMC4: the eMMC port.
 const SDMMC4_BASE: u64 = 0x700B_0600;
 const SDMMC4_INTID: u32 = 32 + 31;
@@ -221,9 +236,11 @@ const FUSE_USB_CALIB_EXT: u64 = 0x350;
 ///
 /// Port Z: the card detect switch of the microSD slot on pin 1 pulls to
 /// ground when a card is in (pin assignment recalled from the same
-/// sources); the slot is empty. The firmware's GPIO driver samples the
-/// port once its clock driver is up (Bus, read of `0x6000d634`). The
-/// port's other pins read low, which is an assumption.
+/// sources; the filesystem process's driver starts the port, and asks for
+/// the card's supply, after reading the pin low). The slot is empty unless
+/// a card image is given ([`SD_CARD_DETECT`]). The firmware's GPIO driver
+/// samples the port once its clock driver is up (Bus, read of
+/// `0x6000d634`). The port's other pins read low, which is an assumption.
 /// Touch IRQ X1 is active-low; motion IRQ X2 is idle low. Rail detect E6
 /// is pulled high with no left Joy-Con (hekate `joycon.c`, active-low
 /// detection). Assignments: Atmosphere `gpio_internal_pad_map_combination.inc`.
@@ -292,12 +309,14 @@ pub struct Soc {
 
 impl Soc {
     /// Builds every block and places it at its address on `bus`. `emmc`
-    /// holds the contents of the eMMC module; without it the slot is empty.
+    /// holds the contents of the eMMC module and `sd_card` those of the
+    /// microSD card; without them their slots are empty.
     pub fn new(
         params: &BootParams,
         gic: &Arc<Gic>,
         ram: &Arc<GuestRam>,
         emmc: Option<EmmcImages>,
+        sd_card: Option<SdCardImage>,
         bus: &mut Bus,
     ) -> Result<Self, ImageError> {
         let mc = Arc::new(Mc::new(params.dram));
@@ -357,6 +376,11 @@ impl Soc {
             GPIO_INPUTS,
             gpio::INTIDS.map(|intid| line(gic, intid)),
         ));
+        if sd_card.is_some() {
+            let (port, pin) = SD_CARD_DETECT;
+            gpio.set_input(port, pin, false)
+                .expect("the card detect port has its inputs listed");
+        }
         let touch_gpio = Arc::downgrade(&gpio);
         let touch_input = Arc::new(touch::TouchInput::new(Box::new(move |asserted| {
             if let Some(gpio) = touch_gpio.upgrade() {
@@ -595,7 +619,8 @@ impl Soc {
         );
         let emmc = emmc
             .map(|images| Emmc::new(images, Arc::clone(&soc.notes)))
-            .transpose()?;
+            .transpose()?
+            .map(|emmc| Box::new(emmc) as Box<dyn Card>);
         let sdmmc4 = Sdmmc::new(
             soc.line(SDMMC4_INTID),
             DeviceMemory::new(&soc.mc, ram, mc::SMMU_SDMMC4A_ASID),
@@ -612,6 +637,22 @@ impl Soc {
             Arc::clone(&soc.notes),
         );
         bus.map("SDMMC2", SDMMC2_BASE, sdmmc::SIZE, Box::new(sdmmc2));
+        let sd_card = sd_card
+            .map(|image| Box::new(SdCard::new(image, Arc::clone(&soc.notes))) as Box<dyn Card>);
+        let sdmmc1 = Sdmmc::new(
+            soc.line(SDMMC1_INTID),
+            DeviceMemory::new(&soc.mc, ram, mc::SMMU_SDMMC1A_ASID),
+            sd_card,
+            sdmmc::Timing::SD_CARD,
+            Arc::clone(&soc.notes),
+        );
+        let supply = sdmmc1.card_supply();
+        soc.gpio.observe_output(Box::new(move |port, pin, high| {
+            if (port, pin) == SD_CARD_SUPPLY {
+                supply(high);
+            }
+        }));
+        bus.map("SDMMC1", SDMMC1_BASE, sdmmc::SIZE, Box::new(sdmmc1));
         Ok(soc)
     }
 

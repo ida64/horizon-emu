@@ -33,6 +33,7 @@ use crate::{
         dc::NoFrame,
         emmc::{EmmcImages, ImageError},
         mc::{self, DeviceMemory},
+        sdcard::SdCardImage,
     },
     svc,
     timer::{PHYSICAL_TIMER_INTID, TimerRegister, Timers},
@@ -582,12 +583,14 @@ pub struct Machine {
 impl Machine {
     /// Builds the machine in its state at kernel entry: image in DRAM, no
     /// core running. `emmc` holds the contents of the eMMC module, if one is
-    /// fitted. `uart_output` receives what the guest sends to UART-A.
+    /// fitted, and `sd_card` those of the microSD card, if one is in the
+    /// slot. `uart_output` receives what the guest sends to UART-A.
     pub fn new(
         image: KernelImage,
         params: &BootParams,
         keys: KeySet,
         emmc: Option<EmmcImages>,
+        sd_card: Option<SdCardImage>,
         uart_output: Box<dyn io::Write + Send>,
     ) -> Result<Self, MachineError> {
         let size =
@@ -627,7 +630,8 @@ impl Machine {
             GIC_CPU_INTERFACE_SIZE,
             Box::new(GicCpuInterface(Arc::clone(&gic))),
         );
-        let soc = Soc::new(params, &gic, &ram, emmc, &mut bus).map_err(MachineError::Emmc)?;
+        let soc =
+            Soc::new(params, &gic, &ram, emmc, sd_card, &mut bus).map_err(MachineError::Emmc)?;
 
         Ok(Self {
             vm,

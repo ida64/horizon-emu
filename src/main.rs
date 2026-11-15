@@ -21,9 +21,9 @@ use horizon_emu::{
     ipc::{Client, ResultCode, Tracker},
     keys::KeySet,
     machine::{Caller, CodeAddress, Machine, Place, Poke, Process, RunEnd, RunOptions, TraceEvent},
-    maxwell, nand,
+    maxwell, nand, sdcard,
     secmon::{self, SmcEffect},
-    soc::{dc::Frame, emmc::EmmcImages, joycon::Button},
+    soc::{dc::Frame, emmc::EmmcImages, joycon::Button, sdcard::SdCardImage},
     svc,
     symbols::SymbolTable,
 };
@@ -37,6 +37,7 @@ const USAGE: &str = "\
 usage: horizon-emu info <kernel.elf>
        horizon-emu boot <kernel.elf> [options]
        horizon-emu format-emmc <new image file> [--keys FILE [--firmware DIR]]
+       horizon-emu format-sd <new image file> --size SIZE [--add HOST=CARD ...]
 
 <kernel.elf> is the package2 kernel wrapped as an ELF (see pkg2elf.py).
 boot runs until a core needs something that is not emulated, the kernel
@@ -47,7 +48,11 @@ console's partitions and the calibration data of this emulator's own
 console (its serial number, addresses and sensor values are made up for
 it; it has no device keys or certificates); with --firmware also the
 contents (*.nca) of that directory, installed as the system's programs
-and data.
+and data. format-sd creates a microSD card image for --sd (a sparse
+file) of SIZE bytes (suffix K, M or G for binary multiples; a multiple
+of 512K above 2088M and up to 32G), formatted as the console formats a
+card, with each --add's host file HOST at the absolute path CARD
+(/hbmenu.nro, /switch/foo.nro), directories created as needed.
 
 options:
   --dram 4|6|8        installed DRAM in GiB (default 4)
@@ -76,6 +81,10 @@ options:
   --emmc-boot1 FILE   erased)
   --emmc-writable     write to the eMMC images instead: what the guest
                       stores is there on the next run
+  --sd FILE           raw image of a microSD card, in the slot from power
+                      on (see format-sd); without it the slot is empty.
+                      Writes stay in memory
+  --sd-writable       write to the microSD card image instead
   --window            show the console's screen in a window. Closing it
                       stops the machine and ends the program; when the
                       machine stops by itself, the window stays, showing
@@ -186,6 +195,9 @@ fn run(arguments: &[String]) -> Result<(), String> {
     if command == "format-emmc" {
         return format_emmc(path, flags).map_err(|error| format!("{path}: {error}"));
     }
+    if command == "format-sd" {
+        return format_sd(path, flags).map_err(|error| format!("{path}: {error}"));
+    }
     let image = KernelImage::load(Path::new(path)).map_err(|error| error.to_string())?;
     match command.as_str() {
         "info" if flags.is_empty() => {
@@ -195,6 +207,41 @@ fn run(arguments: &[String]) -> Result<(), String> {
         "boot" => boot(image, flags),
         _ => Err(USAGE.into()),
     }
+}
+
+fn format_sd(path: &str, flags: &[String]) -> Result<(), String> {
+    let (mut size, mut files) = (None, Vec::new());
+    let mut flags = flags.iter();
+    while let Some(flag) = flags.next() {
+        let value = flags.next().ok_or(USAGE)?;
+        match flag.as_str() {
+            "--size" => size = Some(parse_size(value).ok_or("--size: expected bytes, K, M or G")?),
+            "--add" => {
+                let (host, card) = value.split_once('=').ok_or("--add: expected HOST=CARD")?;
+                files.push((host.to_string(), card.to_string()));
+            }
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let size = size.ok_or("format-sd needs --size")?;
+    let mut image = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    sdcard::format_file(&mut image, size, &files)
+}
+
+/// A byte count, with an optional binary multiple: `4G`, `512K`.
+fn parse_size(text: &str) -> Option<u64> {
+    let (digits, shift) = match text.as_bytes().last()? {
+        b'K' => (&text[..text.len() - 1], 10),
+        b'M' => (&text[..text.len() - 1], 20),
+        b'G' => (&text[..text.len() - 1], 30),
+        _ => (text, 0),
+    };
+    digits.parse::<u64>().ok()?.checked_mul(1 << shift)
 }
 
 fn format_emmc(path: &str, flags: &[String]) -> Result<(), String> {
@@ -294,6 +341,7 @@ fn boot(image: KernelImage, flags: &[String]) -> Result<(), String> {
     let mut steps_after_breakpoint = 0;
     let (mut emmc_user, mut emmc_boot) = (None, [None, None]);
     let mut emmc_writable = false;
+    let (mut sd_card, mut sd_writable) = (None, false);
     let mut screenshot = None;
     let mut inputs = Vec::new();
     let mut timed_screenshots = Vec::new();
@@ -403,6 +451,8 @@ fn boot(image: KernelImage, flags: &[String]) -> Result<(), String> {
             "--emmc-boot0" => emmc_boot[0] = Some(value()?),
             "--emmc-boot1" => emmc_boot[1] = Some(value()?),
             "--emmc-writable" => emmc_writable = true,
+            "--sd" => sd_card = Some(value()?),
+            "--sd-writable" => sd_writable = true,
             "--symbols" => {
                 symbols =
                     SymbolTable::load(Path::new(value()?)).map_err(|error| error.to_string())?
@@ -457,10 +507,20 @@ fn boot(image: KernelImage, flags: &[String]) -> Result<(), String> {
         None if emmc_boot.iter().all(Option::is_none) => None,
         None => return Err("eMMC boot partition images need --emmc for the module itself".into()),
     };
+    let sd_card = sd_card
+        .map(|path| {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(sd_writable)
+                .open(path)
+                .map_err(|error| format!("{path}: {error}"))?;
+            SdCardImage::file(file, sd_writable).map_err(|error| format!("{path}: {error}"))
+        })
+        .transpose()?;
     // A machine somebody is watching runs for as long as they watch.
     let timeout = timeout.or((!show_window).then_some(Duration::from_secs(5)));
 
-    let machine = Machine::new(image, &params, keys, emmc, Box::new(io::stderr()))
+    let machine = Machine::new(image, &params, keys, emmc, sd_card, Box::new(io::stderr()))
         .map_err(|error| error.to_string())?;
     let mut window = show_window.then(ScreenWindow::open).transpose()?;
     let stop = AtomicBool::new(false);
