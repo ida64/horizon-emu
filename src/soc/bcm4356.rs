@@ -1152,7 +1152,14 @@ impl State {
         done[16..20].copy_from_slice(&command.to_le_bytes());
         self.complete(dongle, RING_D2H_CONTROL, &done, upstream)?;
         if command == WLC_UP && status == 0 && event_enabled(dongle, WLC_E_IF) {
-            self.event(dongle, 0, WLC_E_IF, WLC_E_STATUS_SUCCESS, &[0, WLC_E_IF_ADD, 0, 0, 0], upstream)?;
+            self.event(
+                dongle,
+                0,
+                WLC_E_IF,
+                WLC_E_STATUS_SUCCESS,
+                &[0, WLC_E_IF_ADD, 0, 0, 0],
+                upstream,
+            )?;
         }
         Ok(())
     }
@@ -1488,7 +1495,10 @@ fn dongle_ioctl(
         // `0x64f90` only compare it with what they want and set it when
         // it differs).
         (_, "btc_params") => {
-            let Some(index) = value.get(..4).map(|b| u32::from_le_bytes(b.try_into().unwrap())) else {
+            let Some(index) = value
+                .get(..4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            else {
                 return Ok(Err(BCME_BADARG));
             };
             let key = format!("btc_params{index}");
@@ -2186,6 +2196,85 @@ mod tests {
         assert_eq!(u32::from_be_bytes(frame[44..48].try_into().unwrap()), 12);
         assert_eq!(le16(&frame, 72 + 8), 0x1234, "sync ID");
         assert_eq!(le16(&frame, 72 + 10), 0, "no BSS");
+    }
+
+    /// After "up" the firmware announces wl0 (WLC_E_IF, ADD) when the
+    /// host's event mask enables it, after the request's completion.
+    #[test]
+    fn up_announces_the_primary_interface() {
+        let (wifi, host) = setup();
+        let shared = u64::from(boot(&wifi));
+        let ring_info = wifi.memory_read(BAR2 + shared + 48, 4).unwrap();
+        let ring_mem = wifi.memory_read(BAR2 + ring_info, 4).unwrap();
+        let h2d_w = wifi.memory_read(BAR2 + ring_info + 4, 4).unwrap();
+        let d2h_w = wifi.memory_read(BAR2 + ring_info + 12, 4).unwrap();
+        let rings = [
+            (HOST, 64, 40),
+            (HOST + 0x1000, 64, 32),
+            (HOST + 0x2000, 64, 24),
+            (HOST + 0x3000, 64, 16),
+            (HOST + 0x4000, 64, 32),
+        ];
+        for (i, (base, items, len)) in rings.iter().enumerate() {
+            let at = BAR2 + ring_mem + 16 * i as u64;
+            wifi.memory_write(at + 4, 2, *items).unwrap();
+            wifi.memory_write(at + 6, 2, *len).unwrap();
+            wifi.memory_write(at + 8, 8, *base).unwrap();
+        }
+        let post = |kind: u8, id: u32, address: u64| {
+            let mut item = vec![0; 40];
+            item[0] = kind;
+            item[4..8].copy_from_slice(&id.to_le_bytes());
+            item[8..10].copy_from_slice(&2016u16.to_le_bytes());
+            item[16..24].copy_from_slice(&address.to_le_bytes());
+            item
+        };
+        let ioctl = |command: u32, len: usize, request: u64| {
+            let mut item = vec![0; 40];
+            item[0] = MSG_IOCTLPTR_REQ;
+            item[8..12].copy_from_slice(&command.to_le_bytes());
+            item[14..16].copy_from_slice(&(len as u16).to_le_bytes());
+            item[24..32].copy_from_slice(&request.to_le_bytes());
+            item
+        };
+        put(&host, HOST, &post(MSG_IOCTLRESP_BUF_POST, 7, HOST + 0x8000));
+        put(
+            &host,
+            HOST + 40,
+            &post(MSG_IOCTLRESP_BUF_POST, 8, HOST + 0x8800),
+        );
+        put(
+            &host,
+            HOST + 80,
+            &post(MSG_EVENT_BUF_POST, 9, HOST + 0xa000),
+        );
+        // Event mask with WLC_E_IF (54: byte 6, bit 6).
+        let mut mask = b"event_msgs\0".to_vec();
+        mask.extend([0, 0, 0, 0, 0, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        put(&host, HOST + 0x9000, &mask);
+        put(
+            &host,
+            HOST + 120,
+            &ioctl(WLC_SET_VAR, mask.len(), HOST + 0x9000),
+        );
+        put(&host, HOST + 160, &ioctl(WLC_UP, 0, HOST + 0x9800));
+        wifi.memory_write(BAR2 + h2d_w, 2, 5).unwrap();
+        wifi.memory_write(
+            BAR0 + 0x2000 + u64::from(PCIE2_H2D_MAILBOX_0),
+            4,
+            0x1234_5678,
+        )
+        .unwrap();
+        // Two acknowledgements and completions, then the event.
+        assert_eq!(wifi.memory_read(BAR2 + d2h_w, 2), Some(5));
+        let message = get(&host, HOST + 0x2000 + 4 * 24, 24);
+        assert_eq!(message[0], MSG_WL_EVENT);
+        let frame = get(&host, HOST + 0xa000, usize::from(le16(&message, 12)));
+        assert_eq!(
+            u32::from_be_bytes(frame[28..32].try_into().unwrap()),
+            WLC_E_IF
+        );
+        assert_eq!(&frame[72..74], &[0, WLC_E_IF_ADD], "ifidx 0, ADD");
     }
 
     #[test]
