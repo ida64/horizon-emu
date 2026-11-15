@@ -52,6 +52,12 @@ mod register {
     pub const AVERAGE_CURRENT: u8 = 0x0B;
     pub const AVERAGE_TEMPERATURE: u8 = 0x16;
     pub const AVERAGE_VCELL: u8 = 0x19;
+    /// Highest and lowest temperature, voltage and current measured since
+    /// the register was last written: maximum in the upper byte, minimum
+    /// in the lower (hekate `MinMaxTemp`, `MinMaxVolt`, `MinMaxCurr`).
+    pub const MIN_MAX_TEMPERATURE: u8 = 0x1A;
+    pub const MIN_MAX_VOLTAGE: u8 = 0x1B;
+    pub const MIN_MAX_CURRENT: u8 = 0x1C;
     /// Charge counted since power-on.
     pub const QH: u8 = 0x4D;
     /// The two keys that unlock the battery model table.
@@ -70,11 +76,19 @@ const STATUS_POWER_ON_RESET: u16 = 1 << 1;
 /// their representable range (assumed unconfigured board); ptm changes
 /// them by read-modify-write. Register names: public hekate
 /// <https://github.com/CTCaer/hekate/blob/master/bdk/power/max17050.h>.
-const POWER_ON_VALUES: [(u8, u16); 6] = [
+const POWER_ON_VALUES: [(u8, u16); 9] = [
     (register::STATUS, STATUS_POWER_ON_RESET),
     (0x01, 0xff00),
     (0x02, 0x7f80),
     (0x03, 0xff00),
+    // The min/max registers start out empty: each maximum at the bottom
+    // of its range and each minimum at the top, so that the first
+    // measurement becomes both. Datasheet power-on values as remembered,
+    // not checked against the document [assumption]; only their being
+    // empty matters here, since every read includes a measurement.
+    (register::MIN_MAX_TEMPERATURE, 0x807F),
+    (register::MIN_MAX_VOLTAGE, 0x00FF),
+    (register::MIN_MAX_CURRENT, 0x807F),
     // MiscCFG.
     (0x2B, 0x0870),
     // COFF, the current measurement's offset: none.
@@ -86,11 +100,27 @@ const MODEL_KEYS: (u16, u16) = (0x0059, 0x00C4);
 /// Registers the driver may program that are plain storage here, by the
 /// datasheet's register map: alert thresholds, capacities and the
 /// application's seeds for them, configuration, and characterization data.
-const PROGRAMMABLE: [u8; 44] = [
+const PROGRAMMABLE: [u8; 47] = [
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0D, 0x0E, 0x0F, 0x10, 0x12, 0x13, 0x17, 0x18,
-    0x1D, 0x1E, 0x1F, 0x22, 0x23, 0x24, 0x25, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x32,
-    0x36, 0x37, 0x38, 0x39, 0x3A, 0x3F, 0x42, 0x45, 0x46, 0x48, 0x4C, 0x60,
+    0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x22, 0x23, 0x24, 0x25, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D,
+    0x2E, 0x2F, 0x32, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3F, 0x42, 0x45, 0x46, 0x48, 0x4C, 0x60,
 ];
+
+/// A min/max register as the gauge keeps it: what was written (or the
+/// power-on value), widened by `measured`, which is in the register's
+/// units. The battery here holds still, so its one measurement is all the
+/// gauge has seen since.
+fn min_max(stored: u16, measured: i32, signed: bool) -> u16 {
+    let [max, min] = stored.to_be_bytes();
+    let (max, min, range) = if signed {
+        (i32::from(max as i8), i32::from(min as i8), -128..=127)
+    } else {
+        (i32::from(max), i32::from(min), 0..=255)
+    };
+    let measured = measured.clamp(*range.start(), *range.end());
+    // Truncating to a byte keeps two's complement for the signed ones.
+    u16::from_be_bytes([max.max(measured) as u8, min.min(measured) as u8])
+}
 
 pub struct Max17050 {
     battery: Battery,
@@ -136,6 +166,22 @@ impl Max17050 {
             register::CURRENT | register::AVERAGE_CURRENT => (battery.milliamps * 16 / 5) as u16,
             // 1/256 degree per unit.
             register::TEMPERATURE | register::AVERAGE_TEMPERATURE => (battery.celsius * 256) as u16,
+            // 1 degree per unit.
+            register::MIN_MAX_TEMPERATURE => {
+                min_max(*self.registers.get(&register)?, battery.celsius, true)
+            }
+            // 20 mV per unit.
+            register::MIN_MAX_VOLTAGE => min_max(
+                *self.registers.get(&register)?,
+                (battery.millivolts / 20) as i32,
+                false,
+            ),
+            // 0.4 mV across the 5 mOhm sense resistor, 80 mA, per unit.
+            register::MIN_MAX_CURRENT => min_max(
+                *self.registers.get(&register)?,
+                battery.milliamps / 80,
+                true,
+            ),
             // 1/256 percent per unit.
             register::SOCVF => (battery.percent * 256) as u16,
             // Nothing has been counted yet.
@@ -246,6 +292,33 @@ mod tests {
         write(&mut gauge, register::MODEL_ACCESS_1, 0).unwrap();
         write(&mut gauge, register::MODEL_ACCESS_2, 0).unwrap();
         assert_eq!(read(&mut gauge, 0x80), Some(0));
+    }
+
+    #[test]
+    fn min_max_registers_hold_what_was_measured_since_they_were_written() {
+        let battery = Battery {
+            millivolts: 3700,
+            milliamps: -1000,
+            celsius: -10,
+            percent: 55,
+        };
+        let mut gauge = Max17050::new(battery, Arc::default());
+        // From power-on, the one measurement is both maximum and minimum:
+        // -10 degrees, 3.7 V in 20 mV, -1 A in 80 mA (truncated).
+        assert_eq!(
+            read(&mut gauge, register::MIN_MAX_TEMPERATURE),
+            Some(0xF6F6)
+        );
+        assert_eq!(read(&mut gauge, register::MIN_MAX_VOLTAGE), Some(0xB9B9));
+        assert_eq!(read(&mut gauge, register::MIN_MAX_CURRENT), Some(0xF4F4));
+        // A written history is widened by the measurement, not replaced.
+        write(&mut gauge, register::MIN_MAX_TEMPERATURE, 0x2814).unwrap();
+        assert_eq!(
+            read(&mut gauge, register::MIN_MAX_TEMPERATURE),
+            Some(0x28F6)
+        );
+        write(&mut gauge, register::MIN_MAX_VOLTAGE, 0xC8B0).unwrap();
+        assert_eq!(read(&mut gauge, register::MIN_MAX_VOLTAGE), Some(0xC8B0));
     }
 
     #[test]

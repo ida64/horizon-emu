@@ -62,6 +62,14 @@ pub mod user_function {
     /// `W1` item in, `X1`-`X4` value out; the items are those of the kernel's
     /// [`GET_CONFIG`](super::function::GET_CONFIG).
     pub const GET_CONFIG: u32 = 0xC300_0002;
+    /// `W1` item, `X3` value in. Only
+    /// [`IS_CHARGER_HI_Z_MODE_ENABLED`](super::config_item::IS_CHARGER_HI_Z_MODE_ENABLED)
+    /// can be set; `ptm` sets it to 0 on a console that has been set up
+    /// before (`spl` SetConfig, command 5). That the value is in `X3`, with
+    /// `X2` unused, follows Atmosphère's public monitor
+    /// (`secmon_smc_info.cpp`), from memory [assumption]: the one call seen
+    /// has zero in both.
+    pub const SET_CONFIG: u32 = 0xC300_0401;
     /// `X1` operation key in; the operation's own status out in `X1` (`spl`
     /// fails with "unknown secure monitor error" on anything it does not
     /// know there).
@@ -119,6 +127,10 @@ pub mod config_item {
     pub const MEMORY_MODE: u32 = 10;
     pub const IS_DEVELOPMENT_FUNCTION_ENABLED: u32 = 11;
     pub const KERNEL_CONFIGURATION: u32 = 12;
+    /// Whether the monitor puts the charger into high-impedance mode when
+    /// the console powers off. Settable; starts out disabled [assumption:
+    /// nothing set it before the first call seen, which writes 0].
+    pub const IS_CHARGER_HI_Z_MODE_ENABLED: u32 = 13;
 }
 
 /// Interrupt ID the monitor signals asynchronous completions with.
@@ -215,6 +227,9 @@ struct State {
     crypto: Crypto,
     /// Key of the finished asynchronous operation nobody has collected yet.
     async_operation: Option<u64>,
+    /// [`config_item::IS_CHARGER_HI_Z_MODE_ENABLED`]. Nothing here powers
+    /// the console off, so the flag is only remembered.
+    charger_hi_z_mode: bool,
 }
 
 impl SecureMonitor {
@@ -239,6 +254,7 @@ impl SecureMonitor {
                 carveouts: [Carveout::default(); CARVEOUT_COUNT],
                 crypto: Crypto::new(keys, seal_key),
                 async_operation: None,
+                charger_hi_z_mode: false,
             }),
         }
     }
@@ -259,6 +275,7 @@ impl SecureMonitor {
         if immediate == USER_SMC {
             return match id {
                 user_function::GET_CONFIG => self.get_config(x),
+                user_function::SET_CONFIG => self.set_config(x),
                 user_function::GENERATE_RANDOM_BYTES => self.generate_random_bytes(x),
                 user_function::GENERATE_AES_KEK => self.key_operation(x, |crypto, x| {
                     let access_key = crypto.generate_aes_kek(&key_at(x, 1), x[3], x[4] as u32)?;
@@ -393,6 +410,19 @@ impl SecureMonitor {
         self.state.lock().unwrap().carveouts
     }
 
+    /// SetConfig, from userland: item in `W1`, value in `X3`.
+    fn set_config(&self, x: &mut [u64; 8]) -> SmcEffect {
+        let item = x[1] as u32;
+        match item {
+            config_item::IS_CHARGER_HI_Z_MODE_ENABLED => {
+                self.state.lock().unwrap().charger_hi_z_mode = x[3] != 0;
+            }
+            _ => return SmcEffect::Unimplemented(Unimplemented::ConfigItem(item)),
+        }
+        x[0] = STATUS_SUCCESS;
+        SmcEffect::Resume
+    }
+
     /// GetConfig, through either gate: item in `W1`, value out in `X1`-`X4`.
     fn get_config(&self, x: &mut [u64; 8]) -> SmcEffect {
         let item = x[1] as u32;
@@ -415,6 +445,9 @@ impl SecureMonitor {
             }
             config_item::MEMORY_MODE => self.dram.memory_mode(),
             config_item::KERNEL_CONFIGURATION => self.kernel_configuration.bits(self.dram),
+            config_item::IS_CHARGER_HI_Z_MODE_ENABLED => {
+                self.state.lock().unwrap().charger_hi_z_mode.into()
+            }
             _ => return SmcEffect::Unimplemented(Unimplemented::ConfigItem(item)),
         };
         x[0] = STATUS_SUCCESS;
@@ -534,6 +567,7 @@ pub fn function_name(immediate: u16, id: u32) -> &'static str {
         (KERNEL_SMC, function::CONFIGURE_CARVEOUT) => "ConfigureCarveout",
         (KERNEL_SMC, function::READ_WRITE_REGISTER) => "ReadWriteRegister",
         (USER_SMC, user_function::GET_CONFIG) => "GetConfig (user)",
+        (USER_SMC, user_function::SET_CONFIG) => "SetConfig",
         (USER_SMC, user_function::GENERATE_RANDOM_BYTES) => "GenerateRandomBytes (user)",
         (USER_SMC, user_function::GENERATE_AES_KEK) => "GenerateAesKek",
         (USER_SMC, user_function::LOAD_AES_KEY) => "LoadAesKey",
@@ -951,6 +985,36 @@ mod tests {
                 immediate: 1,
                 id: user_function::GET_CONFIG
             })
+        );
+    }
+
+    #[test]
+    fn charger_hi_z_mode_is_the_one_settable_item_and_reads_back() {
+        let monitor = monitor(DramSize::Gb4);
+        let item = config_item::IS_CHARGER_HI_Z_MODE_ENABLED.into();
+        let get = || {
+            let mut x = [user_function::GET_CONFIG.into(), item, 0, 0, 0, 0, 0, 0];
+            assert_eq!(monitor.call(USER_SMC, &mut x), SmcEffect::Resume);
+            x[1]
+        };
+        assert_eq!(get(), 0);
+        let mut x = [user_function::SET_CONFIG.into(), item, 0, 1, 0, 0, 0, 0];
+        assert_eq!(monitor.call(USER_SMC, &mut x), SmcEffect::Resume);
+        assert_eq!(x[0], STATUS_SUCCESS);
+        assert_eq!(get(), 1);
+        let mut x = [
+            user_function::SET_CONFIG.into(),
+            config_item::MEMORY_MODE.into(),
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+        ];
+        assert_eq!(
+            monitor.call(USER_SMC, &mut x),
+            SmcEffect::Unimplemented(Unimplemented::ConfigItem(config_item::MEMORY_MODE))
         );
     }
 
