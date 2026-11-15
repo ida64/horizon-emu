@@ -8,7 +8,7 @@
 //! `0xFB8E0`) writes every VIC method as host1x `INCR` of THI word 0x10
 //! (method offset in words) and 0x11 (data) (`0xAE040`):
 //! SET_APPLICATION_ID 0x200 = 1 (`0xAFBB0`), SET_CONTROL_PARAMS 0x704 =
-//! 0x610010 (`0xAFBD0`), SET_CONFIG_STRUCT_OFFSET 0x708 (`0xAFBF0`), method
+//! 0x610110 (`0xAFBD0`: `MOV W2, #0x610110`), SET_CONFIG_STRUCT_OFFSET 0x708 (`0xAFBF0`), method
 //! 0x730 = 0 (`0xAFC20`, ordinary path), SET_FILTER_STRUCT_OFFSET 0x70C
 //! (`0xAFC60`), the output planes 0x720 + 4·plane (`0xAFD40`), the input
 //! planes 0x400 + 0x60·slot + 4·(3·surface + plane) (`0xAFD60`), EXECUTE
@@ -37,14 +37,24 @@
 //! it in slot order at its destination rectangle; outside the target
 //! rectangle the output surface is left as it was. Implemented: the 32-bit
 //! RGB formats 31-38, pitch-linear and block-linear (16Bx2 GOB) surfaces,
-//! 1:1 source-to-destination copies, the slot colour matrix (Ryujinx
-//! `Blender.cs` formula, MIT), soft clamp, planar/constant alpha, the
-//! blending factor selections (libdrm `vic.h` enum names), override and
-//! mask, alpha fill modes opaque, background and composited (DXVA-HD names
-//! in libdrm `vic.h`). Everything else (scaling and its filters, YUV
-//! formats, deinterlacing and denoise, luma key, gamut and output matrices,
-//! degamma/regamma, clear rectangles, decompression, flips and transposition,
-//! downsampling) refuses with the field named.
+//! 1:1 source-to-destination copies, the slot and output colour matrices
+//! (Ryujinx `Blender.cs` formula, MIT), soft clamp, sRGB degamma/regamma
+//! (mode 1), planar/constant alpha, the blending factor selections (libdrm
+//! `vic.h` enum names), override and mask, alpha fill modes opaque,
+//! background and composited (DXVA-HD names in libdrm `vic.h`).
+//! Everything else (scaling and its filters, YUV formats, deinterlacing and
+//! denoise, luma key, gamut matrix, gamma modes 2-3, clear rectangles,
+//! decompression, flips and transposition, downsampling) refuses with the
+//! field named.
+//!
+//! # The submission seen
+//!
+//! When starter launches the netConnect library applet, nvnflinger sends one
+//! EXECUTE (nvhost-vic SUBMIT `0xC09C0024`): slot 0 copies a 1280×720
+//! A8B8G8R8 block-linear surface (16-GOB blocks) 1:1 into another of the same
+//! kind, degamma and regamma 1, identity output matrix, blending "source ×
+//! K1, destination × 0", alpha overridden to 1023, alpha fill composited —
+//! an opaque copy of the caller's last frame.
 
 use std::sync::{Arc, Mutex};
 
@@ -86,10 +96,11 @@ mod method {
 /// EXECUTE value both nvnflinger (`0xAFDC0`) and libdrm (`1 << 8`) write.
 const EXECUTE_VALUE: u32 = 0x100;
 /// SET_CONTROL_PARAMS: configuration size in 16-byte units in bits 31:16
-/// (libdrm `vic40.c`); nvnflinger also sets bit 4 (`0x610010`), libdrm
-/// leaves it clear, and no output depends on it in either.
+/// (libdrm `vic40.c`); nvnflinger also sets bits 8 and 4 (`0x610110`, seen
+/// on the channel at the netConnect launch), libdrm leaves them clear, and
+/// no output depends on them in either.
 const CONTROL_SIZE_SHIFT: u32 = 16;
-const CONTROL_KNOWN_LOW: [u32; 2] = [0, 0x10];
+const CONTROL_KNOWN_LOW: [u32; 2] = [0, 0x110];
 
 const CONFIG_SIZE: usize = 0x610;
 const SLOT_COUNT: usize = 8;
@@ -421,17 +432,68 @@ impl Config {
     }
 }
 
-/// Coefficients of a colour matrix (libdrm `MatrixStruct`) if enabled.
-fn matrix(words: [u64; 4]) -> Option<([[i64; 4]; 3], u32)> {
-    let [w0, w1, w2, w3] = words;
-    flag(w1, 63).then(|| {
-        let signed = |word: u64, row: u32| {
-            let value = field(word, row * 20, 20) as i64;
-            value - ((value & 0x80000) << 1)
-        };
-        let row = |r: u32| [signed(w0, r), signed(w1, r), signed(w2, r), signed(w3, r)];
-        ([row(0), row(1), row(2)], field(w0, 60, 4))
-    })
+/// An enabled colour matrix (libdrm `MatrixStruct`): 20-bit signed
+/// coefficients `C[row][column]`, row = output component. Ryujinx
+/// `Blender.cs` (MIT) applies it to 10-bit components as
+/// `((Σ in·C >> RShift) + C3) >> 8`; the same arithmetic is done here on
+/// normalized values without the intermediate truncations (the datapath's
+/// precision is not modeled), which keeps linear-light values intact.
+#[derive(Clone, Copy, Debug)]
+struct Matrix([[f32; 4]; 3]);
+
+impl Matrix {
+    fn new(words: [u64; 4]) -> Option<Matrix> {
+        let [w0, w1, w2, w3] = words;
+        flag(w1, 63).then(|| {
+            let scale = (1u64 << (field(w0, 60, 4) + 8)) as f32;
+            let signed = |word: u64, row: u32| {
+                let value = i64::from(field(word, row * 20, 20));
+                (value - ((value & 0x80000) << 1)) as f32
+            };
+            Matrix(std::array::from_fn(|row| {
+                let row = row as u32;
+                [
+                    signed(w0, row) / scale,
+                    signed(w1, row) / scale,
+                    signed(w2, row) / scale,
+                    // The offset is added after the shift, in 10-bit units.
+                    signed(w3, row) / 256.0 / 1023.0,
+                ]
+            }))
+        })
+    }
+
+    fn apply(&self, color: [f32; 4]) -> [f32; 4] {
+        let mut out = color;
+        for (channel, row) in self.0.iter().enumerate() {
+            out[channel] = color[0] * row[0] + color[1] * row[1] + color[2] * row[2] + row[3];
+        }
+        out
+    }
+}
+
+/// Degamma/regamma mode 1: the sRGB transfer function (IEC 61966-2-1),
+/// decoding to linear light in the slot and encoding again at the output.
+/// nvnflinger's serializer (`0xAEA60`) sets mode 1 at both ends on its
+/// linear-blending path for its colour spaces 0 and 1 and mode 2 for the
+/// others [INFERENCE: mode 1 = sRGB; for the 1:1 replace it issues at the
+/// netConnect launch the pair cancels whatever the exact curve].
+const GAMMA_SRGB: u32 = 1;
+
+fn srgb_to_linear(value: f32) -> f32 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(value: f32) -> f32 {
+    if value <= 0.0031308 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    }
 }
 
 /// Blending factor selections (libdrm `vic.h` `VIC_BLEND_*`): source and
@@ -525,7 +587,9 @@ struct Slot {
     surface: Surface,
     source: Rect,
     destination: Rect,
-    matrix: Option<([[i64; 4]; 3], u32)>,
+    matrix: Option<Matrix>,
+    /// sRGB decoding (degamma mode 1) after the colour matrix.
+    degamma: bool,
     clamp: (f32, f32),
     planar_alpha: f32,
     constant_alpha: bool,
@@ -580,8 +644,9 @@ impl Slot {
         if field(w2, 47, 8) != 0 {
             return unmodeled(&format!("clear rectangle mask {:#x}", field(w2, 47, 8)));
         }
-        if field(w2, 55, 2) != 0 {
-            return unmodeled(&format!("degamma mode {}", field(w2, 55, 2)));
+        let degamma = field(w2, 55, 2);
+        if !matches!(degamma, 0 | GAMMA_SRGB) {
+            return unmodeled(&format!("degamma mode {degamma}"));
         }
         if flag(w2, 58) {
             return unmodeled("decompression");
@@ -620,14 +685,15 @@ impl Slot {
         }
         let matrix_at =
             |offset: usize| [0, 8, 16, 24].map(|word| config.word(base + offset + word));
-        if matrix(matrix_at(0x80)).is_some() {
+        if Matrix::new(matrix_at(0x80)).is_some() {
             return unmodeled("gamut matrix");
         }
         Ok(Some(Slot {
             surface,
             source,
             destination,
-            matrix: matrix(matrix_at(0x60)),
+            matrix: Matrix::new(matrix_at(0x60)),
+            degamma: degamma == GAMMA_SRGB,
             clamp,
             planar_alpha: field(w2, 32, 10) as f32 / 1023.0,
             constant_alpha: flag(w2, 42),
@@ -635,19 +701,17 @@ impl Slot {
         }))
     }
 
-    /// The slot's colour of a source pixel, before blending.
+    /// The slot's colour of a source pixel, before blending: colour matrix
+    /// (converts the source's encoding), soft clamp, then degamma to linear
+    /// light for blending [INFERENCE: the order each stage's input implies;
+    /// the observed configuration has no slot matrix].
     fn color(&self, pixel: [f32; 4]) -> [f32; 4] {
-        let mut color = pixel;
-        if let Some((rows, shift)) = self.matrix {
-            // Ryujinx `Blender.cs`: 10-bit components, arithmetic shifts.
-            let ten = pixel.map(|value| (value * 1023.0).round() as i64);
-            for (channel, row) in rows.iter().enumerate() {
-                let sum = ten[0] * row[0] + ten[1] * row[1] + ten[2] * row[2];
-                color[channel] = (((sum >> shift) + row[3]) >> 8) as f32 / 1023.0;
-            }
-        }
+        let mut color = self.matrix.map_or(pixel, |matrix| matrix.apply(pixel));
         for value in &mut color[..3] {
             *value = value.clamp(self.clamp.0, self.clamp.1);
+            if self.degamma {
+                *value = srgb_to_linear(*value);
+            }
         }
         color[3] = if self.constant_alpha {
             self.planar_alpha
@@ -674,16 +738,21 @@ fn compose(memory: &DeviceMemory, methods: &[u32; method::COUNT]) -> Result<(), 
         u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap())
     }));
     compose_config(memory, methods, &config)
-        .map_err(|reason| format!("{reason}; {}", dump(&config)))
+        .map_err(|reason| format!("{reason}; {}", dump(methods, &config)))
 }
 
-/// The non-zero words of `config`, for a refusal note.
-fn dump(config: &Config) -> String {
+/// The non-zero methods and configuration words, for a refusal note: with
+/// the surfaces they name, a replayable description of the EXECUTE.
+fn dump(methods: &[u32; method::COUNT], config: &Config) -> String {
+    let methods: Vec<String> = (methods.iter().enumerate())
+        .filter(|(_, value)| **value != 0)
+        .map(|(i, value)| format!("{:03x}={value:x}", i * 4))
+        .collect();
     let words: Vec<String> = (config.0.iter().enumerate())
         .filter(|(_, word)| **word != 0)
         .map(|(i, word)| format!("{:03x}:{word:016x}", i * 8))
         .collect();
-    format!("config {}", words.join(" "))
+    format!("methods {} config {}", methods.join(" "), words.join(" "))
 }
 
 fn compose_config(
@@ -711,8 +780,9 @@ fn compose_config(
         field(output, 6, 10),
     ]
     .map(|value| value as f32 / 1023.0);
-    if field(output, 46, 2) != 0 {
-        return Err(format!("regamma mode {}", field(output, 46, 2)));
+    let regamma = field(output, 46, 2);
+    if !matches!(regamma, 0 | GAMMA_SRGB) {
+        return Err(format!("regamma mode {regamma}"));
     }
     if field(output, 48, 3) != 0 {
         return Err(format!("output flip/transpose {:#x}", field(output, 48, 3)));
@@ -725,9 +795,9 @@ fn compose_config(
         return Err("output chroma planes".into());
     }
     let surface = Surface::new(config.pair(0x20), planes[0], "output")?;
-    if matrix([0x30, 0x38, 0x40, 0x48].map(|offset| config.word(offset))).is_some() {
-        return Err("output colour matrix".into());
-    }
+    // Identity in the configuration nvnflinger sends at the netConnect
+    // launch (coefficients 0x40000, shift 10).
+    let output_matrix = Matrix::new([0x30, 0x38, 0x40, 0x48].map(|offset| config.word(offset)));
     let area = Rect::inclusive(target).intersect(Rect {
         left: 0,
         top: 0,
@@ -764,6 +834,16 @@ fn compose_config(
     for y in 0..height {
         for x in 0..width {
             let mut color = picture[y * width + x];
+            if regamma == GAMMA_SRGB {
+                for value in &mut color[..3] {
+                    *value = linear_to_srgb(value.clamp(0.0, 1.0));
+                }
+            }
+            // Converts to the output's encoding after regamma
+            // [INFERENCE: a YUV output is formed from encoded RGB].
+            if let Some(matrix) = output_matrix {
+                color = matrix.apply(color);
+            }
             color[3] = match alpha_fill {
                 0 => 1.0,
                 1 => background[3],

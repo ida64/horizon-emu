@@ -117,7 +117,7 @@ impl Bench {
 fn methods(input: Option<u64>) -> Vec<(u32, u32)> {
     let mut methods = vec![
         (0x200, 1),
-        (0x704, 0x610010),
+        (0x704, 0x610110),
         (0x708, (CONFIG >> 8) as u32),
         (0x730, 0),
         (0x720, (OUTPUT >> 8) as u32),
@@ -288,4 +288,131 @@ fn a_channel_submission_composes_and_signals_its_syncpoint() {
     assert_eq!(bench.peek(OUTPUT), [1, 2, 3, 0xff]);
     assert_eq!(bench.peek(OUTPUT + 4), [5, 6, 7, 0xff]);
     assert!(bench.notes.take().is_empty());
+}
+
+/// The EXECUTE nvnflinger sends when starter launches netConnect, replayed
+/// from the refusal note of that run (methods and every non-zero
+/// configuration word, real device addresses): an opaque 1:1 copy of a
+/// 1280x720 block-linear A8B8G8R8 frame through sRGB degamma/regamma and
+/// an identity output matrix, sent as a CDMA stream through a channel.
+#[test]
+fn the_netconnect_launch_capture_copies_the_frame_and_signals() {
+    const METHODS: [(u32, u32); 8] = [
+        (0x200, 0x1),
+        (0x704, 0x610110),
+        (0x708, 0xe2aa00),
+        (0x70c, 0xe2ac00),
+        (0x71c, 0x3c0),
+        (0x72c, 0xe0043d),
+        (0x720, 0xe01600),
+        (0x400, 0xe26e00),
+    ];
+    const CONFIG_WORDS: [(u64, u64); 16] = [
+        (0x010, 0x0000400000000004),
+        (0x018, 0x02cf000004ff0000),
+        (0x020, 0x00b3c4ff00020a1f),
+        (0x028, 0x0fffffff00b3c4ff),
+        (0x030, 0xa000000000040000),
+        (0x038, 0x8000004000000000),
+        (0x040, 0x0400000000000000),
+        (0x090, 0x0000000000000101),
+        (0x0a0, 0x008003ff000ffc00),
+        (0x0b0, 0x04ff000000000000),
+        (0x0b8, 0x02cf000000000000),
+        (0x0c0, 0x02cf000004ff0000),
+        (0x0d0, 0x00b3c4ff000a0a1f),
+        (0x0d8, 0x0fffffff00b3c4ff),
+        (0x130, 0x00002050000003ff),
+        (0x138, 0x000083ff00000000),
+    ];
+    // 4 MiB SMMU sections for the device addresses the submission uses.
+    let sections = [0x380u64, 0x381, 0x389, 0x38a, 0x38b, 0x3fc];
+    let ram = Arc::new(GuestRam::new(RAM_BASE, (sections.len() + 1) << 22).unwrap());
+    let mc = Arc::new(Mc::new(DramSize::Gb4));
+    mc.write(0, 0x1c, 4, 1).unwrap();
+    mc.write(0, 0x20, 4, 0xe008_0000).unwrap();
+    for client in [SMMU_VIC_ASID, SMMU_HOST1X_ASID] {
+        mc.write(0, client, 4, 0x8000_0001).unwrap();
+    }
+    for (n, section) in sections.iter().enumerate() {
+        let frame = (RAM_BASE + ((n as u64 + 1) << 22)) >> 12;
+        let entry = 0xc000_0000 | frame as u32;
+        ram.write(RAM_BASE + section * 4, &entry.to_le_bytes())
+            .unwrap();
+    }
+    let memory = || DeviceMemory::new(&mc, &ram, SMMU_VIC_ASID);
+    let mut config = [0u8; CONFIG_SIZE];
+    for (offset, word) in CONFIG_WORDS {
+        config[offset as usize..offset as usize + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    memory().write(0xe2aa_0000, &config).unwrap();
+    let layout = BlockLinearSurface::new(
+        1280 * 4,
+        720,
+        BlockLinear {
+            block_height_log2: 4,
+            block_depth_log2: 0,
+        },
+    );
+    let size = layout.size(1) as usize;
+    let mut input = vec![0u8; size];
+    let pattern = |x: u32, y: u32| [x as u8, y as u8, (x ^ y) as u8, 0x40];
+    for y in 0..720 {
+        for x in 0..1280 {
+            let at = layout.offset(x * 4, y, 0) as usize;
+            input[at..at + 4].copy_from_slice(&pattern(x, y));
+        }
+    }
+    memory().write(0xe26e_0000, &input).unwrap();
+    memory().write(0xe016_0000, &vec![0x5a; size]).unwrap();
+
+    let syncpoints = Arc::new(Syncpoints::default());
+    let notes: Arc<Notes> = Arc::default();
+    let vic = Arc::new(Vic::new(
+        memory(),
+        Arc::clone(&syncpoints),
+        Arc::clone(&notes),
+    ));
+    let channel = Channel::new(
+        DeviceMemory::new(&mc, &ram, SMMU_HOST1X_ASID),
+        Arc::clone(&syncpoints),
+        Arc::new(move |class, offset, value| {
+            (class == CLASS).then_some(())?;
+            vic.thi_write(offset, value)
+        }),
+        Arc::clone(&notes),
+    );
+    let mut words = vec![CLASS << 6];
+    for (method, value) in METHODS.into_iter().chain([(0x300, 0x100)]) {
+        words.extend([0x1010_0002, method >> 2, value]);
+    }
+    words.extend([0x2000_0001, SYNCPOINT as u32 | 1 << 8]);
+    let push = 0xff00_0000u32;
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    DeviceMemory::new(&mc, &ram, SMMU_HOST1X_ASID)
+        .write(push.into(), &bytes)
+        .unwrap();
+    for (register, value) in [
+        (0x14, 0),
+        (0x20, push + 0x1000),
+        (0x18, push),
+        (0x24, 7),
+        (0x24, 0),
+    ] {
+        channel.write(0, register, 4, value.into()).unwrap();
+    }
+    channel
+        .write(0, 0x18, 4, (push + bytes.len() as u32).into())
+        .unwrap();
+    assert!(notes.take().is_empty());
+    assert_eq!(syncpoints.get(SYNCPOINT), Some(1));
+    let mut output = vec![0u8; size];
+    memory().read(0xe016_0000, &mut output).unwrap();
+    for y in 0..720 {
+        for x in 0..1280 {
+            let at = layout.offset(x * 4, y, 0) as usize;
+            let [r, g, b, _] = pattern(x, y);
+            assert_eq!(output[at..at + 4], [r, g, b, 0xff], "pixel ({x}, {y})");
+        }
+    }
 }
