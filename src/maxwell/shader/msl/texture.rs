@@ -23,10 +23,14 @@
 //! words (buffer 21, see [`Translated::source`](super::Translated::source));
 //! every sample checks its slot's mark first and records an executed
 //! sample of an unbound slot, which the renderer turns into the
-//! interpreter's refusal before any result reaches guest memory. Samples
-//! of helper lanes alone (outside the primitive) are not recorded
-//! [assumption: Metal discards device-memory writes of helper threads, as
-//! Vulkan does for helper invocations], where the interpreter would refuse.
+//! interpreter's refusal before any result reaches guest memory. Known
+//! difference: a sample executed only by helper lanes (outside the
+//! primitive, which the interpreter refuses as well) is recorded only if
+//! Metal performs the device-memory writes of helper threads. The Metal
+//! Shading Language specification found here does not say; SPIRV-Cross
+//! guards stores after `discard_fragment` with an explicit helper check
+//! (`spirv_msl.cpp`, `needs_frag_discard_checks`), which suggests they are
+//! performed [unverified].
 
 use super::super::exec::{bit, bits, sext};
 use super::{PT, RZ, SLOTS, Writer};
