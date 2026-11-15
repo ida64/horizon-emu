@@ -749,20 +749,18 @@ fn depth_test_without_depth_target_passes() {
     assert_eq!(frame.pixel(4, 4), [0, 0, 0, 255]);
 }
 
-/// The Metal renderer binds every texture a program names before it
-/// draws; a handle that names no texture (an unset slot, TIC index
-/// 0xfffff, as netConnect's uber-shader leaves on branches its draws do
-/// not take) leaves the draw to the software renderer, which resolves
-/// textures only where a sample executes, instead of refusing it.
-#[test]
-fn metal_leaves_unresolvable_unsampled_texture_to_software() {
+/// A draw whose pixel program names a texture slot the draw leaves unset
+/// (handle TIC index 0xfffff, as netConnect's uber-shader leaves on
+/// branches its draws do not take): P0 = c3[0] != 0; @P0 BRA over a TEXS
+/// of bound texture 8 (handle c2[0x20]); color = (1, 0.5, 0.25, 1). The
+/// branch depends on a constant, so the program names the texture.
+/// Returns the frame with the draw recorded up to `END`, and `END`'s
+/// result.
+fn unset_texture_draw(kind: super::RendererKind, skip_sample: bool) -> (Frame, Result<(), String>) {
     let elf = std::fs::read(STARTER).expect("starter ELF (fw_elf) must be present");
-    let mut frame = Frame::sized_with(SIZE, SIZE, super::RendererKind::Metal);
+    let mut frame = Frame::sized_with(SIZE, SIZE, kind);
     frame.program(1, 0, starter_program(&elf, 0x4c0e00));
-    // Pixel shader: P0 = c3[0] != 0; @P0 BRA over a TEXS of bound texture
-    // 8 (handle c2[0x20]); color = (1, 0.5, 0.25, 1). The branch depends
-    // on a constant, so the program names the texture; this draw takes
-    // the branch. PS header: shader type 5, target 0 RGBA.
+    // PS header: shader type 5, target 0 RGBA.
     let mut ps = vec![0u8; 0x50];
     ps[..4].copy_from_slice(&0x1402u32.to_le_bytes());
     ps[0x48] = 15;
@@ -791,7 +789,11 @@ fn metal_leaves_unresolvable_unsampled_texture_to_software() {
     frame.program(5, 0x800, &ps);
     frame.constants(0, 3, 0x30_0000, &ui2d_vertex_constants(&[]));
     frame.constants(4, 2, 0x30_1000, &[0xff; 0x40]);
-    frame.constants(4, 3, 0x30_2000, &1u32.to_le_bytes());
+    frame.constants(4, 3, 0x30_2000, &u32::from(skip_sample).to_le_bytes());
+    // SET_TEX_HEADER_POOL_A..C: a pool of 0x11 headers at 0x50_0000.
+    frame.method(0x1574, 0);
+    frame.method(0x1578, 0x50_0000);
+    frame.method(0x157c, 0x10);
     let quad = [
         -0.5, -0.5, 0.0, 0.25, -0.5, 0.0, 0.25, 0.75, 0.0, -0.5, 0.75, 0.0,
     ];
@@ -799,17 +801,40 @@ fn metal_leaves_unresolvable_unsampled_texture_to_software() {
     frame.method(0x1618, 7);
     frame.method(0x0d74, 0);
     frame.method(0x0d78, 4);
-    frame.method(0x1614, 0);
-    frame.channel.flush(&frame.ram).unwrap();
-    assert_eq!(frame.pixel(20, 20), [255, 128, 64, 255]);
+    let end = frame
+        .channel
+        .call(0, 0x1614 / 4, 0, &frame.ram)
+        .map_err(|e| e.0);
+    (frame, end)
+}
+
+/// An unset texture slot whose sample does not execute draws (on Metal,
+/// without falling back); one whose sample executes is refused, by the
+/// software renderer at the draw and by Metal at the next write-back,
+/// before any of its pixels reach memory.
+#[test]
+fn unset_texture_slot_refused_only_where_sampled() {
+    use super::RendererKind::{Metal, Software};
+    for kind in [Software, Metal] {
+        let (mut frame, end) = unset_texture_draw(kind, true);
+        end.unwrap();
+        frame.channel.flush(&frame.ram).unwrap();
+        assert_eq!(frame.pixel(20, 20), [255, 128, 64, 255], "{kind:?}");
+    }
+    let (frame, _) = unset_texture_draw(Metal, true);
     let metal = frame.channel.hooks.metal.as_ref().expect("Metal device");
-    let (_, fallbacks) = metal.fallbacks();
-    assert!(
-        fallbacks
-            .iter()
-            .any(|(reason, _)| reason == "texture handle that does not resolve"),
-        "{fallbacks:?}"
-    );
+    let (draws, fallbacks) = metal.fallbacks();
+    assert_eq!((draws, fallbacks), (1, vec![]));
+
+    let (_, end) = unset_texture_draw(Software, false);
+    let refusal = end.unwrap_err();
+    assert!(refusal.contains("TIC index 0xfffff"), "{refusal}");
+    let (mut frame, end) = unset_texture_draw(Metal, false);
+    end.unwrap();
+    let refusal = frame.channel.flush(&frame.ram).unwrap_err().0;
+    assert!(refusal.contains("TIC index 0xfffff"), "{refusal}");
+    // Nothing recorded since the last write-back reaches memory.
+    assert_ne!(frame.pixel(20, 20), [255, 128, 64, 255]);
 }
 
 /// Binds the ui2d textured shader pair of the starter ELF and an `n` x `n`

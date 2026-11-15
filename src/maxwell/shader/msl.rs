@@ -495,7 +495,10 @@ impl Translated {
     /// when `indirect` is not empty: indexed reads past it return 0, which
     /// is the interpreter's value past the bound size, and its refusal
     /// where the bound range is not mapped); texture and sampler `i` for
-    /// `textures[i]`.
+    /// `textures[i]`; buffer 21, when there are textures, the texture
+    /// fault words: word `2i` non-zero marks texture `i` as unbound (its
+    /// handle names no texture; a placeholder is bound), and a sample of
+    /// such a texture sets word `2i + 1` (see `texture.rs`).
     pub fn source(&self, program: &Program, outputs: &[usize]) -> String {
         let header = &program.header;
         let mut s = String::from(PRELUDE);
@@ -531,6 +534,9 @@ impl Translated {
         for i in 0..self.textures.len() {
             parameters.push(format!("texture2d<float> t{i} [[texture({i})]]"));
             parameters.push(format!("sampler s{i} [[sampler({i})]]"));
+        }
+        if !self.textures.is_empty() {
+            parameters.push("device atomic_uint* texture_faults [[buffer(21)]]".to_string());
         }
         let _ = writeln!(
             s,

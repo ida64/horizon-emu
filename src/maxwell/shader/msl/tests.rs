@@ -536,6 +536,8 @@ fn render(
             data
         }))
         .chain([bytes(&sizes)])
+        // Texture fault words: every texture bound.
+        .chain([vec![0u8; 8 * t.textures.len().max(1)]])
         .map(|data| gpu.buffer(&data))
         .collect();
     // SAFETY: buffers and textures outlive the command buffer; indices are
@@ -548,6 +550,7 @@ fn render(
             encoder.setFragmentBuffer_offset_atIndex(Some(&buffers[3 + slot]), 0, 2 + slot);
         }
         encoder.setFragmentBuffer_offset_atIndex(Some(&buffers[21]), 0, 20);
+        encoder.setFragmentBuffer_offset_atIndex(Some(&buffers[22]), 0, 21);
         for (i, texture) in textures.iter().enumerate() {
             encoder.setFragmentTexture_atIndex(Some(texture), i);
             encoder.setFragmentSamplerState_atIndex(Some(&sampler), i);

@@ -15,6 +15,18 @@
 //! to the texture's last one (`texture/filtering.rs` `coordinates`, after
 //! [public: eden `texture_pass.cpp`, Ryujinx `GetTargetTexture`], which view
 //! a 2D texture as a one-layer array), so the layer operand cannot matter.
+//!
+//! A handle that names no texture (an unset slot of an uber-shader, whose
+//! sample sits on a branch the draw may not take) is not refused when the
+//! draw is set up: the interpreter resolves a handle only when a sample
+//! executes. The draw binds a placeholder and marks the slot in the fault
+//! words (buffer 21, see [`Translated::source`](super::Translated::source));
+//! every sample checks its slot's mark first and records an executed
+//! sample of an unbound slot, which the renderer turns into the
+//! interpreter's refusal before any result reaches guest memory. Samples
+//! of helper lanes alone (outside the primitive) are not recorded
+//! [assumption: Metal discards device-memory writes of helper threads, as
+//! Vulkan does for helper invocations], where the interpreter would refuse.
 
 use super::super::exec::{bit, bits, sext};
 use super::{PT, RZ, SLOTS, Writer};
@@ -116,6 +128,16 @@ impl Writer<'_> {
         slot
     }
 
+    /// Records, before a sample of texture `slot`, that an unbound slot
+    /// was sampled (see the module documentation).
+    fn note_sample(&mut self, slot: usize) {
+        self.line(&format!(
+            "if (atomic_load_explicit(&texture_faults[{}], memory_order_relaxed) != 0u) {{ atomic_store_explicit(&texture_faults[{}], 1u, memory_order_relaxed); }}",
+            2 * slot,
+            2 * slot + 1
+        ));
+    }
+
     /// `TEXS`: 2D with implicit LOD (encoding 1), level zero (2) or an
     /// explicit level (3), and the array forms of the first two (7, 8;
     /// layer operand without effect, see the module documentation);
@@ -180,6 +202,7 @@ impl Writer<'_> {
                 format!("t{slot}.sample(s{slot}, {coordinates}, level(as_type<float>({lod})))")
             }
         };
+        self.note_sample(slot);
         self.line(&format!("{{ float4 v = {sample};"));
         let mut index = 0;
         for c in 0..4 {
@@ -245,6 +268,7 @@ impl Writer<'_> {
                 format!("t{slot}.sample(s{slot}, {coordinates}, level(as_type<float>({lod})))")
             }
         };
+        self.note_sample(slot);
         self.line(&format!("{{ float4 v = {sample};"));
         let mut index = 0;
         for c in 0..4 {

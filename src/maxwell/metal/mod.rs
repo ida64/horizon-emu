@@ -97,6 +97,9 @@ type Sampler = ProtocolObject<dyn MTLSamplerState>;
 type CommandBuffer = ProtocolObject<dyn MTLCommandBuffer>;
 type Encoder = ProtocolObject<dyn MTLRenderCommandEncoder>;
 type Library = ProtocolObject<dyn MTLLibrary>;
+/// A draw's texture fault words, with its unbound slots and the refusal
+/// an executed sample of each is.
+type Faults = (Retained<MetalBuffer>, Vec<(usize, String)>);
 
 /// The host GPU, shared by all channels.
 struct Gpu {
@@ -180,6 +183,13 @@ struct State {
     samplers: HashMap<[u32; 8], Retained<Sampler>>,
     fallbacks: HashMap<String, u64>,
     draws: u64,
+    /// Texture fault words of the draws recorded since the last flush
+    /// that bound placeholders, with each unbound slot and the refusal a
+    /// sample of it is (see `shader::msl` `texture.rs`).
+    faults: Vec<Faults>,
+    /// What an unbound texture slot is bound to: a 1x1 texture and a
+    /// sampler, never read into a result that reaches guest memory.
+    placeholder: Option<(Retained<MetalTexture>, Retained<Sampler>)>,
 }
 
 // SAFETY: the Metal objects of a channel (textures, buffers, pipeline
@@ -272,6 +282,18 @@ impl Renderer {
         use std::sync::atomic::Ordering;
         let mut state = self.state.lock().unwrap();
         state.finish();
+        // An executed sample of an unbound texture is the interpreter's
+        // refusal; nothing of the work is written back.
+        for (buffer, slots) in std::mem::take(&mut state.faults) {
+            let words = buffer.contents().cast::<u32>();
+            for (slot, refusal) in slots {
+                // SAFETY: the buffer holds two words per texture slot of
+                // the draw; the GPU finished.
+                if unsafe { words.add(2 * slot + 1).read() } != 0 {
+                    return Err(Unmodeled(refusal));
+                }
+            }
+        }
         // Residents whose mirror still equals memory do after their own
         // write-back too (residents do not overlap).
         let current: Vec<bool> = state
@@ -402,8 +424,14 @@ impl Renderer {
                 buffer.resize(end, 0);
             }
         }
-        // Textures and samplers.
+        // Textures and samplers. A handle that names no texture is bound to
+        // a placeholder and marked: the program records an executed sample
+        // of it, which `flush` refuses as the interpreter does (see
+        // `shader::msl` `texture.rs`). netConnect's uber-shader names slots
+        // its draws leave unset (TIC index 0xfffff) on branches they do not
+        // take.
         let mut bound = Vec::new();
+        let mut unbound = Vec::new();
         for (slot, &handle_offset) in translated.textures.iter().enumerate() {
             let Some((data, _)) = draw.constants.get(draw.texture_buffer_index as usize) else {
                 return self.fall_back("texture handle buffer unbound".into());
@@ -412,13 +440,13 @@ impl Renderer {
                 return self.fall_back("texture handle outside the constant buffer".into());
             };
             let handle = u32::from_le_bytes(bytes.try_into().expect("4 bytes"));
-            // Every handle the program names is bound up front, but a
-            // sample on a branch the draw does not take reads nothing: an
-            // uber-shader of netConnect names slots its draws leave unset
-            // (TIC index 0xfffff). The software renderer resolves a handle
-            // when a sample executes and refuses then.
-            let Ok((texture, tsc)) = draw.textures.resolve(handle) else {
-                return self.fall_back("texture handle that does not resolve".into());
+            let (texture, tsc) = match draw.textures.resolve(handle) {
+                Ok(resolved) => resolved,
+                Err(refusal) => {
+                    unbound.push((slot, refusal.0));
+                    bound.push(None);
+                    continue;
+                }
             };
             if let Err(reason) = format::check_texture(&texture, &tsc) {
                 return self.fall_back(reason);
@@ -428,7 +456,7 @@ impl Renderer {
             } else {
                 0.0
             };
-            bound.push((texture, tsc, bias));
+            bound.push(Some((texture, tsc, bias)));
         }
         // Targets.
         let mut attachments = Vec::new();
@@ -492,7 +520,11 @@ impl Renderer {
         };
         // Textures and samplers on the GPU.
         let mut gpu_textures = Vec::new();
-        for (texture, tsc, _) in &bound {
+        for entry in &bound {
+            let Some((texture, tsc, _)) = entry else {
+                gpu_textures.push(state.placeholder(gpu)?);
+                continue;
+            };
             let id = Arc::as_ptr(texture) as usize;
             let metal = match state.textures.get(&id) {
                 Some((_, t)) => t.clone(),
@@ -537,7 +569,16 @@ impl Renderer {
                 planes.extend_from_slice(&[plane.dx, plane.dy, plane.base]);
             }
         }
-        let biases: Vec<f32> = bound.iter().map(|b| b.2).chain([0.0]).collect();
+        let biases: Vec<f32> = bound
+            .iter()
+            .map(|b| b.as_ref().map_or(0.0, |b| b.2))
+            .chain([0.0])
+            .collect();
+        // Texture fault words: word 2i marks slot i unbound.
+        let mut fault_words = vec![0u32; 2 * translated.textures.len()];
+        for &(slot, _) in &unbound {
+            fault_words[2 * slot] = 1;
+        }
         let encoder = state.encoder(
             &residents,
             &attachments.iter().map(|a| a.1.srgb).collect::<Vec<_>>(),
@@ -585,6 +626,13 @@ impl Renderer {
             for (i, (texture, sampler)) in gpu_textures.iter().enumerate() {
                 encoder.setFragmentTexture_atIndex(Some(texture), i);
                 encoder.setFragmentSamplerState_atIndex(Some(sampler), i);
+            }
+            if !unbound.is_empty() {
+                let faults = buffer(gpu, bytes_of_u32(&fault_words))?;
+                encoder.setFragmentBuffer_offset_atIndex(Some(&faults), 0, 21);
+                state.faults.push((faults, unbound));
+            } else if !fault_words.is_empty() {
+                bind(gpu, &encoder, Stage::Fragment, bytes_of_u32(&fault_words), 21)?;
             }
             encoder.drawPrimitives_vertexStart_vertexCount(
                 MTLPrimitiveType::Triangle,
@@ -786,6 +834,37 @@ impl State {
                 resident.stamp = Some(writes.stamp());
             }
         }
+    }
+
+    /// What an unbound texture slot is bound to (made once).
+    fn placeholder(
+        &mut self,
+        gpu: &Gpu,
+    ) -> Result<(Retained<MetalTexture>, Retained<Sampler>), Unmodeled> {
+        if let Some(placeholder) = &self.placeholder {
+            return Ok(placeholder.clone());
+        }
+        // SAFETY: plain descriptor construction.
+        let descriptor = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA32Float,
+                1,
+                1,
+                false,
+            )
+        };
+        descriptor.setStorageMode(MTLStorageMode::Shared);
+        descriptor.setUsage(MTLTextureUsage::ShaderRead);
+        let texture = gpu
+            .device
+            .newTextureWithDescriptor(&descriptor)
+            .ok_or_else(|| Unmodeled("Metal: texture allocation failed".into()))?;
+        let sampler = gpu
+            .device
+            .newSamplerStateWithDescriptor(&MTLSamplerDescriptor::new())
+            .expect("sampler state");
+        self.placeholder = Some((texture.clone(), sampler.clone()));
+        Ok((texture, sampler))
     }
 
     /// The compiled library of `source`, compiled once.
