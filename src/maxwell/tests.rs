@@ -718,6 +718,32 @@ fn firmware_ui2d_solid_quad() {
     assert_eq!(image.rgba[at..at + 4], frame.pixel(20, 20));
 }
 
+/// With the depth test on but no depth target (`SET_ZT_SELECT` 0) the test
+/// is bypassed: a draw whose depth function is NEVER still writes color.
+#[test]
+fn depth_test_without_depth_target_passes() {
+    let elf = std::fs::read(STARTER).expect("starter ELF (fw_elf) must be present");
+    let mut frame = Frame::new();
+    frame.program(1, 0, starter_program(&elf, 0x4c0e00));
+    frame.program(5, 0x800, starter_program(&elf, 0x4be400));
+    frame.constants(0, 3, 0x30_0000, &ui2d_vertex_constants(&[]));
+    frame.constants(4, 3, 0x30_1000, &floats(&[0.25, 0.5, 1.0, 1.0]));
+    frame.method(0x12cc, 1); // SET_DEPTH_TEST enable
+    frame.method(0x130c, 0x200); // SET_DEPTH_FUNC NEVER
+    frame.method(0x12e8, 1); // SET_DEPTH_WRITE enable
+    frame.method(0x1538, 0); // SET_ZT_SELECT no target
+    let quad = [
+        -0.5, -0.5, 0.0, 0.25, -0.5, 0.0, 0.25, 0.75, 0.0, -0.5, 0.75, 0.0,
+    ];
+    frame.vertices(0x40_0000, 12, &quad, &[(0, 0x02)]);
+    frame.method(0x1618, 7);
+    frame.method(0x0d74, 0);
+    frame.method(0x0d78, 4);
+    frame.method(0x1614, 0);
+    assert_eq!(frame.pixel(20, 20), [64, 128, 255, 255]);
+    assert_eq!(frame.pixel(4, 4), [0, 0, 0, 255]);
+}
+
 /// Binds the ui2d textured shader pair of the starter ELF and an `n` x `n`
 /// A8B8G8R8 block-linear texture whose texel (x, y) is `texel(x, y)`, and
 /// draws the unit corner square, which the vertex shader maps to NDC

@@ -1063,14 +1063,23 @@ fn rasterize(
         });
     }
     let blend_constant = std::array::from_fn(|i| r.float(SET_BLEND_CONST_RED + 4 * i as u32));
-    let depth = if r.enabled(SET_DEPTH_TEST) {
-        let Some((surface, format)) = depth_target(r)? else {
-            return Err(refuse(
-                "depth test without a depth target",
-                SET_ZT_SELECT,
-                r.get(SET_ZT_SELECT),
-            ));
-        };
+    // Without a depth target (SET_ZT_SELECT TARGET_COUNT 0) the depth
+    // test and depth write are bypassed and every fragment passes: the rule
+    // of the APIs NVN implements [public: OpenGL 4.6 core, 17.3.4 Depth
+    // Buffer Test (with no depth buffer the test behaves as if it always
+    // passes and nothing is written); Vulkan, Fragment Operations, Depth
+    // Test (no depth attachment: the test is skipped)]. eden and Ryujinx
+    // reach the same result by binding no depth attachment and leaving the
+    // test enabled (eden `fixed_pipeline_state.cpp`: `depth_enabled` from
+    // `zeta_enable`, `depth_test_enable` passed through). NVIDIA documents
+    // nothing for the combination [assumption: the hardware follows the
+    // APIs].
+    let depth_target = if r.enabled(SET_DEPTH_TEST) {
+        depth_target(r)?
+    } else {
+        None
+    };
+    let depth = if let Some((surface, format)) = depth_target {
         let control = r.get(SET_VIEWPORT_CLIP_CONTROL);
         // PIXEL_MIN_Z / PIXEL_MAX_Z: CLAMP (1) only.
         if control & 0x18 != 0x18 {
