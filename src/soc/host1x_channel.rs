@@ -1,25 +1,43 @@
-//! Synchronous Tegra X1 host1x CDMA execution; offsets passed to engines are words.
+//! Tegra X1 host1x CDMA execution; offsets passed to engines are words.
 //!
 //! Encoding evidence: Linux `drivers/gpu/host1x/hw/` [opcodes.h],
 //! [hw_host1x04_channel.h], [hw_host1x04_uclass.h], and [channel_hw.c].
 //! The latter emits the 32-bit wait as payload at 0x4e followed by ID at 0x50.
 //! nvservices initializes GET from PUT with DMACTRL=7, then runs with zero.
-//! Unimplemented methods/conditions and unmet waits fail the MMIO submission;
-//! they never manufacture a fence completion. Shared wait-base registers and
-//! conditional host increments are not modeled. A failed stream stays faulted
-//! until DMA GET reset, so retrying a failed submission cannot replay its effects.
+//!
+//! A stream runs synchronously on the DMAPUT write until it reaches PUT or a
+//! host syncpoint wait whose threshold has not been reached. Such a wait
+//! stalls the channel where it stands (ring position and gather nesting are
+//! kept), as the hardware's command processor does; it continues once the
+//! syncpoint gets there. Nothing announces syncpoint changes, so a stalled
+//! channel looks again every `WAIT_POLL` from a thread of its own, like
+//! the GPU's channel waits.
+//!
+//! Unimplemented methods/conditions fail the stream and never manufacture a
+//! fence completion; the DMAPUT write that ran into them is refused, or, for
+//! a stream that failed while continuing after a wait, the next one. Shared
+//! wait-base registers and conditional host increments are not modeled. A
+//! failed stream stays faulted until DMA GET reset, so retrying a failed
+//! submission cannot replay its effects.
 //!
 //! [opcodes.h]: https://github.com/torvalds/linux/blob/master/drivers/gpu/host1x/hw/opcodes.h
 //! [hw_host1x04_channel.h]: https://github.com/torvalds/linux/blob/master/drivers/gpu/host1x/hw/hw_host1x04_channel.h
 //! [hw_host1x04_uclass.h]: https://github.com/torvalds/linux/blob/master/drivers/gpu/host1x/hw/hw_host1x04_uclass.h
 //! [channel_hw.c]: https://github.com/torvalds/linux/blob/master/drivers/gpu/host1x/hw/channel_hw.c
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex, Weak},
+    time::Duration,
+};
 
 use super::{Notes, host1x::Syncpoints, mc::DeviceMemory};
 use crate::bus::MmioDevice;
 
 type Engine = dyn Fn(u32, u32, u32) -> Option<()> + Send + Sync;
+
+/// How often a channel stalled on a syncpoint wait looks again (the GPU's
+/// channels poll at the same rate).
+const WAIT_POLL: Duration = Duration::from_micros(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Opcode {
@@ -112,6 +130,24 @@ struct Frame {
     insert: Option<(u32, bool)>,
 }
 
+/// A host syncpoint wait the stream stands at: syncpoint `index` must reach
+/// `threshold`, compared in the low `bits` bits (the legacy wait has 24).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Wait {
+    index: usize,
+    threshold: u32,
+    bits: u32,
+}
+
+impl Wait {
+    fn met(&self, syncpoints: &Syncpoints) -> bool {
+        let current = syncpoints.get(self.index).unwrap_or(0);
+        (current.wrapping_sub(self.threshold) << (32 - self.bits)) as i32 >= 0
+    }
+}
+
+const FRAME_DEPTH: usize = 32;
+
 struct State {
     start: u32,
     put: u32,
@@ -121,10 +157,30 @@ struct State {
     class: u32,
     payload: Option<u32>,
     pending: Pending,
+    /// Gathers being executed, innermost last (`depth` of them).
+    frames: [Frame; FRAME_DEPTH],
+    depth: usize,
+    wait: Option<Wait>,
+    /// Whether a thread is watching `wait`.
+    polling: bool,
     fault: bool,
 }
 
+impl State {
+    fn idle(&self) -> bool {
+        !self.fault
+            && self.get == self.put
+            && self.depth == 0
+            && self.wait.is_none()
+            && matches!(self.pending, Pending::None)
+    }
+}
+
 pub struct Channel {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
     memory: DeviceMemory,
     syncpoints: Arc<Syncpoints>,
     engine: Arc<Engine>,
@@ -139,25 +195,38 @@ impl Channel {
         engine: Arc<Engine>,
         notes: Arc<Notes>,
     ) -> Self {
+        let frame = Frame {
+            get: 0,
+            end: 0,
+            insert: None,
+        };
         Self {
-            memory,
-            syncpoints,
-            engine,
-            notes,
-            state: Mutex::new(State {
-                start: 0,
-                put: 0,
-                get: 0,
-                end: 0,
-                ctrl: 1,
-                class: 0,
-                payload: None,
-                pending: Pending::None,
-                fault: false,
+            inner: Arc::new(Inner {
+                memory,
+                syncpoints,
+                engine,
+                notes,
+                state: Mutex::new(State {
+                    start: 0,
+                    put: 0,
+                    get: 0,
+                    end: 0,
+                    ctrl: 1,
+                    class: 0,
+                    payload: None,
+                    pending: Pending::None,
+                    frames: [frame; FRAME_DEPTH],
+                    depth: 0,
+                    wait: None,
+                    polling: false,
+                    fault: false,
+                }),
             }),
         }
     }
+}
 
+impl Inner {
     fn method(&self, state: &mut State, offset: u32, value: u32) -> Result<(), &'static str> {
         if offset > 0xfff {
             return Err("method offset exceeds 12-bit range");
@@ -176,25 +245,27 @@ impl Channel {
                 self.syncpoints.add(value as usize, 1);
             }
             8 => {
-                let current = self
-                    .syncpoints
-                    .get((value >> 24) as usize)
+                let index = (value >> 24) as usize;
+                self.syncpoints
+                    .get(index)
                     .ok_or("invalid wait syncpoint ID")?;
-                // The legacy threshold has only 24 bits; compare in that domain.
-                if current.wrapping_sub(value & 0xffffff) & 0x800000 != 0 {
-                    return Err("unmet 24-bit syncpoint wait");
-                }
+                state.wait = Some(Wait {
+                    index,
+                    threshold: value & 0xffffff,
+                    bits: 24,
+                });
             }
             0x4e => state.payload = Some(value),
             0x50 => {
                 let threshold = state.payload.ok_or("32-bit wait has no loaded payload")?;
-                let current = self
-                    .syncpoints
+                self.syncpoints
                     .get(value as usize)
                     .ok_or("invalid wait syncpoint ID")?;
-                if (current.wrapping_sub(threshold) as i32) < 0 {
-                    return Err("unmet 32-bit syncpoint wait");
-                }
+                state.wait = Some(Wait {
+                    index: value as usize,
+                    threshold,
+                    bits: 32,
+                });
             }
             9 | 0xb => return Err("shared syncpoint wait-base methods are unsupported"),
             _ => return Err("unknown host1x class method"),
@@ -213,25 +284,26 @@ impl Channel {
         Ok(u32::from_le_bytes(bytes))
     }
 
+    /// Runs the stream until it reaches PUT or stands at an unmet wait.
     fn execute(&self, state: &mut State) -> Result<(), &'static str> {
         if state.fault {
             return Err("channel remains faulted; DMA GET reset required");
         }
-        // Fixed storage avoids an allocation per submission. Limits refuse loops
-        // or pathological nesting rather than claiming that work completed.
-        let mut frames = [Frame {
-            get: 0,
-            end: 0,
-            insert: None,
-        }; 32];
-        let mut depth = 0usize;
+        // Limits refuse loops rather than claiming that work completed.
         let mut budget = 1_048_576usize;
         loop {
-            if depth != 0 && frames[depth - 1].get == frames[depth - 1].end {
+            if let Some(wait) = state.wait {
+                if !wait.met(&self.syncpoints) {
+                    return Ok(());
+                }
+                state.wait = None;
+            }
+            let depth = state.depth;
+            if depth != 0 && state.frames[depth - 1].get == state.frames[depth - 1].end {
                 if !matches!(state.pending, Pending::None) {
                     return Err("gather ends inside a command packet");
                 }
-                depth -= 1;
+                state.depth -= 1;
                 continue;
             }
             if depth == 0 && state.get == state.put {
@@ -247,16 +319,17 @@ impl Channel {
                 }
                 u64::from(state.get)
             } else {
-                frames[depth - 1].get
+                state.frames[depth - 1].get
             };
             let value = self.word(address)?;
             if depth == 0 {
                 state.get = state.get.checked_add(4).ok_or("DMA GET overflow")?;
             } else {
-                frames[depth - 1].get += 4;
-                if let Some((offset, increment)) = frames[depth - 1].insert {
+                let frame = &mut state.frames[depth - 1];
+                frame.get += 4;
+                if let Some((offset, increment)) = frame.insert {
+                    frame.insert = Some((offset + u32::from(increment), increment));
                     self.method(state, offset, value)?;
-                    frames[depth - 1].insert = Some((offset + u32::from(increment), increment));
                     continue;
                 }
             }
@@ -266,7 +339,6 @@ impl Channel {
                     count,
                     increment,
                 } => {
-                    self.method(state, offset, value)?;
                     if count > 1 {
                         state.pending = Pending::Sequence {
                             offset: offset + u32::from(increment),
@@ -274,15 +346,16 @@ impl Channel {
                             increment,
                         };
                     }
+                    self.method(state, offset, value)?;
                     continue;
                 }
                 Pending::Mask { offset, mask } => {
                     let bit = mask.trailing_zeros();
-                    self.method(state, offset + bit, value)?;
-                    let mask = mask & (mask - 1);
-                    if mask != 0 {
-                        state.pending = Pending::Mask { offset, mask };
+                    let rest = mask & (mask - 1);
+                    if rest != 0 {
+                        state.pending = Pending::Mask { offset, mask: rest };
                     }
+                    self.method(state, offset + bit, value)?;
                     continue;
                 }
                 Pending::Gather {
@@ -295,23 +368,19 @@ impl Channel {
                         return Err("unaligned gather address");
                     }
                     if count != 0 {
-                        if depth == frames.len() {
+                        if depth == FRAME_DEPTH {
                             return Err("nested gather depth exceeded");
                         }
                         let end = u64::from(value) + u64::from(count) * 4;
                         if end > 1u64 << 32 {
                             return Err("gather crosses 32-bit address space");
                         }
-                        frames[depth] = Frame {
+                        state.frames[depth] = Frame {
                             get: value.into(),
                             end,
-                            insert: if insert {
-                                Some((offset, increment))
-                            } else {
-                                None
-                            },
+                            insert: insert.then_some((offset, increment)),
                         };
-                        depth += 1;
+                        state.depth += 1;
                     }
                     continue;
                 }
@@ -373,6 +442,41 @@ impl Channel {
             }
         }
     }
+
+    /// Runs the stream; on failure faults the channel and leaves a note.
+    fn run(&self, state: &mut State) -> Option<()> {
+        if let Err(reason) = self.execute(state) {
+            state.fault = true;
+            state.wait = None;
+            self.notes.add(format!(
+                "host1x channel: {reason}; GET={:#010x}, PUT={:#010x}, class={:#x}",
+                state.get, state.put, state.class
+            ));
+            return None;
+        }
+        Some(())
+    }
+}
+
+/// Continues `inner`'s stream whenever its wait is met, until it no longer
+/// stands at one or the channel is gone.
+fn poll(inner: Weak<Inner>) {
+    loop {
+        std::thread::sleep(WAIT_POLL);
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        let mut state = inner.state.lock().unwrap();
+        if state.wait.is_some_and(|wait| wait.met(&inner.syncpoints)) {
+            // A failure faults the channel; its note and the refusal of the
+            // next DMAPUT write report it.
+            let _ = inner.run(&mut state);
+        }
+        if state.wait.is_none() {
+            state.polling = false;
+            return;
+        }
+    }
 }
 
 impl MmioDevice for Channel {
@@ -380,15 +484,9 @@ impl MmioDevice for Channel {
         if size != 4 || offset & 3 != 0 {
             return None;
         }
-        let state = self.state.lock().unwrap();
+        let state = self.inner.state.lock().unwrap();
         let value = match offset {
-            0 => {
-                u32::from(
-                    !state.fault
-                        && state.get == state.put
-                        && matches!(state.pending, Pending::None),
-                ) << 11
-            }
+            0 => u32::from(state.idle()) << 11,
             0x14 => state.start,
             0x18 => state.put,
             0x1c => state.get,
@@ -403,11 +501,12 @@ impl MmioDevice for Channel {
         if size != 4 || offset & 3 != 0 {
             return None;
         }
+        let inner = &self.inner;
         let value = value as u32;
-        let mut state = self.state.lock().unwrap();
+        let mut state = inner.state.lock().unwrap();
         match offset {
             0x14 | 0x18 | 0x20 if value & 3 != 0 => {
-                self.notes.add(format!(
+                inner.notes.add(format!(
                     "host1x channel: unaligned DMA register {offset:#x}={value:#x}"
                 ));
                 return None;
@@ -417,7 +516,8 @@ impl MmioDevice for Channel {
             0x20 => state.end = value,
             0x24 => {
                 if value & !7 != 0 {
-                    self.notes
+                    inner
+                        .notes
                         .add(format!("host1x channel: unsupported DMACTRL {value:#x}"));
                     return None;
                 }
@@ -429,26 +529,28 @@ impl MmioDevice for Channel {
                         state.start
                     };
                     state.pending = Pending::None;
+                    state.depth = 0;
+                    state.wait = None;
                     state.fault = false;
                 }
             }
             _ => {
-                self.notes.add(format!(
+                inner.notes.add(format!(
                     "host1x channel: unsupported register write {offset:#x}={value:#x}"
                 ));
                 return None;
             }
         }
-        if matches!(offset, 0x18 | 0x24)
-            && state.ctrl & 1 == 0
-            && let Err(reason) = self.execute(&mut state)
-        {
-            state.fault = true;
-            self.notes.add(format!(
-                "host1x channel: {reason}; GET={:#010x}, PUT={:#010x}, class={:#x}",
-                state.get, state.put, state.class
-            ));
-            return None;
+        if matches!(offset, 0x18 | 0x24) && state.ctrl & 1 == 0 {
+            inner.run(&mut state)?;
+            if state.wait.is_some() && !state.polling {
+                state.polling = true;
+                let weak = Arc::downgrade(inner);
+                std::thread::Builder::new()
+                    .name("host1x channel wait".into())
+                    .spawn(move || poll(weak))
+                    .expect("host1x channel wait thread");
+            }
         }
         Some(())
     }
@@ -456,7 +558,157 @@ impl MmioDevice for Channel {
 
 #[cfg(test)]
 mod tests {
-    use super::{Opcode, decode};
+    use super::*;
+    use crate::{
+        boot::DramSize,
+        memory::GuestRam,
+        soc::mc::{Mc, SMMU_HOST1X_ASID},
+    };
+    use std::time::Instant;
+
+    const RAM_BASE: u64 = 0x8000_0000;
+    /// Device address 0 maps here (one 4 MiB SMMU section).
+    const WINDOW: u64 = RAM_BASE + 0x40_0000;
+    const RING: u32 = 0x1000;
+    const GATHER: u32 = 0x8000;
+
+    struct Bench {
+        ram: Arc<GuestRam>,
+        syncpoints: Arc<Syncpoints>,
+        notes: Arc<Notes>,
+        calls: Arc<Mutex<Vec<(u32, u32, u32)>>>,
+        channel: Channel,
+    }
+
+    impl Bench {
+        fn new() -> Self {
+            let ram = Arc::new(GuestRam::new(RAM_BASE, 0x80_0000).unwrap());
+            let mc = Arc::new(Mc::new(DramSize::Gb4));
+            mc.write(0, 0x1c, 4, 1).unwrap();
+            mc.write(0, 0x20, 4, 0xe008_0000).unwrap();
+            mc.write(0, SMMU_HOST1X_ASID, 4, 0x8000_0001).unwrap();
+            ram.write(RAM_BASE, &0xc008_0400u32.to_le_bytes()).unwrap();
+            let syncpoints = Arc::new(Syncpoints::default());
+            let notes: Arc<Notes> = Arc::default();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let record = Arc::clone(&calls);
+            let channel = Channel::new(
+                DeviceMemory::new(&mc, &ram, SMMU_HOST1X_ASID),
+                Arc::clone(&syncpoints),
+                Arc::new(move |class, offset, value| {
+                    record.lock().unwrap().push((class, offset, value));
+                    Some(())
+                }),
+                Arc::clone(&notes),
+            );
+            for (register, value) in [(0x14, RING), (0x20, RING + 0x1000), (0x18, RING)] {
+                channel.write(0, register, 4, value.into()).unwrap();
+            }
+            channel.write(0, 0x24, 4, 7).unwrap();
+            channel.write(0, 0x24, 4, 0).unwrap();
+            Bench {
+                ram,
+                syncpoints,
+                notes,
+                calls,
+                channel,
+            }
+        }
+
+        fn poke(&self, address: u32, words: &[u32]) {
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            self.ram.write(WINDOW + u64::from(address), &bytes).unwrap();
+        }
+
+        /// Puts `words` in the ring and moves PUT past them.
+        fn submit(&self, words: &[u32]) -> Option<()> {
+            self.poke(RING, words);
+            self.channel
+                .write(0, 0x18, 4, u64::from(RING) + 4 * words.len() as u64)
+        }
+
+        fn idle(&self) -> bool {
+            self.channel.read(0, 0, 4) == Some(1 << 11)
+        }
+
+        /// Waits (up to a second) for the engine to have seen `count` methods.
+        fn engine_calls(&self, count: usize) -> Vec<(u32, u32, u32)> {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while self.calls.lock().unwrap().len() < count && Instant::now() < deadline {
+                std::thread::sleep(WAIT_POLL);
+            }
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    /// `SETCLASS class, offset, mask`.
+    fn setclass(class: u32, offset: u32, mask: u32) -> u32 {
+        offset << 16 | class << 6 | mask
+    }
+
+    /// The 32-bit wait nvservices puts before a job (Linux `channel_hw.c`):
+    /// payload at host method 0x4e, syncpoint at 0x50.
+    fn wait32(index: u32, threshold: u32) -> [u32; 4] {
+        [setclass(1, 0x4e, 1), threshold, setclass(1, 0x50, 1), index]
+    }
+
+    #[test]
+    fn an_unmet_wait_stalls_the_channel_until_its_syncpoint_gets_there() {
+        let bench = Bench::new();
+        bench.syncpoints.add(7, 4);
+        let mut words = wait32(7, 5).to_vec();
+        words.extend([setclass(0x5d, 0, 0), 0x1010_0002, 0xc0, 0x100]);
+        bench.submit(&words).unwrap();
+        assert!(bench.calls.lock().unwrap().is_empty());
+        assert!(!bench.idle());
+        // The stream stands right after the wait.
+        assert_eq!(bench.channel.read(0, 0x1c, 4), Some(u64::from(RING) + 16));
+        bench.syncpoints.add(7, 1);
+        assert_eq!(
+            bench.engine_calls(2),
+            [(0x5d, 0x10, 0xc0), (0x5d, 0x11, 0x100)]
+        );
+        assert!(bench.idle());
+        assert!(bench.notes.take().is_empty());
+    }
+
+    #[test]
+    fn a_met_wait_runs_through_and_a_wait_inside_a_gather_resumes_inside_it() {
+        let bench = Bench::new();
+        bench.syncpoints.add(3, 2);
+        // Met at once: the legacy 24-bit form, id in bits 31:24.
+        bench
+            .submit(&[setclass(1, 8, 1), 3 << 24 | 2, setclass(0x5d, 0x10, 1), 1])
+            .unwrap();
+        assert_eq!(bench.calls.lock().unwrap().len(), 1);
+        let mut gather = wait32(3, 3).to_vec();
+        gather.extend([setclass(0x5d, 0x11, 1), 2]);
+        bench.poke(GATHER, &gather);
+        // The ring continues after the gather; the method after it waits too.
+        bench.poke(RING + 16, &[0x6000_0000 | gather.len() as u32, GATHER]);
+        bench.poke(RING + 24, &[setclass(0x5d, 0x12, 1), 3]);
+        bench
+            .channel
+            .write(0, 0x18, 4, u64::from(RING) + 32)
+            .unwrap();
+        assert_eq!(bench.calls.lock().unwrap().len(), 1);
+        bench.syncpoints.add(3, 1);
+        assert_eq!(
+            bench.engine_calls(3),
+            [(0x5d, 0x10, 1), (0x5d, 0x11, 2), (0x5d, 0x12, 3)]
+        );
+        assert!(bench.idle());
+    }
+
+    #[test]
+    fn a_get_reset_abandons_a_stalled_wait() {
+        let bench = Bench::new();
+        bench.submit(&wait32(9, 1)).unwrap();
+        assert!(!bench.idle());
+        bench.channel.write(0, 0x24, 4, 7).unwrap();
+        bench.channel.write(0, 0x24, 4, 0).unwrap();
+        assert!(bench.idle());
+    }
 
     #[test]
     fn class_and_mask_fields() {
