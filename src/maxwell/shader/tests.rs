@@ -2,13 +2,13 @@
 //! by NVN's magic and zero reserved header, as observed in starter main.elf.
 use super::*;
 use std::collections::{BTreeMap, HashSet};
-const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../");
-const TITLE: &str = "0100000000001012/ca6e167d711b924ba111ecb24f6a4ae0/";
-fn elf() -> Vec<u8> {
+pub(super) const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../");
+pub(super) const TITLE: &str = "0100000000001012/ca6e167d711b924ba111ecb24f6a4ae0/";
+pub(super) fn elf() -> Vec<u8> {
     std::fs::read(format!("{ROOT}fw_elf/{TITLE}section0_exefs/main.elf"))
         .expect("required starter ELF")
 }
-fn stages(data: &[u8]) -> Vec<(usize, Program)> {
+pub(super) fn stages(data: &[u8]) -> Vec<(usize, Program)> {
     let mut result = Vec::new();
     for offset in 0..data.len().saturating_sub(0x80) {
         if data[offset..offset + 4] != [0x78, 0x56, 0x34, 0x12]
@@ -25,7 +25,7 @@ fn stages(data: &[u8]) -> Vec<(usize, Program)> {
     }
     result
 }
-fn yaz0(data: &[u8]) -> Vec<u8> {
+pub(super) fn yaz0(data: &[u8]) -> Vec<u8> {
     if &data[..4] != b"Yaz0" {
         return data.to_vec();
     }
@@ -62,7 +62,7 @@ fn yaz0(data: &[u8]) -> Vec<u8> {
     }
     out
 }
-fn members(data: &[u8]) -> Vec<&[u8]> {
+pub(super) fn members(data: &[u8]) -> Vec<&[u8]> {
     assert_eq!(&data[..4], b"SARC");
     let le = data[6..8] == [0xff, 0xfe];
     let u16at = |o| {
@@ -523,57 +523,6 @@ fn unordered_predicate_combining_and_sparse_omap_depth() {
     assert_eq!(q.outputs[0].colors[0], [0.0, 7.0, 0.0, 0.0]);
     assert_eq!(q.outputs[0].colors[2], [0.0, 0.0, 9.0, 0.0]);
     assert_eq!(q.outputs[0].depth, Some(0.5));
-}
-
-/// Every pixel program of the corpus either translates to MSL that Metal
-/// compiles, or is refused with a reason.
-#[test]
-fn firmware_pixel_programs_translate_and_compile() {
-    let mut seen = HashSet::new();
-    let mut programs = Vec::new();
-    let mut add = |data: &[u8]| {
-        for (offset, p) in stages(data) {
-            let code = data[offset + 0x80..offset + 0x30 + p.len()].to_vec();
-            if seen.insert(code) && p.header().shader_type() == ShaderType::Pixel {
-                programs.push(p);
-            }
-        }
-    };
-    add(&elf());
-    for name in [
-        "shader/VarietyOceanShader_Nx.arc.szs",
-        "agl/agl_resource_min.Nin_Nx_NVN.release.sarc.szs",
-    ] {
-        let data = std::fs::read(format!("{ROOT}fw_dump/{TITLE}section1_romfs/common/{name}"))
-            .expect("required shader archive");
-        for member in members(&yaz0(&data)) {
-            add(member);
-        }
-    }
-    let mut refused = BTreeMap::new();
-    let mut compiled = 0;
-    for program in &programs {
-        match msl::translate(program) {
-            Ok(translated) => {
-                let outputs: Vec<usize> = (0..8)
-                    .filter(|&t| program.header().ps_color_mask(t) != 0)
-                    .collect();
-                let source = translated.source(program, &outputs);
-                crate::maxwell::metal::compile(&source, outputs.len())
-                    .unwrap_or_else(|e| panic!("{e}"));
-                compiled += 1;
-            }
-            Err(reason) => {
-                let key = reason.split(" 0x").next().unwrap_or(&reason).to_string();
-                *refused.entry(key).or_insert(0usize) += 1;
-            }
-        }
-    }
-    println!(
-        "{compiled} of {} pixel programs compiled; refused: {refused:?}",
-        programs.len()
-    );
-    assert!(compiled > 0);
 }
 /// A geometry shader header: VTG, shader type 4, one thread per
 /// primitive, TRIANGLESTRIP output of at most `max` vertices.

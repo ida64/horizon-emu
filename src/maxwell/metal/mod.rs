@@ -191,6 +191,8 @@ unsafe impl Send for State {}
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct PipelineKey {
     program: usize,
+    /// The constant buffer 1 a translation with BRX was made for.
+    jump_tables: Option<Vec<u8>>,
     /// Per attachment: pixel format, blend, write mask, program output.
     attachments: Vec<(usize, Option<Blend>, u8, usize)>,
 }
@@ -334,18 +336,27 @@ impl Renderer {
     ) -> Result<bool, Unmodeled> {
         // Inputs that come from memory are gathered before the state is
         // locked: reading them may flush.
+        // Constant buffer 1, where BRX jump tables live (a translation with
+        // indirect branches is valid only for the content it was made for).
+        let constant_buffer_1 = draw
+            .constants
+            .get(1)
+            .map_or(&[][..], |(data, size)| &data[..data.len().min(*size)]);
         let translated = {
             let mut state = self.state.lock().unwrap();
             let key = Arc::as_ptr(draw.program) as usize;
-            state
-                .programs
-                .entry(key)
-                .or_insert_with(|| Program2 {
-                    _program: Arc::clone(draw.program),
-                    translated: msl::translate(draw.program).map(Arc::new),
-                })
-                .translated
-                .clone()
+            let entry = state.programs.entry(key).or_insert_with(|| Program2 {
+                _program: Arc::clone(draw.program),
+                translated: msl::translate(draw.program, constant_buffer_1).map(Arc::new),
+            });
+            if let Ok(t) = &entry.translated
+                && t.constant_buffer_1
+                    .as_deref()
+                    .is_some_and(|table| table != constant_buffer_1)
+            {
+                entry.translated = msl::translate(draw.program, constant_buffer_1).map(Arc::new);
+            }
+            entry.translated.clone()
         };
         let translated = match translated {
             Ok(t) => t,
@@ -354,15 +365,37 @@ impl Renderer {
         if draw.program.header().ps_writes_depth() {
             return self.fall_back("pixel program writes depth".into());
         }
-        // Constant buffer words read statically must be readable.
+        // Slots read at register offsets (LDC): their readable part of the
+        // bound range, in words, and its size in bytes (see
+        // `Translated::source`). A bound range can reach past the memory
+        // its owner mapped (see `pipeline::read_mapped`); an indexed read
+        // there, which the interpreter refuses (hardware would fault),
+        // reads 0 on Metal. No statically known read may go there.
         let mut constants: HashMap<u32, Vec<u8>> = HashMap::new();
+        let mut sizes = [0u32; 18];
+        for &slot in &translated.indirect {
+            let Some((data, size)) = draw.constants.get(slot as usize) else {
+                return self.fall_back(format!("constant buffer slot {slot}"));
+            };
+            let readable = data.len().min(*size);
+            let mut buffer = data[..readable].to_vec();
+            buffer.resize(readable.next_multiple_of(4).max(4), 0);
+            constants.insert(slot, buffer);
+            sizes[slot as usize] = readable as u32;
+        }
+        // Constant buffer words read statically must be readable.
         for &(slot, offset) in &translated.constants {
+            let indexed = translated.indirect.contains(&slot);
             let Some((data, size)) = draw.constants.get(slot as usize) else {
                 return self.fall_back(format!("constant buffer slot {slot}"));
             };
             let end = offset as usize + 4;
             if end > data.len() && end <= *size {
                 return self.fall_back("constant read past the mapped part".into());
+            }
+            if indexed {
+                // Bounds-checked by the program against `sizes`.
+                continue;
             }
             let buffer = constants.entry(slot).or_insert_with(|| data.clone());
             if buffer.len() < end {
@@ -421,6 +454,7 @@ impl Renderer {
         // Pipeline.
         let key = PipelineKey {
             program: Arc::as_ptr(draw.program) as usize,
+            jump_tables: translated.constant_buffer_1.clone(),
             attachments: attachments
                 .iter()
                 .map(|(_, color, pixel_format)| {
@@ -537,6 +571,9 @@ impl Renderer {
             bind(gpu, &encoder, Stage::Fragment, bytes_of(&biases), 1)?;
             for (slot, data) in &constants {
                 bind(gpu, &encoder, Stage::Fragment, data, 2 + *slot as usize)?;
+            }
+            if !translated.indirect.is_empty() {
+                bind(gpu, &encoder, Stage::Fragment, bytes_of_u32(&sizes), 20)?;
             }
             for (i, (texture, sampler)) in gpu_textures.iter().enumerate() {
                 encoder.setFragmentTexture_atIndex(Some(texture), i);
@@ -1071,20 +1108,6 @@ fn build_sampler(gpu: &Gpu, texture: &Texture, tsc: &Tsc) -> Retained<Sampler> {
         .expect("sampler state")
 }
 
-/// Compiles `source` into a pipeline with `outputs` RGBA8 attachments, for
-/// tests of the translation.
-#[cfg(test)]
-pub(crate) fn compile(source: &str, outputs: usize) -> Result<(), String> {
-    let gpu = GPU.as_ref().ok_or("no Metal device")?;
-    let attachments: Vec<_> = (0..outputs)
-        .map(|i| (MTLPixelFormat::RGBA8Unorm.0, None, 15, i))
-        .collect();
-    let library = compile_library(gpu, source).map_err(|e| e.0)?;
-    build_pipeline(gpu, &library, "fragment_main", &attachments)
-        .map(drop)
-        .map_err(|e| e.0)
-}
-
 fn buffer(gpu: &Gpu, data: &[u8]) -> Result<Retained<MetalBuffer>, Unmodeled> {
     // Metal refuses empty buffers.
     let padded;
@@ -1153,6 +1176,11 @@ unsafe fn bind(
 
 fn bytes_of(values: &[f32]) -> &[u8] {
     // SAFETY: f32 has no padding and any byte is a valid u8.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
+}
+
+fn bytes_of_u32(values: &[u32]) -> &[u8] {
+    // SAFETY: u32 has no padding and any byte is a valid u8.
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
 }
 
