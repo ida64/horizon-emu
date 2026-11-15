@@ -147,11 +147,20 @@ impl HomebrewOptions {
             let failed =
                 |error: String| format!("--replace-program {program_id:016x}={nsp}: {error}");
             let exefs = std::fs::read(&nsp).map_err(|error| failed(error.to_string()))?;
+            let mut dropped = Vec::new();
             let replacement = nand::replace_program(user, keys, program_id, |original| {
-                program::build_program_nca(keys, original, program_id, &exefs)
-                    .map_err(|error| error.to_string())
+                let (archive, changes) =
+                    program::build_program_nca(keys, original, program_id, &exefs)
+                        .map_err(|error| error.to_string())?;
+                dropped = changes;
+                Ok(archive)
             })
             .map_err(|error| failed(error.to_string()))?;
+            report.extend(
+                dropped
+                    .into_iter()
+                    .map(|line| format!("program {program_id:016x}: {line}")),
+            );
             report.push(format!(
                 "program {program_id:016x}: SYSTEM:{} ({} bytes) now begins with the {} bytes made from {nsp}",
                 replacement.path, replacement.original_size, replacement.size
@@ -175,8 +184,11 @@ impl HomebrewOptions {
             return Ok(None);
         };
         let contents = std::fs::read(nro).map_err(|error| format!("--homebrew {nro}: {error}"))?;
-        let image = sdcard::image_with_files(SD_CARD_SIZE, &[("/hbmenu.nro", &contents)])
-            .map_err(|error| format!("--homebrew: {error}"))?;
+        let image = sdcard::image_with_files(
+            SD_CARD_SIZE,
+            &[("/hbmenu.nro", &contents), ("/switch/", &[])],
+        )
+        .map_err(|error| format!("--homebrew: {error}"))?;
         SdCardImage::memory(image)
             .map(Some)
             .map_err(|error| format!("--homebrew: {error}"))

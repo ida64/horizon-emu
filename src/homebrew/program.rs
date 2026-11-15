@@ -54,7 +54,7 @@ const CODE_FILES: [&str; 13] = [
 ];
 const NPDM: &str = "main.npdm";
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgramError {
     /// Not a partition FS, or one that holds something else.
     ExeFs(String),
@@ -222,8 +222,75 @@ fn pool_partition(original: &Nca) -> Result<u32, ProgramError> {
     Ok(u32_at(npdm, acid.start + 0x20C).expect("the ACID is long enough") & POOL_PARTITION)
 }
 
+/// Region type of a map-region kernel capability (descriptor ending in
+/// ten ones, three seven-bit fields from bit 11: a six-bit type and a
+/// read-only bit) for the kernel trace buffer.
+const REGION_KERNEL_TRACE_BUFFER: u32 = 1;
+/// A kernel capability word that stands for nothing (the loader skips it,
+/// `0x5540`; so does the kernel).
+const PADDING: u32 = 0xFFFF_FFFF;
+
+/// The kernel capabilities of `npdm`'s ACI and of its ACID, as byte
+/// ranges.
+fn capability_ranges(npdm: &[u8]) -> Result<[std::ops::Range<usize>; 2], ProgramError> {
+    let short = ProgramError::Npdm("a capability table is past the end");
+    let aci = u32_at(npdm, 0x70).ok_or(ProgramError::Npdm("short META"))? as usize;
+    let acid = acid(npdm)?.start;
+    let mut ranges = Vec::new();
+    for (start, field) in [(aci, 0x30), (acid, 0x230)] {
+        let offset = u32_at(npdm, start + field).ok_or(short.clone())? as usize;
+        let size = u32_at(npdm, start + field + 4).ok_or(short.clone())? as usize;
+        let range = start + offset..start + offset + size;
+        if range.end > npdm.len() || !size.is_multiple_of(4) {
+            return Err(short);
+        }
+        ranges.push(range);
+    }
+    Ok(ranges.try_into().expect("two"))
+}
+
+/// Takes out of `npdm` (ACI and ACID alike) every request to map the
+/// kernel trace buffer, which this console's kernel does not have: it
+/// refuses to create a process that asks for a region it lacks (result
+/// `0xee01`, `KCapabilities_ValidateMapRegion` at `0x8006e070`, called
+/// for `svcCreateProcess` from `0x8006e38c`). Retail kernels have no trace
+/// buffer; hbloader's NPDM asks for it read-only (`0x20bff`). This is a
+/// rule about the homebrew's own metadata, the one Atmosphère's loader
+/// applied to hbloader's capabilities before its own kernel learned to
+/// accept the request. A descriptor left with no region becomes padding.
+/// Returns a line per descriptor changed.
+fn drop_absent_regions(npdm: &mut [u8]) -> Result<Vec<String>, ProgramError> {
+    let mut dropped = Vec::new();
+    for (table, range) in ["ACI", "ACID"].into_iter().zip(capability_ranges(npdm)?) {
+        for at in range.step_by(4) {
+            let word = u32_at(npdm, at).expect("within the table");
+            if word & 0x7FF != 0x3FF {
+                continue;
+            }
+            let mut kept = word & 0x7FF;
+            for shift in [11, 18, 25] {
+                let field = (word >> shift) & 0x7F;
+                if field & 0x3F != REGION_KERNEL_TRACE_BUFFER {
+                    kept |= field << shift;
+                }
+            }
+            if kept == word {
+                continue;
+            }
+            let new = if kept == 0x3FF { PADDING } else { kept };
+            npdm[at..at + 4].copy_from_slice(&new.to_le_bytes());
+            dropped.push(format!(
+                "{table} capability {word:#x} (map the kernel trace buffer) became {new:#x}: \
+                 this kernel has no trace buffer"
+            ));
+        }
+    }
+    Ok(dropped)
+}
+
 /// The program archive for the ExeFS `nsp`, which must be for
-/// `program_id`, in place of `original`; see the module documentation.
+/// `program_id`, in place of `original`, and a line for each change
+/// [`drop_absent_regions`] made; see the module documentation.
 ///
 /// The ACID's pool partition becomes that of `original`: the system
 /// starts the program as the one it replaces, and the loader refuses an
@@ -235,7 +302,7 @@ pub fn build_program_nca(
     original: &Nca,
     program_id: u64,
     nsp: &[u8],
-) -> Result<Vec<u8>, ProgramError> {
+) -> Result<(Vec<u8>, Vec<String>), ProgramError> {
     let pool = pool_partition(original)?;
     let mut files = exefs_files(nsp)?;
     let npdm = &mut files.last_mut().expect("main.npdm is last").1;
@@ -249,8 +316,10 @@ pub fn build_program_nca(
     let flags_at = acid(npdm)?.start + 0x20C;
     let flags = u32_at(npdm, flags_at).expect("the ACID is long enough") & !POOL_PARTITION | pool;
     npdm[flags_at..flags_at + 4].copy_from_slice(&flags.to_le_bytes());
+    let dropped = drop_absent_regions(npdm)?;
     sign_npdm(npdm)?;
-    seal(keys, original.header(), program_id, &pfs0(&files))
+    let archive = seal(keys, original.header(), program_id, &pfs0(&files))?;
+    Ok((archive, dropped))
 }
 
 /// The archive of the ExeFS `exefs`, with what its header takes over from
@@ -420,7 +489,9 @@ mod tests {
         let keys = keys();
         let original = original(&keys);
         let original = Nca::open(&original, &keys).unwrap();
-        let archive = build_program_nca(&keys, &original, PROGRAM_ID, &nsp(PROGRAM_ID)).unwrap();
+        let (archive, dropped) =
+            build_program_nca(&keys, &original, PROGRAM_ID, &nsp(PROGRAM_ID)).unwrap();
+        assert!(dropped.is_empty());
 
         let built = Nca::open(&archive, &keys).unwrap();
         assert_eq!(built.program_id(), PROGRAM_ID);
@@ -454,6 +525,32 @@ mod tests {
             "applet pool"
         );
         assert!(verifies(&acid[0x100..], &acid[..0x100]), "ACID signature");
+    }
+
+    #[test]
+    fn trace_buffer_requests_are_dropped_from_both_tables() {
+        let mut npdm = npdm(PROGRAM_ID, 1);
+        let (aci, acid) = (0x2C0, 0x80);
+        // Eight bytes of kernel capabilities at the end of each.
+        for (start, field, offset) in [(aci, 0x30, 0x38usize), (acid, 0x230, 0x238)] {
+            npdm[start + field..start + field + 4].copy_from_slice(&(offset as u32).to_le_bytes());
+            npdm[start + field + 4..start + field + 8].copy_from_slice(&8u32.to_le_bytes());
+            // Trace buffer read-only and a second region kept; program type.
+            let map = 0x3FFu32 | 0x41 << 11 | 0x02 << 18;
+            npdm[start + offset..start + offset + 4].copy_from_slice(&map.to_le_bytes());
+            npdm[start + offset + 4..start + offset + 8].copy_from_slice(&0x9FFFu32.to_le_bytes());
+        }
+        let mut alone = npdm.clone();
+        let at = aci + 0x38;
+        alone[at..at + 4].copy_from_slice(&0x20BFFu32.to_le_bytes());
+
+        assert_eq!(drop_absent_regions(&mut npdm).unwrap().len(), 2);
+        for start in [aci + 0x38, acid + 0x238] {
+            assert_eq!(u32_at(&npdm, start), Some(0x3FF | 0x02 << 18));
+            assert_eq!(u32_at(&npdm, start + 4), Some(0x9FFF));
+        }
+        drop_absent_regions(&mut alone).unwrap();
+        assert_eq!(u32_at(&alone, aci + 0x38), Some(PADDING));
     }
 
     #[test]

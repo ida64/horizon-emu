@@ -165,8 +165,10 @@ pub fn add_file<S: Sectors>(
 
 /// A card image of `size` bytes, formatted as the console formats a card,
 /// with `files` at the absolute paths given (`/hbmenu.nro`,
-/// `/switch/foo.nro`) and the directories they need. `size` is that of an
-/// SDHC card: a multiple of 512 KiB above 0x8287_FFFF bytes and up to
+/// `/switch/foo.nro`) and the directories they need. A path that ends in
+/// `/` (`/switch/`) is a directory to make; its contents are ignored.
+/// `size` is that of an SDHC card: a multiple of 512 KiB above
+/// 0x8287_FFFF bytes and up to
 /// 32 GiB. The buffer is zero-filled by the allocator on demand, so what
 /// is never written takes no host memory.
 pub fn image_with_files(size: u64, files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
@@ -179,8 +181,12 @@ pub fn image_with_files(size: u64, files: &[(&str, &[u8])]) -> Result<Vec<u8>, S
     format(&mut image, sectors).map_err(|error| failed("format", error))?;
     let mut volume = open_volume(&mut image).map_err(|error| failed("open", error))?;
     for (path, contents) in files {
-        add_file(&mut volume, path, &mut &contents[..], contents.len() as u64)
-            .map_err(|error| failed(path, error))?;
+        let added = if path.ends_with('/') {
+            volume.create_dir_all(path)
+        } else {
+            add_file(&mut volume, path, &mut &contents[..], contents.len() as u64)
+        };
+        added.map_err(|error| failed(path, error))?;
     }
     volume.finish().map_err(|error| failed("finish", error))?;
     Ok(image)
