@@ -304,11 +304,41 @@ const NMODE: u32 = 1;
 const MIMO_BW_CAP: u32 = 1;
 /// Broadcom error codes (`bcmutils.h`, public).
 const BCME_BADARG: i16 = -2;
+/// A message carrying a firmware event to the host, in a posted event
+/// buffer (`wlan` `0x1057e0`; brcmfmac `MSGBUF_TYPE_WL_EVENT`).
+const MSG_WL_EVENT: u8 = 0x0e;
+/// Event type and status of an escan's results (public `wlioctl_defs.h`:
+/// `WLC_E_ESCAN_RESULT` 69, `WLC_E_STATUS_SUCCESS` 0).
+const WLC_E_ESCAN_RESULT: u32 = 69;
+const WLC_E_STATUS_SUCCESS: u32 = 0;
+/// `wl_escan_params_t` action starting a scan, and the one aborting it
+/// (public `wlioctl.h`).
+const WL_SCAN_ACTION_START: u16 = 1;
+const WL_SCAN_ACTION_ABORT: u16 = 3;
+/// `wl_event_msg_t` version (`BCM_EVENT_MSG_VERSION`) and the BSS info
+/// version escan results carry (`WL_BSS_INFO_VERSION`), public headers.
+const EVENT_MSG_VERSION: u16 = 2;
+const BSS_INFO_VERSION: u32 = 109;
+/// Per-channel dwell when the host leaves it to the firmware (-1): the
+/// firmware's defaults for an unassociated active scan (40 ms) and a
+/// passive one (110 ms), Broadcom's `scan_unassoc_time` and
+/// `scan_passive_time` defaults (public `wl` documentation; assumed for
+/// this firmware).
+const DEFAULT_ACTIVE_DWELL_MS: u64 = 40;
+const DEFAULT_PASSIVE_DWELL_MS: u64 = 110;
+
+/// An escan in progress: when it ends and how to label its result.
+struct Scan {
+    if_id: u8,
+    sync_id: u16,
+    duration: std::time::Duration,
+}
 
 /// The function.
 pub struct Bcm4356Wifi {
-    state: Mutex<State>,
-    upstream: Box<dyn Upstream>,
+    /// Shared with the timer threads that finish scans.
+    state: Arc<Mutex<State>>,
+    upstream: Arc<dyn Upstream>,
     notes: Arc<Notes>,
 }
 
@@ -380,6 +410,11 @@ struct Dongle {
     up: bool,
     /// What the host set and the firmware keeps.
     settings: HashMap<String, Vec<u8>>,
+    /// A scan started by the last request, for the outer layer to time;
+    /// the sync ID of the scan in flight (cleared by an abort).
+    scan_started: Option<Scan>,
+    scan_in_flight: Option<u16>,
+    event_sequence: u16,
 }
 
 struct State {
@@ -422,7 +457,7 @@ impl Bcm4356Wifi {
             resetctrl: AIRC_RESET,
         };
         Self {
-            state: Mutex::new(State {
+            state: Arc::new(Mutex::new(State {
                 config: Config {
                     command: 0,
                     bars: [0x4, 0, 0x4, 0],
@@ -454,8 +489,8 @@ impl Bcm4356Wifi {
                 halted: false,
                 dongle: None,
                 interrupt: false,
-            }),
-            upstream,
+            })),
+            upstream: Arc::from(upstream),
             notes,
         }
     }
@@ -468,6 +503,25 @@ impl Bcm4356Wifi {
                 self.notes.survey().then(T::default)
             }
         }
+    }
+
+    /// A scan the firmware started ends after its dwell time on every
+    /// channel: deliver the result then, from a timer thread (timers keep
+    /// real time, like the guest's).
+    fn finish_scan_later(&self, scan: Scan) {
+        let state = Arc::clone(&self.state);
+        let upstream = Arc::clone(&self.upstream);
+        let notes = Arc::clone(&self.notes);
+        std::thread::spawn(move || {
+            std::thread::sleep(scan.duration);
+            let result = state
+                .lock()
+                .unwrap()
+                .scan_complete(&scan, upstream.as_ref());
+            if let Err(note) = result {
+                notes.add(format!("BCM4356 WiFi: {note}"));
+            }
+        });
     }
 }
 
@@ -862,6 +916,9 @@ impl State {
             fwid,
             up: false,
             settings: HashMap::new(),
+            scan_started: None,
+            scan_in_flight: None,
+            event_sequence: 0,
         });
     }
 
@@ -1081,6 +1138,93 @@ impl State {
         self.complete(dongle, RING_D2H_CONTROL, &done, upstream)
     }
 
+    /// The scan's time is up: with no network in range nothing was heard,
+    /// so the firmware reports the escan finished with no BSS (status
+    /// success, `bss_count` 0; a partial result precedes it only when a
+    /// beacon or probe response arrived).
+    fn scan_complete(&mut self, scan: &Scan, upstream: &dyn Upstream) -> Result<(), Refusal> {
+        let Some(mut dongle) = self.dongle.take() else {
+            return Ok(());
+        };
+        let result = if dongle.scan_in_flight == Some(scan.sync_id) {
+            dongle.scan_in_flight = None;
+            // wl_escan_result_t without BSS entries, firmware byte order.
+            let mut data = Vec::with_capacity(12);
+            data.extend(12u32.to_le_bytes());
+            data.extend(BSS_INFO_VERSION.to_le_bytes());
+            data.extend(scan.sync_id.to_le_bytes());
+            data.extend(0u16.to_le_bytes());
+            self.event(
+                &mut dongle,
+                scan.if_id,
+                WLC_E_ESCAN_RESULT,
+                WLC_E_STATUS_SUCCESS,
+                &data,
+                upstream,
+            )
+            .and_then(|()| self.update_interrupt(upstream))
+        } else {
+            Ok(())
+        };
+        self.dongle = Some(dongle);
+        result
+    }
+
+    /// Sends firmware event `event_type` to the host: an Ethernet frame
+    /// to the station address with Broadcom's event ether type 0x886C,
+    /// `bcmeth_hdr_t` (subtype 0x8001, OUI 00:10:18, user subtype 1) and a
+    /// big-endian `wl_event_msg_t`, then `data` (the layout `wlan`
+    /// `0x100d40` checks), in the next posted event buffer.
+    fn event(
+        &mut self,
+        dongle: &mut Dongle,
+        if_id: u8,
+        event_type: u32,
+        status: u32,
+        data: &[u8],
+        upstream: &dyn Upstream,
+    ) -> Result<(), Refusal> {
+        let mut frame = Vec::with_capacity(72 + data.len());
+        frame.extend(dongle.mac);
+        frame.extend(dongle.mac);
+        frame.extend(0x886cu16.to_be_bytes());
+        frame.extend(0x8001u16.to_be_bytes());
+        frame.extend(((8 + 48 + data.len()) as u16).to_be_bytes());
+        frame.extend([0, 0x00, 0x10, 0x18]);
+        frame.extend(1u16.to_be_bytes());
+        frame.extend(EVENT_MSG_VERSION.to_be_bytes());
+        frame.extend(0u16.to_be_bytes());
+        frame.extend(event_type.to_be_bytes());
+        frame.extend(status.to_be_bytes());
+        frame.extend(0u32.to_be_bytes()); // reason
+        frame.extend(0u32.to_be_bytes()); // auth type
+        frame.extend((data.len() as u32).to_be_bytes());
+        frame.extend([0; 6]); // no peer address
+        let mut ifname = [0u8; 16];
+        ifname[..3].copy_from_slice(b"wl0");
+        frame.extend(ifname);
+        frame.extend([if_id, 0]);
+        frame.extend(data);
+        let buffer = dongle
+            .event_buffers
+            .pop_front()
+            .ok_or("event with no event buffer posted")?;
+        if frame.len() > usize::from(buffer.len) {
+            return Err(format!(
+                "event of {} bytes for a {}-byte buffer",
+                frame.len(),
+                buffer.len
+            ));
+        }
+        upstream
+            .write(buffer.address, &frame)
+            .ok_or_else(|| format!("event buffer at {:#x} not writable", buffer.address))?;
+        let mut message = header(MSG_WL_EVENT, if_id, buffer.request_id);
+        message[12..14].copy_from_slice(&(frame.len() as u16).to_le_bytes());
+        message[14..16].copy_from_slice(&dongle.event_sequence.to_le_bytes());
+        dongle.event_sequence = dongle.event_sequence.wrapping_add(1);
+        self.complete(dongle, RING_D2H_CONTROL, &message, upstream)
+    }
     /// Writes `message` to D2H ring `ring` and raises the doorbell interrupt.
     fn complete(
         &mut self,
@@ -1285,6 +1429,7 @@ fn dongle_ioctl(
             None => Err(BCME_BADARG),
         },
         (false, "ver") => Ok(version_string(dongle)),
+        (true, "escan") => escan(dongle, if_id, value),
         (false, "nmode") => Ok(NMODE.to_le_bytes().to_vec()),
         (false, "mimo_bw_cap") => Ok(MIMO_BW_CAP.to_le_bytes().to_vec()),
         (false, "chanspecs") => {
@@ -1356,6 +1501,58 @@ const SETTINGS: [&str; 37] = [
 ];
 /// Iovars `wlan` reads, modifies and writes back.
 const READ_BACK: [&str; 3] = ["event_msgs", "nsc_subtypes", "btc_dynctl"];
+
+/// "escan": `wl_escan_params_t` (version 1, action, sync ID, then
+/// `wl_scan_params_t`: SSID, BSSID, BSS type, scan type at 43, probes,
+/// active/passive/home dwell at 48/52/56, channel and SSID counts at 60,
+/// chanspecs from 64; `wlan`'s builder at `0x637d0`). Starting a scan
+/// arms its end after the dwell on every channel (all valid channels when
+/// the list is empty); aborting it drops the pending result.
+fn escan(dongle: &mut Dongle, if_id: u8, value: &[u8]) -> Result<Vec<u8>, i16> {
+    let field = |at: usize| {
+        value
+            .get(at..at + 4)
+            .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+    };
+    let (Some(1), Some(action)) = (field(0), value.get(4..6)) else {
+        return Err(BCME_BADARG);
+    };
+    let action = u16::from_le_bytes(action.try_into().unwrap());
+    let sync_id = le16(value, 6);
+    match action {
+        WL_SCAN_ACTION_START => {
+            let params = &value[8..];
+            let (Some(&scan_type), Some(active), Some(passive), Some(counts)) =
+                (params.get(43), field(8 + 48), field(8 + 52), field(8 + 60))
+            else {
+                return Err(BCME_BADARG);
+            };
+            let channels = match (counts & 0xffff) as usize {
+                0 => CHANNELS.len(),
+                n => n,
+            };
+            let passive_scan = scan_type & 1 != 0;
+            let dwell_ms = match (passive_scan, active, passive) {
+                (false, ms, _) if ms > 0 => ms as u64,
+                (false, _, _) => DEFAULT_ACTIVE_DWELL_MS,
+                (true, _, ms) if ms > 0 => ms as u64,
+                (true, _, _) => DEFAULT_PASSIVE_DWELL_MS,
+            };
+            dongle.scan_in_flight = Some(sync_id);
+            dongle.scan_started = Some(Scan {
+                if_id,
+                sync_id,
+                duration: std::time::Duration::from_millis(dwell_ms * channels as u64),
+            });
+            Ok(Vec::new())
+        }
+        WL_SCAN_ACTION_ABORT => {
+            dongle.scan_in_flight = None;
+            Ok(Vec::new())
+        }
+        _ => Err(BCME_BADARG),
+    }
+}
 
 fn words(values: &[u32]) -> Vec<u8> {
     values.iter().flat_map(|w| w.to_le_bytes()).collect()
@@ -1574,7 +1771,14 @@ impl PcieFunction for Bcm4356Wifi {
         } else {
             Err(format!("memory write at {address:#x} outside the BARs"))
         };
+        let scan = state
+            .dongle
+            .as_mut()
+            .and_then(|dongle| dongle.scan_started.take());
         drop(state);
+        if let Some(scan) = scan {
+            self.finish_scan_later(scan);
+        }
         self.served(result)
     }
 }
@@ -1824,6 +2028,97 @@ mod tests {
             wifi.memory_read(BAR0 + 0x2000 + u64::from(PCIE2_MAILBOXINT), 4),
             Some(0)
         );
+    }
+
+    #[test]
+    fn escan_ends_with_an_empty_result_after_its_dwell_time() {
+        let (wifi, host) = setup();
+        let shared = u64::from(boot(&wifi));
+        let ring_info = wifi.memory_read(BAR2 + shared + 48, 4).unwrap();
+        let ring_mem = wifi.memory_read(BAR2 + ring_info, 4).unwrap();
+        let h2d_w = wifi.memory_read(BAR2 + ring_info + 4, 4).unwrap();
+        let d2h_w = wifi.memory_read(BAR2 + ring_info + 12, 4).unwrap();
+        let rings = [
+            (HOST, 64, 40),
+            (HOST + 0x1000, 64, 32),
+            (HOST + 0x2000, 64, 24),
+            (HOST + 0x3000, 64, 16),
+            (HOST + 0x4000, 64, 32),
+        ];
+        for (i, (base, items, len)) in rings.iter().enumerate() {
+            let at = BAR2 + ring_mem + 16 * i as u64;
+            wifi.memory_write(at + 4, 2, *items).unwrap();
+            wifi.memory_write(at + 6, 2, *len).unwrap();
+            wifi.memory_write(at + 8, 8, *base).unwrap();
+        }
+        // An ioctl response buffer, an event buffer, then "escan" over two
+        // channels with 5 ms active dwell.
+        let post = |kind: u8, id: u32, address: u64| {
+            let mut item = vec![0; 40];
+            item[0] = kind;
+            item[4..8].copy_from_slice(&id.to_le_bytes());
+            item[8..10].copy_from_slice(&2016u16.to_le_bytes());
+            item[16..24].copy_from_slice(&address.to_le_bytes());
+            item
+        };
+        put(&host, HOST, &post(MSG_IOCTLRESP_BUF_POST, 7, HOST + 0x8000));
+        put(
+            &host,
+            HOST + 40,
+            &post(MSG_EVENT_BUF_POST, 9, HOST + 0xa000),
+        );
+        let mut request = b"escan\0".to_vec();
+        let mut params = vec![0u8; 76];
+        params[0..4].copy_from_slice(&1u32.to_le_bytes());
+        params[4..6].copy_from_slice(&WL_SCAN_ACTION_START.to_le_bytes());
+        params[6..8].copy_from_slice(&0x1234u16.to_le_bytes());
+        params[56..60].copy_from_slice(&5i32.to_le_bytes());
+        params[60..64].copy_from_slice(&(-1i32).to_le_bytes());
+        params[68..72].copy_from_slice(&2u32.to_le_bytes());
+        params[72..76].copy_from_slice(&[1, 0x10, 6, 0x10]);
+        request.extend(params);
+        put(&host, HOST + 0x9000, &request);
+        let mut ioctl = vec![0; 40];
+        ioctl[0] = MSG_IOCTLPTR_REQ;
+        ioctl[8..12].copy_from_slice(&WLC_SET_VAR.to_le_bytes());
+        ioctl[12..14].copy_from_slice(&1u16.to_le_bytes());
+        ioctl[14..16].copy_from_slice(&(request.len() as u16).to_le_bytes());
+        ioctl[24..32].copy_from_slice(&(HOST + 0x9000).to_le_bytes());
+        put(&host, HOST + 80, &ioctl);
+        wifi.memory_write(BAR2 + h2d_w, 2, 3).unwrap();
+        wifi.memory_write(
+            BAR0 + 0x2000 + u64::from(PCIE2_H2D_MAILBOX_0),
+            4,
+            0x1234_5678,
+        )
+        .unwrap();
+        // Acknowledged and completed at once; the result follows the dwell.
+        assert_eq!(wifi.memory_read(BAR2 + d2h_w, 2), Some(2));
+        assert_eq!(
+            le16(&get(&host, HOST + 0x2000 + 24, 24), 8),
+            0,
+            "escan accepted"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(wifi.memory_read(BAR2 + d2h_w, 2), Some(3));
+        let message = get(&host, HOST + 0x2000 + 48, 24);
+        assert_eq!(message[0], MSG_WL_EVENT);
+        assert_eq!(le32(&message, 4), 9, "in the posted event buffer");
+        let len = usize::from(le16(&message, 12));
+        let frame = get(&host, HOST + 0xa000, len);
+        assert_eq!(&frame[12..14], &[0x88, 0x6c]);
+        assert_eq!(&frame[19..22], &[0x00, 0x10, 0x18]);
+        assert_eq!(
+            u32::from_be_bytes(frame[28..32].try_into().unwrap()),
+            WLC_E_ESCAN_RESULT
+        );
+        assert_eq!(
+            u32::from_be_bytes(frame[32..36].try_into().unwrap()),
+            WLC_E_STATUS_SUCCESS
+        );
+        assert_eq!(u32::from_be_bytes(frame[44..48].try_into().unwrap()), 12);
+        assert_eq!(le16(&frame, 72 + 8), 0x1234, "sync ID");
+        assert_eq!(le16(&frame, 72 + 10), 0, "no BSS");
     }
 
     #[test]
