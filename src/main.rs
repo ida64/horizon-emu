@@ -119,8 +119,12 @@ options:
                         touch X,Y [HOLD_MS]
                         joycons on|off
                         screenshot FILE
-                      Unlike the times of --press and --touch, a wait does
-                      not depend on how fast the host gets the guest there
+                      A press or touch line may end in
+                        until X,Y RRGGBB [SECONDS]
+                      and is then done again every SECONDS (default 3) until
+                      that pixel has that colour. Unlike the times of --press
+                      and --touch, none of this depends on how fast the host
+                      gets the guest anywhere
   --debug-mode        report development functions as enabled to the kernel,
                       which turns on its debug log (UART-A, shown on stderr)
 
