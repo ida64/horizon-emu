@@ -67,7 +67,7 @@ pub mod user_function {
     /// can be set; `ptm` sets it to 0 on a console that has been set up
     /// before (`spl` SetConfig, command 5). That the value is in `X3`, with
     /// `X2` unused, follows Atmosphère's public monitor
-    /// (`secmon_smc_info.cpp`), from memory [assumption]: the one call seen
+    /// (`secmon_smc_info.cpp`), from memory \[assumption\]: the one call seen
     /// has zero in both.
     pub const SET_CONFIG: u32 = 0xC300_0401;
     /// `X1` operation key in; the operation's own status out in `X1` (`spl`
@@ -128,8 +128,8 @@ pub mod config_item {
     pub const IS_DEVELOPMENT_FUNCTION_ENABLED: u32 = 11;
     pub const KERNEL_CONFIGURATION: u32 = 12;
     /// Whether the monitor puts the charger into high-impedance mode when
-    /// the console powers off. Settable; starts out disabled [assumption:
-    /// nothing set it before the first call seen, which writes 0].
+    /// the console powers off. Settable; starts out disabled \[assumption:
+    /// nothing set it before the first call seen, which writes 0\].
     pub const IS_CHARGER_HI_Z_MODE_ENABLED: u32 = 13;
 }
 
