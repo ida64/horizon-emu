@@ -47,6 +47,7 @@ pub mod tmp451;
 pub mod tmr;
 pub mod touch;
 pub mod vic;
+pub mod wifi_ap;
 pub mod xusb_device;
 pub mod xusb_padctl;
 
@@ -294,6 +295,9 @@ pub struct Soc {
     pub touch_input: Arc<touch::TouchInput>,
     /// The pair of Joy-Con: where they are and what is held on them.
     pub joycons: Arc<joycon::Controls>,
+    /// The WiFi function of the radio, for placing an access point around
+    /// it (`--wifi-ssid`); set once the PCIe root complex is built.
+    pub wifi: std::sync::OnceLock<Arc<bcm4356::Bcm4356Wifi>>,
     gic: Arc<Gic>,
     dc: Arc<Dc>,
     /// The external output's display controller; nothing is attached to it.
@@ -397,6 +401,7 @@ impl Soc {
             gpio,
             touch_input,
             joycons: Arc::default(),
+            wifi: std::sync::OnceLock::new(),
             gic: Arc::clone(gic),
             dc: controller(DC_INTID),
             dcb: controller(DCB_INTID),
@@ -520,10 +525,12 @@ impl Soc {
             pcie::MEMORY_SIZE,
             Box::new(pcie.memory_window()),
         );
-        pcie.attach(Arc::new(bcm4356::Bcm4356Wifi::new(
+        let wifi = Arc::new(bcm4356::Bcm4356Wifi::new(
             pcie.upstream(),
             Arc::clone(&soc.notes),
-        )));
+        ));
+        pcie.attach(Arc::clone(&wifi) as Arc<dyn pcie_endpoint::PcieFunction>);
+        let _ = soc.wifi.set(wifi);
         bus.map("PWM", PWM_BASE, PWM_SIZE, Box::new(Arc::clone(&soc.pwm)));
         bus.map("PMC", pmc::BASE, pmc::SIZE, Box::new(Pmc::new()));
         bus.map(

@@ -686,6 +686,14 @@ impl Machine {
         self.soc.joycons.press(button, held);
     }
 
+    /// The WiFi function of the console's radio.
+    pub fn wifi(&self) -> &std::sync::Arc<crate::soc::bcm4356::Bcm4356Wifi> {
+        self.soc
+            .wifi
+            .get()
+            .expect("the SoC attaches its WiFi function when built")
+    }
+
     pub fn secure_monitor(&self) -> &SecureMonitor {
         &self.secmon
     }

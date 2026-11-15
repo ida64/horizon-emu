@@ -22,9 +22,9 @@ use horizon_emu::{
     ipc::{Client, ResultCode, Tracker},
     keys::KeySet,
     machine::{Caller, CodeAddress, Machine, Place, Poke, Process, RunEnd, RunOptions, TraceEvent},
-    maxwell, nand, sdcard,
+    maxwell, nand, net, sdcard,
     secmon::{self, SmcEffect},
-    soc::{dc::Frame, emmc::EmmcImages, joycon::Button, sdcard::SdCardImage},
+    soc::{dc::Frame, emmc::EmmcImages, joycon::Button, sdcard::SdCardImage, wifi_ap::AccessPoint},
     svc,
     symbols::SymbolTable,
 };
@@ -87,6 +87,13 @@ options:
                       on (see format-sd); without it the slot is empty.
                       Writes stay in memory
   --sd-writable       write to the microSD card image instead
+  --wifi-ssid NAME    an access point in range of the console's WiFi radio,
+                      with network NAME on 2.4 GHz channel 6, and behind it
+                      a router with DHCP, DNS and NAT to the host's
+                      internet connection (the console can go online); an
+                      open network unless
+  --wifi-passphrase P makes it WPA2-Personal (CCMP) with passphrase P
+                      (8 to 63 printable ASCII characters)
   --window            show the console's screen in a window. Closing it
                       stops the machine and ends the program; when the
                       machine stops by itself, the window stays, showing
@@ -354,6 +361,7 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
     let mut timed_screenshots = Vec::new();
     let mut script = None;
     let mut homebrew = HomebrewOptions::default();
+    let (mut wifi_ssid, mut wifi_passphrase) = (None::<String>, None::<String>);
     if maxwell::metal::available() {
         maxwell::select_renderer(maxwell::RendererKind::Metal);
     }
@@ -461,6 +469,8 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
             "--emmc-writable" => emmc_writable = true,
             "--sd" => sd_card = Some(value()?),
             "--sd-writable" => sd_writable = true,
+            "--wifi-ssid" => wifi_ssid = Some(value()?.clone()),
+            "--wifi-passphrase" => wifi_passphrase = Some(value()?.clone()),
             "--symbols" => {
                 symbols =
                     SymbolTable::load(Path::new(value()?)).map_err(|error| error.to_string())?
@@ -546,6 +556,20 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
 
     let machine = Machine::new(image, &params, keys, emmc, sd_card, Box::new(io::stderr()))
         .map_err(|error| error.to_string())?;
+    if let Some(ssid) = &wifi_ssid {
+        let ap = AccessPoint::new(ssid, wifi_passphrase.as_deref())
+            .map_err(|error| format!("--wifi-ssid: {error}"))?;
+        let wifi = std::sync::Arc::clone(machine.wifi());
+        let router = net::Router::new(Box::new(move |frame| wifi.from_network(&frame)));
+        // One line per DHCP lease, DNS query, new flow and plain-HTTP
+        // exchange: what the console does on the network, never payload.
+        router.set_trace(Box::new(|line| eprintln!("net: {line}")));
+        machine
+            .wifi()
+            .set_access_point(ap, Box::new(move |frame| router.send(frame)));
+    } else if wifi_passphrase.is_some() {
+        return Err("--wifi-passphrase needs --wifi-ssid".into());
+    }
     let mut window = show_window.then(ScreenWindow::open).transpose()?;
     let stop = AtomicBool::new(false);
     let log = LogOverlay::default();

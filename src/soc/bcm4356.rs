@@ -40,11 +40,13 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use super::{
     Notes,
     pcie_endpoint::{PcieFunction, Upstream},
+    wifi_ap::{self, AccessPoint},
 };
 
 // ---------------------------------------------------------------------------
@@ -334,6 +336,62 @@ const WL_SCAN_ACTION_ABORT: u16 = 3;
 /// version escan results carry (`WL_BSS_INFO_VERSION`), public headers.
 const EVENT_MSG_VERSION: u16 = 2;
 const BSS_INFO_VERSION: u32 = 109;
+/// Events of a station's association (public `wlioctl_defs.h`). After a
+/// join the firmware reports, in this order, authentication, association,
+/// "join" (`WLC_E_JOIN`, on which `wlan`'s event handler `0x5f5a0`, cases
+/// 1/8/10, raises the supplicant's association event), link up
+/// (`WLC_E_LINK` with `WLC_EVENT_MSG_LINK`) and the join's completion
+/// (`WLC_E_SET_SSID` with its status), as Broadcom firmware does (public
+/// brcmfmac `cfg80211.c` and DHD event logs show the same sequence).
+const WLC_E_SET_SSID: u32 = 0;
+const WLC_E_JOIN: u32 = 1;
+const WLC_E_AUTH: u32 = 3;
+const WLC_E_ASSOC: u32 = 7;
+const WLC_E_DISASSOC: u32 = 11;
+const WLC_E_LINK: u32 = 16;
+const WLC_E_STATUS_FAIL: u32 = 1;
+const WLC_E_STATUS_NO_NETWORKS: u32 = 3;
+const WLC_E_STATUS_PARTIAL: u32 = 8;
+const WLC_EVENT_MSG_LINK: u16 = 1;
+/// How long authentication and association take on the air (four
+/// management frames and their acknowledgements, a few milliseconds on a
+/// quiet channel; assumed).
+const ASSOCIATION_TIME: Duration = Duration::from_millis(20);
+/// When the access point sends message 1 of the 4-way handshake after
+/// association, how long it waits for message 2 before sending it again
+/// and how often: hostapd's defaults (`wpa_auth.c`: 100 ms first timeout
+/// is used for later messages; 1 s and 4 attempts for message 1; assumed
+/// for an ordinary home router).
+const EAPOL_START_DELAY: Duration = Duration::from_millis(10);
+const EAPOL_RETRY: Duration = Duration::from_secs(1);
+const EAPOL_ATTEMPTS: u32 = 4;
+/// Control requests of association (public `wlioctl_defs.h`).
+const WLC_GET_BSSID: u32 = 23;
+const WLC_GET_SSID: u32 = 25;
+const WLC_SET_SSID: u32 = 26;
+const WLC_DISASSOC: u32 = 52;
+const WLC_GET_BSS_INFO: u32 = 136;
+/// Authorizing (or deauthorizing) the 802.1X port of a peer, named by its
+/// address: `wlan` authorizes the access point after joining an open
+/// network (traced: input is the BSSID). The firmware's station port is
+/// open on an open network anyway, so nothing changes here.
+const WLC_SCB_AUTHORIZE: u32 = 121;
+const WLC_SCB_DEAUTHORIZE: u32 = 122;
+/// The signal strength of the access point, in dBm (`scb_val_t.val`);
+/// nifm polls it for the signal bars while connected (traced, once a
+/// second, through `wlan#0` request 106).
+const WLC_GET_RSSI: u32 = 127;
+const BCME_NOTUP: i16 = -4;
+const BCME_NOTASSOCIATED: i16 = -17;
+/// Data messages (public brcmfmac `msgbuf.c`, DHD `bcmmsgbuf.h`): a frame
+/// to transmit on a flow ring, its completion on the TX completion ring,
+/// and a received frame in a posted receive buffer on the RX completion
+/// ring.
+const MSG_TX_POST: u8 = 0x0f;
+const MSG_TX_STATUS: u8 = 0x10;
+const MSG_RX_CMPLT: u8 = 0x12;
+const RING_D2H_TX_COMPLETE: usize = 3;
+const RING_D2H_RX_COMPLETE: usize = 4;
 /// Per-channel dwell when the host leaves it to the firmware (-1): the
 /// firmware's defaults for an unassociated active scan (40 ms) and a
 /// passive one (110 ms), Broadcom's `scan_unassoc_time` and
@@ -342,11 +400,78 @@ const BSS_INFO_VERSION: u32 = 109;
 const DEFAULT_ACTIVE_DWELL_MS: u64 = 40;
 const DEFAULT_PASSIVE_DWELL_MS: u64 = 110;
 
-/// An escan in progress: when it ends and how to label its result.
-struct Scan {
+/// Work the firmware finishes later, on the air: tagged with what it
+/// belongs to so that work overtaken by events (an aborted scan, a new
+/// join) does nothing.
+enum Deferred {
+    /// The scan reached the access point's channel and heard it.
+    ScanFound {
+        sync_id: u16,
+        if_id: u8,
+    },
+    ScanDone {
+        sync_id: u16,
+        if_id: u8,
+    },
+    Associated {
+        epoch: u32,
+    },
+    AssociationFailed {
+        epoch: u32,
+        if_id: u8,
+        status: u32,
+    },
+    Disassociated {
+        if_id: u8,
+    },
+    /// The access point sends (or resends) handshake message 1.
+    EapolStart {
+        epoch: u32,
+        attempt: u32,
+    },
+}
+
+/// The station's association with the access point.
+struct Association {
     if_id: u8,
-    sync_id: u16,
-    duration: std::time::Duration,
+    epoch: u32,
+    /// Whether the link is up (the association completed).
+    linked: bool,
+    /// The access point's authenticator (WPA2-PSK only).
+    authenticator: Option<wifi_ap::Authenticator>,
+}
+
+/// The network around the radio: the access point and where the frames
+/// it forwards from the station go (the router behind it).
+struct Network {
+    ap: AccessPoint,
+    uplink: Box<dyn Fn(&[u8]) + Send + Sync>,
+}
+
+/// A firmware event to the host.
+struct Event<'a> {
+    kind: u32,
+    status: u32,
+    flags: u16,
+    addr: [u8; 6],
+    data: &'a [u8],
+}
+
+impl<'a> Event<'a> {
+    fn new(kind: u32, status: u32, data: &'a [u8]) -> Self {
+        Self {
+            kind,
+            status,
+            flags: 0,
+            addr: [0; 6],
+            data,
+        }
+    }
+
+    fn from(mut self, addr: [u8; 6]) -> Self {
+        self.addr = addr;
+        self
+    }
 }
 
 /// The function.
@@ -382,6 +507,7 @@ struct Config {
     bar2_config: u32,
 }
 
+#[derive(Clone, Copy)]
 struct Ring {
     base: u64,
     max_items: u16,
@@ -425,11 +551,14 @@ struct Dongle {
     up: bool,
     /// What the host set and the firmware keeps.
     settings: HashMap<String, Vec<u8>>,
-    /// A scan started by the last request, for the outer layer to time;
-    /// the sync ID of the scan in flight (cleared by an abort).
-    scan_started: Option<Scan>,
+    /// Work to finish later, for the outer layer to time.
+    timers: Vec<(Duration, Deferred)>,
+    /// The sync ID of the scan in flight (cleared by an abort).
     scan_in_flight: Option<u16>,
     event_sequence: u16,
+    association: Option<Association>,
+    /// Counts joins, to tell stale association work from current.
+    epoch: u32,
 }
 
 struct State {
@@ -452,6 +581,7 @@ struct State {
     halted: bool,
     dongle: Option<Dongle>,
     interrupt: bool,
+    network: Option<Network>,
 }
 
 /// Why an access was not served.
@@ -504,6 +634,7 @@ impl Bcm4356Wifi {
                 halted: false,
                 dongle: None,
                 interrupt: false,
+                network: None,
             })),
             upstream: Arc::from(upstream),
             notes,
@@ -520,22 +651,51 @@ impl Bcm4356Wifi {
         }
     }
 
-    /// A scan the firmware started ends after its dwell time on every
-    /// channel: deliver the result then, from a timer thread (timers keep
-    /// real time, like the guest's).
-    fn finish_scan_later(&self, scan: Scan) {
-        let state = Arc::clone(&self.state);
-        let upstream = Arc::clone(&self.upstream);
-        let notes = Arc::clone(&self.notes);
+    /// Places the access point configured on the command line around the
+    /// radio; `uplink` takes the Ethernet frames the station sends through
+    /// it.
+    pub fn set_access_point(&self, ap: AccessPoint, uplink: Box<dyn Fn(&[u8]) + Send + Sync>) {
+        self.state.lock().unwrap().network = Some(Network { ap, uplink });
+    }
+
+    /// An Ethernet frame from the network behind the access point for the
+    /// station: delivered if the station is associated (and, on a WPA2
+    /// network, authorized), else lost on the air.
+    pub fn from_network(&self, frame: &[u8]) {
+        let mut state = self.state.lock().unwrap();
+        let result = state.from_network(frame, self.upstream.as_ref());
+        drop(state);
+        if let Err(note) = result {
+            self.notes.add(format!("BCM4356 WiFi: {note}"));
+        }
+    }
+
+    fn schedule(&self) {
+        let timers = self.state.lock().unwrap().take_timers();
+        schedule(&self.state, &self.upstream, &self.notes, timers);
+    }
+}
+
+/// Runs `timers` on threads of their own after their delays (timers keep
+/// real time, like the guest's), then whatever work they leave.
+fn schedule(
+    state: &Arc<Mutex<State>>,
+    upstream: &Arc<dyn Upstream>,
+    notes: &Arc<Notes>,
+    timers: Vec<(Duration, Deferred)>,
+) {
+    for (delay, work) in timers {
+        let (state, upstream, notes) = (Arc::clone(state), Arc::clone(upstream), Arc::clone(notes));
         std::thread::spawn(move || {
-            std::thread::sleep(scan.duration);
-            let result = state
-                .lock()
-                .unwrap()
-                .scan_complete(&scan, upstream.as_ref());
+            std::thread::sleep(delay);
+            let mut locked = state.lock().unwrap();
+            let result = locked.deferred(work, upstream.as_ref());
+            let more = locked.take_timers();
+            drop(locked);
             if let Err(note) = result {
                 notes.add(format!("BCM4356 WiFi: {note}"));
             }
+            schedule(&state, &upstream, &notes, more);
         });
     }
 }
@@ -931,7 +1091,9 @@ impl State {
             fwid,
             up: false,
             settings: HashMap::new(),
-            scan_started: None,
+            timers: Vec::new(),
+            association: None,
+            epoch: 0,
             scan_in_flight: None,
             event_sequence: 0,
         });
@@ -1000,26 +1162,35 @@ impl State {
                 self.submission(dongle, ring, &item, upstream)?;
             }
         }
-        if let Some((id, _)) = dongle.flow_rings.iter().find(|(id, ring)| {
-            let slot = u32::from(*id);
-            ring.max_items != 0
-                && self.ram_u16(dongle.h2d_write + slot * INDEX_SIZE)
-                    != self.ram_u16(dongle.h2d_read + slot * INDEX_SIZE)
-        }) {
-            return Err(format!("transmit on flow ring {id} not modeled"));
+        // Frames the host transmits, on the flow rings it created.
+        let flow_rings: Vec<(u16, Ring)> = dongle.flow_rings.clone();
+        for (id, ring) in flow_rings {
+            while let Some(item) = self.next_item(dongle, id, ring, upstream)? {
+                self.transmit(dongle, id, &item, upstream)?;
+            }
         }
         Ok(())
     }
 
-    /// The next item the host submitted on H2D ring `ring`, if any.
+    /// The next item the host submitted on H2D common ring `ring`, if any.
     fn next_submission(
         &mut self,
         dongle: &Dongle,
         ring: u16,
         upstream: &dyn Upstream,
     ) -> Result<Option<Vec<u8>>, Refusal> {
-        let rings = dongle.rings.as_ref().unwrap();
-        let desc = &rings[usize::from(ring)];
+        let desc = dongle.rings.as_ref().unwrap()[usize::from(ring)];
+        self.next_item(dongle, ring, desc, upstream)
+    }
+    /// The next item the host submitted on H2D ring `ring` (common or
+    /// flow ring, by its index slot), if any.
+    fn next_item(
+        &mut self,
+        dongle: &Dongle,
+        ring: u16,
+        desc: Ring,
+        upstream: &dyn Upstream,
+    ) -> Result<Option<Vec<u8>>, Refusal> {
         let slot = u32::from(ring) * INDEX_SIZE;
         let write = self.ram_u16(dongle.h2d_write + slot);
         let read = self.ram_u16(dongle.h2d_read + slot);
@@ -1119,7 +1290,8 @@ impl State {
         upstream
             .read(address, &mut input)
             .ok_or_else(|| format!("ioctl buffer at {address:#x} not readable"))?;
-        let outcome = dongle_ioctl(dongle, if_id, command, &input)?;
+        let ap = self.network.as_ref().map(|network| &network.ap);
+        let outcome = dongle_ioctl(dongle, ap, if_id, command, &input)?;
         let mut ack = header(MSG_IOCTLPTR_REQ_ACK, if_id, request_id);
         ack[12..16].copy_from_slice(&command.to_le_bytes());
         self.complete(dongle, RING_D2H_CONTROL, &ack, upstream)?;
@@ -1155,61 +1327,293 @@ impl State {
             self.event(
                 dongle,
                 0,
-                WLC_E_IF,
-                WLC_E_STATUS_SUCCESS,
-                &[0, WLC_E_IF_ADD, 0, 0, 0],
+                Event::new(WLC_E_IF, WLC_E_STATUS_SUCCESS, &[0, WLC_E_IF_ADD, 0, 0, 0]),
                 upstream,
             )?;
         }
         Ok(())
     }
 
-    /// The scan's time is up: with no network in range nothing was heard,
-    /// so the firmware reports the escan finished with no BSS (status
-    /// success, `bss_count` 0; a partial result precedes it only when a
-    /// beacon or probe response arrived).
-    fn scan_complete(&mut self, scan: &Scan, upstream: &dyn Upstream) -> Result<(), Refusal> {
+    fn take_timers(&mut self) -> Vec<(Duration, Deferred)> {
+        self.dongle
+            .as_mut()
+            .map(|dongle| std::mem::take(&mut dongle.timers))
+            .unwrap_or_default()
+    }
+
+    /// Finishes work the firmware began earlier.
+    fn deferred(&mut self, work: Deferred, upstream: &dyn Upstream) -> Result<(), Refusal> {
         let Some(mut dongle) = self.dongle.take() else {
             return Ok(());
         };
-        let result = if dongle.scan_in_flight == Some(scan.sync_id) {
-            dongle.scan_in_flight = None;
-            // wl_escan_result_t without BSS entries, firmware byte order.
-            let mut data = Vec::with_capacity(12);
-            data.extend(12u32.to_le_bytes());
-            data.extend(BSS_INFO_VERSION.to_le_bytes());
-            data.extend(scan.sync_id.to_le_bytes());
-            data.extend(0u16.to_le_bytes());
-            self.event(
-                &mut dongle,
-                scan.if_id,
-                WLC_E_ESCAN_RESULT,
-                WLC_E_STATUS_SUCCESS,
-                &data,
-                upstream,
-            )
-            .and_then(|()| self.update_interrupt(upstream))
-        } else {
-            Ok(())
-        };
+        let result = self.run(&mut dongle, work, upstream);
         self.dongle = Some(dongle);
-        result
+        result.and_then(|()| self.update_interrupt(upstream))
     }
 
-    /// Sends firmware event `event_type` to the host: an Ethernet frame
-    /// to the station address with Broadcom's event ether type 0x886C,
-    /// `bcmeth_hdr_t` (subtype 0x8001, OUI 00:10:18, user subtype 1) and a
-    /// big-endian `wl_event_msg_t`, then `data` (the layout `wlan`
-    /// `0x100d40` checks), in the next posted event buffer.
+    fn run(
+        &mut self,
+        dongle: &mut Dongle,
+        work: Deferred,
+        upstream: &dyn Upstream,
+    ) -> Result<(), Refusal> {
+        match work {
+            // A probe response from the access point: a partial escan
+            // result with its BSS.
+            Deferred::ScanFound { sync_id, if_id } => {
+                let Some(bss) = self.network.as_ref().map(|n| n.ap.bss_info()) else {
+                    return Ok(());
+                };
+                if dongle.scan_in_flight == Some(sync_id) {
+                    let data = escan_result(sync_id, &[bss]);
+                    self.event(
+                        dongle,
+                        if_id,
+                        Event::new(WLC_E_ESCAN_RESULT, WLC_E_STATUS_PARTIAL, &data),
+                        upstream,
+                    )?;
+                }
+            }
+            // The scan's time is up: the escan finishes with no further
+            // BSS (status success, `bss_count` 0).
+            Deferred::ScanDone { sync_id, if_id } => {
+                if dongle.scan_in_flight == Some(sync_id) {
+                    dongle.scan_in_flight = None;
+                    let data = escan_result(sync_id, &[]);
+                    self.event(
+                        dongle,
+                        if_id,
+                        Event::new(WLC_E_ESCAN_RESULT, WLC_E_STATUS_SUCCESS, &data),
+                        upstream,
+                    )?;
+                }
+            }
+            Deferred::Associated { epoch } => {
+                let Some(association) = dongle.association.as_mut().filter(|a| a.epoch == epoch)
+                else {
+                    return Ok(());
+                };
+                association.linked = true;
+                let if_id = association.if_id;
+                let secured = association.authenticator.is_some();
+                let ssid = self
+                    .network
+                    .as_ref()
+                    .map(|n| n.ap.ssid().to_vec())
+                    .unwrap_or_default();
+                for kind in [WLC_E_AUTH, WLC_E_ASSOC, WLC_E_JOIN] {
+                    self.event(
+                        dongle,
+                        if_id,
+                        Event::new(kind, WLC_E_STATUS_SUCCESS, &[]).from(wifi_ap::BSSID),
+                        upstream,
+                    )?;
+                }
+                let mut link =
+                    Event::new(WLC_E_LINK, WLC_E_STATUS_SUCCESS, &[]).from(wifi_ap::BSSID);
+                link.flags = WLC_EVENT_MSG_LINK;
+                self.event(dongle, if_id, link, upstream)?;
+                self.event(
+                    dongle,
+                    if_id,
+                    Event::new(WLC_E_SET_SSID, WLC_E_STATUS_SUCCESS, &ssid).from(wifi_ap::BSSID),
+                    upstream,
+                )?;
+                if secured {
+                    dongle.timers.push((
+                        EAPOL_START_DELAY,
+                        Deferred::EapolStart { epoch, attempt: 0 },
+                    ));
+                }
+            }
+            Deferred::AssociationFailed {
+                epoch,
+                if_id,
+                status,
+            } => {
+                if dongle.epoch == epoch {
+                    dongle.association = None;
+                    self.event(
+                        dongle,
+                        if_id,
+                        Event::new(WLC_E_SET_SSID, status, &[]),
+                        upstream,
+                    )?;
+                }
+            }
+            Deferred::Disassociated { if_id } => {
+                self.event(
+                    dongle,
+                    if_id,
+                    Event::new(WLC_E_DISASSOC, WLC_E_STATUS_SUCCESS, &[]).from(wifi_ap::BSSID),
+                    upstream,
+                )?;
+                self.event(
+                    dongle,
+                    if_id,
+                    Event::new(WLC_E_LINK, WLC_E_STATUS_SUCCESS, &[]).from(wifi_ap::BSSID),
+                    upstream,
+                )?;
+            }
+            Deferred::EapolStart { epoch, attempt } => {
+                let Some(association) = dongle.association.as_mut().filter(|a| a.epoch == epoch)
+                else {
+                    return Ok(());
+                };
+                let if_id = association.if_id;
+                if let Some(m1) = association
+                    .authenticator
+                    .as_mut()
+                    .and_then(|a| a.message_1())
+                {
+                    if attempt + 1 < EAPOL_ATTEMPTS {
+                        dongle.timers.push((
+                            EAPOL_RETRY,
+                            Deferred::EapolStart {
+                                epoch,
+                                attempt: attempt + 1,
+                            },
+                        ));
+                    }
+                    self.to_station(dongle, if_id, &m1, upstream)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A frame the host transmits: `msgbuf_tx_msghdr` with the Ethernet
+    /// header inline (offset 8) and the rest in a host buffer (address at
+    /// 32, length at 42). It is completed at once on the TX completion
+    /// ring and goes to the access point.
+    fn transmit(
+        &mut self,
+        dongle: &mut Dongle,
+        ring: u16,
+        item: &[u8],
+        upstream: &dyn Upstream,
+    ) -> Result<(), Refusal> {
+        if item[0] != MSG_TX_POST {
+            return Err(format!(
+                "flow ring {ring} message type {:#x} not modeled: {item:02x?}",
+                item[0]
+            ));
+        }
+        let if_id = item[1];
+        let address = le64(item, 32);
+        let mut frame = item[8..22].to_vec();
+        let start = frame.len();
+        frame.resize(start + usize::from(le16(item, 42)), 0);
+        upstream
+            .read(address, &mut frame[start..])
+            .ok_or_else(|| format!("transmit buffer at {address:#x} not readable"))?;
+        let mut status = header(MSG_TX_STATUS, if_id, le32(item, 4));
+        status[10..12].copy_from_slice(&ring.to_le_bytes());
+        self.complete(dongle, RING_D2H_TX_COMPLETE, &status, upstream)?;
+        self.from_station(dongle, &frame, upstream)
+    }
+
+    /// A frame the station sends: lost without an association; EAPOL goes
+    /// to the authenticator; data goes through the access point once the
+    /// port is open.
+    fn from_station(
+        &mut self,
+        dongle: &mut Dongle,
+        frame: &[u8],
+        upstream: &dyn Upstream,
+    ) -> Result<(), Refusal> {
+        let Some(association) = dongle.association.as_mut().filter(|a| a.linked) else {
+            return Ok(());
+        };
+        let if_id = association.if_id;
+        if frame.get(12..14) == Some(&wifi_ap::ETHERTYPE_EAPOL.to_be_bytes()) {
+            let reply = association
+                .authenticator
+                .as_mut()
+                .and_then(|a| a.receive(frame));
+            if let Some(reply) = reply {
+                self.to_station(dongle, if_id, &reply, upstream)?;
+            }
+            return Ok(());
+        }
+        let open = association
+            .authenticator
+            .as_ref()
+            .is_none_or(|a| a.authorized());
+        if let Some(network) = self.network.as_ref().filter(|_| open) {
+            (network.uplink)(frame);
+        }
+        Ok(())
+    }
+
+    /// A frame from the network for the station.
+    fn from_network(&mut self, frame: &[u8], upstream: &dyn Upstream) -> Result<(), Refusal> {
+        let Some(mut dongle) = self.dongle.take() else {
+            return Ok(());
+        };
+        let station = dongle.mac;
+        let result = match dongle.association.as_ref() {
+            Some(a)
+                if a.linked
+                    && a.authenticator.as_ref().is_none_or(|a| a.authorized())
+                    && (frame.get(..6) == Some(&station)
+                        || frame.first().is_some_and(|b| b & 1 != 0)) =>
+            {
+                let if_id = a.if_id;
+                self.to_station(&mut dongle, if_id, frame, upstream)
+            }
+            _ => Ok(()),
+        };
+        self.dongle = Some(dongle);
+        result.and_then(|()| self.update_interrupt(upstream))
+    }
+
+    /// Hands a received frame to the host in the next posted receive
+    /// buffer (`msgbuf_rx_complete`: data length at 14, data offset 0,
+    /// 802.3 frame). With no buffer posted the firmware has nowhere to put
+    /// it and the frame is lost, as on the air.
+    fn to_station(
+        &mut self,
+        dongle: &mut Dongle,
+        if_id: u8,
+        frame: &[u8],
+        upstream: &dyn Upstream,
+    ) -> Result<(), Refusal> {
+        let Some(buffer) = dongle.rx_buffers.pop_front() else {
+            return Ok(());
+        };
+        if frame.len() > usize::from(buffer.len) {
+            return Err(format!(
+                "received frame of {} bytes for a {}-byte buffer",
+                frame.len(),
+                buffer.len
+            ));
+        }
+        upstream
+            .write(buffer.address, frame)
+            .ok_or_else(|| format!("receive buffer at {:#x} not writable", buffer.address))?;
+        let mut message = header(MSG_RX_CMPLT, if_id, buffer.request_id);
+        message[14..16].copy_from_slice(&(frame.len() as u16).to_le_bytes());
+        self.complete(dongle, RING_D2H_RX_COMPLETE, &message, upstream)
+    }
+
+    /// Sends firmware event `e` to the host, if its event mask enables it:
+    /// an Ethernet frame to the station address with Broadcom's event
+    /// ether type 0x886C, `bcmeth_hdr_t` (subtype 0x8001, OUI 00:10:18,
+    /// user subtype 1) and a big-endian `wl_event_msg_t`, then the data
+    /// (the layout `wlan` `0x100d40` checks), in the next posted event
+    /// buffer.
     fn event(
         &mut self,
         dongle: &mut Dongle,
         if_id: u8,
-        event_type: u32,
-        status: u32,
-        data: &[u8],
+        e: Event,
         upstream: &dyn Upstream,
     ) -> Result<(), Refusal> {
+        if !event_enabled(dongle, e.kind) {
+            return Ok(());
+        }
+        let data = e.data;
         let mut frame = Vec::with_capacity(72 + data.len());
         frame.extend(dongle.mac);
         frame.extend(dongle.mac);
@@ -1219,13 +1623,13 @@ impl State {
         frame.extend([0, 0x00, 0x10, 0x18]);
         frame.extend(1u16.to_be_bytes());
         frame.extend(EVENT_MSG_VERSION.to_be_bytes());
-        frame.extend(0u16.to_be_bytes());
-        frame.extend(event_type.to_be_bytes());
-        frame.extend(status.to_be_bytes());
+        frame.extend(e.flags.to_be_bytes());
+        frame.extend(e.kind.to_be_bytes());
+        frame.extend(e.status.to_be_bytes());
         frame.extend(0u32.to_be_bytes()); // reason
-        frame.extend(0u32.to_be_bytes()); // auth type
+        frame.extend(0u32.to_be_bytes()); // auth type: open system
         frame.extend((data.len() as u32).to_be_bytes());
-        frame.extend([0; 6]); // no peer address
+        frame.extend(e.addr);
         let mut ifname = [0u8; 16];
         ifname[..3].copy_from_slice(b"wl0");
         frame.extend(ifname);
@@ -1385,6 +1789,7 @@ impl State {
 /// commands from public `wlioctl_defs.h`.
 fn dongle_ioctl(
     dongle: &mut Dongle,
+    ap: Option<&AccessPoint>,
     if_id: u8,
     command: u32,
     input: &[u8],
@@ -1425,6 +1830,69 @@ fn dongle_ioctl(
             list.extend(CHANNELS.iter().map(|&c| u32::from(c)));
             return Ok(Ok(words(&list)));
         }
+        // A join without the "join" iovar: `wl_join_params_t` (SSID, then
+        // BSSID at 36), `wlan`'s fallback at `0x646e0`.
+        WLC_SET_SSID => {
+            let (Some(len), Some(bssid)) = (input.get(..4), input.get(36..42)) else {
+                return Ok(Err(BCME_BADARG));
+            };
+            let len = (u32::from_le_bytes(len.try_into().unwrap()) as usize).min(32);
+            let ssid = input[4..4 + len].to_vec();
+            return Ok(join(dongle, ap, if_id, &ssid, bssid.try_into().unwrap()));
+        }
+        WLC_GET_BSSID => {
+            return Ok(match dongle.association.as_ref().filter(|a| a.linked) {
+                Some(_) => Ok(wifi_ap::BSSID.to_vec()),
+                None => Err(BCME_NOTASSOCIATED),
+            });
+        }
+        // `wlc_ssid_t` of the network joined: length, 32 bytes.
+        WLC_GET_SSID => {
+            let mut ssid = vec![0u8; 36];
+            if let (Some(ap), Some(_)) = (ap, dongle.association.as_ref().filter(|a| a.linked)) {
+                ssid[..4].copy_from_slice(&(ap.ssid().len() as u32).to_le_bytes());
+                ssid[4..4 + ap.ssid().len()].copy_from_slice(ap.ssid());
+            }
+            return Ok(Ok(ssid));
+        }
+        WLC_GET_RSSI => {
+            return Ok(match dongle.association.as_ref().filter(|a| a.linked) {
+                Some(_) => Ok(i32::from(wifi_ap::RSSI_DBM).to_le_bytes().to_vec()),
+                None => Err(BCME_NOTASSOCIATED),
+            });
+        }
+        WLC_SCB_AUTHORIZE | WLC_SCB_DEAUTHORIZE => {
+            return Ok(match dongle.association.as_ref().filter(|a| a.linked) {
+                Some(_) if input.get(..6) == Some(&wifi_ap::BSSID) => Ok(Vec::new()),
+                _ => Err(BCME_NOTASSOCIATED),
+            });
+        }
+        // Leaving the network: the firmware reports the disassociation and
+        // the link going down.
+        WLC_DISASSOC => {
+            if let Some(association) = dongle.association.take().filter(|a| a.linked) {
+                dongle.timers.push((
+                    Duration::ZERO,
+                    Deferred::Disassociated {
+                        if_id: association.if_id,
+                    },
+                ));
+            }
+            return Ok(Ok(Vec::new()));
+        }
+        // The current BSS: the buffer's length word, then `wl_bss_info_t`.
+        WLC_GET_BSS_INFO => {
+            return Ok(
+                match (ap, dongle.association.as_ref().filter(|a| a.linked)) {
+                    (Some(ap), Some(_)) => {
+                        let mut info = input.get(..4).unwrap_or(&[0; 4]).to_vec();
+                        info.extend(ap.bss_info());
+                        Ok(info)
+                    }
+                    _ => Err(BCME_NOTASSOCIATED),
+                },
+            );
+        }
         _ => {
             return Err(format!(
                 "ioctl {command} on interface {if_id} not modeled: {:02x?}",
@@ -1457,7 +1925,24 @@ fn dongle_ioctl(
             None => Err(BCME_BADARG),
         },
         (false, "ver") => Ok(version_string(dongle)),
-        (true, "escan") => escan(dongle, if_id, value),
+        // The radio's channel: the access point's while associated, else
+        // what the host last set.
+        (false, "chanspec") if dongle.association.as_ref().is_some_and(|a| a.linked) => {
+            Ok(u32::from(ap.map_or(0, AccessPoint::chanspec))
+                .to_le_bytes()
+                .to_vec())
+        }
+        (true, "escan") => escan(dongle, ap, if_id, value),
+        // `wl_extjoin_params_t`: SSID (length, 32 bytes), join scan
+        // parameters, then the BSSID at 56 (`wlan` `0x646e0`).
+        (true, "join") => {
+            let (Some(len), Some(bssid)) = (value.get(..4), value.get(56..62)) else {
+                return Ok(Err(BCME_BADARG));
+            };
+            let len = (u32::from_le_bytes(len.try_into().unwrap()) as usize).min(32);
+            let ssid = value[4..4 + len].to_vec();
+            join(dongle, ap, if_id, &ssid, bssid.try_into().unwrap())
+        }
         (false, "nmode") => Ok(NMODE.to_le_bytes().to_vec()),
         (false, "mimo_bw_cap") => Ok(MIMO_BW_CAP.to_le_bytes().to_vec()),
         (false, "chanspecs") => {
@@ -1527,8 +2012,9 @@ fn dongle_ioctl(
 }
 
 /// Iovars `wlan` sets and the firmware just stores.
-const SETTINGS: [&str; 37] = [
+const SETTINGS: [&str; 42] = [
     "ampdu_hostreorder",
+    "auth",
     "country",
     "buf_key_b4_m4",
     "wsec_key",
@@ -1565,17 +2051,100 @@ const SETTINGS: [&str; 37] = [
     "arpoe",
     "bcn_li_dtim",
     "obss_coex",
+    "mkeep_alive",
+    "vndr_ie",
+    "chanspec",
+    "mcast_list",
 ];
 /// Iovars `wlan` reads, modifies and writes back.
 const READ_BACK: [&str; 4] = ["event_msgs", "nsc_subtypes", "btc_dynctl", "nsc_afmode"];
+
+/// A join request: the firmware finds the network, authenticates and
+/// associates, which ends in events after [`ASSOCIATION_TIME`]. The access
+/// point is found when its SSID matches (and the BSSID, unless the request
+/// leaves it open); it refuses a station whose security settings
+/// (`wpa_auth`, the RSN element given with `wpaie`) do not match its own.
+/// A network nobody answers for is reported after a join scan of every
+/// channel at the default active dwell.
+fn join(
+    dongle: &mut Dongle,
+    ap: Option<&AccessPoint>,
+    if_id: u8,
+    ssid: &[u8],
+    bssid: [u8; 6],
+) -> Result<Vec<u8>, i16> {
+    if !dongle.up {
+        return Err(BCME_NOTUP);
+    }
+    dongle.epoch += 1;
+    let epoch = dongle.epoch;
+    dongle.association = None;
+    let any_bssid = bssid == [0; 6] || bssid == [0xff; 6];
+    let found = ap.filter(|ap| ap.ssid() == ssid && (any_bssid || bssid == wifi_ap::BSSID));
+    let setting = |name: &str| dongle.settings.get(name).cloned().unwrap_or_default();
+    let wpa_auth = setting("wpa_auth")
+        .get(..4)
+        .map_or(0, |w| u32::from_le_bytes(w.try_into().unwrap()));
+    match found {
+        Some(ap) if ap.accepts(wpa_auth, &setting("wpaie")) => {
+            dongle.association = Some(Association {
+                if_id,
+                epoch,
+                linked: false,
+                authenticator: ap.authenticator(dongle.mac),
+            });
+            dongle
+                .timers
+                .push((ASSOCIATION_TIME, Deferred::Associated { epoch }));
+        }
+        Some(_) => dongle.timers.push((
+            ASSOCIATION_TIME,
+            Deferred::AssociationFailed {
+                epoch,
+                if_id,
+                status: WLC_E_STATUS_FAIL,
+            },
+        )),
+        None => dongle.timers.push((
+            Duration::from_millis(DEFAULT_ACTIVE_DWELL_MS * CHANNELS.len() as u64),
+            Deferred::AssociationFailed {
+                epoch,
+                if_id,
+                status: WLC_E_STATUS_NO_NETWORKS,
+            },
+        )),
+    }
+    Ok(Vec::new())
+}
+
+/// `wl_escan_result_t`: buffer length, version, sync ID, BSS count, BSSs.
+fn escan_result(sync_id: u16, bss: &[Vec<u8>]) -> Vec<u8> {
+    let length = 12 + bss.iter().map(Vec::len).sum::<usize>();
+    let mut data = Vec::with_capacity(length);
+    data.extend((length as u32).to_le_bytes());
+    data.extend(BSS_INFO_VERSION.to_le_bytes());
+    data.extend(sync_id.to_le_bytes());
+    data.extend((bss.len() as u16).to_le_bytes());
+    for info in bss {
+        data.extend(info);
+    }
+    data
+}
 
 /// "escan": `wl_escan_params_t` (version 1, action, sync ID, then
 /// `wl_scan_params_t`: SSID, BSSID, BSS type, scan type at 43, probes,
 /// active/passive/home dwell at 48/52/56, channel and SSID counts at 60,
 /// chanspecs from 64; `wlan`'s builder at `0x637d0`). Starting a scan
 /// arms its end after the dwell on every channel (all valid channels when
-/// the list is empty); aborting it drops the pending result.
-fn escan(dongle: &mut Dongle, if_id: u8, value: &[u8]) -> Result<Vec<u8>, i16> {
+/// the list is empty), and, if the access point is on one of them and
+/// matches the SSID asked for (if any), a partial result with it when the
+/// scan has dwelt on its channel; aborting drops the pending results.
+fn escan(
+    dongle: &mut Dongle,
+    ap: Option<&AccessPoint>,
+    if_id: u8,
+    value: &[u8],
+) -> Result<Vec<u8>, i16> {
     let field = |at: usize| {
         value
             .get(at..at + 4)
@@ -1594,9 +2163,11 @@ fn escan(dongle: &mut Dongle, if_id: u8, value: &[u8]) -> Result<Vec<u8>, i16> {
             else {
                 return Err(BCME_BADARG);
             };
-            let channels = match (counts & 0xffff) as usize {
-                0 => CHANNELS.len(),
-                n => n,
+            let channels: Vec<u8> = match (counts & 0xffff) as usize {
+                0 => CHANNELS.to_vec(),
+                n => (0..n)
+                    .map(|i| value.get(72 + 2 * i).copied().unwrap_or(0))
+                    .collect(),
             };
             let passive_scan = scan_type & 1 != 0;
             let dwell_ms = match (passive_scan, active, passive) {
@@ -1605,12 +2176,23 @@ fn escan(dongle: &mut Dongle, if_id: u8, value: &[u8]) -> Result<Vec<u8>, i16> {
                 (true, _, ms) if ms > 0 => ms as u64,
                 (true, _, _) => DEFAULT_PASSIVE_DWELL_MS,
             };
+            let dwell = Duration::from_millis(dwell_ms);
+            let ssid_len = field(8).unwrap_or(0).clamp(0, 32) as usize;
+            let ssid = value.get(12..12 + ssid_len).unwrap_or(&[]);
+            let heard = ap.filter(|ap| ssid.is_empty() || ap.ssid() == ssid);
+            if let Some(index) =
+                heard.and_then(|_| channels.iter().position(|&c| c == wifi_ap::CHANNEL))
+            {
+                dongle.timers.push((
+                    dwell * (index as u32 + 1),
+                    Deferred::ScanFound { sync_id, if_id },
+                ));
+            }
             dongle.scan_in_flight = Some(sync_id);
-            dongle.scan_started = Some(Scan {
-                if_id,
-                sync_id,
-                duration: std::time::Duration::from_millis(dwell_ms * channels as u64),
-            });
+            dongle.timers.push((
+                dwell * channels.len() as u32,
+                Deferred::ScanDone { sync_id, if_id },
+            ));
             Ok(Vec::new())
         }
         WL_SCAN_ACTION_ABORT => {
@@ -1848,14 +2430,8 @@ impl PcieFunction for Bcm4356Wifi {
         } else {
             Err(format!("memory write at {address:#x} outside the BARs"))
         };
-        let scan = state
-            .dongle
-            .as_mut()
-            .and_then(|dongle| dongle.scan_started.take());
         drop(state);
-        if let Some(scan) = scan {
-            self.finish_scan_later(scan);
-        }
+        self.schedule();
         self.served(result)
     }
 }
@@ -2107,10 +2683,163 @@ mod tests {
         );
     }
 
+    /// Enables every firmware event, as `wlan` does for those it handles.
+    fn enable_all_events(wifi: &Bcm4356Wifi) {
+        let mut state = wifi.state.lock().unwrap();
+        let dongle = state.dongle.as_mut().unwrap();
+        dongle.settings.insert("event_msgs".into(), vec![0xff; 16]);
+        dongle.up = true;
+    }
+
+    /// Joining an open network: the association events in order, then a
+    /// frame transmitted on a flow ring reaches the network behind the
+    /// access point and one from it reaches a posted receive buffer.
+    #[test]
+    fn open_network_association_and_data() {
+        let (wifi, host) = setup();
+        let shared = u64::from(boot(&wifi));
+        let ring_info = wifi.memory_read(BAR2 + shared + 48, 4).unwrap();
+        let ring_mem = wifi.memory_read(BAR2 + ring_info, 4).unwrap();
+        let h2d_w = wifi.memory_read(BAR2 + ring_info + 4, 4).unwrap();
+        let d2h_w = wifi.memory_read(BAR2 + ring_info + 12, 4).unwrap();
+        let rings = [
+            (HOST, 64, 40),
+            (HOST + 0x1000, 64, 32),
+            (HOST + 0x2000, 64, 24),
+            (HOST + 0x3000, 64, 16),
+            (HOST + 0x4000, 64, 32),
+        ];
+        for (i, (base, items, len)) in rings.iter().enumerate() {
+            let at = BAR2 + ring_mem + 16 * i as u64;
+            wifi.memory_write(at + 4, 2, *items).unwrap();
+            wifi.memory_write(at + 6, 2, *len).unwrap();
+            wifi.memory_write(at + 8, 8, *base).unwrap();
+        }
+        enable_all_events(&wifi);
+        let uplinked: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let sink = Arc::clone(&uplinked);
+        wifi.set_access_point(
+            AccessPoint::new("emulated", None).unwrap(),
+            Box::new(move |frame| sink.lock().unwrap().push(frame.to_vec())),
+        );
+        let post = |kind: u8, id: u32, address: u64| {
+            let mut item = vec![0; 40];
+            item[0] = kind;
+            item[4..8].copy_from_slice(&id.to_le_bytes());
+            item[8..10].copy_from_slice(&0x100u16.to_le_bytes());
+            item[16..24].copy_from_slice(&address.to_le_bytes());
+            item
+        };
+        put(&host, HOST, &post(MSG_IOCTLRESP_BUF_POST, 7, HOST + 0x8000));
+        for i in 0..5u64 {
+            put(
+                &host,
+                HOST + 40 * (i + 1),
+                &post(MSG_EVENT_BUF_POST, 20 + i as u32, HOST + 0xa000 + 0x100 * i),
+            );
+        }
+        let mut join = b"join\0".to_vec();
+        let mut params = vec![0u8; 0x44];
+        params[0..4].copy_from_slice(&8u32.to_le_bytes());
+        params[4..12].copy_from_slice(b"emulated");
+        params[56..62].fill(0xff);
+        join.extend(params);
+        put(&host, HOST + 0x9000, &join);
+        let mut ioctl = vec![0; 40];
+        ioctl[0] = MSG_IOCTLPTR_REQ;
+        ioctl[8..12].copy_from_slice(&WLC_SET_VAR.to_le_bytes());
+        ioctl[14..16].copy_from_slice(&(join.len() as u16).to_le_bytes());
+        ioctl[24..32].copy_from_slice(&(HOST + 0x9000).to_le_bytes());
+        put(&host, HOST + 240, &ioctl);
+        // A receive buffer on the RX post ring.
+        let mut rx = vec![0; 32];
+        rx[0] = MSG_RXBUF_POST;
+        rx[4..8].copy_from_slice(&30u32.to_le_bytes());
+        rx[10..12].copy_from_slice(&2048u16.to_le_bytes());
+        rx[24..32].copy_from_slice(&(HOST + 0xc000).to_le_bytes());
+        put(&host, HOST + 0x1000, &rx);
+        wifi.memory_write(BAR2 + h2d_w, 2, 7).unwrap();
+        wifi.memory_write(BAR2 + h2d_w + 4, 2, 1).unwrap();
+        wifi.memory_write(
+            BAR0 + 0x2000 + u64::from(PCIE2_H2D_MAILBOX_0),
+            4,
+            0x1234_5678,
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        // Acknowledgement, completion, then the five events in order.
+        assert_eq!(wifi.memory_read(BAR2 + d2h_w, 2), Some(7));
+        let kinds: Vec<u32> = (0..5u64)
+            .map(|i| {
+                let frame = get(&host, HOST + 0xa000 + 0x100 * i, 32);
+                u32::from_be_bytes(frame[28..32].try_into().unwrap())
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                WLC_E_AUTH,
+                WLC_E_ASSOC,
+                WLC_E_JOIN,
+                WLC_E_LINK,
+                WLC_E_SET_SSID
+            ]
+        );
+        // Transmit on flow ring 2.
+        wifi.state
+            .lock()
+            .unwrap()
+            .dongle
+            .as_mut()
+            .unwrap()
+            .flow_rings
+            .push((
+                2,
+                Ring {
+                    base: HOST + 0x5000,
+                    max_items: 16,
+                    item_len: 48,
+                },
+            ));
+        let mut tx = vec![0; 48];
+        tx[0] = MSG_TX_POST;
+        tx[4..8].copy_from_slice(&40u32.to_le_bytes());
+        tx[8..14].copy_from_slice(&wifi_ap::BSSID);
+        tx[14..20].copy_from_slice(&[0x00, 0x90, 0x4c, 0x1a, 0xa0, 0x01]);
+        tx[20..22].copy_from_slice(&[0x08, 0x00]);
+        tx[32..40].copy_from_slice(&(HOST + 0x6000).to_le_bytes());
+        tx[42..44].copy_from_slice(&4u16.to_le_bytes());
+        put(&host, HOST + 0x5000, &tx);
+        put(&host, HOST + 0x6000, b"ping");
+        wifi.memory_write(BAR2 + h2d_w + 8, 2, 1).unwrap();
+        wifi.memory_write(
+            BAR0 + 0x2000 + u64::from(PCIE2_H2D_MAILBOX_0),
+            4,
+            0x1234_5678,
+        )
+        .unwrap();
+        let sent = uplinked.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(&sent[0][14..], b"ping");
+        assert_eq!(get(&host, HOST + 0x3000, 1), [MSG_TX_STATUS]);
+        // A frame from the network for the station.
+        let mut frame = vec![0x00, 0x90, 0x4c, 0x1a, 0xa0, 0x01];
+        frame.extend(wifi_ap::BSSID);
+        frame.extend([0x08, 0x00]);
+        frame.extend(b"pong");
+        wifi.from_network(&frame);
+        let complete = get(&host, HOST + 0x4000, 32);
+        assert_eq!(complete[0], MSG_RX_CMPLT);
+        assert_eq!(le32(&complete, 4), 30);
+        assert_eq!(usize::from(le16(&complete, 14)), frame.len());
+        assert_eq!(get(&host, HOST + 0xc000, frame.len()), frame);
+    }
+
     #[test]
     fn escan_ends_with_an_empty_result_after_its_dwell_time() {
         let (wifi, host) = setup();
         let shared = u64::from(boot(&wifi));
+        enable_all_events(&wifi);
         let ring_info = wifi.memory_read(BAR2 + shared + 48, 4).unwrap();
         let ring_mem = wifi.memory_read(BAR2 + ring_info, 4).unwrap();
         let h2d_w = wifi.memory_read(BAR2 + ring_info + 4, 4).unwrap();
