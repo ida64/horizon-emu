@@ -287,6 +287,8 @@ const WLC_SET_PM: u32 = 86;
 const WLC_SET_AP: u32 = 118;
 const WLC_GET_BANDLIST: u32 = 140;
 const WLC_SET_BAND: u32 = 142;
+/// Default scan type, 0 active / 1 passive (`WLC_SET_PASSIVE_SCAN`).
+const WLC_SET_PASSIVE_SCAN: u32 = 49;
 const WLC_GET_VALID_CHANNELS: u32 = 217;
 /// Two bands: 5 GHz (1) and 2.4 GHz (2) (`WLC_BAND_5G`/`WLC_BAND_2G`); the
 /// chip is dual-band (the NVRAM calibrates both).
@@ -311,6 +313,19 @@ const MSG_WL_EVENT: u8 = 0x0e;
 /// `WLC_E_ESCAN_RESULT` 69, `WLC_E_STATUS_SUCCESS` 0).
 const WLC_E_ESCAN_RESULT: u32 = 69;
 const WLC_E_STATUS_SUCCESS: u32 = 0;
+/// Interface event (`WLC_E_IF`, 54) with `wl_event_data_if_t` {ifidx,
+/// opcode `WLC_E_IF_ADD` (1), reserved, bssidx, role STA (0)}, public
+/// `wlioctl_defs.h`/`dhd.h`. Broadcom firmware announces the primary
+/// interface this way (public brcmfmac `fweh.c` handles, and ignores, the
+/// firmware's ADD for interface 0). `wlan` waits for it after "up": its
+/// event handler (`0x5f5a0`, case 54, opcode 1) raises the supplicant's
+/// "CTRL-EVENT-INTERFACE-UP" (`0x44eb0`), which its state machine turns
+/// into event 5 (`0xe62e0`) completing the pending interface-up request
+/// (`0xdb6e0` for request 10, `0xde260`); scans wait behind that request
+/// (`0xcb7f0`). Sent when the interface comes up, if the host's event
+/// mask enables it (assumed timing: right after the "up" completes).
+const WLC_E_IF: u32 = 54;
+const WLC_E_IF_ADD: u8 = 1;
 /// `wl_escan_params_t` action starting a scan, and the one aborting it
 /// (public `wlioctl.h`).
 const WL_SCAN_ACTION_START: u16 = 1;
@@ -1135,7 +1150,11 @@ impl State {
         done[12..14].copy_from_slice(&(len as u16).to_le_bytes());
         done[14..16].copy_from_slice(&transaction.to_le_bytes());
         done[16..20].copy_from_slice(&command.to_le_bytes());
-        self.complete(dongle, RING_D2H_CONTROL, &done, upstream)
+        self.complete(dongle, RING_D2H_CONTROL, &done, upstream)?;
+        if command == WLC_UP && status == 0 && event_enabled(dongle, WLC_E_IF) {
+            self.event(dongle, 0, WLC_E_IF, WLC_E_STATUS_SUCCESS, &[0, WLC_E_IF_ADD, 0, 0, 0], upstream)?;
+        }
+        Ok(())
     }
 
     /// The scan's time is up: with no network in range nothing was heard,
@@ -1381,8 +1400,10 @@ fn dongle_ioctl(
             return Ok(Ok(Vec::new()));
         }
         // Settings taking one word, which the firmware stores: infrastructure
-        // mode, channel, power save mode, access point mode (off), band.
-        WLC_SET_INFRA | WLC_SET_CHANNEL | WLC_SET_PM | WLC_SET_AP | WLC_SET_BAND => {
+        // mode, channel, power save mode, access point mode (off), band,
+        // default scan type.
+        WLC_SET_INFRA | WLC_SET_CHANNEL | WLC_SET_PM | WLC_SET_AP | WLC_SET_BAND
+        | WLC_SET_PASSIVE_SCAN => {
             let Some(word) = input.get(..4) else {
                 return Ok(Err(BCME_BADARG));
             };
@@ -1449,6 +1470,42 @@ fn dongle_ioctl(
             data.resize(value.len(), 0);
             Ok(data)
         }
+        // A stored setting reads back as the host set it.
+        (false, name) if SETTINGS.contains(&name) && dongle.settings.contains_key(name) => {
+            let mut data = dongle.settings[name].clone();
+            data.resize(value.len().max(4), 0);
+            Ok(data)
+        }
+        // The radio chains in use before the host chose them: what the
+        // NVRAM lists (`txchain=3`, `rxchain=3` in `wlan`'s embedded NVRAM).
+        (false, "txchain" | "rxchain") => match nvram_number(&dongle.nvram, &name) {
+            Some(chains) => Ok(chains.to_le_bytes().to_vec()),
+            None => Err(BCME_BADARG),
+        },
+        // Coexistence parameters, indexed: set {index, value}, get by index.
+        // Unset ones read as the NVRAM's `btc_params<index>`, else 0
+        // (assumed: the firmware's built-in value; `wlan` `0x64e70`/
+        // `0x64f90` only compare it with what they want and set it when
+        // it differs).
+        (_, "btc_params") => {
+            let Some(index) = value.get(..4).map(|b| u32::from_le_bytes(b.try_into().unwrap())) else {
+                return Ok(Err(BCME_BADARG));
+            };
+            let key = format!("btc_params{index}");
+            if set {
+                let Some(word) = value.get(4..8) else {
+                    return Ok(Err(BCME_BADARG));
+                };
+                dongle.settings.insert(key, word.to_vec());
+                Ok(Vec::new())
+            } else {
+                let word = match dongle.settings.get(&key) {
+                    Some(word) => u32::from_le_bytes(word[..4].try_into().unwrap()),
+                    None => nvram_number(&dongle.nvram, &key).unwrap_or(0),
+                };
+                Ok(word.to_le_bytes().to_vec())
+            }
+        }
         _ => {
             let verb = if set { "set" } else { "get" };
             return Err(format!(
@@ -1500,7 +1557,7 @@ const SETTINGS: [&str; 37] = [
     "obss_coex",
 ];
 /// Iovars `wlan` reads, modifies and writes back.
-const READ_BACK: [&str; 3] = ["event_msgs", "nsc_subtypes", "btc_dynctl"];
+const READ_BACK: [&str; 4] = ["event_msgs", "nsc_subtypes", "btc_dynctl", "nsc_afmode"];
 
 /// "escan": `wl_escan_params_t` (version 1, action, sync ID, then
 /// `wl_scan_params_t`: SSID, BSSID, BSS type, scan type at 43, probes,
@@ -1552,6 +1609,16 @@ fn escan(dongle: &mut Dongle, if_id: u8, value: &[u8]) -> Result<Vec<u8>, i16> {
         }
         _ => Err(BCME_BADARG),
     }
+}
+
+/// Whether the host's event mask (`event_msgs`, one bit per event type)
+/// enables `event_type`.
+fn event_enabled(dongle: &Dongle, event_type: u32) -> bool {
+    dongle
+        .settings
+        .get("event_msgs")
+        .and_then(|mask| mask.get((event_type / 8) as usize))
+        .is_some_and(|byte| byte >> (event_type % 8) & 1 != 0)
 }
 
 fn words(values: &[u32]) -> Vec<u8> {
