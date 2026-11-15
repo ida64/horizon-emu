@@ -14,7 +14,7 @@
 //! or a back-reference (length and distance) into what it has already
 //! written. A key that comes out of literals only, with nothing referring
 //! back into it, is changed by changing those literals: the segment keeps
-//! its size, and nothing else of the image moves. [`replace_key`] checks
+//! its size, and nothing else of the image moves. The replacement checks
 //! both and refuses otherwise.
 //!
 //! The two modules are those of firmware 23.5.0, recognized by the GNU

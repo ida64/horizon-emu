@@ -428,6 +428,21 @@ impl Controller {
                 r[1] = p[1];
                 2
             }
+            // Sub-op 1 (filter parameters, Android's
+            // BTM_BLE_META_PF_FEAT_SEL) with action 2 (clear,
+            // BTM_BLE_SCAN_COND_CLEAR) and no filter index: the clearing of
+            // every filter's parameters that `BTM_BleAdvFilterParamSetup`
+            // sends as sub-op and action alone. Answered like the other
+            // sub-ops: status, sub-op, action, entries free. Completion
+            // 0x9b8a0 takes three or four return bytes and, for sub-op 1,
+            // hands action, status and free count to the waiting caller.
+            0xfd57 if p == [1, 2] => {
+                self.filters.retain(|e| e.0 != 1);
+                r[0] = 1;
+                r[1] = 2;
+                r[2] = APCF_ENTRIES as u8;
+                3
+            }
             0xfd57 if p.len() >= 3 && (1..=7).contains(&p[0]) && p[1] <= 2 => {
                 let (kind, action, index) = (p[0], p[1], p[2]);
                 match action {
@@ -583,6 +598,12 @@ mod tests {
         assert_eq!(
             run(&mut c, 0xfd57, &add).unwrap(),
             [MEMORY_CAPACITY_EXCEEDED, 6, 0, 0]
+        );
+        // Clearing every filter's parameters: sub-op and action only.
+        assert_eq!(run(&mut c, 0xfd57, &[1, 2]).unwrap(), [0, 1, 2, free]);
+        assert_eq!(
+            run(&mut c, 0xfd57, &[1, 0, 1, 0x20, 0, 0, 0, 1, 0x80, 0]).unwrap(),
+            [0, 1, 0, free - 1]
         );
         assert_eq!(run(&mut c, 0xfd57, &[8, 0, 0]), None);
     }

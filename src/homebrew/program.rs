@@ -289,8 +289,8 @@ fn drop_absent_regions(npdm: &mut [u8]) -> Result<Vec<String>, ProgramError> {
 }
 
 /// The program archive for the ExeFS `nsp`, which must be for
-/// `program_id`, in place of `original`, and a line for each change
-/// [`drop_absent_regions`] made; see the module documentation.
+/// `program_id`, in place of `original`, and a line for each trace buffer
+/// request it dropped from the NPDM; see the module documentation.
 ///
 /// The ACID's pool partition becomes that of `original`: the system
 /// starts the program as the one it replaces, and the loader refuses an

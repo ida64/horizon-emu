@@ -39,7 +39,10 @@ running programs Nintendo did not sign (horizon_emu::homebrew):
                       Implies --homebrew-keys, --disable-program-verification
                       and --replace-program 010000000000100D=HBL
   --hbl NSP           the hbloader ExeFS for --homebrew (default: hbl.nsp
-                      next to NRO)";
+                      next to NRO)
+  --homebrew-app NRO  also put NRO on the --homebrew card, as
+                      /switch/<its file name>, where hbmenu lists it; may
+                      be given more than once";
 
 /// The Album applet, which Atmosphere has hbloader stand in for.
 const ALBUM: u64 = 0x0100_0000_0000_100D;
@@ -50,6 +53,7 @@ pub struct HomebrewOptions {
     replacements: Vec<(u64, String)>,
     homebrew: Option<String>,
     hbl: Option<String>,
+    apps: Vec<String>,
 }
 
 impl HomebrewOptions {
@@ -74,6 +78,7 @@ impl HomebrewOptions {
             }
             "--homebrew" => self.homebrew = Some(value()?.clone()),
             "--hbl" => self.hbl = Some(value()?.clone()),
+            "--homebrew-app" => self.apps.push(value()?.clone()),
             _ => return Ok(false),
         }
         Ok(true)
@@ -178,17 +183,33 @@ impl HomebrewOptions {
     }
 
     /// For `--homebrew`, a 4 GiB card with the NRO as `/hbmenu.nro`, where
-    /// hbloader looks for it.
+    /// hbloader looks for it, and `/switch/` with the `--homebrew-app`s.
     pub fn sd_card(&self) -> Result<Option<SdCardImage>, String> {
         let Some(nro) = &self.homebrew else {
+            if let Some(app) = self.apps.first() {
+                return Err(format!("--homebrew-app {app} goes with --homebrew"));
+            }
             return Ok(None);
         };
-        let contents = std::fs::read(nro).map_err(|error| format!("--homebrew {nro}: {error}"))?;
-        let image = sdcard::image_with_files(
-            SD_CARD_SIZE,
-            &[("/hbmenu.nro", &contents), ("/switch/", &[])],
-        )
-        .map_err(|error| format!("--homebrew: {error}"))?;
+        let read = |path: &String| {
+            std::fs::read(path).map_err(|error| format!("--homebrew {path}: {error}"))
+        };
+        let menu = read(nro)?;
+        let mut apps = Vec::new();
+        for app in &self.apps {
+            let name = Path::new(app)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("--homebrew-app {app}: no file name"))?;
+            apps.push((format!("/switch/{name}"), read(app)?));
+        }
+        let mut files: Vec<(&str, &[u8])> = vec![("/hbmenu.nro", &menu), ("/switch/", &[])];
+        files.extend(
+            apps.iter()
+                .map(|(path, data)| (path.as_str(), data.as_slice())),
+        );
+        let image = sdcard::image_with_files(SD_CARD_SIZE, &files)
+            .map_err(|error| format!("--homebrew: {error}"))?;
         SdCardImage::memory(image)
             .map(Some)
             .map_err(|error| format!("--homebrew: {error}"))
