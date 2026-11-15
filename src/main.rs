@@ -1,3 +1,4 @@
+mod script;
 mod window;
 
 use std::{
@@ -27,7 +28,10 @@ use horizon_emu::{
     symbols::SymbolTable,
 };
 
-use crate::window::{LogOverlay, ScreenWindow};
+use crate::{
+    script::{Event, Script},
+    window::{LogOverlay, ScreenWindow},
+};
 
 const USAGE: &str = "\
 usage: horizon-emu info <kernel.elf>
@@ -106,6 +110,17 @@ options:
                       100); may be given more than once. BUTTON is one of a
                       b x y l r zl zr plus minus home capture up down left
                       right lstick rstick
+  --script FILE       do to the console what FILE says, a step per line, each
+                      when the one before is over (# starts a comment):
+                        wait X,Y RRGGBB      until that pixel of the screen
+                                             (1280x720) has that colour
+                        sleep SECONDS
+                        press BUTTON [HOLD_MS]    (default 300)
+                        touch X,Y [HOLD_MS]
+                        joycons on|off
+                        screenshot FILE
+                      Unlike the times of --press and --touch, a wait does
+                      not depend on how fast the host gets the guest there
   --debug-mode        report development functions as enabled to the kernel,
                       which turns on its debug log (UART-A, shown on stderr)
 
@@ -274,6 +289,7 @@ fn boot(image: KernelImage, flags: &[String]) -> Result<(), String> {
     let mut screenshot = None;
     let mut inputs = Vec::new();
     let mut timed_screenshots = Vec::new();
+    let mut script = None;
     if maxwell::metal::available() {
         maxwell::select_renderer(maxwell::RendererKind::Metal);
     }
@@ -369,6 +385,12 @@ fn boot(image: KernelImage, flags: &[String]) -> Result<(), String> {
                 inputs.push((at, Input::Seat(seated)));
             }
             "--press" => inputs.extend(parse_press(value()?)?),
+            "--script" => {
+                let path = value()?;
+                let text =
+                    std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
+                script = Some(Script::parse(&text).map_err(|error| format!("{path}: {error}"))?);
+            }
             "--emmc" => emmc_user = Some(value()?),
             "--emmc-boot0" => emmc_boot[0] = Some(value()?),
             "--emmc-boot1" => emmc_boot[1] = Some(value()?),
@@ -528,20 +550,16 @@ fn boot(image: KernelImage, flags: &[String]) -> Result<(), String> {
                 }
             }
             while let Some((at, path)) = timed_screenshots.next_if(|(at, _)| *at <= now) {
-                let line = match machine.screen() {
-                    Ok(screen) => match File::create(&path)
-                        .map_err(|error| error.to_string())
-                        .and_then(|file| {
-                            write_png(file, &screen.frame).map_err(|error| error.to_string())
-                        }) {
-                        Ok(()) => format!("screen at {:.3} s saved to {path}", at.as_secs_f64()),
-                        Err(error) => format!("{path}: {error}"),
-                    },
-                    Err(reason) => {
-                        format!("screen at {:.3} s: no picture, {reason}", at.as_secs_f64())
-                    }
-                };
-                narrate(&line, &tracing);
+                narrate(&save_screen(&machine, &path, at), &tracing);
+            }
+            if let Some(script) = &mut script {
+                script.advance(&machine, |event| {
+                    let line = match event {
+                        Event::Done { line, text } => format!("script line {line}: {text}"),
+                        Event::Screenshot(path) => save_screen(&machine, path, now),
+                    };
+                    narrate(&line, &tracing);
+                });
             }
         }
         run.join()
@@ -558,6 +576,9 @@ fn boot(image: KernelImage, flags: &[String]) -> Result<(), String> {
     };
     println!("{ended}");
     log.push(&ended);
+    if let Some((line, text)) = script.as_ref().and_then(Script::waiting_at) {
+        println!("script: did not get past line {line}: {text}");
+    }
     for core in report
         .cores
         .iter()
@@ -637,6 +658,21 @@ fn write_png(file: File, frame: &Frame) -> Result<(), png::EncodingError> {
     encoder.set_color(png::ColorType::Rgb);
     encoder.set_depth(png::BitDepth::Eight);
     encoder.write_header()?.write_image_data(&frame.rgb())
+}
+
+/// Saves what the screen shows to `path`; the line to report it with.
+fn save_screen(machine: &Machine, path: &str, at: Duration) -> String {
+    let at = at.as_secs_f64();
+    match machine.screen() {
+        Ok(screen) => match File::create(path)
+            .map_err(|error| error.to_string())
+            .and_then(|file| write_png(file, &screen.frame).map_err(|error| error.to_string()))
+        {
+            Ok(()) => format!("screen at {at:.3} s saved to {path}"),
+            Err(error) => format!("{path}: {error}"),
+        },
+        Err(reason) => format!("screen at {at:.3} s: no picture, {reason}"),
+    }
 }
 
 /// Something done to the console at a moment of the run.
