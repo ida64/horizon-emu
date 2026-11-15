@@ -27,6 +27,9 @@ pub struct Medium {
     backing: Backing,
     /// Sectors written during this run over a file that is not written to.
     written: HashMap<u64, Box<[u8; SECTOR_SIZE]>>,
+    /// Sectors read in place of the backing until the guest writes them;
+    /// never written to the backing.
+    overlay: HashMap<u64, Box<[u8; SECTOR_SIZE]>>,
     /// Names the device in the message of a failing host file.
     device: &'static str,
 }
@@ -45,6 +48,7 @@ impl Medium {
             sectors,
             backing,
             written: HashMap::new(),
+            overlay: HashMap::new(),
             device,
         }
     }
@@ -55,25 +59,19 @@ impl Medium {
             sectors: (memory.len() / SECTOR_SIZE) as u64,
             backing: Backing::Memory(memory),
             written: HashMap::new(),
+            overlay: HashMap::new(),
             device,
         }
     }
 
-    /// Has `overlay` read in place of what the file holds, as if this run
-    /// had written those sectors before it started; for a file that is not
-    /// written to.
+    /// Has `overlay` read in place of what the backing holds, as if this
+    /// run had written those sectors before it started. The overlay itself
+    /// never reaches the backing: a writable image keeps its own contents
+    /// under it. A sector the guest writes is the guest's from then on, in
+    /// the backing (or this run's memory) like any other write, so a file
+    /// the guest rewrites, or clusters it reuses, are never masked.
     pub fn with_overlay(mut self, overlay: HashMap<u64, Box<[u8; SECTOR_SIZE]>>) -> Self {
-        assert!(
-            !matches!(
-                self.backing,
-                Backing::File {
-                    write_through: true,
-                    ..
-                }
-            ) || overlay.is_empty(),
-            "an overlay is for files that are not written to"
-        );
-        self.written = overlay;
+        self.overlay = overlay;
         self
     }
 
@@ -87,8 +85,12 @@ impl Medium {
         if sector >= self.sectors || block.len() != SECTOR_SIZE {
             return None;
         }
-        if let Some(written) = self.written.get(&sector) {
-            block.copy_from_slice(&written[..]);
+        if let Some(sector) = self
+            .written
+            .get(&sector)
+            .or_else(|| self.overlay.get(&sector))
+        {
+            block.copy_from_slice(&sector[..]);
             return Some(());
         }
         let offset = sector * SECTOR_SIZE as u64;
@@ -117,6 +119,7 @@ impl Medium {
     pub fn write(&mut self, sector: u64, block: &[u8]) -> Option<()> {
         let block: &[u8; SECTOR_SIZE] = block.try_into().ok()?;
         (sector < self.sectors).then_some(())?;
+        self.overlay.remove(&sector);
         let offset = sector * SECTOR_SIZE as u64;
         match &mut self.backing {
             Backing::Memory(memory) => {
@@ -133,5 +136,47 @@ impl Medium {
             }
         }
         Some(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_overlay_over_a_writable_image_is_read_but_never_written_and_yields_to_the_guest() {
+        let path =
+            std::env::temp_dir().join(format!("horizon-emu-medium-test-{}", std::process::id()));
+        std::fs::write(&path, [1u8; 2 * SECTOR_SIZE]).unwrap();
+        let file = File::options().read(true).write(true).open(&path).unwrap();
+        let overlay = HashMap::from([(0, Box::new([7u8; SECTOR_SIZE]))]);
+        let mut medium = Medium::new("test", 2, Some(file), true).with_overlay(overlay);
+        let mut block = [0; SECTOR_SIZE];
+
+        medium.read(0, &mut block).unwrap();
+        assert_eq!(
+            block, [7; SECTOR_SIZE],
+            "the overlay is what the guest reads"
+        );
+        medium.write(1, &[2; SECTOR_SIZE]).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap()[..SECTOR_SIZE],
+            [1; SECTOR_SIZE]
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap()[SECTOR_SIZE..],
+            [2; SECTOR_SIZE]
+        );
+
+        // Once the guest writes an overlaid sector, that write is the sector,
+        // in the image as well.
+        medium.write(0, &[3; SECTOR_SIZE]).unwrap();
+        medium.read(0, &mut block).unwrap();
+        assert_eq!(block, [3; SECTOR_SIZE]);
+        assert_eq!(
+            std::fs::read(&path).unwrap()[..SECTOR_SIZE],
+            [3; SECTOR_SIZE]
+        );
+        std::fs::remove_file(&path).unwrap();
     }
 }

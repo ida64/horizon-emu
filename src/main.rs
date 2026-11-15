@@ -546,7 +546,7 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
     };
     let [boot0, boot1] = emmc_boot.map(|path| path.map(open_image).transpose());
     let user = emmc_user.map(open_image).transpose()?;
-    let (overlay, replaced) = homebrew.overlay(user.as_ref(), emmc_writable, &keys)?;
+    let (overlay, replaced) = homebrew.overlay(user.as_ref(), &keys)?;
     let emmc = match user {
         Some(user) => Some(EmmcImages {
             user,

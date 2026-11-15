@@ -123,8 +123,8 @@ pub struct EmmcImages {
     pub writable: bool,
     /// Sectors of the user area that read differently from its image, as
     /// if this run had written them before it started: a change to the
-    /// storage the run makes and the image never sees. Only for images
-    /// that are not writable.
+    /// storage the run makes and the image never sees, writable or not.
+    /// A sector the guest writes leaves the overlay.
     pub overlay: HashMap<u64, Box<[u8; SECTOR_SIZE]>>,
 }
 

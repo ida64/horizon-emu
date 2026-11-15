@@ -30,9 +30,9 @@ running programs Nintendo did not sign (horizon_emu::homebrew):
                       serve, in place of that program's content, a content
                       archive made from the ExeFS NSP (main, main.npdm and
                       any rtld, sdk, subsdk0-9), signed with the homebrew
-                      test key. The eMMC image does not change. Needs
-                      --homebrew-keys and an eMMC image that is not
-                      writable; may be given more than once
+                      test key. Served from memory: the eMMC image keeps
+                      the original, also with --emmc-writable. Needs
+                      --homebrew-keys; may be given more than once
   --homebrew NRO      run homebrew the way Atmosphere does: hbloader in
                       place of the Album applet loads NRO as sdmc:/hbmenu.nro,
                       from a 4 GiB microSD card made in memory (no --sd).
@@ -127,7 +127,6 @@ impl HomebrewOptions {
     pub fn overlay(
         &self,
         user: Option<&File>,
-        writable: bool,
         keys: &KeySet,
     ) -> Result<(Overlay, Vec<String>), String> {
         let replacements = self.replacements()?;
@@ -136,11 +135,6 @@ impl HomebrewOptions {
             return Ok((overlay, report));
         }
         let user = user.ok_or("--replace-program needs --emmc")?;
-        if writable {
-            return Err("--replace-program: the replacement lives in memory; \
-                        it cannot go with --emmc-writable"
-                .into());
-        }
         if !self.installs_keys() {
             return Err(
                 "--replace-program: the archive is signed with the homebrew test key, \
