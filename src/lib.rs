@@ -14,7 +14,8 @@
 //!   the initial processes drive; [`keys`] loads the console keys the
 //!   secure monitor derives from; [`nand`] makes the eMMC image of a
 //!   console that has the firmware installed, and [`sdcard`] the image of
-//!   a microSD card with files on it.
+//!   a microSD card with files on it; [`homebrew`] runs programs Nintendo
+//!   did not sign on it.
 //! * [`machine`] ties these into a console and executes it.
 //! * [`symbols`] and [`svc`] name things for traces, and [`ipc`] decodes the
 //!   messages processes send each other.
@@ -26,6 +27,7 @@ pub mod arm64;
 pub mod boot;
 pub mod bus;
 pub mod gic;
+pub mod homebrew;
 pub mod hvf;
 pub mod image;
 pub mod ipc;

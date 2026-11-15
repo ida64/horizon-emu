@@ -42,19 +42,20 @@ use super::{
 };
 use crate::keys::KeySet;
 
-const HEADER_SIZE: usize = 0xC00;
-const XTS_SECTOR: u64 = 0x200;
-const MEDIA_UNIT: u64 = 0x200;
+pub const HEADER_SIZE: usize = 0xC00;
+pub(crate) const XTS_SECTOR: u64 = 0x200;
+pub(crate) const MEDIA_UNIT: u64 = 0x200;
 const SECTION_COUNT: usize = 4;
-const SECTION_HEADER_SIZE: usize = 0x200;
+pub(crate) const SECTION_HEADER_SIZE: usize = 0x200;
 
+pub const CONTENT_TYPE_PROGRAM: u8 = 0;
 pub const CONTENT_TYPE_META: u8 = 1;
 
-const FS_TYPE_PARTITION: u8 = 1;
-const HASH_TYPE_HIERARCHICAL_SHA256: u8 = 2;
+pub(crate) const FS_TYPE_PARTITION: u8 = 1;
+pub(crate) const HASH_TYPE_HIERARCHICAL_SHA256: u8 = 2;
 const ENCRYPTION_NONE: u8 = 1;
-const ENCRYPTION_CTR: u8 = 3;
-const CTR_KEY_SLOT: usize = 2;
+pub(crate) const ENCRYPTION_CTR: u8 = 3;
+pub(crate) const CTR_KEY_SLOT: usize = 2;
 
 #[derive(Debug)]
 pub enum NcaError {
@@ -147,6 +148,15 @@ impl<'a> Nca<'a> {
 
     pub fn size(&self) -> u64 {
         u64_at(&self.header[..], 0x208)
+    }
+
+    pub fn program_id(&self) -> u64 {
+        u64_at(&self.header[..], 0x210)
+    }
+
+    /// The whole header, decrypted.
+    pub fn header(&self) -> &[u8; HEADER_SIZE] {
+        &self.header
     }
 
     fn section_header(&self, section: usize) -> &[u8] {

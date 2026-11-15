@@ -6,6 +6,7 @@ pub mod agic;
 pub mod ahub;
 pub mod alc5639;
 pub mod apb_dma;
+pub mod bcm4356;
 pub mod bh1730;
 pub mod bluetooth_uart;
 pub mod bq24193;
@@ -26,6 +27,7 @@ pub mod host1x_channel;
 pub mod i2c;
 pub mod joycon;
 pub mod lsm6ds3;
+pub mod m92t36;
 pub mod max17050;
 pub mod max77620;
 pub mod max77621;
@@ -33,22 +35,20 @@ pub mod mc;
 mod medium;
 pub mod mipi_cal;
 pub mod pcie;
-pub mod bcm4356;
 pub mod pcie_endpoint;
 pub mod pmc;
 pub mod regs;
 pub mod sdcard;
 pub mod sdmmc;
 pub mod serial;
-pub mod spi;
-pub mod xusb_device;
-pub mod tmr;
-pub mod tmp451;
-pub mod touch;
-pub mod xusb_padctl;
-pub mod m92t36;
 pub mod soctherm;
+pub mod spi;
+pub mod tmp451;
+pub mod tmr;
+pub mod touch;
 pub mod vic;
+pub mod xusb_device;
+pub mod xusb_padctl;
 
 use std::{
     sync::{
@@ -407,8 +407,18 @@ impl Soc {
             mc,
             notes,
         };
-        bus.map("XUSB device", xusb_device::BASE, xusb_device::SIZE, Box::new(xusb_device::XusbDevice::default()));
-        bus.map("SOCTHERM", soctherm::BASE, soctherm::SIZE, Box::new(soctherm::Soctherm::default()));
+        bus.map(
+            "XUSB device",
+            xusb_device::BASE,
+            xusb_device::SIZE,
+            Box::new(xusb_device::XusbDevice::default()),
+        );
+        bus.map(
+            "SOCTHERM",
+            soctherm::BASE,
+            soctherm::SIZE,
+            Box::new(soctherm::Soctherm::default()),
+        );
         bus.map(
             "display controller",
             dc::BASE,
@@ -442,38 +452,78 @@ impl Soc {
             Box::new(Dpaux::default()),
         );
         let serial = |peer: Box<dyn serial::Peer>, intid| {
-            Arc::new(serial::Serial::new(peer, line(gic, intid), Arc::clone(&soc.notes)))
+            Arc::new(serial::Serial::new(
+                peer,
+                line(gic, intid),
+                Arc::clone(&soc.notes),
+            ))
         };
         let rail = |side| Box::new(joycon::Rail::new(side, Arc::clone(&soc.joycons)));
         let uarts = vec![
-            (joycon::RIGHT_UART_BASE, "UART-B",
-                serial(rail(joycon::Side::Right), joycon::RIGHT_UART_INTID)),
-            (joycon::LEFT_UART_BASE, "UART-C",
-                serial(rail(joycon::Side::Left), joycon::LEFT_UART_INTID)),
-            (bluetooth_uart::BASE, "Bluetooth UART",
-                serial(Box::<bluetooth_uart::Line>::default(), bluetooth_uart::INTID)),
+            (
+                joycon::RIGHT_UART_BASE,
+                "UART-B",
+                serial(rail(joycon::Side::Right), joycon::RIGHT_UART_INTID),
+            ),
+            (
+                joycon::LEFT_UART_BASE,
+                "UART-C",
+                serial(rail(joycon::Side::Left), joycon::LEFT_UART_INTID),
+            ),
+            (
+                bluetooth_uart::BASE,
+                "Bluetooth UART",
+                serial(
+                    Box::<bluetooth_uart::Line>::default(),
+                    bluetooth_uart::INTID,
+                ),
+            ),
         ];
         for (base, name, uart) in &uarts {
             bus.map(name, *base, serial::SIZE, Box::new(Arc::clone(uart)));
         }
-        bus.map("APB DMA", apb_dma::BASE, apb_dma::SIZE, Box::new(apb_dma::ApbDma::new(
-            DeviceMemory::new(&soc.mc, ram, apb_dma::SMMU_ASID),
-            uarts.into_iter().map(|(base, _, uart)| (base, uart)).collect(),
-            (0..32).map(|c| line(gic, apb_dma::intid(c))).collect(), Arc::clone(&soc.notes))));
+        bus.map(
+            "APB DMA",
+            apb_dma::BASE,
+            apb_dma::SIZE,
+            Box::new(apb_dma::ApbDma::new(
+                DeviceMemory::new(&soc.mc, ram, apb_dma::SMMU_ASID),
+                uarts
+                    .into_iter()
+                    .map(|(base, _, uart)| (base, uart))
+                    .collect(),
+                (0..32).map(|c| line(gic, apb_dma::intid(c))).collect(),
+                Arc::clone(&soc.notes),
+            )),
+        );
         bus.map(
             "XUSB pads",
             xusb_padctl::BASE,
             xusb_padctl::SIZE,
             Box::new(xusb_padctl::XusbPadctl::default()),
         );
-        let pcie = pcie::Pcie::new(DeviceMemory::new(&soc.mc, ram, pcie::SMMU_ASID),
-            line(gic, pcie::INTR_INTID), line(gic, pcie::MSI_INTID));
+        let pcie = pcie::Pcie::new(
+            DeviceMemory::new(&soc.mc, ram, pcie::SMMU_ASID),
+            line(gic, pcie::INTR_INTID),
+            line(gic, pcie::MSI_INTID),
+        );
         bus.map("PCIe", pcie::BASE, pcie::SIZE, Box::new(pcie.clone()));
-        bus.map("PCIe configuration", pcie::CONFIG_BASE, pcie::CONFIG_SIZE,
-            Box::new(pcie.configuration()));
-        bus.map("PCIe memory", pcie::MEMORY_BASE, pcie::MEMORY_SIZE,
-            Box::new(pcie.memory_window()));
-        pcie.attach(Arc::new(bcm4356::Bcm4356Wifi::new(pcie.upstream(), Arc::clone(&soc.notes))));
+        bus.map(
+            "PCIe configuration",
+            pcie::CONFIG_BASE,
+            pcie::CONFIG_SIZE,
+            Box::new(pcie.configuration()),
+        );
+        bus.map(
+            "PCIe memory",
+            pcie::MEMORY_BASE,
+            pcie::MEMORY_SIZE,
+            Box::new(pcie.memory_window()),
+        );
+        pcie.attach(Arc::new(bcm4356::Bcm4356Wifi::new(
+            pcie.upstream(),
+            Arc::clone(&soc.notes),
+        )));
         bus.map("PWM", PWM_BASE, PWM_SIZE, Box::new(Arc::clone(&soc.pwm)));
         bus.map("PMC", pmc::BASE, pmc::SIZE, Box::new(Pmc::new()));
         bus.map(
@@ -504,30 +554,74 @@ impl Soc {
         let (clock_change, disp1, disp2) =
             (Arc::clone(&emc), Arc::clone(&soc.dc), Arc::clone(&soc.dcb));
         let agic = Arc::new(agic::Agic::new(soc.line(agic::INTID)));
-        bus.map("AGIC distributor", agic::DISTRIBUTOR_BASE, agic::DISTRIBUTOR_SIZE,
-            Box::new(agic.distributor()));
-        bus.map("AGIC CPU interface", agic::CPU_INTERFACE_BASE, agic::CPU_INTERFACE_SIZE,
-            Box::new(agic.cpu_interface()));
+        bus.map(
+            "AGIC distributor",
+            agic::DISTRIBUTOR_BASE,
+            agic::DISTRIBUTOR_SIZE,
+            Box::new(agic.distributor()),
+        );
+        bus.map(
+            "AGIC CPU interface",
+            agic::CPU_INTERFACE_BASE,
+            agic::CPU_INTERFACE_SIZE,
+            Box::new(agic.cpu_interface()),
+        );
         let adsp = Arc::new(adsp::Adsp::new(
-            DeviceMemory::new(&soc.mc, ram, adsp::SMMU_ASID), agic, Arc::clone(&soc.notes)));
-        bus.map("AMISC", adsp::AMISC_BASE, adsp::AMISC_SIZE, Box::new(Arc::clone(&adsp)));
-        bus.map("ADSP vectors", adsp::EVP_BASE, adsp::EVP_SIZE, Box::new(RegisterFile::strict([])));
+            DeviceMemory::new(&soc.mc, ram, adsp::SMMU_ASID),
+            agic,
+            Arc::clone(&soc.notes),
+        ));
+        bus.map(
+            "AMISC",
+            adsp::AMISC_BASE,
+            adsp::AMISC_SIZE,
+            Box::new(Arc::clone(&adsp)),
+        );
+        bus.map(
+            "ADSP vectors",
+            adsp::EVP_BASE,
+            adsp::EVP_SIZE,
+            Box::new(RegisterFile::strict([])),
+        );
         bus.map("I2S", ahub::I2S_BASE, ahub::I2S_SIZE, Box::new(ahub::i2s()));
-        bus.map("ADMAIF", ahub::ADMAIF_BASE, ahub::ADMAIF_SIZE, Box::new(ahub::admaif()));
-        bus.map("ADMA", ahub::ADMA_BASE, ahub::ADMA_SIZE, Box::new(ahub::adma()));
-        bus.map("HD Audio", hda::BASE, hda::SIZE, Box::new(hda::Hda::new(
-            DeviceMemory::new(&soc.mc, ram, hda::SMMU_ASID), soc.line(hda::INTID),
-            Arc::clone(&soc.notes))));
+        bus.map(
+            "ADMAIF",
+            ahub::ADMAIF_BASE,
+            ahub::ADMAIF_SIZE,
+            Box::new(ahub::admaif()),
+        );
+        bus.map(
+            "ADMA",
+            ahub::ADMA_BASE,
+            ahub::ADMA_SIZE,
+            Box::new(ahub::adma()),
+        );
+        bus.map(
+            "HD Audio",
+            hda::BASE,
+            hda::SIZE,
+            Box::new(hda::Hda::new(
+                DeviceMemory::new(&soc.mc, ram, hda::SMMU_ASID),
+                soc.line(hda::INTID),
+                Arc::clone(&soc.notes),
+            )),
+        );
         let adsp_reset = Arc::clone(&adsp);
         let car = Car::new()
             .on_emc_clock_change(Box::new(move || clock_change.clock_changed()))
             // RST_DEVICES_L bits 27 and 26: DISP1 and DISP2 (hekate `clock.h`).
             .on_reset_asserted(0x004, 27, Box::new(move || disp1.reset()))
             .on_reset_asserted(0x004, 26, Box::new(move || disp2.reset()))
-            .on_reset_asserted(adsp::RESET_REGISTER, adsp::RESET_BIT,
-                Box::new(move || adsp_reset.reset()))
-            .on_reset_released(adsp::RESET_REGISTER, adsp::RESET_BIT,
-                Box::new(move || adsp.release()));
+            .on_reset_asserted(
+                adsp::RESET_REGISTER,
+                adsp::RESET_BIT,
+                Box::new(move || adsp_reset.reset()),
+            )
+            .on_reset_released(
+                adsp::RESET_REGISTER,
+                adsp::RESET_BIT,
+                Box::new(move || adsp.release()),
+            );
         bus.map("clock and reset", car::BASE, car::SIZE, Box::new(car));
         bus.map(
             "CL-DVFS",
@@ -579,10 +673,20 @@ impl Soc {
             Box::new(Max17050::new(Battery::FULL, Arc::clone(&soc.notes)));
         let i2c1 = [
             soc.byte_registers("charger", bq24193::ADDRESS, Bq24193::new()),
-            soc.byte_registers("temperature sensor", tmp451::ADDRESS, tmp451::Tmp451::default()),
+            soc.byte_registers(
+                "temperature sensor",
+                tmp451::ADDRESS,
+                tmp451::Tmp451::default(),
+            ),
             (max17050::ADDRESS, gauge),
-            (m92t36::ADDRESS, Box::new(m92t36::M92t36::new(&soc.gpio, Arc::clone(&soc.notes)))),
-            (alc5639::ADDRESS, Box::new(alc5639::Alc5639::new(Arc::clone(&soc.notes)))),
+            (
+                m92t36::ADDRESS,
+                Box::new(m92t36::M92t36::new(&soc.gpio, Arc::clone(&soc.notes))),
+            ),
+            (
+                alc5639::ADDRESS,
+                Box::new(alc5639::Alc5639::new(Arc::clone(&soc.notes))),
+            ),
         ];
         bus.map(
             "I2C1",
@@ -591,16 +695,29 @@ impl Soc {
             Box::new(soc.i2c("I2C1", I2C1_INTID, i2c1)),
         );
         // Tegra210 DTS: I2C2 SPI 84, I2C3 SPI 92, SPI4 SPI 93.
-        let light: Box<dyn I2cDevice> =
-            Box::new(bh1730::Bh1730::new(Arc::clone(&soc.notes)));
-        bus.map("I2C2", 0x7000_C400, i2c::SIZE,
-            Box::new(soc.i2c("I2C2", 32 + 84, [(bh1730::ADDRESS, light)])));
+        let light: Box<dyn I2cDevice> = Box::new(bh1730::Bh1730::new(Arc::clone(&soc.notes)));
+        bus.map(
+            "I2C2",
+            0x7000_C400,
+            i2c::SIZE,
+            Box::new(soc.i2c("I2C2", 32 + 84, [(bh1730::ADDRESS, light)])),
+        );
         let touch: Box<dyn I2cDevice> = Box::new(touch::Touch::new(
-            Arc::clone(&soc.touch_input), Arc::clone(&soc.notes)));
-        bus.map("I2C3", 0x7000_C500, i2c::SIZE,
-            Box::new(soc.i2c("I2C3", 32 + 92, [(touch::ADDRESS, touch)])));
-        bus.map("SPI4", spi::BASE, spi::SIZE, Box::new(spi::Spi::new(
-            soc.line(spi::INTID), Arc::clone(&soc.notes))));
+            Arc::clone(&soc.touch_input),
+            Arc::clone(&soc.notes),
+        ));
+        bus.map(
+            "I2C3",
+            0x7000_C500,
+            i2c::SIZE,
+            Box::new(soc.i2c("I2C3", 32 + 92, [(touch::ADDRESS, touch)])),
+        );
+        bus.map(
+            "SPI4",
+            spi::BASE,
+            spi::SIZE,
+            Box::new(spi::Spi::new(soc.line(spi::INTID), Arc::clone(&soc.notes))),
+        );
         let i2c5 = [
             soc.byte_registers("PMIC", max77620::PMIC_ADDRESS, max77620::Pmic::new()),
             soc.byte_registers(

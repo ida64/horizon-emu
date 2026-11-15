@@ -17,7 +17,7 @@
 //! protected partition and the boot operation mode are not modeled; their
 //! commands are illegal here and leave a note.
 
-use std::{fs::File, io, sync::Arc};
+use std::{collections::HashMap, fs::File, io, sync::Arc};
 
 use super::{
     Notes,
@@ -121,6 +121,11 @@ pub struct EmmcImages {
     /// Write to the images (which must be open for writing) instead of
     /// keeping this run's writes in memory.
     pub writable: bool,
+    /// Sectors of the user area that read differently from its image, as
+    /// if this run had written them before it started: a change to the
+    /// storage the run makes and the image never sees. Only for images
+    /// that are not writable.
+    pub overlay: HashMap<u64, Box<[u8; SECTOR_SIZE]>>,
 }
 
 #[derive(Debug)]
@@ -211,12 +216,10 @@ impl Emmc {
             ))
         };
         let [boot1, boot2] = images.boot;
+        let user = Medium::new(DEVICE, sectors, Some(images.user), images.writable)
+            .with_overlay(images.overlay);
         Ok(Self::with_storage(
-            [
-                Medium::new(DEVICE, sectors, Some(images.user), images.writable),
-                boot(boot1)?,
-                boot(boot2)?,
-            ],
+            [user, boot(boot1)?, boot(boot2)?],
             notes,
         ))
     }

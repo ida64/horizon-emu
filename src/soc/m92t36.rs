@@ -35,7 +35,9 @@ impl M92t36 {
         });
         let weak = Arc::downgrade(&device);
         gpio.observe_output(Box::new(move |port, pin, high| {
-            if port == 21 && pin == 5 && !high
+            if port == 21
+                && pin == 5
+                && !high
                 && let Some(device) = weak.upgrade()
             {
                 let mut state = device.state.lock().unwrap();

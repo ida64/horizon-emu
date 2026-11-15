@@ -167,6 +167,13 @@ pub struct BootParams {
     /// Secure monitor config item 11. The kernel's debug log, its only use of
     /// the UART, is live exactly when this is set (`0x800d3e90`, `0x8006a1c0`).
     pub development_function_enabled: bool,
+    /// Secure monitor config item 1, DisableProgramVerification: the
+    /// setting of consoles configured not to check the signatures of the
+    /// programs they run, off on retail ones. In firmware 23.5.0 only the
+    /// loader reads it (text `0x518`), and it heeds it only on development
+    /// hardware (`IsDevelopment`, spl text `0x11b40`: hardware state, item
+    /// 6, is 0), which this console is not: see [`crate::homebrew`].
+    pub program_verification_disabled: bool,
     /// Seeds the monitor's random number SMC. The kernel's KASLR, stack
     /// placement and physical page shuffle are functions of this value, so a
     /// fixed seed gives a reproducible address space.

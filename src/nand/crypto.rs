@@ -29,6 +29,12 @@ pub fn aes_decrypt(key: &Key, block: &Key) -> Key {
     block.into()
 }
 
+pub fn aes_encrypt(key: &Key, block: &Key) -> Key {
+    let mut block = (*block).into();
+    Aes128::new(key.into()).encrypt_block(&mut block);
+    block.into()
+}
+
 fn kek(keys: &KeySet, root: &Key, kek_source: &Key) -> Result<Key, MissingKey> {
     let static_source = keys
         .aes_kek_generation_source()

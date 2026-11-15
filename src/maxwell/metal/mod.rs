@@ -653,7 +653,13 @@ impl Renderer {
                 encoder.setFragmentBuffer_offset_atIndex(Some(&faults), 0, 21);
                 state.faults.push((faults, unbound));
             } else if !fault_words.is_empty() {
-                bind(gpu, &encoder, Stage::Fragment, bytes_of_u32(&fault_words), 21)?;
+                bind(
+                    gpu,
+                    &encoder,
+                    Stage::Fragment,
+                    bytes_of_u32(&fault_words),
+                    21,
+                )?;
             }
             encoder.drawPrimitives_vertexStart_vertexCount(
                 MTLPrimitiveType::Triangle,

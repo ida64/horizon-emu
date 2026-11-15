@@ -59,6 +59,24 @@ impl Medium {
         }
     }
 
+    /// Has `overlay` read in place of what the file holds, as if this run
+    /// had written those sectors before it started; for a file that is not
+    /// written to.
+    pub fn with_overlay(mut self, overlay: HashMap<u64, Box<[u8; SECTOR_SIZE]>>) -> Self {
+        assert!(
+            !matches!(
+                self.backing,
+                Backing::File {
+                    write_through: true,
+                    ..
+                }
+            ) || overlay.is_empty(),
+            "an overlay is for files that are not written to"
+        );
+        self.written = overlay;
+        self
+    }
+
     pub fn sectors(&self) -> u64 {
         self.sectors
     }

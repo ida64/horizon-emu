@@ -128,6 +128,14 @@ impl KernelImage {
         &self.blob.bytes
     }
 
+    /// The embedded INI1 archive, for changing the initial processes
+    /// before the image is placed in DRAM.
+    pub fn ini1_mut(&mut self) -> Option<&mut [u8]> {
+        let ini1 = self.ini1?;
+        let start = (ini1.address - self.blob.load_address) as usize;
+        self.blob.bytes.get_mut(start..start + ini1.size as usize)
+    }
+
     /// Link-time address of the image page whose contents equal `page`, if
     /// exactly one does. The loader shuffles the physical pages behind the
     /// kernel's virtual mapping, so contents are the only stable way to map a

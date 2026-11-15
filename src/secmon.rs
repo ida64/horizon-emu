@@ -213,6 +213,7 @@ pub struct SecureMonitor {
     dram: DramSize,
     kernel_configuration: KernelConfiguration,
     development_function_enabled: bool,
+    program_verification_disabled: bool,
     device_id: u64,
     state: Mutex<State>,
 }
@@ -246,6 +247,7 @@ impl SecureMonitor {
             dram: params.dram,
             kernel_configuration: params.kernel_configuration,
             development_function_enabled: params.development_function_enabled,
+            program_verification_disabled: params.program_verification_disabled,
             device_id: params.device_id,
             state: Mutex::new(State {
                 rng: SplitMix64(params.rng_seed),
@@ -427,7 +429,7 @@ impl SecureMonitor {
     fn get_config(&self, x: &mut [u64; 8]) -> SmcEffect {
         let item = x[1] as u32;
         let value = match item {
-            config_item::DISABLE_PROGRAM_VERIFICATION => 0,
+            config_item::DISABLE_PROGRAM_VERIFICATION => self.program_verification_disabled.into(),
             config_item::DRAM_ID => match self.dram.dram_id() {
                 Some(id) => id,
                 None => return SmcEffect::Unimplemented(Unimplemented::ConfigItem(item)),
@@ -907,6 +909,25 @@ mod tests {
             ..BootParams::default()
         };
         assert_eq!(smc(&console(&enabled), item).1[..2], [STATUS_SUCCESS, 1]);
+        assert_eq!(
+            smc(&monitor(DramSize::Gb4), item).1[..2],
+            [STATUS_SUCCESS, 0]
+        );
+    }
+
+    #[test]
+    fn program_verification_is_disabled_only_when_chosen() {
+        let item = [
+            function::GET_CONFIG.into(),
+            config_item::DISABLE_PROGRAM_VERIFICATION.into(),
+            0,
+            0,
+        ];
+        let disabled = BootParams {
+            program_verification_disabled: true,
+            ..BootParams::default()
+        };
+        assert_eq!(smc(&console(&disabled), item).1[..2], [STATUS_SUCCESS, 1]);
         assert_eq!(
             smc(&monitor(DramSize::Gb4), item).1[..2],
             [STATUS_SUCCESS, 0]

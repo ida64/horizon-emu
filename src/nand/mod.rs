@@ -36,6 +36,7 @@
 //! and nothing else is.
 
 use std::{
+    collections::HashMap,
     fmt,
     fs::File,
     io,
@@ -46,7 +47,7 @@ use std::{
 
 use crate::keys::KeySet;
 use bis::{BisKeys, MissingKey, Xts};
-use fat::{Fat32, FatError, Sectors};
+use fat::{Fat32, FatError, MountedFat32, Sectors};
 
 pub mod bis;
 pub mod calibration;
@@ -389,6 +390,9 @@ pub enum NandError {
     },
     /// The record of the installed contents could not be built.
     ContentDatabase(content_db::ContentDbError),
+    /// The program content to replace is not there once, or its
+    /// replacement could not be made.
+    Replacement(String),
 }
 
 impl fmt::Display for NandError {
@@ -408,6 +412,7 @@ impl fmt::Display for NandError {
             Self::ContentDatabase(error) => {
                 write!(f, "cannot build the content meta database: {error}")
             }
+            Self::Replacement(why) => write!(f, "cannot replace the program: {why}"),
         }
     }
 }
@@ -421,7 +426,13 @@ pub struct EncryptedPartition<'a> {
     cipher: Xts,
     /// Cipher text on its way to the image.
     scratch: Vec<u8>,
+    /// Where writes go instead of the image, when they do: cipher text
+    /// by sector of the user area.
+    overlay: Option<Overlay>,
 }
+
+/// Sectors of the user area, encrypted as stored, laid over its image.
+pub type Overlay = HashMap<u64, Box<[u8; SECTOR_SIZE as usize]>>;
 
 impl<'a> EncryptedPartition<'a> {
     fn new(image: &'a File, keys: &BisKeys, volume: &Volume) -> Self {
@@ -430,6 +441,7 @@ impl<'a> EncryptedPartition<'a> {
             range: partition_range(volume.partition).expect("volumes are partitions"),
             cipher: keys.cipher(volume.key),
             scratch: Vec::new(),
+            overlay: None,
         }
     }
 
@@ -455,6 +467,14 @@ impl Sectors for EncryptedPartition<'_> {
     fn read(&mut self, sector: u64, data: &mut [u8]) -> io::Result<()> {
         let offset = self.offset(sector, data.len())?;
         self.image.read_exact_at(data, self.range.start + offset)?;
+        if let Some(overlay) = &self.overlay {
+            let first = (self.range.start + offset) / SECTOR_SIZE;
+            for (index, block) in data.chunks_mut(SECTOR_SIZE as usize).enumerate() {
+                if let Some(laid) = overlay.get(&(first + index as u64)) {
+                    block.copy_from_slice(&laid[..]);
+                }
+            }
+        }
         self.cipher.decrypt(offset, data);
         Ok(())
     }
@@ -464,8 +484,24 @@ impl Sectors for EncryptedPartition<'_> {
         self.scratch.clear();
         self.scratch.extend_from_slice(data);
         self.cipher.encrypt(offset, &mut self.scratch);
-        self.image
-            .write_all_at(&self.scratch, self.range.start + offset)
+        match &mut self.overlay {
+            Some(overlay) => {
+                let first = (self.range.start + offset) / SECTOR_SIZE;
+                for (index, block) in self
+                    .scratch
+                    .as_chunks::<{ SECTOR_SIZE as usize }>()
+                    .0
+                    .iter()
+                    .enumerate()
+                {
+                    overlay.insert(first + index as u64, Box::new(*block));
+                }
+                Ok(())
+            }
+            None => self
+                .image
+                .write_all_at(&self.scratch, self.range.start + offset),
+        }
     }
 }
 
@@ -616,6 +652,91 @@ fn install(
     Ok(Installed {
         contents: contents.len(),
         bytes,
+    })
+}
+
+/// What [`replace_program`] lays over the user area.
+pub struct ProgramReplacement {
+    /// The file of the system partition that holds the program content.
+    pub path: String,
+    pub original_size: u64,
+    pub size: u64,
+    /// The sectors that hold the new archive, encrypted as stored.
+    pub overlay: Overlay,
+}
+
+/// Lays the content archive `build` makes over the program content of
+/// `program_id` among the built-in system contents of `image`, in memory:
+/// the image does not change. `build` gets the archive it replaces.
+///
+/// The content manager's database keeps naming the same content ID, so
+/// the new archive takes the place of the old one's contents: the file
+/// keeps its size and clusters, and only its first sectors change. That
+/// leaves the directories and FATs alone, which keeps the recovery file of
+/// a system partition a console has mounted valid (see [`fat`]), and
+/// nothing reads a content archive past the size its header gives. The
+/// archive found is the one file of `/Contents/registered` whose header
+/// names a program content (type 0, offset `0x205`) of `program_id`
+/// (offset `0x210`).
+pub fn replace_program(
+    image: &File,
+    keys: &KeySet,
+    program_id: u64,
+    build: impl FnOnce(&nca::Nca) -> Result<Vec<u8>, String>,
+) -> Result<ProgramReplacement, NandError> {
+    let filesystem = |error| NandError::Filesystem {
+        partition: SYSTEM.partition,
+        error,
+    };
+    let mut partition = EncryptedPartition::new(image, &storage_keys(image, keys)?, &SYSTEM);
+    partition.overlay = Some(Overlay::new());
+    let mut volume = MountedFat32::open(partition).map_err(filesystem)?;
+    let mut found = Vec::new();
+    for file in volume.list(REGISTERED).map_err(filesystem)? {
+        if file.directory || !file.name.ends_with(".nca") {
+            continue;
+        }
+        let path = format!("{REGISTERED}/{}", file.name);
+        let header = volume.read(&path, nca::HEADER_SIZE).map_err(filesystem)?;
+        let archive = match nca::Nca::open(&header, keys) {
+            Ok(archive) => archive,
+            Err(nca::NcaError::MissingKey(missing)) => return Err(NandError::Key(missing)),
+            Err(_) => continue,
+        };
+        if archive.content_type() == nca::CONTENT_TYPE_PROGRAM && archive.program_id() == program_id
+        {
+            found.push((path, u64::from(file.size)));
+        }
+    }
+    let (path, original_size) = match found.len() {
+        1 => found.pop().expect("one"),
+        0 => {
+            return Err(NandError::Replacement(format!(
+                "no program content of {program_id:016x} in {REGISTERED}"
+            )));
+        }
+        _ => {
+            return Err(NandError::Replacement(format!(
+                "{} program contents of {program_id:016x} in {REGISTERED}",
+                found.len()
+            )));
+        }
+    };
+    let whole = volume
+        .read(&path, original_size as usize)
+        .map_err(filesystem)?;
+    let original = nca::Nca::open(&whole, keys).expect("opened before");
+    let archive = build(&original).map_err(NandError::Replacement)?;
+    volume.overwrite(&path, &archive).map_err(filesystem)?;
+    let overlay = volume
+        .into_storage()
+        .overlay
+        .expect("the partition was given an overlay");
+    Ok(ProgramReplacement {
+        path,
+        original_size,
+        size: archive.len() as u64,
+        overlay,
     })
 }
 

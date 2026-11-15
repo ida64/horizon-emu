@@ -1,3 +1,4 @@
+mod homebrew_options;
 mod script;
 mod window;
 
@@ -29,6 +30,7 @@ use horizon_emu::{
 };
 
 use crate::{
+    homebrew_options::HomebrewOptions,
     script::{Event, Script},
     window::{LogOverlay, ScreenWindow},
 };
@@ -326,7 +328,7 @@ fn info(image: &KernelImage) {
     println!("loader entry   {:#x}", image.loader_entry);
 }
 
-fn boot(image: KernelImage, flags: &[String]) -> Result<(), String> {
+fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
     let mut params = BootParams::default();
     let mut timeout = None;
     let mut show_window = false;
@@ -346,6 +348,7 @@ fn boot(image: KernelImage, flags: &[String]) -> Result<(), String> {
     let mut inputs = Vec::new();
     let mut timed_screenshots = Vec::new();
     let mut script = None;
+    let mut homebrew = HomebrewOptions::default();
     if maxwell::metal::available() {
         maxwell::select_renderer(maxwell::RendererKind::Metal);
     }
@@ -473,7 +476,9 @@ fn boot(image: KernelImage, flags: &[String]) -> Result<(), String> {
                     .map_err(|error| format!("--step: {error}"))?
             }
             "--debug-mode" => params.development_function_enabled = true,
-            _ => return Err(USAGE.into()),
+            "--disable-program-verification" => params.program_verification_disabled = true,
+            other if homebrew.parse(other, &mut value)? => {}
+            _ => return Err(format!("{USAGE}\n\n{}", homebrew_options::USAGE)),
         }
     }
     // Names can only be looked up once every --symbols has been seen.
@@ -498,11 +503,14 @@ fn boot(image: KernelImage, flags: &[String]) -> Result<(), String> {
             .map_err(|error| format!("{path}: {error}"))
     };
     let [boot0, boot1] = emmc_boot.map(|path| path.map(open_image).transpose());
-    let emmc = match emmc_user {
+    let user = emmc_user.map(open_image).transpose()?;
+    let (overlay, replaced) = homebrew.overlay(user.as_ref(), emmc_writable, &keys)?;
+    let emmc = match user {
         Some(user) => Some(EmmcImages {
-            user: open_image(user)?,
+            user,
             boot: [boot0?, boot1?],
             writable: emmc_writable,
+            overlay,
         }),
         None if emmc_boot.iter().all(Option::is_none) => None,
         None => return Err("eMMC boot partition images need --emmc for the module itself".into()),
@@ -517,6 +525,17 @@ fn boot(image: KernelImage, flags: &[String]) -> Result<(), String> {
             SdCardImage::file(file, sd_writable).map_err(|error| format!("{path}: {error}"))
         })
         .transpose()?;
+    let sd_card = match sd_card {
+        Some(_) if homebrew.makes_sd_card() => {
+            return Err("--homebrew makes the microSD card; it cannot go with --sd".into());
+        }
+        Some(card) => Some(card),
+        None => homebrew.sd_card()?,
+    };
+    params.program_verification_disabled |= homebrew.disables_verification();
+    for line in homebrew.install_keys(&mut image)?.iter().chain(&replaced) {
+        println!("{line}");
+    }
     // A machine somebody is watching runs for as long as they watch.
     let timeout = timeout.or((!show_window).then_some(Duration::from_secs(5)));
 

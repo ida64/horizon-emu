@@ -120,6 +120,8 @@ pub enum FatError {
     /// A directory at the size limit of 65536 entries.
     DirectoryFull(String),
     NoSpace,
+    /// New contents for a file in place that are longer than the file.
+    LongerThanFile(String),
 }
 
 impl fmt::Display for FatError {
@@ -146,6 +148,9 @@ impl fmt::Display for FatError {
             Self::TooLarge(path) => write!(f, "{path} is too large for FAT32"),
             Self::DirectoryFull(path) => write!(f, "the directory of {path} is full"),
             Self::NoSpace => write!(f, "no space left"),
+            Self::LongerThanFile(path) => {
+                write!(f, "the new contents are longer than {path}")
+            }
         }
     }
 }
@@ -688,6 +693,21 @@ struct Entry {
     short_name: ShortName,
     directory: bool,
     cluster: u32,
+    size: u32,
+}
+
+impl Entry {
+    fn name(&self) -> String {
+        self.long_name.clone().unwrap_or_else(|| {
+            let part = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim_end().to_string();
+            let (base, extension) = (part(&self.short_name[..8]), part(&self.short_name[8..]));
+            if extension.is_empty() {
+                base
+            } else {
+                format!("{base}.{extension}")
+            }
+        })
+    }
 }
 
 struct Directory {
@@ -749,6 +769,7 @@ fn parse_directory(data: &[u8]) -> (Vec<Entry>, usize) {
                     short_name,
                     directory: attributes & ATTRIBUTE_DIRECTORY != 0,
                     cluster: u32::from(get16(record, 20)) << 16 | u32::from(get16(record, 26)),
+                    size: get32(record, 28),
                 });
             }
         }
@@ -779,7 +800,16 @@ pub struct Fat32<S> {
 }
 
 impl<S: Sectors> Fat32<S> {
-    pub fn open(mut storage: S) -> Result<Self, FatError> {
+    pub fn open(storage: S) -> Result<Self, FatError> {
+        let mut volume = Self::read_volume(storage)?;
+        if volume.find(volume.root, RECOVERY_FILE)?.is_some() {
+            return Err(FatError::Journaled);
+        }
+        Ok(volume)
+    }
+
+    /// The volume's parameters and FAT, whoever mounted it before.
+    fn read_volume(mut storage: S) -> Result<Self, FatError> {
         let mut boot = [0; SECTOR_SIZE];
         storage.read(0, &mut boot)?;
         let not = FatError::NotFat32;
@@ -832,9 +862,6 @@ impl<S: Sectors> Fat32<S> {
         volume.free_clusters = (2..cluster_end)
             .filter(|&cluster| volume.entry(cluster) == 0)
             .count() as u32;
-        if volume.find(root, RECOVERY_FILE)?.is_some() {
-            return Err(FatError::Journaled);
-        }
         Ok(volume)
     }
 
@@ -985,6 +1012,7 @@ impl<S: Sectors> Fat32<S> {
                 short_name,
                 directory: attributes & ATTRIBUTE_DIRECTORY != 0,
                 cluster,
+                size,
             });
         }
         self.directories.insert(parent, directory);
@@ -1156,6 +1184,124 @@ impl<S: Sectors> Fat32<S> {
             }
         }
         Ok(self.storage)
+    }
+}
+
+/// A file as a directory lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileInfo {
+    pub name: String,
+    pub directory: bool,
+    pub size: u32,
+}
+
+/// A FAT32 volume a console may have mounted, for reading files and for
+/// rewriting what an existing file holds. Neither touches a directory or
+/// a FAT, the only sectors the driver's recovery file (see the module
+/// documentation) records and would restore, so it stays valid.
+pub struct MountedFat32<S>(Fat32<S>);
+
+impl<S: Sectors> MountedFat32<S> {
+    pub fn open(storage: S) -> Result<Self, FatError> {
+        Fat32::read_volume(storage).map(Self)
+    }
+
+    /// The entries of the directory `path`, without `.` and `..`.
+    pub fn list(&mut self, path: &str) -> Result<Vec<FileInfo>, FatError> {
+        let components = path.split('/').filter(|component| !component.is_empty());
+        let directory = self.0.walk(path, components, false)?;
+        self.0.load(directory)?;
+        Ok(self.0.directories[&directory]
+            .entries
+            .iter()
+            .map(|entry| FileInfo {
+                name: entry.name(),
+                directory: entry.directory,
+                size: entry.size,
+            })
+            .collect())
+    }
+
+    /// First cluster and size of the file `path`.
+    fn file(&mut self, path: &str) -> Result<(u32, u32), FatError> {
+        let mut components = path.split('/').filter(|component| !component.is_empty());
+        let name = components
+            .next_back()
+            .ok_or_else(|| FatError::NotFound(path.into()))?;
+        let parent = self.0.walk(path, components, false)?;
+        self.0.load(parent)?;
+        let entry = self.0.directories[&parent]
+            .entries
+            .iter()
+            .find(|entry| entry.name().eq_ignore_ascii_case(name))
+            .ok_or_else(|| FatError::NotFound(path.into()))?;
+        if entry.directory {
+            return Err(FatError::NotFound(path.into()));
+        }
+        Ok((entry.cluster, entry.size))
+    }
+
+    /// The sectors of the file `path` that hold its first `length` bytes,
+    /// or all of them when it is shorter, each with the bytes of the file
+    /// it holds.
+    fn sectors(&mut self, path: &str, length: usize) -> Result<Vec<(u64, usize)>, FatError> {
+        let (first, size) = self.file(path)?;
+        let length = length.min(size as usize);
+        let chain = if size == 0 {
+            Vec::new()
+        } else {
+            self.0.chain(first)?
+        };
+        let per_cluster = self.0.sectors_per_cluster as usize;
+        let sectors = length.div_ceil(SECTOR_SIZE);
+        if sectors > chain.len() * per_cluster {
+            return Err(FatError::Corrupt("a file is longer than its clusters"));
+        }
+        Ok((0..sectors)
+            .map(|index| {
+                let cluster = chain[index / per_cluster];
+                let sector = self.0.cluster_sector(cluster) + (index % per_cluster) as u64;
+                (sector, (length - index * SECTOR_SIZE).min(SECTOR_SIZE))
+            })
+            .collect())
+    }
+
+    /// The first `length` bytes of the file `path`, or all of it when it is
+    /// shorter.
+    pub fn read(&mut self, path: &str, length: usize) -> Result<Vec<u8>, FatError> {
+        let mut data = Vec::with_capacity(length);
+        let mut sector_data = [0; SECTOR_SIZE];
+        for (sector, bytes) in self.sectors(path, length)? {
+            self.0.storage.read(sector, &mut sector_data)?;
+            data.extend_from_slice(&sector_data[..bytes]);
+        }
+        Ok(data)
+    }
+
+    /// Stores `contents` at the start of the file `path`, which keeps its
+    /// size and its clusters: whatever it held after `contents` (from the
+    /// end of their last sector on) stays. `contents` may not be longer
+    /// than the file.
+    pub fn overwrite(&mut self, path: &str, contents: &[u8]) -> Result<(), FatError> {
+        let (_, size) = self.file(path)?;
+        if contents.len() > size as usize {
+            return Err(FatError::LongerThanFile(path.into()));
+        }
+        let mut sector_data = [0; SECTOR_SIZE];
+        for ((sector, bytes), chunk) in self
+            .sectors(path, contents.len())?
+            .into_iter()
+            .zip(contents.chunks(SECTOR_SIZE))
+        {
+            sector_data.fill(0);
+            sector_data[..bytes].copy_from_slice(chunk);
+            self.0.storage.write(sector, &sector_data)?;
+        }
+        Ok(())
+    }
+
+    pub fn into_storage(self) -> S {
+        self.0.storage
     }
 }
 
@@ -1675,5 +1821,48 @@ pub(crate) mod tests {
             .unwrap();
         volume.finish().unwrap();
         assert!(matches!(Fat32::open(&mut memory), Err(FatError::Journaled)));
+    }
+
+    #[test]
+    fn a_mounted_volume_has_file_contents_replaced_and_nothing_else() {
+        let mut memory = Memory::new(SECTORS);
+        format(&mut memory, SECTORS as u64, true, 7).unwrap();
+        let mut volume = Fat32::open(&mut memory).unwrap();
+        volume.create_dir_all("/Contents/registered").unwrap();
+        let old = pattern(5000, 1);
+        let path = "/Contents/registered/0123456789abcdef0123456789abcdef.nca";
+        volume.write_file(path, &mut old.as_slice(), 5000).unwrap();
+        volume
+            .write_file("/PRF2SAFE.RCV", &mut &[0u8; 16][..], 16)
+            .unwrap();
+        volume.finish().unwrap();
+        memory.written.fill(false);
+
+        let mut mounted = MountedFat32::open(&mut memory).unwrap();
+        let listed = mounted.list("/Contents/registered").unwrap();
+        assert_eq!(
+            listed,
+            [FileInfo {
+                name: "0123456789abcdef0123456789abcdef.nca".into(),
+                directory: false,
+                size: 5000,
+            }]
+        );
+        assert_eq!(mounted.read(path, 700).unwrap(), old[..700]);
+        let new = pattern(1200, 9);
+        mounted.overwrite(path, &new).unwrap();
+        assert!(matches!(
+            mounted.overwrite(path, &pattern(5001, 9)),
+            Err(FatError::LongerThanFile(_))
+        ));
+        drop(mounted);
+
+        // Three sectors of file data, the last zero after the new bytes,
+        // and the rest of the file as it was.
+        assert_eq!(memory.written.iter().filter(|&&written| written).count(), 3);
+        let mut expected = new.clone();
+        expected.resize(1536, 0);
+        expected.extend_from_slice(&old[1536..]);
+        assert_eq!(Reader::open(&mut memory).file(path), expected);
     }
 }

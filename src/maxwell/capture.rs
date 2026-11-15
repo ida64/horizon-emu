@@ -765,8 +765,7 @@ mod tests {
                 if seen.contains_key(&(pipeline, address)) {
                     continue;
                 }
-                let program = match super::super::shader::Program::decode(&state.memory, address)
-                {
+                let program = match super::super::shader::Program::decode(&state.memory, address) {
                     Ok(program) => program,
                     Err(error) => {
                         seen.insert((pipeline, address), error.0);
