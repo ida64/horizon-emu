@@ -562,8 +562,13 @@ impl Frame {
 
     /// A `width` x `height` target with a full-target viewport.
     fn sized(width: u32, height: u32) -> Frame {
+        Frame::sized_with(width, height, super::RendererKind::Software)
+    }
+
+    /// A `width` x `height` target drawn by renderer `kind`.
+    fn sized_with(width: u32, height: u32, kind: super::RendererKind) -> Frame {
         let ram = Ram::new(0x80_0000 + (width * height * 4) as usize);
-        let mut channel = Channel::new();
+        let mut channel = Channel::with_renderer(kind);
         call(&mut channel, &ram, 0, 0, 0xB197);
         initial_state(&mut channel);
         // Netlist initial pipeline bindings: vertex B group 0, pixel group 4.
@@ -742,6 +747,69 @@ fn depth_test_without_depth_target_passes() {
     frame.method(0x1614, 0);
     assert_eq!(frame.pixel(20, 20), [64, 128, 255, 255]);
     assert_eq!(frame.pixel(4, 4), [0, 0, 0, 255]);
+}
+
+/// The Metal renderer binds every texture a program names before it
+/// draws; a handle that names no texture (an unset slot, TIC index
+/// 0xfffff, as netConnect's uber-shader leaves on branches its draws do
+/// not take) leaves the draw to the software renderer, which resolves
+/// textures only where a sample executes, instead of refusing it.
+#[test]
+fn metal_leaves_unresolvable_unsampled_texture_to_software() {
+    let elf = std::fs::read(STARTER).expect("starter ELF (fw_elf) must be present");
+    let mut frame = Frame::sized_with(SIZE, SIZE, super::RendererKind::Metal);
+    frame.program(1, 0, starter_program(&elf, 0x4c0e00));
+    // Pixel shader: P0 = c3[0] != 0; @P0 BRA over a TEXS of bound texture
+    // 8 (handle c2[0x20]); color = (1, 0.5, 0.25, 1). The branch depends
+    // on a constant, so the program names the texture; this draw takes
+    // the branch. PS header: shader type 5, target 0 RGBA.
+    let mut ps = vec![0u8; 0x50];
+    ps[..4].copy_from_slice(&0x1402u32.to_le_bytes());
+    ps[0x48] = 15;
+    let mov = |rd: u64, v: f32| 0x010000000007f000u64 | (u64::from(v.to_bits()) << 20) | rd;
+    for word in [
+        0,
+        0x4c98_078c_0007_0004, // MOV R4, c3[0x0]
+        0x5b6b_0380_0ff7_0407, // ISETP.NE.AND P0, PT, R4, RZ, PT
+        0xe240_0000_0100_000f, // @P0 BRA 0x30
+        0,
+        0xd832_0080_4057_040a, // TEXS (from netConnect's shader), texture 8
+        mov(0, 1.0),
+        mov(1, 0.5),
+        0,
+        mov(2, 0.25),
+        mov(3, 1.0),
+        0xe300_0000_0007_000f, // EXIT
+        0,
+        0xe240_0fff_ff07_000f, // BRA to itself
+        0x50b0_0000_0007_0f00, // NOP
+        0x50b0_0000_0007_0f00, // NOP
+    ] {
+        ps.extend_from_slice(&u64::to_le_bytes(word));
+    }
+    ps.extend_from_slice(&[0; 32]);
+    frame.program(5, 0x800, &ps);
+    frame.constants(0, 3, 0x30_0000, &ui2d_vertex_constants(&[]));
+    frame.constants(4, 2, 0x30_1000, &[0xff; 0x40]);
+    frame.constants(4, 3, 0x30_2000, &1u32.to_le_bytes());
+    let quad = [
+        -0.5, -0.5, 0.0, 0.25, -0.5, 0.0, 0.25, 0.75, 0.0, -0.5, 0.75, 0.0,
+    ];
+    frame.vertices(0x40_0000, 12, &quad, &[(0, 0x02)]);
+    frame.method(0x1618, 7);
+    frame.method(0x0d74, 0);
+    frame.method(0x0d78, 4);
+    frame.method(0x1614, 0);
+    frame.channel.flush(&frame.ram).unwrap();
+    assert_eq!(frame.pixel(20, 20), [255, 128, 64, 255]);
+    let metal = frame.channel.hooks.metal.as_ref().expect("Metal device");
+    let (_, fallbacks) = metal.fallbacks();
+    assert!(
+        fallbacks
+            .iter()
+            .any(|(reason, _)| reason == "texture handle that does not resolve"),
+        "{fallbacks:?}"
+    );
 }
 
 /// Binds the ui2d textured shader pair of the starter ELF and an `n` x `n`

@@ -412,7 +412,14 @@ impl Renderer {
                 return self.fall_back("texture handle outside the constant buffer".into());
             };
             let handle = u32::from_le_bytes(bytes.try_into().expect("4 bytes"));
-            let (texture, tsc) = draw.textures.resolve(handle)?;
+            // Every handle the program names is bound up front, but a
+            // sample on a branch the draw does not take reads nothing: an
+            // uber-shader of netConnect names slots its draws leave unset
+            // (TIC index 0xfffff). The software renderer resolves a handle
+            // when a sample executes and refuses then.
+            let Ok((texture, tsc)) = draw.textures.resolve(handle) else {
+                return self.fall_back("texture handle that does not resolve".into());
+            };
             if let Err(reason) = format::check_texture(&texture, &tsc) {
                 return self.fall_back(reason);
             }
