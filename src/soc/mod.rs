@@ -18,6 +18,7 @@ pub mod emc;
 pub mod emmc;
 pub mod falcon_host;
 pub mod gm20b;
+pub mod gmix;
 pub mod gpio;
 pub mod hda;
 pub mod host1x;

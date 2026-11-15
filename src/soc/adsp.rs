@@ -72,8 +72,9 @@
 //!   record holding the mailbox channel it opened. `audio` polls for that
 //!   record (text `0x12580`) and then sends commands: a record in the
 //!   command queue and its opcode as message (text `0x124f0`). No command
-//!   needs an answer; what the commands configure (routes, stream buffers)
-//!   carries no sound here, so they are taken without effect.
+//!   needs an answer. Its audio output sessions play into nothing in real
+//!   time and give their buffers back ([`super::gmix`]); its other
+//!   commands carry no sound here and are taken without effect.
 //! * `AudioRenderer` executes the command lists `audio`'s renderers build.
 //!   On channel 50 it answers 22 with 22 and then 32, each 42 (render) with
 //!   32 once the frame is done, and 52 (stop) with 52; on channel 51 the
@@ -108,6 +109,7 @@ use std::{
 use super::{
     Notes,
     agic::Agic,
+    gmix::{self, Shared, Streams},
     mc::DeviceMemory,
     regs::{RegisterFile, word},
 };
@@ -272,6 +274,10 @@ struct State {
     control: u32,
     /// `gmix`'s shared memory, once launched.
     gmix: Option<u32>,
+    /// `gmix`'s output sessions and speaker (see [`super::gmix`]).
+    streams: Streams,
+    /// When the speaker's next period ends, while it plays.
+    period_due: Option<Instant>,
     /// The renderer's shared memory, once launched.
     renderer: Option<u32>,
     opus: Opus,
@@ -310,6 +316,8 @@ impl Adsp {
                 outbox: VecDeque::new(),
                 control: 0,
                 gmix: None,
+                streams: Streams::default(),
+                period_due: None,
                 renderer: None,
                 opus: Opus::Idle,
                 frame_due: None,
@@ -349,6 +357,8 @@ impl Adsp {
         state.running = false;
         state.outbox.clear();
         state.gmix = None;
+        state.streams = Streams::default();
+        state.period_due = None;
         state.renderer = None;
         state.opus = Opus::Idle;
         state.frame_due = None;
@@ -356,7 +366,7 @@ impl Adsp {
     }
 }
 
-/// Completes renderer frames when they are due.
+/// Completes renderer frames and the speaker's periods when they are due.
 fn keep_time(inner: Weak<Inner>) {
     while let Some(inner) = inner.upgrade() {
         let mut state = inner.state.lock().unwrap();
@@ -368,13 +378,40 @@ fn keep_time(inner: Weak<Inner>) {
                 inner.notes.add(format!("ADSP: renderer: {what}"));
             }
         }
-        let wait = state
-            .frame_due
-            .map_or(Duration::from_millis(100), |due| {
-                due.saturating_duration_since(now)
-            })
-            .min(Duration::from_millis(100));
+        if let Some(due) = state.period_due.filter(|&due| due <= now) {
+            // A host that fell far behind does not get a burst of periods.
+            state.period_due = Some((due + PERIOD).max(now));
+            if let Err(what) = inner.speaker_period(&mut state) {
+                inner.notes.add(format!("ADSP: gmix: {what}"));
+                state.period_due = None;
+            }
+        }
+        let wait = [state.frame_due, state.period_due]
+            .into_iter()
+            .flatten()
+            .map(|due| due.saturating_duration_since(now))
+            .fold(Duration::from_millis(100), Duration::min);
         drop(inner.wake.wait_timeout(state, wait).unwrap());
+    }
+}
+
+/// One period of the speaker's DMA: 240 frames at 48 kHz (see
+/// [`super::gmix`]).
+const PERIOD: Duration = Duration::from_millis(5);
+
+/// `gmix`'s shared memory at `base`, for [`Streams`].
+struct GmixMemory<'a> {
+    inner: &'a Inner,
+    base: u32,
+}
+
+impl Shared for GmixMemory<'_> {
+    fn read(&self, offset: u32) -> Result<u32> {
+        self.inner.read_word(self.base + offset)
+    }
+
+    fn write(&mut self, offset: u32, value: u32) -> Result<()> {
+        self.inner.write_word(self.base + offset, value)
     }
 }
 
@@ -578,7 +615,7 @@ impl Inner {
     }
 
     /// A `gmix` command: the opcode as message, its record in the command
-    /// queue. Taken without effect (see the module documentation).
+    /// queue (see [`super::gmix`]).
     fn gmix(&self, state: &mut State, opcode: u32) -> Result<()> {
         let base = state.gmix.ok_or("gmix is not running")?;
         let command = self
@@ -587,6 +624,37 @@ impl Inner {
         if command.first() != Some(&opcode) {
             return Err(format!("gmix command {opcode} with record {command:x?}"));
         }
+        let mut memory = GmixMemory { inner: self, base };
+        state.streams.command(&command, &mut memory)?;
+        match (state.streams.playing(), state.period_due) {
+            (true, None) => {
+                state.period_due = Some(Instant::now() + PERIOD);
+                self.wake.notify_all();
+            }
+            (false, Some(_)) => state.period_due = None,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// The speaker's period ended: `gmix` plays its sessions and tells the
+    /// host, unless the host has yet to take its previous message.
+    fn speaker_period(&self, state: &mut State) -> Result<()> {
+        let base = state.gmix.ok_or("gmix is not running")?;
+        state
+            .streams
+            .period(&mut GmixMemory { inner: self, base })?;
+        let waiting = GMIX << 20 | 1;
+        if state
+            .outbox
+            .iter()
+            .chain(&state.mailboxes[..1])
+            .any(|&message| message & !FULL == waiting)
+        {
+            return Ok(());
+        }
+        self.enqueue(base + GMIX_NOTIFICATIONS, &gmix::NOTIFICATION)?;
+        self.send(state, GMIX, 1);
         Ok(())
     }
 
@@ -868,6 +936,53 @@ mod tests {
             adsp.write(0, TO_DSP, 4, u64::from(FULL | 3 << 20 | 1)),
             None
         );
+    }
+
+    #[test]
+    fn gmix_plays_output_sessions_in_real_time() {
+        let (adsp, ram, agic, _) = dsp();
+        adsp.release();
+        receive(&adsp, &agic);
+        while host_dequeue(&ram, DSP_QUEUE).is_some() {}
+        let base = 0x8080_0000;
+        let mut request = [0u32; 1 + LAUNCH_WORDS];
+        request[0] = LAUNCH_WORDS as u32;
+        request[1] = GMIX_APP;
+        request[1 + LAUNCH_SHARED_DRAM] = base;
+        request[1 + LAUNCH_COMMAND] = LAUNCH_RUN;
+        adsp.0.enqueue(HOST_QUEUE, &request).unwrap();
+        send(&adsp, &agic, APP_SERVICE, 0);
+        receive(&adsp, &agic);
+        while host_dequeue(&ram, base + GMIX_NOTIFICATIONS).is_some() {}
+        // Default device 7; open and start the speaker and output session
+        // 0 (stereo), and append one period's worth.
+        for record in [
+            &[2, 1, 7][..],
+            &[3, 8, 7, 0],
+            &[3, 10, 7, 0],
+            &[6, 8, 2, 0, 0, 2, 0],
+            &[3, 10, 2, 0],
+            &[5, 15, 2, 0, 0x8100_0000, 960],
+        ] {
+            adsp.0.enqueue(base, record).unwrap();
+            send(&adsp, &agic, GMIX, record[1]);
+        }
+        assert_eq!(word_at(&ram, base + 0x2_B060), 1, "appended");
+        let started = Instant::now();
+        while agic.cpu_interface().read(0, 0x18, 4) != Some(u64::from(TO_HOST_FULL)) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(started.elapsed() >= PERIOD / 2);
+        assert_eq!(receive(&adsp, &agic), FULL | GMIX << 20 | 1);
+        assert_eq!(
+            host_dequeue(&ram, base + GMIX_NOTIFICATIONS),
+            Some(gmix::NOTIFICATION[1..].to_vec())
+        );
+        assert_eq!(word_at(&ram, base + 0x2_B064), 1, "played and released");
+        // Stopping the speaker ends the periods.
+        adsp.0.enqueue(base, &[3, 11, 7, 0]).unwrap();
+        send(&adsp, &agic, GMIX, 11);
+        assert!(adsp.0.state.lock().unwrap().period_due.is_none());
     }
 
     #[test]
