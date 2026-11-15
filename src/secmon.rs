@@ -99,6 +99,17 @@ pub mod user_function {
     /// user pointer, so what arrives is the physical address the kernel
     /// found for it, good for the rest of that page.
     pub const COMPUTE_CMAC: u32 = 0xC300_040B;
+    /// `X1`-`X2` access key, `W3` mode, `X4` address of the data, `X5` its
+    /// length, `X6`-`X7` key source in; the data decrypted in place (the
+    /// format is [`super::crypto::seal_device_unique_data`]'s). Bit 12 of
+    /// the identifier marks `X4` as a user pointer, which the kernel turns
+    /// into a physical address; `spl` passes its work buffer (`0x35000`,
+    /// text `0x11340`). Mode 0 hands the plain data back; the modes that
+    /// import a key into the monitor (1 to 4) are not modeled. `ssl`
+    /// reaches it through `spl` to unwrap its TLS client key of key
+    /// generation 0 (`0x35f80`), and `spl` copies the payload, all but the
+    /// last `0x30` bytes, back to it.
+    pub const DECRYPT_DEVICE_UNIQUE_DATA: u32 = 0xC300_100D;
 }
 
 /// Config items. Numbers 1 and 10-12 are established by what the kernel
@@ -302,6 +313,9 @@ impl SecureMonitor {
                         set_key_at(x, 1, &mac);
                         Ok(())
                     })
+                }
+                user_function::DECRYPT_DEVICE_UNIQUE_DATA => {
+                    self.decrypt_device_unique_data(x, engine)
                 }
                 user_function::GENERATE_SPECIFIC_AES_KEY => self.key_operation(x, |crypto, x| {
                     let key = crypto.generate_specific_aes_key(&key_at(x, 1), x[3], x[4])?;
@@ -534,6 +548,38 @@ impl SecureMonitor {
         SmcEffect::Resume
     }
 
+    /// DecryptDeviceUniqueData, synchronous like the monitor's. Mode 0 only;
+    /// the mode word's other bits are reserved and refused.
+    fn decrypt_device_unique_data(&self, x: &mut [u64; 8], memory: &DeviceMemory) -> SmcEffect {
+        let unimplemented = |what| SmcEffect::Unimplemented(Unimplemented::Crypto(what));
+        let (mode, address, len) = (x[3] as u32, x[4], x[5]);
+        if mode >> 3 != 0 || len > crypto::DEVICE_UNIQUE_DATA_MAX as u64 {
+            x[0] = STATUS_INVALID_ARGUMENT;
+            return SmcEffect::Resume;
+        }
+        if mode != 0 {
+            return unimplemented("device-unique data that the monitor imports as a key");
+        }
+        let mut data = vec![0; len as usize];
+        if address % PAGE_SIZE + len > PAGE_SIZE || memory.ram().read(address, &mut data).is_none()
+        {
+            return unimplemented("device-unique data that is not within one page of DRAM");
+        }
+        let device_id = self.device_id;
+        let (access_key, key_source) = (key_at(x, 1), key_at(x, 6));
+        let effect = self.key_operation(x, |crypto, _| {
+            crypto.decrypt_device_unique_data(&access_key, &key_source, &mut data, device_id)
+        });
+        if x[0] == STATUS_SUCCESS {
+            // Within the page just read.
+            memory
+                .ram()
+                .write(address, &data)
+                .expect("the data was read from RAM");
+        }
+        effect
+    }
+
     /// GenerateRandomBytes, through either gate: byte count in `X1`, bytes
     /// out packed into `X1`-`X7`, the rest of which keep their values.
     fn generate_random_bytes(&self, x: &mut [u64; 8]) -> SmcEffect {
@@ -576,6 +622,7 @@ pub fn function_name(immediate: u16, id: u32) -> &'static str {
         (USER_SMC, user_function::COMPUTE_AES) => "ComputeAes",
         (USER_SMC, user_function::COMPUTE_CMAC) => "ComputeCmac",
         (USER_SMC, user_function::GENERATE_SPECIFIC_AES_KEY) => "GenerateSpecificAesKey",
+        (USER_SMC, user_function::DECRYPT_DEVICE_UNIQUE_DATA) => "DecryptDeviceUniqueData",
         (USER_SMC, user_function::GET_RESULT) => "GetResult",
         _ => "?",
     }
@@ -826,6 +873,71 @@ mod tests {
             .read(PHYSICAL + 0x100, &mut restored)
             .unwrap();
         assert_eq!(restored[..], plaintext[..]);
+    }
+
+    #[test]
+    fn device_unique_data_is_decrypted_in_place_for_this_console_only() {
+        let text = "aes_kek_generation_source = 000102030405060708090a0b0c0d0e0f\n\
+                    rsa_private_kek_generation_source = 202122232425262728292a2b2c2d2e2f\n\
+                    master_key_00 = 101112131415161718191a1b1c1d1e1f\n";
+        let keys = KeySet::parse(text).unwrap();
+        let device_id = 0x0011_2233_4455_6677;
+        let params = BootParams {
+            device_id,
+            ..BootParams::default()
+        };
+        let console = console_with_keys(&params, keys.clone());
+        let user = |arguments: [u64; 8]| {
+            let mut x = arguments;
+            let effect = console.call(USER_SMC, &mut x);
+            (effect, x)
+        };
+        let (kek_source, key_source) = ([0x33; 16], [0x44; 16]);
+        let option = crypto::kek_option(crypto::SEAL_DECRYPT_DEVICE_UNIQUE_DATA);
+        let (_, access) = user([
+            user_function::GENERATE_AES_KEK.into(),
+            0x3333_3333_3333_3333,
+            0x3333_3333_3333_3333,
+            0,
+            option.into(),
+            0,
+            0,
+            0,
+        ]);
+        assert_eq!(access[0], STATUS_SUCCESS);
+
+        let key =
+            crypto::device_unique_data_key(&keys, &kek_source, &key_source, 0, option).unwrap();
+        let payload: Vec<u8> = (0..0x100).map(|index| index as u8).collect();
+        let sealed = crypto::seal_device_unique_data(&key, &[0x77; 16], &payload, device_id);
+        const PHYSICAL: u64 = MEMORY_BASE + 0x3010;
+        let decrypt = |data: &[u8], mode: u64| {
+            console.memory.write(PHYSICAL, data).unwrap();
+            user([
+                user_function::DECRYPT_DEVICE_UNIQUE_DATA.into(),
+                access[1],
+                access[2],
+                mode,
+                PHYSICAL,
+                data.len() as u64,
+                0x4444_4444_4444_4444,
+                0x4444_4444_4444_4444,
+            ])
+        };
+        let (effect, x) = decrypt(&sealed, 0);
+        assert_eq!((effect, x[0]), (SmcEffect::Resume, STATUS_SUCCESS));
+        let mut plain = vec![0; 0x100];
+        console.memory.read(PHYSICAL, &mut plain).unwrap();
+        assert_eq!(plain, payload);
+
+        let mut tampered = sealed.clone();
+        tampered[0x20] ^= 0x80;
+        assert_eq!(decrypt(&tampered, 0).1[0], STATUS_INVALID_ARGUMENT);
+        assert_eq!(decrypt(&sealed, 1 << 3).1[0], STATUS_INVALID_ARGUMENT);
+        assert!(matches!(
+            decrypt(&sealed, 3).0,
+            SmcEffect::Unimplemented(Unimplemented::Crypto(_))
+        ));
     }
 
     /// Issues a kernel SMC and returns the effect with the result registers.

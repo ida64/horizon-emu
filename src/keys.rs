@@ -17,6 +17,15 @@ const AES_KEK_GENERATION_SOURCE: &str = "aes_kek_generation_source";
 const MASTER_KEY_PREFIX: &str = "master_key_";
 const DEVICE_KEY: &str = "device_key";
 const RETAIL_SPECIFIC_AES_KEY_SOURCE: &str = "retail_specific_aes_key_source";
+/// The monitor's static source for keks sealed for `DecryptDeviceUniqueData`
+/// (key type 0 combined with that seal key's mask, as Atmosphère's
+/// `secmon_smc_aes.cpp` describes `GenerateAesKek`).
+const RSA_PRIVATE_KEK_GENERATION_SOURCE: &str = "rsa_private_kek_generation_source";
+/// Lines whose value `ssl` hands the monitor to unwrap the console's TLS
+/// client key: the kek source (`ssl` data `0x2633E0`) and the key source of
+/// a retail console (`ssl` text `0x36080`).
+const SSL_RSA_KEKEK_SOURCE: &str = "ssl_rsa_kekek_source";
+const SSL_RSA_KEK_SOURCE: &str = "ssl_rsa_kek_source";
 /// Lines whose value seeds the derivation of a built-in storage key.
 const AES_KEY_GENERATION_SOURCE: &str = "aes_key_generation_source";
 const BIS_KEK_SOURCE: &str = "bis_kek_source";
@@ -72,6 +81,9 @@ pub struct KeySet {
     aes_kek_generation_source: Option<Key>,
     device_key: Option<Key>,
     retail_specific_aes_key_source: Option<Key>,
+    rsa_private_kek_generation_source: Option<Key>,
+    ssl_rsa_kekek_source: Option<Key>,
+    ssl_rsa_kek_source: Option<Key>,
     aes_key_generation_source: Option<Key>,
     bis_kek_source: Option<Key>,
     bis_key_sources: [Option<KeyPair>; BIS_KEY_SOURCE_COUNT],
@@ -96,6 +108,12 @@ impl fmt::Debug for KeySet {
                 "retail_specific_aes_key_source",
                 &self.retail_specific_aes_key_source.is_some(),
             )
+            .field(
+                "rsa_private_kek_generation_source",
+                &self.rsa_private_kek_generation_source.is_some(),
+            )
+            .field("ssl_rsa_kekek_source", &self.ssl_rsa_kekek_source.is_some())
+            .field("ssl_rsa_kek_source", &self.ssl_rsa_kek_source.is_some())
             .field(
                 "aes_key_generation_source",
                 &self.aes_key_generation_source.is_some(),
@@ -137,6 +155,12 @@ impl KeySet {
                 keys.device_key = Some(key()?);
             } else if name == RETAIL_SPECIFIC_AES_KEY_SOURCE {
                 keys.retail_specific_aes_key_source = Some(key()?);
+            } else if name == RSA_PRIVATE_KEK_GENERATION_SOURCE {
+                keys.rsa_private_kek_generation_source = Some(key()?);
+            } else if name == SSL_RSA_KEKEK_SOURCE {
+                keys.ssl_rsa_kekek_source = Some(key()?);
+            } else if name == SSL_RSA_KEK_SOURCE {
+                keys.ssl_rsa_kek_source = Some(key()?);
             } else if name == AES_KEY_GENERATION_SOURCE {
                 keys.aes_key_generation_source = Some(key()?);
             } else if name == BIS_KEK_SOURCE {
@@ -191,6 +215,23 @@ impl KeySet {
     /// consoles (`GenerateSpecificAesKey`).
     pub fn retail_specific_aes_key_source(&self) -> Option<&Key> {
         self.retail_specific_aes_key_source.as_ref()
+    }
+
+    /// What takes the place of `aes_kek_generation_source` in the ladder
+    /// when the kek is sealed for `DecryptDeviceUniqueData`.
+    pub fn rsa_private_kek_generation_source(&self) -> Option<&Key> {
+        self.rsa_private_kek_generation_source.as_ref()
+    }
+
+    /// The kek source `ssl` asks the monitor for when it unwraps the TLS
+    /// client key of key generation 0.
+    pub fn ssl_rsa_kekek_source(&self) -> Option<&Key> {
+        self.ssl_rsa_kekek_source.as_ref()
+    }
+
+    /// The key source `ssl` unwraps that key with on a retail console.
+    pub fn ssl_rsa_kek_source(&self) -> Option<&Key> {
+        self.ssl_rsa_kek_source.as_ref()
     }
 
     /// Constant of `spl` with which it turns a key encryption key from the

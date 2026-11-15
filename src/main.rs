@@ -39,6 +39,7 @@ const USAGE: &str = "\
 usage: horizon-emu info <kernel.elf>
        horizon-emu boot <kernel.elf> [options]
        horizon-emu format-emmc <new image file> [--keys FILE [--firmware DIR]]
+       horizon-emu patch-prodinfo <image file> --keys FILE
        horizon-emu format-sd <new image file> --size SIZE [--add HOST=CARD ...]
 
 <kernel.elf> is the package2 kernel wrapped as an ELF (see pkg2elf.py).
@@ -48,13 +49,17 @@ an eMMC user area image for --emmc (a sparse file): the 32 GB module's
 partition table; with --keys also the empty, encrypted file systems of a
 console's partitions and the calibration data of this emulator's own
 console (its serial number, addresses and sensor values are made up for
-it; it has no device keys or certificates); with --firmware also the
-contents (*.nca) of that directory, installed as the system's programs
-and data. format-sd creates a microSD card image for --sd (a sparse
-file) of SIZE bytes (suffix K, M or G for binary multiples; a multiple
-of 512K above 2088M and up to 32G), formatted as the console formats a
-card, with each --add's host file HOST at the absolute path CARD
-(/hbmenu.nro, /switch/foo.nro), directories created as needed.
+it; it has no device keys or Nintendo-issued certificates, only a made-up
+TLS client key and self-signed certificate, which Nintendo's servers
+reject); with --firmware also the contents (*.nca) of that directory,
+installed as the system's programs and data. patch-prodinfo gives the
+calibration data of an image formatted before it had one that made-up
+TLS client identity, and changes nothing else. format-sd creates a
+microSD card image for --sd (a sparse file) of SIZE bytes (suffix K, M or
+G for binary multiples; a multiple of 512K above 2088M and up to 32G),
+formatted as the console formats a card, with each --add's host file HOST
+at the absolute path CARD (/hbmenu.nro, /switch/foo.nro), directories
+created as needed.
 
 options:
   --dram 4|6|8        installed DRAM in GiB (default 4)
@@ -212,6 +217,9 @@ fn run(arguments: &[String]) -> Result<(), String> {
     if command == "format-sd" {
         return format_sd(path, flags).map_err(|error| format!("{path}: {error}"));
     }
+    if command == "patch-prodinfo" {
+        return patch_prodinfo(path, flags).map_err(|error| format!("{path}: {error}"));
+    }
     let image = KernelImage::load(Path::new(path)).map_err(|error| error.to_string())?;
     match command.as_str() {
         "info" if flags.is_empty() => {
@@ -295,6 +303,25 @@ fn format_emmc(path: &str, flags: &[String]) -> Result<(), String> {
             installed.contents, installed.bytes
         );
     }
+    Ok(())
+}
+
+fn patch_prodinfo(path: &str, flags: &[String]) -> Result<(), String> {
+    let [flag, keys] = flags else {
+        return Err(usage());
+    };
+    if flag != "--keys" {
+        return Err(usage());
+    }
+    let keys = KeySet::load(Path::new(keys)).map_err(|error| error.to_string())?;
+    let image = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    let device_id = nand::calibration::install_ssl_identity(&image, &keys)
+        .map_err(|error| error.to_string())?;
+    println!("console {device_id:016X}: made-up TLS client identity installed");
     Ok(())
 }
 

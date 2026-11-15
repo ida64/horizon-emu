@@ -56,20 +56,30 @@
 //! a console gets them from Nintendo's factory, and only those are accepted
 //! by Nintendo's servers. The key blocks are therefore left unprogrammed
 //! ([`UNPROGRAMMED`]: zero, with no valid CRC), which every client handles
-//! at boot: `es` loads no eticket key (`0xa3ac0` tolerates `0x48C69`), `ssl`
-//! and the filesystem process's game card driver fail only when they first
-//! need their key. A key block with a valid CRC would be worse: `es`
-//! imports the eticket key through the monitor at boot and aborts if that
-//! fails (`0x7adb0`). The certificates are sealed but carry no key and no
+//! at boot: `es` loads no eticket key (`0xa3ac0` tolerates `0x48C69`), and
+//! the filesystem process's game card driver fails only when it first needs
+//! its key. A key block with a valid CRC would be worse: `es` imports the
+//! eticket key through the monitor at boot and aborts if that fails
+//! (`0x7adb0`). The certificates are sealed but carry no key and no
 //! signature, except the one field the firmware checks at boot: the
 //! eticket certificate's name, from which `settings` parses the device ID
 //! that `am` (`0x3c2b0`) and `nim` (`0xa5c70`) abort without
-//! ([`eticket_certificate`]). Online services (eShop, account
-//! authentication, TLS client certificates), personalized tickets and game
-//! cards will not work.
+//! ([`eticket_certificate`]).
+//!
+//! The exception is the TLS client identity: without one, `ssl` fails
+//! `RegisterInternalPki` (2123-0011), and `nim` stops the console with a
+//! fatal error when it does that right after the first connection test.
+//! The virtual console has a MADE-UP one ([`SslIdentity`]): a generated key
+//! pair, wrapped with the console's keys as the firmware unwraps it, and a
+//! self-signed certificate that Nintendo's servers reject. Online services
+//! (eShop, account authentication), personalized tickets and game cards
+//! will not work.
+
+mod ssl;
 
 use std::{fs::File, ops::Range, os::unix::fs::FileExt};
 
+pub use self::ssl::SslIdentity;
 use super::{NandError, bis, crypto::sha256, partition_range, storage_keys};
 use crate::keys::KeySet;
 
@@ -300,6 +310,7 @@ pub const SEALED: &[Block] = &[
     PRODUCT_MODEL_BLOCK,
     COLOR_VARIATION_BLOCK,
     LCD_BACKLIGHT_BRIGHTNESS_MAPPING_BLOCK,
+    EXTENDED_SSL_KEY,
     LCD_VENDOR_ID_BLOCK,
     RSA_2048_DEVICE_CERTIFICATE,
     USB_TYPE_C_POWER_SOURCE_CIRCUIT,
@@ -324,9 +335,11 @@ pub const SEALED: &[Block] = &[
 
 /// The private keys, which the virtual console does not have (see the
 /// module documentation): all zero, CRC included, which is no valid CRC.
-/// Their getters (commands 16, 18, 20, 21, 25, 26, 29) fail with
-/// `0x48C69`; of those, only 16, 18 and 21 have callers, and each takes the
-/// failure as "no key".
+/// Their getters (commands 18, 20, 21, 25, 26, 29) fail with `0x48C69`; of
+/// those, only 18 and 21 have callers, and each takes the failure as "no
+/// key". The old SSL key is here too: command 16 answers it only when the
+/// extended one fails its CRC, and the stand-in identity has the extended
+/// one.
 pub const UNPROGRAMMED: &[Block] = &[
     ECC_P256_DEVICE_KEY,
     ECC_B233_DEVICE_KEY,
@@ -341,7 +354,6 @@ pub const UNPROGRAMMED: &[Block] = &[
     EXTENDED_ECC_P256_ETICKET_KEY,
     EXTENDED_ECC_B233_ETICKET_KEY,
     EXTENDED_RSA_2048_ETICKET_KEY,
-    EXTENDED_SSL_KEY,
     EXTENDED_GAME_CARD_KEY,
     EXTENDED_RSA_2048_DEVICE_KEY,
 ];
@@ -488,10 +500,9 @@ const GYROSCOPE_SCALE_VALUE: [i16; 3] = [0x343B; 3];
 // - the speaker calibration: nothing in this firmware asks for it;
 // - home menu scheme model 0, the only value switchbrew knows;
 // - the touch controller vendor 0, `FTM4CD60DA1BE` (switchbrew);
-// - the SSL certificate (size 0), the game card certificate and the
-//   random number, each with its hash;
-// - the certificates other than the eticket one, which nothing reads at
-//   boot.
+// - the game card certificate and the random number, each with its hash;
+// - the certificates other than the eticket and the SSL one, which nothing
+//   reads at boot.
 
 /// The eticket device certificate: Nintendo's certificate format with an
 /// ECDSA signature block (signature type `0x00010005`, signature and
@@ -532,8 +543,53 @@ fn seal_hash(data: &mut [u8], field: &Hashed, len: usize) {
     data[field.offset + field.capacity..][..hash.len()].copy_from_slice(&hash);
 }
 
-/// The calibration data of a console with `identity`.
-pub fn build(identity: &Identity) -> Vec<u8> {
+fn seal_crc(data: &mut [u8], block: Block) {
+    let crc = crc16(&data[block.data()]);
+    data[block.crc_offset()..][..2].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// The body hash and the header's CRC, which cover everything else.
+fn seal_header(data: &mut [u8]) {
+    let body_hash = sha256(&data[HEADER_SIZE..]);
+    data[0x20..0x40].copy_from_slice(&body_hash);
+    seal_crc(data, HEADER);
+}
+
+/// Puts a TLS client identity in, sealed: `key`, the key data of command
+/// 16 ([`SslIdentity::wrapped_key`]), and `certificate`, the DER
+/// certificate of command 17.
+fn put_ssl_identity(data: &mut [u8], key: &[u8; ssl::KEY_SIZE], certificate: &[u8]) {
+    assert!(certificate.len() <= SSL_CERTIFICATE.capacity);
+    data[EXTENDED_SSL_KEY.data()].fill(0);
+    put(data, EXTENDED_SSL_KEY, key);
+    put(
+        data,
+        SSL_CERTIFICATE_SIZE,
+        &(certificate.len() as u64).to_le_bytes(),
+    );
+    let field = &mut data[SSL_CERTIFICATE.offset..][..SSL_CERTIFICATE.capacity];
+    field.fill(0);
+    field[..certificate.len()].copy_from_slice(certificate);
+    seal_crc(data, EXTENDED_SSL_KEY);
+    seal_crc(data, SSL_CERTIFICATE_SIZE);
+    seal_hash(data, &SSL_CERTIFICATE, certificate.len());
+}
+
+/// The device ID `settings` reads for command 42 (`0x8920`): the sixteen
+/// hex digits after `NX` in the eticket certificate's name.
+fn device_id(data: &[u8]) -> Option<u64> {
+    let name = &data[RSA_2048_ETICKET_CERTIFICATE.offset + 0xC4..][..18];
+    let digits = name.strip_prefix(b"NX")?;
+    u64::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
+}
+
+/// The calibration data of a console with `identity`, whose TLS client
+/// identity is `ssl_key` and `ssl_certificate` ([`SslIdentity`]).
+pub fn build(
+    identity: &Identity,
+    ssl_key: &[u8; ssl::KEY_SIZE],
+    ssl_certificate: &[u8],
+) -> Vec<u8> {
     assert!(identity.serial_number.len() <= SERIAL_NUMBER.data().len() - 6);
     let mut data = vec![0; SIZE];
     data[..4].copy_from_slice(&MAGIC);
@@ -598,43 +654,77 @@ pub fn build(identity: &Identity) -> Vec<u8> {
         CONSOLE_SIX_AXIS_SENSOR_MOUNT_TYPE_BLOCK,
         &[CONSOLE_SIX_AXIS_SENSOR_MOUNT_TYPE],
     );
+    put_ssl_identity(&mut data, ssl_key, ssl_certificate);
 
     for &block in SEALED {
-        let crc = crc16(&data[block.data()]);
-        data[block.crc_offset()..][..2].copy_from_slice(&crc.to_le_bytes());
+        seal_crc(&mut data, block);
     }
-    let ssl_certificate_size = u64::from_le_bytes(
-        data[SSL_CERTIFICATE_SIZE.offset..][..8]
-            .try_into()
-            .expect("eight bytes"),
-    );
-    seal_hash(&mut data, &SSL_CERTIFICATE, ssl_certificate_size as usize);
     seal_hash(&mut data, &RANDOM_NUMBER, RANDOM_NUMBER.capacity);
     seal_hash(
         &mut data,
         &GAME_CARD_CERTIFICATE,
         GAME_CARD_CERTIFICATE.capacity,
     );
-
-    let body_hash = sha256(&data[HEADER_SIZE..]);
-    data[0x20..0x40].copy_from_slice(&body_hash);
-    let crc = crc16(&data[HEADER.data()]);
-    data[HEADER.crc_offset()..][..2].copy_from_slice(&crc.to_le_bytes());
+    seal_header(&mut data);
     data
 }
 
 /// Writes the calibration data of a console with `identity` to the
 /// partitioned `image`, under the calibration storage key of the console
-/// `keys` describes. Only [`SIZE`] bytes are written: the rest of the
-/// partition is never read.
+/// `keys` describes, with the console's stand-in TLS client identity
+/// ([`SslIdentity`]) wrapped with the same keys. Only [`SIZE`] bytes are
+/// written: the rest of the partition is never read.
 pub fn install(image: &File, keys: &KeySet, identity: &Identity) -> Result<(), NandError> {
     let cipher = storage_keys(image, keys)?.cipher(bis::KEY_CALIBRATION);
-    let mut data = build(identity);
+    let ssl = SslIdentity::generate(identity.device_id);
+    let ssl_key = ssl.wrapped_key(keys, identity.device_id)?;
+    let mut data = build(identity, &ssl_key, ssl.certificate());
     cipher.encrypt(0, &mut data);
-    let start = partition_range(PARTITION)
+    image
+        .write_all_at(&data, partition_start())
+        .map_err(NandError::Image)
+}
+
+/// Gives the console whose calibration data the partitioned `image` holds
+/// the stand-in TLS client identity [`install`] would, and leaves
+/// everything else as it is but the update count: for images whose
+/// calibration data was written before it had one. The console is the one
+/// the eticket certificate names; its device ID is returned.
+pub fn install_ssl_identity(image: &File, keys: &KeySet) -> Result<u64, NandError> {
+    let cipher = storage_keys(image, keys)?.cipher(bis::KEY_CALIBRATION);
+    let mut data = vec![0; SIZE];
+    image
+        .read_exact_at(&mut data, partition_start())
+        .map_err(NandError::Image)?;
+    cipher.decrypt(0, &mut data);
+    if data[..4] != MAGIC {
+        return Err(NandError::Calibration(
+            "PRODINFO holds no calibration data under these keys",
+        ));
+    }
+    let device_id = device_id(&data).ok_or(NandError::Calibration(
+        "the eticket certificate in PRODINFO names no device ID",
+    ))?;
+    let ssl = SslIdentity::generate(device_id);
+    put_ssl_identity(
+        &mut data,
+        &ssl.wrapped_key(keys, device_id)?,
+        ssl.certificate(),
+    );
+    let updates = u16::from_le_bytes([data[14], data[15]]).saturating_add(1);
+    data[14..16].copy_from_slice(&updates.to_le_bytes());
+    seal_header(&mut data);
+    cipher.encrypt(0, &mut data);
+    image
+        .write_all_at(&data, partition_start())
+        .map_err(NandError::Image)?;
+    Ok(device_id)
+}
+
+fn partition_start() -> u64 {
+    partition_range(PARTITION)
         .expect("the layout has the partition")
-        .start;
-    image.write_all_at(&data, start).map_err(NandError::Image)
+        .start
 }
 
 #[cfg(test)]
@@ -777,9 +867,17 @@ mod tests {
         }
     }
 
+    /// The calibration data of `identity` with the tests' TLS identity.
+    fn built(identity: &Identity) -> Vec<u8> {
+        let keys = KeySet::parse(&ssl::tests::key_file()).unwrap();
+        let ssl = ssl::tests::identity();
+        let key = ssl.wrapped_key(&keys, ssl::tests::DEVICE_ID).unwrap();
+        build(identity, &key, ssl.certificate())
+    }
+
     #[test]
     fn every_getter_but_the_keys_succeeds() {
-        let data = build(&Identity::VIRTUAL_CONSOLE);
+        let data = built(&Identity::VIRTUAL_CONSOLE);
         let crc_at =
             |block: Block| u16::from_le_bytes(data[block.crc_offset()..][..2].try_into().unwrap());
         for &block in SEALED {
@@ -794,8 +892,9 @@ mod tests {
             assert_ne!(crc_at(block), crc16(&data[block.data()]), "{block:?}");
         }
         // The SHA-256 fields, the body and the header.
-        assert_eq!(data[0xAD0..0xAD8], [0; 8]);
-        assert_eq!(data[0x12E0..0x1300], sha256(&[]));
+        let certificate = ssl::tests::identity().certificate();
+        assert_eq!(data[0xAD0..0xAD8], (certificate.len() as u64).to_le_bytes());
+        assert_eq!(data[0x12E0..0x1300], sha256(certificate));
         assert_eq!(data[0x2300..0x2320], sha256(&data[0x1300..0x2300]));
         assert_eq!(data[0x2840..0x2860], sha256(&data[0x2440..0x2840]));
         assert_eq!(data[..4], *b"CAL0");
@@ -805,12 +904,42 @@ mod tests {
     }
 
     #[test]
+    fn the_tls_identity_is_where_commands_16_and_17_read_it() {
+        let data = built(&Identity::VIRTUAL_CONSOLE);
+        let keys = KeySet::parse(&ssl::tests::key_file()).unwrap();
+        let ssl = ssl::tests::identity();
+        // Command 16: 0x134 bytes from 0x3AE0, the generation (0) last,
+        // zeros up to the CRC.
+        let key = ssl.wrapped_key(&keys, ssl::tests::DEVICE_ID).unwrap();
+        assert_eq!(data[0x3AE0..0x3C14], key);
+        assert_eq!(data[0x3C10..0x3C14], [0; 4]);
+        assert!(data[0x3C14..0x3C1E].iter().all(|&byte| byte == 0));
+        assert_eq!(
+            data[0x3C1E..0x3C20],
+            crc16(&data[0x3AE0..0x3C1E]).to_le_bytes()
+        );
+        // The old key is not there; its getter is not reached.
+        assert!(data[0x9B0..0xAD0].iter().all(|&byte| byte == 0));
+        // Command 17: the size, eight bytes with their CRC, then the
+        // certificate and its hash.
+        let certificate = ssl.certificate();
+        assert_eq!(data[0xADE..0xAE0], crc16(&data[0xAD0..0xADE]).to_le_bytes());
+        assert_eq!(&data[0xAE0..][..certificate.len()], certificate);
+        assert!(
+            data[0xAE0 + certificate.len()..0x12E0]
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+        assert_eq!(certificate[0], 0x30, "DER");
+    }
+
+    #[test]
     fn values_land_where_the_getters_read_them() {
         let identity = Identity {
             device_id: 0x0012_3456_789A_BCDE,
             ..Identity::VIRTUAL_CONSOLE
         };
-        let data = build(&identity);
+        let data = built(&identity);
         // Command 42: sixteen hex digits at certificate + 0xC6.
         let digits = std::str::from_utf8(&data[0x2A90 + 0xC6..][..16]).unwrap();
         assert_eq!(u64::from_str_radix(digits, 16).unwrap(), identity.device_id);
@@ -845,24 +974,13 @@ mod tests {
     }
 
     #[test]
-    fn installed_data_decrypts_back_to_the_built_data() {
-        let mut text = String::new();
-        for (index, name) in [
-            "device_key",
-            "retail_specific_aes_key_source",
-            "aes_kek_generation_source",
-            "aes_key_generation_source",
-            "bis_kek_source",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            text += &format!("{name} = {:032x}\n", 0x0765_4321 * (index as u128 + 3));
-        }
-        for index in 0..3 {
-            text += &format!("bis_key_source_{index:02x} = {:064x}\n", index + 0x5A5A);
-        }
-        let keys = KeySet::parse(&text).unwrap();
+    fn installed_data_decrypts_back_to_the_built_data_and_takes_an_identity_later() {
+        let keys = KeySet::parse(&ssl::tests::key_file()).unwrap();
+        // The tests' TLS identity is this console's.
+        let identity = Identity {
+            device_id: ssl::tests::DEVICE_ID,
+            ..Identity::VIRTUAL_CONSOLE
+        };
 
         let path = std::env::temp_dir().join(format!(
             "horizon-emu-calibration-test-{}.img",
@@ -874,22 +992,49 @@ mod tests {
             .create_new(true)
             .open(&path)
             .unwrap();
-        let unpartitioned = install(&image, &keys, &Identity::VIRTUAL_CONSOLE);
+        let unpartitioned = install(&image, &keys, &identity);
         assert!(matches!(unpartitioned, Err(NandError::NotPartitioned)));
         format_user_area(&image).unwrap();
-        install(&image, &keys, &Identity::VIRTUAL_CONSOLE).unwrap();
+        let empty = install_ssl_identity(&image, &keys);
+        assert!(matches!(empty, Err(NandError::Calibration(_))));
+        install(&image, &keys, &identity).unwrap();
 
+        let cipher = BisKeys::derive(&keys).unwrap().cipher(bis::KEY_CALIBRATION);
         let range = partition_range("PRODINFO").unwrap();
-        let mut stored = vec![0; SIZE];
-        image.read_exact_at(&mut stored, range.start).unwrap();
-        let built = build(&Identity::VIRTUAL_CONSOLE);
-        assert_ne!(stored, built, "stored encrypted");
-        BisKeys::derive(&keys)
-            .unwrap()
-            .cipher(bis::KEY_CALIBRATION)
-            .decrypt(0, &mut stored);
+        let stored = || {
+            let mut stored = vec![0; SIZE];
+            image.read_exact_at(&mut stored, range.start).unwrap();
+            stored
+        };
+        let mut installed = stored();
+        let expected = built(&identity);
+        assert_ne!(installed, expected, "stored encrypted");
+        cipher.decrypt(0, &mut installed);
+        assert_eq!(installed, expected);
+
+        // What an earlier formatter wrote: no key, a certificate of size 0.
+        let mut earlier = installed.clone();
+        earlier[EXTENDED_SSL_KEY.offset..][..EXTENDED_SSL_KEY.len].fill(0);
+        earlier[0xAD0..0x12E0].fill(0);
+        seal_crc(&mut earlier, SSL_CERTIFICATE_SIZE);
+        seal_hash(&mut earlier, &SSL_CERTIFICATE, 0);
+        seal_header(&mut earlier);
+        cipher.encrypt(0, &mut earlier);
+        image.write_all_at(&earlier, range.start).unwrap();
+
+        let patched = install_ssl_identity(&image, &keys);
+        let mut patched_data = stored();
         drop(image);
         let _ = std::fs::remove_file(&path);
-        assert_eq!(stored, built);
+        assert_eq!(patched.unwrap(), identity.device_id);
+        cipher.decrypt(0, &mut patched_data);
+        // As installed, one update later.
+        assert_eq!(patched_data[14..16], 2u16.to_le_bytes());
+        assert_eq!(
+            patched_data[0x1E..0x20],
+            crc16(&patched_data[..0x1E]).to_le_bytes()
+        );
+        assert_eq!(patched_data[..14], expected[..14]);
+        assert_eq!(patched_data[0x20..], expected[0x20..]);
     }
 }
