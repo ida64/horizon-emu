@@ -13,10 +13,16 @@
 //! the bits it keeps (registers `0x16` to `0x57`). Event masks start with
 //! everything masked (`0x0D` to `0x12`). Any other register refuses to be
 //! read.
+//!
+//! The two blocks share the chip's interrupt output, which is the SoC's
+//! PMU interrupt (pcv binds interrupt 118, level-triggered) and one of its
+//! wake sources: [`Max77620`] is the chip as a whole. Two things happen on
+//! it: the power key and the clock's alarms.
 
 use std::{
     collections::BTreeMap,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex, Weak},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use super::i2c::RegisterMap;
@@ -35,23 +41,45 @@ const PMIC_LAST_REGISTER: u8 = 0x5D;
 /// zero, which is an assumption.
 const CNFG1_32K: u8 = 0x03;
 const CNFG1_32K_AT_START: u8 = 1 << 7 | 1 << 2;
-/// Mask of the chip's interrupt sources by block. Everything masked.
+/// Which blocks have an event pending that their own mask lets through
+/// (bit names as in Linux, `include/linux/mfd/max77620.h`). Only the
+/// clock and the power key ever have one here.
+const IRQTOP: u8 = 0x05;
+const IRQTOP_RTC: u8 = 1 << 3;
+const IRQTOP_ONOFF: u8 = 1 << 1;
+/// Mask of the chip's interrupt sources by block, laid out as [`IRQTOP`].
+/// Everything masked.
 const IRQTOPM: u8 = 0x0D;
 const IRQTOPM_AT_START: u8 = 0xFF;
-/// Mask of the chip's own events (low battery, two temperature alarms)
-/// and, in bit 0, of its interrupt line as a whole (recalled). Everything
-/// masked.
+/// Mask of the chip's own events (low battery, two temperature alarms,
+/// bits 3 to 1) and, in bit 0, of its interrupt output as a whole (Linux's
+/// `GLBLM`: `max77620_irq_global_mask` sets it, `..._unmask` clears it).
+/// The events start masked, the output does not: the firmware's driver
+/// unmasks the events one by one and writes bit 0 back as it found it
+/// (`0x09`, then `0x01`, had this started as `0x0f`), yet it binds the output's
+/// interrupt, lets the clock and the power key through [`IRQTOPM`], sets
+/// an alarm before sleeping and has the output among the wake sources it
+/// enables (Atmosphère's table of them for this board, `PwrIntN`). So the
+/// output is not masked when the kernel starts, an inference.
 const INTENLBT: u8 = 0x0E;
-const INTENLBT_AT_START: u8 = 0x0F;
+const INTENLBT_AT_START: u8 = 0x0E;
+const INTENLBT_OUTPUT: u8 = 1 << 0;
 /// Power key and adapter events since they were last read; reading clears
-/// them. Bit 3: the power key went down.
+/// them. Bit 3: the power key went down; bit 2: it came up (hekate's
+/// `EN0_R` and `EN0_F`). The chip also has an event for the key being
+/// held a second (bit 1), which is not modeled.
 const ONOFFIRQ: u8 = 0x0B;
 const ONOFFIRQ_POWER_KEY_PRESSED: u8 = 1 << 3;
+const ONOFFIRQ_POWER_KEY_RELEASED: u8 = 1 << 2;
+/// Mask of [`ONOFFIRQ`].
+const ONOFFIRQM: u8 = 0x12;
 /// Why the previous power-down happened, if it was forced. Nothing was.
 const NVERC: u8 = 0x0C;
-/// Present levels of the power key, adapter detection and lid inputs. All
-/// inactive: the key was let go, no adapter.
+/// Present levels of the power key (bit 2, hekate's `EN0`), adapter
+/// detection and lid inputs. No adapter, and the lid input stays
+/// inactive.
 const ONOFFSTAT: u8 = 0x15;
+const ONOFFSTAT_POWER_KEY: u8 = 1 << 2;
 /// The version of the chip's factory programming. The firmware knows two,
 /// and with this one it uses the regulator table of the original console:
 /// 1.125 V memory, 1.35 V pre-regulator (pcv text `0x195d0`, tables at
@@ -83,12 +111,12 @@ const FPS_SOURCE: u8 = 0b11 << 6;
 const FPS_SOURCE_NONE: u8 = 0b11 << 6;
 
 /// The power block of the PMIC.
-pub struct Pmic {
+struct Pmic {
     registers: BTreeMap<u8, u8>,
 }
 
 impl Pmic {
-    pub fn new() -> Self {
+    fn new() -> Self {
         let mut registers: BTreeMap<u8, u8> = CONFIGURATION
             .map(|register| (register, 0))
             .chain(EVENT_MASKS.map(|register| (register, 0xFF)))
@@ -105,11 +133,160 @@ impl Pmic {
         ]);
         Self { registers }
     }
+
+    /// The power key going down or coming up.
+    fn power_key(&mut self, held: bool) {
+        let was_held = self.registers[&ONOFFSTAT] & ONOFFSTAT_POWER_KEY != 0;
+        if held == was_held {
+            return;
+        }
+        let (status, event) = if held {
+            (ONOFFSTAT_POWER_KEY, ONOFFIRQ_POWER_KEY_PRESSED)
+        } else {
+            (0, ONOFFIRQ_POWER_KEY_RELEASED)
+        };
+        self.registers.insert(ONOFFSTAT, status);
+        *self.registers.entry(ONOFFIRQ).or_default() |= event;
+    }
+
+    /// Whether a power-key event is pending that its mask lets through.
+    fn power_key_event(&self) -> bool {
+        self.registers[&ONOFFIRQ] & !self.registers[&ONOFFIRQM] != 0
+    }
 }
 
-impl Default for Pmic {
-    fn default() -> Self {
-        Self::new()
+/// The chip: both blocks and the interrupt output they share.
+struct Chip {
+    pmic: Pmic,
+    rtc: Rtc,
+}
+
+impl Chip {
+    /// What [`IRQTOP`] reads.
+    fn sources(&mut self) -> u8 {
+        let key = if self.pmic.power_key_event() {
+            IRQTOP_ONOFF
+        } else {
+            0
+        };
+        let alarm = if self.rtc.alarm_due() { IRQTOP_RTC } else { 0 };
+        key | alarm
+    }
+
+    /// The level of the interrupt output.
+    fn interrupt(&mut self) -> bool {
+        let output_masked = self.pmic.registers[&INTENLBT] & INTENLBT_OUTPUT != 0;
+        !output_masked && self.sources() & !self.pmic.registers[&IRQTOPM] != 0
+    }
+}
+
+/// How often the interrupt output is brought up to date with the clock,
+/// whose alarms go off with nothing touching the chip.
+const ALARM_POLL: Duration = Duration::from_millis(50);
+
+/// The chip as a whole: what its two bus addresses, the power key and the
+/// interrupt output are parts of.
+#[derive(Clone)]
+pub struct Max77620 {
+    chip: Arc<Mutex<Chip>>,
+    interrupt: Arc<dyn Fn(bool) + Send + Sync>,
+}
+
+impl Max77620 {
+    /// A chip whose clock follows the host's and whose interrupt output
+    /// drives `interrupt`.
+    pub fn new(interrupt: impl Fn(bool) + Send + Sync + 'static) -> Self {
+        let chip = Self {
+            chip: Arc::new(Mutex::new(Chip {
+                pmic: Pmic::new(),
+                rtc: Rtc::following_host(),
+            })),
+            interrupt: Arc::new(interrupt),
+        };
+        let (state, interrupt) = (Arc::downgrade(&chip.chip), Arc::clone(&chip.interrupt));
+        std::thread::spawn(move || watch_alarms(&state, &*interrupt));
+        chip
+    }
+
+    /// The power block, as its bus address shows it.
+    pub fn power_block(&self) -> impl RegisterMap + use<> {
+        Block {
+            chip: self.clone(),
+            clock: false,
+        }
+    }
+
+    /// The clock, as its bus address shows it.
+    pub fn clock_block(&self) -> impl RegisterMap + use<> {
+        Block {
+            chip: self.clone(),
+            clock: true,
+        }
+    }
+
+    /// The power key going down (`held`) or coming up.
+    pub fn power_key(&self, held: bool) {
+        self.update(|chip| chip.pmic.power_key(held));
+    }
+
+    /// The level of the interrupt output: what wakes a sleeping console.
+    pub fn interrupt(&self) -> bool {
+        self.update(|_| ()).1
+    }
+
+    /// Does `action` on the chip and brings the interrupt output up to
+    /// date; returns the output's level along with the action's result.
+    fn update<T>(&self, action: impl FnOnce(&mut Chip) -> T) -> (T, bool) {
+        let mut chip = self.chip.lock().unwrap();
+        let result = action(&mut chip);
+        let level = chip.interrupt();
+        (self.interrupt)(level);
+        (result, level)
+    }
+}
+
+/// Keeps the interrupt output following the clock's alarms for as long as
+/// the chip exists.
+fn watch_alarms(chip: &Weak<Mutex<Chip>>, interrupt: &(dyn Fn(bool) + Send + Sync)) {
+    while let Some(chip) = chip.upgrade() {
+        let mut chip = chip.lock().unwrap();
+        if chip.rtc.armed.iter().any(Option::is_some) {
+            interrupt(chip.interrupt());
+        }
+        drop(chip);
+        std::thread::sleep(ALARM_POLL);
+    }
+}
+
+/// One of the chip's two bus addresses.
+struct Block {
+    chip: Max77620,
+    clock: bool,
+}
+
+impl RegisterMap for Block {
+    fn read(&mut self, register: u8) -> Option<u8> {
+        let clock = self.clock;
+        self.chip
+            .update(|chip| match (clock, register) {
+                (true, _) => chip.rtc.read(register),
+                (false, IRQTOP) => Some(chip.sources()),
+                (false, _) => chip.pmic.read(register),
+            })
+            .0
+    }
+
+    fn write(&mut self, register: u8, value: u8) -> Option<()> {
+        let clock = self.clock;
+        self.chip
+            .update(|chip| {
+                if clock {
+                    chip.rtc.write(register, value)
+                } else {
+                    chip.pmic.write(register, value)
+                }
+            })
+            .0
     }
 }
 
@@ -133,7 +310,7 @@ impl RegisterMap for Pmic {
     fn write(&mut self, register: u8, value: u8) -> Option<()> {
         match register {
             // Event and status registers follow the inputs, not the bus.
-            ONOFFIRQ | NVERC | ONOFFSTAT => {}
+            IRQTOP | ONOFFIRQ | NVERC | ONOFFSTAT => {}
             _ if register <= PMIC_LAST_REGISTER => {
                 self.registers.insert(register, value);
             }
@@ -143,9 +320,11 @@ impl RegisterMap for Pmic {
     }
 }
 
-/// Pending clock events; reading clears them. None: no alarm woke the
-/// console.
+/// Pending clock events; reading clears them. Of the six only the two
+/// alarms ever happen here (bit positions as in the Linux driver,
+/// `max77686-private.h`).
 const RTCINT: u8 = 0x00;
+const RTCINT_ALARM: [u8; 2] = [1 << 1, 1 << 2];
 /// Event mask, all six events masked as after power-on.
 const RTCINTM: u8 = 0x01;
 const RTCINTM_AT_POWER_ON: u8 = 0x3F;
@@ -176,10 +355,17 @@ const RTCDOM: u8 = 0x0D;
 /// In 12-hour mode the hour register counts 1 to 12 and this bit says "PM".
 const RTCHOUR_PM: u8 = 1 << 6;
 /// The two alarms, each with the layout of the time registers plus an
-/// enable bit in every register.
+/// enable bit in every register: the alarm goes off when every enabled
+/// field matches the clock.
 const ALARM1_SEC: u8 = 0x0E;
+const ALARM2_SEC: u8 = 0x15;
 const ALARM2_DOM: u8 = 0x1B;
 const ALARM_ENABLE: u8 = 1 << 7;
+/// The fields the Linux driver enables for an alarm at a date and time
+/// (`max77686_rtc_start_alarm`): all but the day of the week. The
+/// firmware's driver sets the same; other selections, which make alarms
+/// that repeat, are not modeled.
+const ALARM_AT_DATE: [bool; 7] = [true, true, true, false, true, true, true];
 
 /// The year the two-digit year register counts from.
 const RTC_EPOCH_YEAR: i64 = 2000;
@@ -190,9 +376,10 @@ const RTC_EPOCH_YEAR: i64 = 2000;
 /// difference afterwards: a console that has been keeping time, which is
 /// what the battery is for. The register layout and the transfer protocol
 /// are recalled from the chip's Linux driver, not read off a datasheet;
-/// the firmware's driver agreeing with them is the evidence. Alarms are
-/// kept but never go off, so enabling one is refused.
-pub struct Rtc {
+/// the firmware's driver agreeing with them is the evidence. An alarm set
+/// for a date and time goes off then: the event shows in [`RTCINT`], and
+/// [`Rtc::alarm_due`] is how what the alarm is wired to learns of it.
+struct Rtc {
     /// Seconds since the Unix epoch, on the host.
     host_time: Box<dyn Fn() -> i64 + Send>,
     /// What the guest's setting of the clock added to the host's time.
@@ -206,6 +393,11 @@ pub struct Rtc {
     captured: Option<[u8; 7]>,
     transfers_done: u8,
     alarms: BTreeMap<u8, u8>,
+    /// When each alarm goes off, in the clock's seconds, while it is set
+    /// and has not gone off.
+    armed: [Option<i64>; 2],
+    /// Alarms that went off and have not been read from [`RTCINT`].
+    events: u8,
 }
 
 impl Rtc {
@@ -213,7 +405,7 @@ impl Rtc {
     /// epoch. It counts in binary with a 24-hour day: the setting the
     /// firmware's driver takes as the sign of a clock that has not lost its
     /// time (pcv text `0x16850`, `RTCCNTL & 3 == 2`).
-    pub fn new(host_time: impl Fn() -> i64 + Send + 'static) -> Self {
+    fn new(host_time: impl Fn() -> i64 + Send + 'static) -> Self {
         Self {
             host_time: Box::new(host_time),
             offset: 0,
@@ -227,11 +419,13 @@ impl Rtc {
             alarms: (ALARM1_SEC..=ALARM2_DOM)
                 .map(|register| (register, 0))
                 .collect(),
+            armed: [None; 2],
+            events: 0,
         }
     }
 
     /// A clock following the host's.
-    pub fn following_host() -> Self {
+    fn following_host() -> Self {
         Self::new(|| {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -279,8 +473,8 @@ impl Rtc {
         ]
     }
 
-    /// Sets the clock from a full set of time registers.
-    fn set_time(&mut self, registers: [u8; 7]) {
+    /// The clock's seconds for a full set of time registers.
+    fn seconds(&self, registers: [u8; 7]) -> i64 {
         let [second, minute, hour, _day_of_week, month, year, day] = registers;
         let hour = if self.control & RTCCNTL_24_HOUR != 0 {
             self.decode(hour)
@@ -293,11 +487,50 @@ impl Rtc {
             self.decode(month),
             self.decode(day),
         );
-        let time = days * 86_400
+        days * 86_400
             + i64::from(hour) * 3600
             + i64::from(self.decode(minute)) * 60
-            + i64::from(self.decode(second));
-        self.offset = time - (self.host_time)();
+            + i64::from(self.decode(second))
+    }
+
+    /// Sets the clock from a full set of time registers.
+    fn set_time(&mut self, registers: [u8; 7]) {
+        self.offset = self.seconds(registers) - (self.host_time)();
+    }
+
+    /// When the alarm whose registers start at `first` goes off: `None`
+    /// for one with nothing enabled, `Err` for a selection of fields that
+    /// is not modeled.
+    fn alarm_time(&self, first: u8) -> Result<Option<i64>, ()> {
+        let fields: [u8; 7] = std::array::from_fn(|index| self.alarms[&(first + index as u8)]);
+        let enabled = fields.map(|field| field & ALARM_ENABLE != 0);
+        if enabled == [false; 7] {
+            Ok(None)
+        } else if enabled == ALARM_AT_DATE {
+            Ok(Some(
+                self.seconds(fields.map(|field| field & !ALARM_ENABLE)),
+            ))
+        } else {
+            Err(())
+        }
+    }
+
+    /// Moves the alarms whose time has come to the pending events.
+    fn ring(&mut self) {
+        let now = (self.host_time)() + self.offset;
+        for (alarm, event) in self.armed.iter_mut().zip(RTCINT_ALARM) {
+            if alarm.is_some_and(|at| at <= now) {
+                *alarm = None;
+                self.events |= event;
+            }
+        }
+    }
+
+    /// Whether an alarm has gone off whose event is neither masked nor
+    /// read yet: what the clock's interrupt output shows.
+    fn alarm_due(&mut self) -> bool {
+        self.ring();
+        self.events & !self.event_mask != 0
     }
 
     /// Makes what was written since the last transfer take effect.
@@ -317,10 +550,12 @@ impl Rtc {
             Err(_) => {}
         }
         for (&register, &value) in written.range(ALARM1_SEC..=ALARM2_DOM) {
-            if value & ALARM_ENABLE != 0 {
-                return None;
-            }
             self.alarms.insert(register, value);
+        }
+        for (index, first) in [ALARM1_SEC, ALARM2_SEC].into_iter().enumerate() {
+            if written.range(first..first + 7).next().is_some() {
+                self.armed[index] = self.alarm_time(first).ok()?;
+            }
         }
         Some(())
     }
@@ -360,7 +595,11 @@ fn days_from_civil(year: i64, month: u8, day: u8) -> i64 {
 impl RegisterMap for Rtc {
     fn read(&mut self, register: u8) -> Option<u8> {
         match register {
-            RTCINT | RTCUPDATE0 => Some(0),
+            RTCINT => {
+                self.ring();
+                Some(std::mem::take(&mut self.events))
+            }
+            RTCUPDATE0 => Some(0),
             RTCINTM => Some(self.event_mask),
             RTCCNTLM => Some(self.control_mask),
             RTCCNTL => Some(self.control),
@@ -448,9 +687,67 @@ mod tests {
         }
         rtc.write(RTCUPDATE0, RTCUPDATE0_WRITE).unwrap();
         assert_eq!(time(&mut rtc), [0x58, 0x59, 0x23, 1 << 3, 0x12, 0x31, 0x31]);
+    }
 
-        // An alarm that would have to go off.
-        rtc.write(ALARM1_SEC, ALARM_ENABLE).unwrap();
+    #[test]
+    fn an_alarm_for_a_date_goes_off_once_when_its_time_comes() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let host = std::sync::Arc::new(AtomicI64::new(0));
+        let clock = std::sync::Arc::clone(&host);
+        let mut rtc = Rtc::new(move || clock.load(Ordering::SeqCst));
+        // The clock at 2031-12-31 23:59:58, the alarm at 2032-01-01
+        // 00:00:01: every field but the day of the week.
+        for (index, value) in [58, 59, 23, 1 << 3, 12, 31, 31].into_iter().enumerate() {
+            rtc.write(RTCSEC + index as u8, value).unwrap();
+        }
+        rtc.write(RTCUPDATE0, RTCUPDATE0_WRITE).unwrap();
+        rtc.write(RTCINTM, !RTCINT_ALARM[0]).unwrap();
+        for (index, value) in [1, 0, 0, 0, 1, 32, 1].into_iter().enumerate() {
+            let enable = if index == 3 { 0 } else { ALARM_ENABLE };
+            rtc.write(ALARM1_SEC + index as u8, value | enable).unwrap();
+        }
+        rtc.write(RTCUPDATE0, RTCUPDATE0_WRITE).unwrap();
+        host.store(2, Ordering::SeqCst);
+        assert!(!rtc.alarm_due());
+        host.store(3, Ordering::SeqCst);
+        assert!(rtc.alarm_due());
+        assert_eq!(rtc.read(RTCINT), Some(RTCINT_ALARM[0]));
+        assert_eq!(rtc.read(RTCINT), Some(0));
+        assert!(!rtc.alarm_due(), "an alarm goes off once");
+
+        // Alarms that repeat (only some fields enabled) are refused.
+        rtc.write(ALARM1_SEC, 1).unwrap();
         assert_eq!(rtc.write(RTCUPDATE0, RTCUPDATE0_WRITE), None);
+    }
+
+    #[test]
+    fn power_key_drives_the_interrupt_output_through_both_masks() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let level = Arc::new(AtomicBool::new(false));
+        let output = Arc::clone(&level);
+        let chip = Max77620::new(move |high| output.store(high, Ordering::SeqCst));
+        let mut power = chip.power_block();
+        let level = || level.load(Ordering::SeqCst);
+        // The press that switched the console on.
+        assert_eq!(power.read(ONOFFIRQ), Some(ONOFFIRQ_POWER_KEY_PRESSED));
+
+        chip.power_key(true);
+        assert_eq!(power.read(IRQTOP), Some(0), "the event is masked");
+        power.write(ONOFFIRQM, 0).unwrap();
+        assert_eq!(power.read(IRQTOP), Some(IRQTOP_ONOFF));
+        assert!(!level(), "the block is masked");
+        power.write(INTENLBT, INTENLBT_OUTPUT).unwrap();
+        power.write(IRQTOPM, !IRQTOP_ONOFF).unwrap();
+        assert!(!level(), "the output is masked");
+        power.write(INTENLBT, 0).unwrap();
+        assert!(level());
+        assert_eq!(power.read(ONOFFSTAT), Some(ONOFFSTAT_POWER_KEY));
+        assert_eq!(power.read(ONOFFIRQ), Some(ONOFFIRQ_POWER_KEY_PRESSED));
+        assert!(!level(), "reading the event takes it back");
+
+        chip.power_key(false);
+        assert!(chip.interrupt());
+        assert_eq!(power.read(ONOFFSTAT), Some(0));
+        assert_eq!(power.read(ONOFFIRQ), Some(ONOFFIRQ_POWER_KEY_RELEASED));
     }
 }

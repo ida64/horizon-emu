@@ -95,6 +95,8 @@ const COMMANDS: &[Command] = &[
     (0x0c01, 8, Some((5, 6))),           // Set Event Mask
     (0x0c03, 0, Some((5, 7))),           // Reset
     (0x0c0a, 1, Some((6, 3))),           // Write PIN Type
+    (0x0c11, usize::MAX, Some((6, 6))),  // Write Stored Link Key: count + 22 each
+    (0x0c12, 7, Some((6, 7))),           // Delete Stored Link Key
     (0x0c13, 248, Some((7, 0))),         // Write Local Name
     (0x0c16, 2, Some((7, 3))),           // Write Connection Accept Timeout
     (0x0c18, 2, Some((7, 5))),           // Write Page Timeout
@@ -149,6 +151,7 @@ const COMMANDS: &[Command] = &[
     (0xfc79, 0, None),          // Read Verbose Config Version Info
     (0xfc34, 1, None),          // Enable Radio (see `execute`)
     (0xfd8d, 2, None),          // Nintendo: two feature flags (see `execute`)
+    (0xfd90, 1, None),          // Nintendo: last step before sleep (see `execute`)
     (0xfd98, 7, None),          // Nintendo: second address (see `execute`)
     (0xfd57, usize::MAX, None), // LE advertising packet content filter
 ];
@@ -195,6 +198,10 @@ fn supported_commands() -> [u8; 64] {
     mask
 }
 
+/// Link keys the controller is taken to have room for: the console pairs
+/// at most eight controllers.
+const MAX_LINK_KEYS: usize = 8;
+
 /// Controller state the host can set and read back.
 #[derive(Default)]
 pub(super) struct Controller {
@@ -218,6 +225,9 @@ pub(super) struct Controller {
     /// LE advertising packet content filter entries: (sub-op = filter
     /// type, filter index).
     filters: Vec<(u8, u8)>,
+    /// Link keys the host stored, by address. They outlast HCI Reset, as
+    /// the controller's own storage does (Core spec vol 4 part E 7.3.9).
+    link_keys: Vec<([u8; 6], [u8; 16])>,
 }
 
 impl Controller {
@@ -245,6 +255,50 @@ impl Controller {
                 self.filters.clear();
                 0
             }
+            // Write Stored Link Key (Core spec vol 4 part E 7.3.9): a
+            // count, then an address and a key for each; returns how many
+            // were written. Before the console sleeps `bluetooth` deletes
+            // all and stores the keys of the paired controllers, so that
+            // the controller can answer one of them by itself. The room a
+            // real controller has for keys is not known; more than
+            // [`MAX_LINK_KEYS`] stops the machine rather than guess what
+            // is reported then.
+            0x0c11 => {
+                let (&count, keys) = p.split_first()?;
+                let (keys, []) = keys.as_chunks::<22>() else {
+                    return None;
+                };
+                if keys.len() != usize::from(count) {
+                    return None;
+                }
+                for entry in keys {
+                    let (address, key) = entry.split_first_chunk::<6>()?;
+                    let key: [u8; 16] = key.try_into().ok()?;
+                    self.link_keys.retain(|(stored, _)| stored != address);
+                    self.link_keys.push((*address, key));
+                }
+                if self.link_keys.len() > MAX_LINK_KEYS {
+                    return None;
+                }
+                r[0] = count;
+                1
+            }
+            // Delete Stored Link Key (7.3.10): address, then whether all
+            // are meant; returns how many were deleted.
+            0x0c12 => match p[6] {
+                0 | 1 => {
+                    let before = self.link_keys.len();
+                    self.link_keys
+                        .retain(|(address, _)| p[6] == 0 && address[..] != p[..6]);
+                    let deleted = (before - self.link_keys.len()) as u16;
+                    r[..2].copy_from_slice(&deleted.to_le_bytes());
+                    2
+                }
+                _ => {
+                    *status = INVALID_PARAMETERS;
+                    0
+                }
+            },
             0x0c56 => match p[0] {
                 0 | 1 => {
                     self.host_features = self.host_features & !1 | p[0];
@@ -398,9 +452,18 @@ impl Controller {
             // Public hci_bcm.c (`bcm_set_sleep_mode`): Write Sleep Mode,
             // 12 bytes, mode first. `bluetooth` text 0x8a9a0 sends mode 0,
             // no sleep: the controller stays awake and never toggles the
-            // host-wake line, which is the idle this model is. Sleep modes
-            // (wake-line handshakes) are not modeled.
+            // host-wake line, which is the idle this model is.
             0xfc27 if p.iter().all(|&b| b == 0) => 0,
+            // When the console goes to sleep `bluetooth` sends mode 1,
+            // UART sleep, all else zero: no idle thresholds, both wake
+            // lines active low (`struct bcm_set_sleep_mode` in public
+            // `btbcm.h`). The controller may then sleep while the host
+            // holds BT_WAKE released, and wakes the host through
+            // HOST_WAKE when it has something for it. With no radio
+            // traffic modeled it never has: accepting the mode changes
+            // nothing this controller does. Other settings are not
+            // modeled.
+            0xfc27 if p[0] == 1 && p[1..].iter().all(|&b| b == 0) => 0,
             // Switchbrew (btdrv SetAdapterProperty type 3): BSA message
             // 0x8ce sends 0xfd98 with a "non-zero" flag and a byte-swapped
             // address (text 0x4fc90). Completion 0x51d40 turns any failure
@@ -415,6 +478,17 @@ impl Controller {
             // Two flags from BSA message 0x8ce (text 0x4fc90); completion
             // 0x51bf0 turns failure into error 2120 for btm.
             0xfd8d if p[0] <= 1 && p[1] <= 1 => 0,
+            // The last command of `bluetooth`'s sequence for the console
+            // going to sleep, always with 1: Write Sleep Mode (UART), the
+            // link keys of the paired controllers into the controller's
+            // store, then this (text 0x51fe0, 0x525e0). Its completion
+            // (0x526f0) reads the status alone and reports failure to btm
+            // as error 2118. Public sources do not name it; by its place
+            // it arms the controller to wake the host for one of the
+            // stored controllers [inference]. With no radio traffic
+            // modeled none ever calls, so the patched controller accepting
+            // it is all there is to it.
+            0xfd90 if p[0] == 1 => 0,
             // LE advertising packet content filter (Android's 0xfd57 layout,
             // public `btm_ble_adv_filter.c`, facts only). Sub-op 0 enables
             // or disables the feature: status, sub-op, action — the 3-byte
@@ -524,6 +598,30 @@ mod tests {
         assert_eq!(run(&mut c, 0x1004, &[3]).unwrap()[0], INVALID_PARAMETERS);
         run(&mut c, 0x0c03, &[]).unwrap();
         assert_eq!(run(&mut c, 0x1004, &[1]).unwrap()[3], 0);
+    }
+
+    #[test]
+    fn stored_link_keys_are_counted_replaced_and_outlast_reset() {
+        let mut c = Controller::default();
+        let entry = |address: u8, key: u8| [[address; 6].as_slice(), &[key; 16]].concat();
+        let two = [&[2][..], &entry(1, 0xAA), &entry(2, 0xBB)].concat();
+        assert_eq!(run(&mut c, 0x0c11, &two).unwrap(), [0, 2]);
+        // The same address again replaces its key.
+        let again = [&[1][..], &entry(1, 0xCC)].concat();
+        assert_eq!(run(&mut c, 0x0c11, &again).unwrap(), [0, 1]);
+        run(&mut c, 0x0c03, &[]).unwrap();
+        // One by address, then all that is left.
+        assert_eq!(
+            run(&mut c, 0x0c12, &[1, 1, 1, 1, 1, 1, 0]).unwrap(),
+            [0, 1, 0]
+        );
+        assert_eq!(run(&mut c, 0x0c12, &[0; 7]).unwrap(), [0, 0, 0]);
+        assert_eq!(
+            run(&mut c, 0x0c12, &[0, 0, 0, 0, 0, 0, 1]).unwrap(),
+            [0, 1, 0]
+        );
+        // A count that does not match what follows is not a command.
+        assert_eq!(run(&mut c, 0x0c11, &two[..23]), None);
     }
 
     #[test]

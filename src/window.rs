@@ -6,7 +6,8 @@
 //! machine's state at the host display's pace, whatever the guest is doing.
 //! Holding the left mouse button on the picture touches the screen there.
 //! The keyboard is the pair of Joy-Con: J slides them onto the rails or
-//! off, and [`KEYS`] are their buttons.
+//! off, and [`KEYS`] are their buttons. [`POWER_KEY`] is the console's
+//! power button.
 //!
 //! AppKit only lets a process's first thread own windows, so the window
 //! belongs to the thread that called `main` and the machine runs on others.
@@ -57,6 +58,9 @@ const KEYS: [(Key, Button); 18] = [
     (Key::Comma, Button::LEFT_STICK),
     (Key::Period, Button::RIGHT_STICK),
 ];
+
+/// The key that holds the console's power button.
+const POWER_KEY: Key = Key::P;
 
 /// The emulator's own log lines, drawn over the top right corner of the
 /// window's picture. They are the host talking, not something the
@@ -126,6 +130,8 @@ pub struct ScreenWindow {
     /// Which of [`KEYS`] were down, as the machine was told. Changes only
     /// are passed on, so `--press` is left alone.
     held: [bool; KEYS.len()],
+    /// Whether [`POWER_KEY`] was down, as the machine was told.
+    power_held: bool,
 }
 
 impl ScreenWindow {
@@ -146,6 +152,7 @@ impl ScreenWindow {
             problem: None,
             touching: None,
             held: [false; KEYS.len()],
+            power_held: false,
         })
     }
 
@@ -206,6 +213,11 @@ impl ScreenWindow {
                 machine.press(button, down);
                 *held = down;
             }
+        }
+        let down = self.window.is_key_down(POWER_KEY);
+        if down != self.power_held {
+            machine.press_power(down);
+            self.power_held = down;
         }
         true
     }

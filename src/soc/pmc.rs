@@ -15,6 +15,11 @@
 //! otherwise). Here a partition switches at once. Register and partition
 //! names are as in Linux (`drivers/soc/tegra/pmc.c`, Tegra210 table),
 //! recalled.
+//!
+//! So do the wake events, as far as something here raises one: an event
+//! that is enabled and at its wake level is recorded in the status
+//! registers, which is where the firmware looks, one event at a time,
+//! for why the console woke. See [`Pmc::wake`].
 
 use std::sync::Mutex;
 
@@ -29,14 +34,32 @@ const TOGGLE_START: u32 = 1 << 8;
 const TOGGLE_PARTITION: u32 = 0x1F;
 const PWRGATE_STATUS: u64 = 0x38;
 
+/// The 64 wake events, 32 to a register: which may wake the console
+/// (`WAKE_MASK`, `WAKE2_MASK`), at which level of their input, high if
+/// set (`WAKE_LVL`, `WAKE2_LVL`: the firmware sets the one event its
+/// table has as active high, the radio's, and leaves the active low ones
+/// clear), and which have (`WAKE_STATUS`, `WAKE2_STATUS`). The firmware
+/// clears the status by writing all ones before the console sleeps and
+/// reads it 64 times after (Bus through the monitor), so a write clears
+/// the bits it has set.
+const WAKE_MASK: [u64; 2] = [0x0C, 0x160];
+const WAKE_LVL: [u64; 2] = [0x10, 0x164];
+const WAKE_STATUS: [u64; 2] = [0x14, 0x168];
+
+/// The wake event of the power management IC's interrupt output, active
+/// low (`PwrIntN` in Atmosphère's list of this board's wake events,
+/// `wec_wake_event.board.nintendo_nx.hpp`; the firmware enables it, bit
+/// 19 of `WAKE2_MASK`).
+pub const WAKE_EVENT_PMIC: u8 = 51;
+
 /// Partitions powered at kernel entry: the CPU rail (CRAIL, 0), the
 /// non-CPU part of the fast cluster (C0NC, 15) and its first core (CE0, 14)
-/// — fusee `fusee_cpu.cpp:141-143` powers these before starting the CPU —
-/// and the other three cores (CE1-3, 9-11), which the secure monitor
-/// powers on when the kernel starts them (the kernel runs on four cores).
-/// Every other partition is assumed off: no public stage of the boot chain
-/// powers one, and the firmware's clock driver turns on what it needs.
-const POWERED_AT_ENTRY: u32 = 1 << 0 | 1 << 9 | 1 << 10 | 1 << 11 | 1 << 14 | 1 << 15;
+/// — fusee `fusee_cpu.cpp:141-143` powers these before starting the CPU.
+/// The other three cores (CE1-3, 9-11) are the secure monitor's to switch,
+/// when the kernel starts and stops them. Every other partition is assumed
+/// off: no public stage of the boot chain powers one, and the firmware's
+/// clock driver turns on what it needs.
+const POWERED_AT_ENTRY: u32 = 1 << 0 | 1 << 14 | 1 << 15;
 
 /// The GPU rail's gate: bit 0 set clamps the rail off. The firmware's
 /// clock driver reads it when it starts, to count the rail as in use if
@@ -59,6 +82,20 @@ impl Pmc {
             registers: RegisterFile::zeroed([(GPU_RG_CNTRL, GPU_RAIL_CLAMPED)]),
             powered: Mutex::new(POWERED_AT_ENTRY),
         }
+    }
+
+    /// The input of wake event `event` is at this level. If the event is
+    /// enabled and that is its wake level, it is recorded and the answer
+    /// is `true`: the console wakes.
+    pub fn wake(&self, event: u8, high: bool) -> bool {
+        let (index, bit) = (usize::from(event / 32), 1 << (event % 32));
+        let is_set = |register| self.registers.get(register).unwrap_or(0) & bit != 0;
+        let wakes = is_set(WAKE_MASK[index]) && is_set(WAKE_LVL[index]) == high;
+        if wakes {
+            let status = self.registers.get(WAKE_STATUS[index]).unwrap_or(0);
+            self.registers.set(WAKE_STATUS[index], status | bit);
+        }
+        wakes
     }
 }
 
@@ -90,6 +127,11 @@ impl MmioDevice for Pmc {
             }
             _ => {}
         }
+        let value = if WAKE_STATUS.contains(&register) {
+            self.registers.get(register)? & !value
+        } else {
+            value
+        };
         self.registers.set(register, value);
         Some(())
     }
@@ -114,5 +156,19 @@ mod tests {
         // Without the start bit nothing switches.
         pmc.write(0, PWRGATE_TOGGLE, 4, 3).unwrap();
         assert_eq!(status(&pmc), POWERED_AT_ENTRY);
+    }
+
+    #[test]
+    fn an_enabled_wake_event_at_its_level_is_recorded_until_cleared() {
+        let pmc = Pmc::new();
+        let status = |pmc: &Pmc| pmc.read(0, WAKE_STATUS[1], 4).unwrap();
+        assert!(!pmc.wake(WAKE_EVENT_PMIC, false), "not enabled");
+        pmc.write(0, WAKE_MASK[1], 4, 1 << 19).unwrap();
+        assert!(!pmc.wake(WAKE_EVENT_PMIC, true), "its wake level is low");
+        assert_eq!(status(&pmc), 0);
+        assert!(pmc.wake(WAKE_EVENT_PMIC, false));
+        assert_eq!(status(&pmc), 1 << 19);
+        pmc.write(0, WAKE_STATUS[1], 4, 0xFFFF_FFFF).unwrap();
+        assert_eq!(status(&pmc), 0);
     }
 }

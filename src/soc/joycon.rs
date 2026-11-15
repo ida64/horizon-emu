@@ -48,6 +48,16 @@ pub const LEFT_UART_INTID: u32 = 32 + 46;
 /// rail, E6 for the left.
 pub const RIGHT_DETECT: (usize, u8) = (7, 6);
 pub const LEFT_DETECT: (usize, u8) = (4, 6);
+/// The rails' CTS lines as GPIO pins: G3 for UART-B, D4 for UART-C
+/// (Atmosphère's pad map, `ExtUart2Cts` and `ExtUart3Cts`). `hid` turns
+/// them into any-edge wake interrupts when the console goes to sleep, for
+/// which the GPIO driver samples them. The line is low while the Joy-Con
+/// asserts it, which here is whenever one is on the rail
+/// ([`Rail::clear_to_send`]), and pulled high on an empty rail
+/// \[assumption\]. What a sleeping Joy-Con does to the line when a button
+/// is pressed, which is how one wakes a console, is not modeled.
+pub const RIGHT_CTS: (usize, u8) = (6, 3);
+pub const LEFT_CTS: (usize, u8) = (3, 4);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -323,6 +333,8 @@ const REPORT: u8 = 0x92;
 const ENVELOPE: usize = 7;
 /// A controller report in a wired packet: `0x31` bytes.
 const REPORT_SIZE: usize = 49;
+/// How many answered packets a Joy-Con remembers for its refusals.
+const ANSWERED_KEPT: usize = 4;
 
 /// A packet to the console.
 fn packet(command: u8, subcommand: u8, status: u8, payload: &[u8]) -> Vec<u8> {
@@ -343,12 +355,17 @@ struct JoyCon {
     controls: Arc<Controls>,
     /// The packet being received.
     incoming: Vec<u8>,
+    /// The last few packets answered, a run of the same one counted once:
+    /// what a refusal says the refused packet came after.
+    answered: Vec<Vec<u8>>,
     /// The console has opened the wired session for controller reports.
     reporting: bool,
     motion: bool,
     vibration: bool,
     /// The right Joy-Con's NFC and infrared processor is running.
     processor: bool,
+    /// Put to sleep by the console (subcommand 6); the handshake wakes it.
+    asleep: bool,
     powered: Instant,
 }
 
@@ -358,10 +375,12 @@ impl JoyCon {
             side,
             controls,
             incoming: Vec::new(),
+            answered: Vec::new(),
             reporting: false,
             motion: false,
             vibration: false,
             processor: false,
+            asleep: false,
             powered: Instant::now(),
         }
     }
@@ -390,11 +409,28 @@ impl JoyCon {
             return Ok(Vec::new());
         }
         let received = std::mem::take(&mut self.incoming);
+        let refusal = |joycon: &Self| {
+            joycon.refuse(format_args!(
+                "the packet {received:02x?}, after {:02x?},",
+                joycon.answered
+            ))
+        };
         if received[..3] != TO_JOYCON || length < ENVELOPE {
-            return self.refuse(format_args!("the packet {received:02x?}"));
+            return refusal(self);
         }
-        self.packet(&received[5..])
-            .or_else(|()| self.refuse(format_args!("the packet {received:02x?}")))
+        let answered = std::mem::take(&mut self.answered);
+        let answer = self.packet(&received[5..]).or_else(|()| {
+            self.answered = answered.clone();
+            refusal(self)
+        })?;
+        // The list outlasts a handshake that starts the Joy-Con over.
+        self.answered = answered;
+        if self.answered.last() != Some(&received) {
+            self.answered.push(received);
+            let excess = self.answered.len().saturating_sub(ANSWERED_KEPT);
+            self.answered.drain(..excess);
+        }
+        Ok(answer)
     }
 
     /// Answers the packet whose bytes after the header are `body`. `Err`
@@ -402,10 +438,18 @@ impl JoyCon {
     fn packet(&mut self, body: &[u8]) -> Result<Vec<u8>, ()> {
         let (envelope, payload) = body.split_at(ENVELOPE);
         if envelope == HANDSHAKE && payload.is_empty() {
+            // A sleeping Joy-Con starts over, as one just slid on.
+            if self.asleep {
+                self.unplug();
+            }
             let mut answer = TO_CONSOLE.to_vec();
             answer.extend([ENVELOPE as u8, 0]);
             answer.extend(HANDSHAKE_ANSWER);
             return Ok(answer);
+        }
+        // Asleep, it listens for nothing else [assumption].
+        if self.asleep {
+            return Ok(Vec::new());
         }
         let [
             command,
@@ -462,6 +506,13 @@ impl JoyCon {
                 let report = self.report(output)?;
                 Ok(packet(REPORT, 0x00, 0, &report))
             }
+            // With no session there is nobody to report to. `hid` ends
+            // the session (`91 11`) when the console goes back to sleep
+            // after a wake that never lit the screen, and what polls the
+            // Joy-Con still sends a request for its state after that.
+            // That a Joy-Con says nothing to one, or to vibration data, is
+            // an assumption; a subcommand without a session is refused.
+            (REPORT, 0x00, [0x1F] | [0x10, ..]) => Ok(Vec::new()),
             _ => Err(()),
         }
     }
@@ -582,6 +633,18 @@ impl JoyCon {
             0x04 => (0x83, vec![0; 14]),
             // Leave the low power state of shipment.
             0x08 if argument(0)? == 0 => DONE,
+            // Power state (`bluetooth_hid_subcommands_notes.md`, "Set HCI
+            // state"): 0 is sleep, which `hid` sends each Joy-Con on the
+            // rails when the console goes to sleep. The bootloader's
+            // driver reads a packet after sending it (hekate `joycon.c`),
+            // so it is acknowledged first; that the acknowledgement is the
+            // plain one, and that only a new handshake wakes the Joy-Con,
+            // are assumptions. The other states (reboot into reconnecting
+            // or pairing over Bluetooth) are not modeled.
+            0x06 if argument(0)? == 0 => {
+                self.asleep = true;
+                DONE
+            }
             // Flash memory read: address, size.
             0x10 => {
                 let request = arguments.first_chunk::<5>().ok_or(())?;
@@ -862,6 +925,29 @@ mod tests {
     }
 
     #[test]
+    fn asleep_a_joycon_answers_only_the_handshake_and_starts_over() {
+        let (mut rail, _) = connected(Side::Left);
+        let report = subcommand(&mut rail, 0x06, &[0]).unwrap();
+        assert_eq!(report[13..15], [0x80, 0x06]);
+        assert!(send(&mut rail, &STATUS).is_empty());
+        let handshake = [
+            0xA1, 0xA2, 0xA3, 0xA4, 0x19, 0x01, 0x03, 0x07, 0x00, 0xA5, 0x02, 0x01, 0x7E, 0x00,
+            0x00, 0x00,
+        ];
+        assert_eq!(send(&mut rail, &handshake).len(), 12);
+        // Awake, with no session for reports yet: it answers commands,
+        // not a request for its state.
+        assert!(send(&mut rail, &STATUS).is_empty());
+        let who = [
+            0x19, 0x01, 0x03, 0x07, 0x00, 0x91, 0x01, 0x00, 0x00, 0x00, 0x00, 0x24,
+        ];
+        assert!(!send(&mut rail, &who).is_empty());
+        // The reboots into Bluetooth modes are not modeled.
+        let (mut rail, _) = connected(Side::Left);
+        assert!(subcommand(&mut rail, 0x06, &[2]).is_err());
+    }
+
+    #[test]
     fn pairing_gives_the_address_backwards_then_the_masked_key() {
         let (mut rail, _) = connected(Side::Left);
         let report = subcommand(&mut rail, 0x01, &[1, 0x02, 0x75, 0x6D, 0x45, 0x68, 0x02]).unwrap();
@@ -917,8 +1003,7 @@ mod tests {
         assert!(!rail.clear_to_send());
         // Back on the rail, reports have to be asked for again.
         controls.set_seated(true);
-        assert!(rail.byte(STATUS[0]).is_ok());
-        let rest: Result<Vec<_>, _> = STATUS[1..].iter().map(|&byte| rail.byte(byte)).collect();
-        assert!(rest.is_err());
+        assert!(rail.clear_to_send());
+        assert_eq!(send(&mut rail, &STATUS), Vec::<u8>::new());
     }
 }

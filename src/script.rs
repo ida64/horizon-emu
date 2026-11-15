@@ -25,6 +25,30 @@ const TOLERANCE: u8 = 16;
 /// Size of the console's screen.
 const SCREEN: (u32, u32) = (1280, 720);
 
+/// Something that is pressed: a button of the Joy-Con, or the console's
+/// power button (`power`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Key {
+    Joycon(Button),
+    Power,
+}
+
+impl Key {
+    fn named(name: &str) -> Option<Self> {
+        match name {
+            "power" => Some(Self::Power),
+            _ => Button::named(name).map(Self::Joycon),
+        }
+    }
+
+    fn hold(self, machine: &Machine, held: bool) {
+        match self {
+            Self::Joycon(button) => machine.press(button, held),
+            Self::Power => machine.press_power(held),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Step {
     /// Until the pixel at `(x, y)` of the screen has this colour.
@@ -34,7 +58,7 @@ enum Step {
         rgb: [u8; 3],
     },
     Sleep(Duration),
-    Press(Button, Duration),
+    Press(Key, Duration),
     Touch((u16, u16), Duration),
     /// A press or a touch done again, `every` so often, until the pixel
     /// at `(x, y)` has this colour; not at all if it has it already.
@@ -53,7 +77,7 @@ enum Step {
 #[derive(Debug, Clone, Copy)]
 enum Held {
     Nothing,
-    Button(Button),
+    Button(Key),
     Finger,
 }
 
@@ -82,6 +106,7 @@ impl Script {
     /// wait X,Y RRGGBB       until that pixel of the 1280x720 screen is that colour
     /// sleep SECONDS
     /// press BUTTON [HOLD_MS] [until X,Y RRGGBB [SECONDS]]
+    ///                       BUTTON: one of the Joy-Con's, or `power`
     /// touch X,Y [HOLD_MS] [until X,Y RRGGBB [SECONDS]]
     ///                       with `until`: again every SECONDS (3) until
     ///                       that pixel is that colour; not at all if it is
@@ -117,7 +142,7 @@ impl Script {
                 }
                 match held {
                     Held::Nothing => {}
-                    Held::Button(button) => machine.press(button, false),
+                    Held::Button(key) => key.hold(machine, false),
                     Held::Finger => {
                         machine.set_touch(None);
                     }
@@ -144,9 +169,9 @@ impl Script {
                     self.finish(&mut report);
                 }
                 Step::Sleep(span) => self.until = hold(*span, Held::Nothing),
-                Step::Press(button, span) => {
-                    machine.press(*button, true);
-                    self.until = hold(*span, Held::Button(*button));
+                Step::Press(key, span) => {
+                    key.hold(machine, true);
+                    self.until = hold(*span, Held::Button(*key));
                 }
                 Step::Touch(place, span) => {
                     // The touch controller is told once it scans.
@@ -167,9 +192,9 @@ impl Script {
                         return;
                     }
                     match **action {
-                        Step::Press(button, span) => {
-                            machine.press(button, true);
-                            self.until = hold(span, Held::Button(button));
+                        Step::Press(key, span) => {
+                            key.hold(machine, true);
+                            self.until = hold(span, Held::Button(key));
                         }
                         Step::Touch(place, span) if machine.set_touch(Some(place)) => {
                             self.until = hold(span, Held::Finger);
@@ -264,7 +289,7 @@ fn parse_step(line: &str) -> Option<Step> {
         }
         "sleep" => Step::Sleep(Duration::try_from_secs_f64(words.next()?.parse().ok()?).ok()?),
         "press" => {
-            let press = Step::Press(Button::named(words.next()?)?, hold(&mut words)?);
+            let press = Step::Press(Key::named(words.next()?)?, hold(&mut words)?);
             until(&mut words, press)?
         }
         "touch" => {
@@ -293,6 +318,7 @@ mod tests {
             "# to the region screen\n\
              wait 999,54 2f4fe8\n\
              press a 500   # English\n\
+             press power\n\
              \n\
              touch 640,219 until 1059,54 3250f0\n\
              joycons off\n\
@@ -316,9 +342,13 @@ mod tests {
                         rgb: [0x2F, 0x4F, 0xE8]
                     }
                 ),
-                (3, Step::Press(Button::A, Duration::from_millis(500))),
                 (
-                    5,
+                    3,
+                    Step::Press(Key::Joycon(Button::A), Duration::from_millis(500))
+                ),
+                (4, Step::Press(Key::Power, HOLD)),
+                (
+                    6,
                     Step::Until {
                         action: Box::new(Step::Touch((640, 219), HOLD)),
                         x: 1059,
@@ -327,9 +357,9 @@ mod tests {
                         every: AGAIN,
                     }
                 ),
-                (6, Step::Joycons(false)),
-                (7, Step::Sleep(Duration::from_millis(1500))),
-                (8, Step::Screenshot("/tmp/a.png".into())),
+                (7, Step::Joycons(false)),
+                (8, Step::Sleep(Duration::from_millis(1500))),
+                (9, Step::Screenshot("/tmp/a.png".into())),
             ]
         );
         assert_eq!(script.waiting_at(), Some((2, "wait 999,54 2f4fe8")));

@@ -315,6 +315,11 @@ const MSG_WL_EVENT: u8 = 0x0e;
 /// `WLC_E_ESCAN_RESULT` 69, `WLC_E_STATUS_SUCCESS` 0).
 const WLC_E_ESCAN_RESULT: u32 = 69;
 const WLC_E_STATUS_SUCCESS: u32 = 0;
+/// The scan was aborted (public `wlioctl_defs.h`, 4). Both public host
+/// drivers end a scan on an escan result with this status (brcmfmac
+/// `brcmf_cfg80211_escan_handler`, bcmdhd `wl_escan_handler`), which is
+/// how they learn that the abort they asked for took effect.
+const WLC_E_STATUS_ABORT: u32 = 4;
 /// Interface event (`WLC_E_IF`, 54) with `wl_event_data_if_t` {ifidx,
 /// opcode `WLC_E_IF_ADD` (1), reserved, bssidx, role STA (0)}, public
 /// `wlioctl_defs.h`/`dhd.h`. Broadcom firmware announces the primary
@@ -410,6 +415,11 @@ enum Deferred {
         if_id: u8,
     },
     ScanDone {
+        sync_id: u16,
+        if_id: u8,
+    },
+    /// The host aborted the scan in flight.
+    ScanAborted {
         sync_id: u16,
         if_id: u8,
     },
@@ -1391,6 +1401,18 @@ impl State {
                     )?;
                 }
             }
+            // `nifm` stops its scan when the console goes to sleep (`wlan`
+            // request 61) and waits for the scan to end before it lets the
+            // sleep go on.
+            Deferred::ScanAborted { sync_id, if_id } => {
+                let data = escan_result(sync_id, &[]);
+                self.event(
+                    dongle,
+                    if_id,
+                    Event::new(WLC_E_ESCAN_RESULT, WLC_E_STATUS_ABORT, &data),
+                    upstream,
+                )?;
+            }
             Deferred::Associated { epoch } => {
                 let Some(association) = dongle.association.as_mut().filter(|a| a.epoch == epoch)
                 else {
@@ -2141,7 +2163,9 @@ fn escan_result(sync_id: u16, bss: &[Vec<u8>]) -> Vec<u8> {
 /// arms its end after the dwell on every channel (all valid channels when
 /// the list is empty), and, if the access point is on one of them and
 /// matches the SSID asked for (if any), a partial result with it when the
-/// scan has dwelt on its channel; aborting drops the pending results.
+/// scan has dwelt on its channel; aborting a scan in flight ends it with a
+/// result of status abort and drops the rest (with none in flight there
+/// is nothing to report).
 fn escan(
     dongle: &mut Dongle,
     ap: Option<&AccessPoint>,
@@ -2199,7 +2223,11 @@ fn escan(
             Ok(Vec::new())
         }
         WL_SCAN_ACTION_ABORT => {
-            dongle.scan_in_flight = None;
+            if let Some(sync_id) = dongle.scan_in_flight.take() {
+                dongle
+                    .timers
+                    .push((Duration::ZERO, Deferred::ScanAborted { sync_id, if_id }));
+            }
             Ok(Vec::new())
         }
         _ => Err(BCME_BADARG),
@@ -2839,7 +2867,7 @@ mod tests {
     }
 
     #[test]
-    fn escan_ends_with_an_empty_result_after_its_dwell_time() {
+    fn escan_ends_after_its_dwell_time_or_when_aborted() {
         let (wifi, host) = setup();
         let shared = u64::from(boot(&wifi));
         enable_all_events(&wifi);
@@ -2928,6 +2956,54 @@ mod tests {
         assert_eq!(u32::from_be_bytes(frame[44..48].try_into().unwrap()), 12);
         assert_eq!(le16(&frame, 72 + 8), 0x1234, "sync ID");
         assert_eq!(le16(&frame, 72 + 10), 0, "no BSS");
+
+        // A scan that dwells a minute on each channel, and its abort: it
+        // ends at once, with a result that says so.
+        let mut long_scan = request.clone();
+        long_scan[6 + 6..6 + 8].copy_from_slice(&0x4321u16.to_le_bytes());
+        long_scan[6 + 56..6 + 60].copy_from_slice(&60_000i32.to_le_bytes());
+        let mut abort = long_scan.clone();
+        abort[6 + 4..6 + 6].copy_from_slice(&WL_SCAN_ACTION_ABORT.to_le_bytes());
+        put(&host, HOST + 0x9400, &long_scan);
+        put(&host, HOST + 0x9800, &abort);
+        put(
+            &host,
+            HOST + 120,
+            &post(MSG_IOCTLRESP_BUF_POST, 8, HOST + 0x8000),
+        );
+        put(
+            &host,
+            HOST + 160,
+            &post(MSG_IOCTLRESP_BUF_POST, 10, HOST + 0x8800),
+        );
+        put(
+            &host,
+            HOST + 200,
+            &post(MSG_EVENT_BUF_POST, 11, HOST + 0xb000),
+        );
+        for (slot, transaction, address) in [(240, 2u16, HOST + 0x9400), (280, 3, HOST + 0x9800)] {
+            let mut next = ioctl.clone();
+            next[12..14].copy_from_slice(&transaction.to_le_bytes());
+            next[24..32].copy_from_slice(&address.to_le_bytes());
+            put(&host, HOST + slot, &next);
+        }
+        wifi.memory_write(BAR2 + h2d_w, 2, 8).unwrap();
+        wifi.memory_write(
+            BAR0 + 0x2000 + u64::from(PCIE2_H2D_MAILBOX_0),
+            4,
+            0x1234_5678,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(wifi.memory_read(BAR2 + d2h_w, 2), Some(8));
+        let message = get(&host, HOST + 0x2000 + 7 * 24, 24);
+        assert_eq!((message[0], le32(&message, 4)), (MSG_WL_EVENT, 11));
+        let frame = get(&host, HOST + 0xb000, usize::from(le16(&message, 12)));
+        assert_eq!(
+            u32::from_be_bytes(frame[32..36].try_into().unwrap()),
+            WLC_E_STATUS_ABORT
+        );
+        assert_eq!(le16(&frame, 72 + 8), 0x4321, "sync ID");
     }
 
     /// After "up" the firmware announces wl0 (WLC_E_IF, ADD) when the

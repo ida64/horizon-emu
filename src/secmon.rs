@@ -23,6 +23,26 @@
 //! | [`CONFIGURE_CARVEOUT`](function::CONFIGURE_CARVEOUT) | `X1` index, `X2` address, `X3` size | | `0x800d25f0` |
 //! | [`PANIC`](function::PANIC) | `W1` code | does not return | `0x800d2650` |
 //!
+//! And when the console goes to sleep, from the kernel's sleep handler on
+//! each core (mesosphere `kern_k_sleep_manager_asm.s`, `CpuSleepHandler`):
+//! cores 1 to 3 call [`CPU_OFF`](function::CPU_OFF), core 0 waits for their
+//! power partitions to read off and calls
+//! [`CPU_SUSPEND`](function::CPU_SUSPEND). Neither returns.
+//!
+//! # Sleep
+//!
+//! On the console the monitor then powers the whole SoC down but for the
+//! PMC and the memory, which keeps itself; a wake event starts the SoC
+//! from its boot ROM, whose warm boot path leads back into the monitor,
+//! and the monitor starts core 0 where the kernel asked. Here nothing
+//! loses power: core 0 stands still until a wake event and then starts at
+//! that address, and every device is as the firmware left it instead of
+//! out of reset. The firmware's drivers put back what a real sleep loses,
+//! which here writes what is already there. Of what the monitor checks
+//! before sleeping (exosphere `secmon_smc_power_management.cpp`,
+//! `ValidateSocStateForSuspend`) only that the other cores are off is
+//! checked.
+//!
 //! Config items read while booting: 1, 10 (memory mode), 11 and 12 (kernel
 //! configuration). Every wrapper in the kernel treats a non-zero status as
 //! fatal, so the only error paths here are argument bounds the kernel itself
@@ -49,6 +69,11 @@ pub const KERNEL_SMC: u16 = 1;
 pub const USER_SMC: u16 = 0;
 
 pub mod function {
+    /// `W1` power state, `X2` entry PA, `X3` context. The one state there
+    /// is: [`super::POWER_STATE_SLEEP`].
+    pub const CPU_SUSPEND: u32 = 0xC400_0001;
+    /// No arguments: switches the calling core off.
+    pub const CPU_OFF: u32 = 0x8400_0002;
     pub const CPU_ON: u32 = 0xC400_0003;
     pub const GET_CONFIG: u32 = 0xC300_0004;
     pub const GENERATE_RANDOM_BYTES: u32 = 0xC300_0005;
@@ -172,7 +197,22 @@ const STATUS_INVALID_ASYNC_OPERATION: u64 = 5;
 
 const PSCI_SUCCESS: u64 = 0;
 const PSCI_INVALID_PARAMETERS: u64 = -2i64 as u64;
+const PSCI_DENIED: u64 = -3i64 as u64;
 const PSCI_ALREADY_ON: u64 = -4i64 as u64;
+
+/// The power state the kernel suspends core 0 into: a power-down state
+/// (bit 16) with ID 27, the whole SoC off (exosphere's `PowerStateId_Sc7`;
+/// the kernel passes `0x0201001b`). The monitor denies any other.
+pub const POWER_STATE_SLEEP: u32 = 1 << 16 | 27;
+const POWER_STATE_TYPE_AND_ID: u32 = 0x1_FFFF;
+
+/// The PMC's power partition switch, its status, and the partition of
+/// each core (exosphere `secmon_smc_power_management.cpp`,
+/// `CpuPowerGateTogglePartitionIds`: CE0 is 14, CE1 to CE3 are 9 to 11).
+const PMC_PWRGATE_TOGGLE: u64 = 0x7000_E430;
+const PMC_PWRGATE_STATUS: u64 = 0x7000_E438;
+const PWRGATE_TOGGLE_START: u64 = 1 << 8;
+const CORE_PARTITIONS: [u32; CORE_COUNT] = [14, 9, 10, 11];
 
 const MAX_RANDOM_BYTES: u64 = 56;
 const CARVEOUT_COUNT: usize = 2;
@@ -192,6 +232,13 @@ pub enum SmcEffect {
         entry: u64,
         context: u64,
     },
+    /// The calling core is switched off. The call does not return; the
+    /// core runs again when another turns it on.
+    PowerOff,
+    /// The console sleeps. The call does not return; when the console
+    /// wakes, the calling core starts at physical `entry` with `context`
+    /// in `X0`.
+    Sleep { entry: u64, context: u64 },
     /// The kernel reported a fatal error. The call does not return.
     Panic { code: u32 },
     /// The call is outside what is modeled; registers are untouched.
@@ -212,6 +259,8 @@ pub enum Unimplemented {
     },
     /// A key operation, with what it would need.
     Crypto(&'static str),
+    /// The console's monitor would not have carried on either: it aborts.
+    Abort(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -272,12 +321,13 @@ impl SecureMonitor {
         }
     }
 
-    /// Serves one SMC. `x` is `X0`-`X7` at the instruction and is rewritten
-    /// with the values the caller resumes with. `bus` is where the registers
-    /// the monitor proxies live, `engine` the memory the security engine
-    /// reaches.
+    /// Serves one SMC of `core`. `x` is `X0`-`X7` at the instruction and is
+    /// rewritten with the values the caller resumes with. `bus` is where
+    /// the registers the monitor proxies live, `engine` the memory the
+    /// security engine reaches.
     pub fn call(
         &self,
+        core: usize,
         immediate: u16,
         x: &mut [u64; 8],
         bus: &Bus,
@@ -407,12 +457,38 @@ impl SecureMonitor {
                     x[0] = PSCI_ALREADY_ON;
                     return SmcEffect::Resume;
                 }
+                if !switch_core(bus, core, true) {
+                    return unimplemented;
+                }
                 *on = true;
                 x[0] = PSCI_SUCCESS;
                 return SmcEffect::StartCore {
                     core,
                     entry,
                     context,
+                };
+            }
+            function::CPU_OFF => {
+                if !switch_core(bus, core, false) {
+                    return unimplemented;
+                }
+                state.cores_on[core] = false;
+                return SmcEffect::PowerOff;
+            }
+            function::CPU_SUSPEND => {
+                if x[1] as u32 & POWER_STATE_TYPE_AND_ID != POWER_STATE_SLEEP {
+                    x[0] = PSCI_DENIED;
+                    return SmcEffect::Resume;
+                }
+                let others = state.cores_on.iter().enumerate();
+                if others.filter(|&(other, &on)| on && other != core).count() != 0 {
+                    return SmcEffect::Unimplemented(Unimplemented::Abort(
+                        "sleep was asked for while another core was on",
+                    ));
+                }
+                return SmcEffect::Sleep {
+                    entry: x[2],
+                    context: x[3],
                 };
             }
             function::PANIC => return SmcEffect::Panic { code: x[1] as u32 },
@@ -609,6 +685,8 @@ impl SecureMonitor {
 pub fn function_name(immediate: u16, id: u32) -> &'static str {
     match (immediate, id) {
         (KERNEL_SMC, function::CPU_ON) => "CpuOn",
+        (KERNEL_SMC, function::CPU_OFF) => "CpuOff",
+        (KERNEL_SMC, function::CPU_SUSPEND) => "CpuSuspend",
         (KERNEL_SMC, function::GET_CONFIG) => "GetConfig",
         (KERNEL_SMC, function::GENERATE_RANDOM_BYTES) => "GenerateRandomBytes",
         (KERNEL_SMC, function::PANIC) => "Panic",
@@ -626,6 +704,22 @@ pub fn function_name(immediate: u16, id: u32) -> &'static str {
         (USER_SMC, user_function::GET_RESULT) => "GetResult",
         _ => "?",
     }
+}
+
+/// Switches the power partition of `core` on or off, as the monitor does
+/// around starting and stopping it. `false` if the PMC refused.
+fn switch_core(bus: &Bus, core: usize, on: bool) -> bool {
+    let partition = CORE_PARTITIONS[core];
+    let Access::Done(status) = bus.read(0, PMC_PWRGATE_STATUS, 4) else {
+        return false;
+    };
+    (status >> partition & 1 != 0) == on
+        || bus.write(
+            0,
+            PMC_PWRGATE_TOGGLE,
+            4,
+            PWRGATE_TOGGLE_START | u64::from(partition),
+        ) == Access::Done(())
 }
 
 /// The 128-bit value `x[index]`, `x[index + 1]` carry, in memory order.
@@ -695,7 +789,12 @@ mod tests {
 
     impl Console {
         fn call(&self, immediate: u16, x: &mut [u64; 8]) -> SmcEffect {
-            self.monitor.call(immediate, x, &self.bus, &self.engine)
+            self.call_on(0, immediate, x)
+        }
+
+        fn call_on(&self, core: usize, immediate: u16, x: &mut [u64; 8]) -> SmcEffect {
+            self.monitor
+                .call(core, immediate, x, &self.bus, &self.engine)
         }
 
         fn carveouts(&self) -> [Carveout; CARVEOUT_COUNT] {
@@ -710,7 +809,7 @@ mod tests {
             "PMC",
             0x7000_E400,
             0xC00,
-            Box::new(RegisterFile::zeroed([])),
+            Box::new(crate::soc::pmc::Pmc::new()),
         );
         bus.map(
             "MC",
@@ -1057,12 +1156,12 @@ mod tests {
         );
         assert_eq!(x[..4], before);
 
-        let (effect, _) = smc(&monitor, [0xC400_0001, 0, 0, 0]);
+        let (effect, _) = smc(&monitor, [0x8400_0009, 0, 0, 0]);
         assert_eq!(
             effect,
             SmcEffect::Unimplemented(Unimplemented::Function {
                 immediate: 1,
-                id: 0xC400_0001
+                id: 0x8400_0009
             })
         );
 
@@ -1248,6 +1347,63 @@ mod tests {
             (on(4).0, on(4).1[0]),
             (SmcEffect::Resume, PSCI_INVALID_PARAMETERS)
         );
+    }
+
+    #[test]
+    fn sleep_needs_the_other_cores_off_and_their_partitions_follow() {
+        let monitor = monitor(DramSize::Gb4);
+        let partitions = || {
+            let status = smc(
+                &monitor,
+                [
+                    function::READ_WRITE_REGISTER.into(),
+                    PMC_PWRGATE_STATUS,
+                    0,
+                    0,
+                ],
+            );
+            status.1[1] >> 9 & 7
+        };
+        assert_eq!(partitions(), 0);
+        for core in 1..4 {
+            smc(&monitor, [function::CPU_ON.into(), core, 0x8000_0000, 0]);
+        }
+        assert_eq!(partitions(), 7);
+
+        let sleep = |state: u64| {
+            smc(
+                &monitor,
+                [function::CPU_SUSPEND.into(), state, 0x8000_1000, 7],
+            )
+        };
+        // Any state but the one there is is denied.
+        assert_eq!(
+            (sleep(27).0, sleep(27).1[0]),
+            (SmcEffect::Resume, PSCI_DENIED)
+        );
+        assert!(matches!(
+            sleep(0x0201_001B).0,
+            SmcEffect::Unimplemented(Unimplemented::Abort(_))
+        ));
+        for core in 1..4 {
+            let mut x = [function::CPU_OFF.into(), 0, 0, 0, 0, 0, 0, 0];
+            assert_eq!(
+                monitor.call_on(core, KERNEL_SMC, &mut x),
+                SmcEffect::PowerOff
+            );
+        }
+        assert_eq!(partitions(), 0);
+        assert_eq!(
+            sleep(0x0201_001B).0,
+            SmcEffect::Sleep {
+                entry: 0x8000_1000,
+                context: 7
+            }
+        );
+        // A core that was switched off can be turned on again.
+        let again = smc(&monitor, [function::CPU_ON.into(), 2, 0x8000_0000, 0]);
+        assert!(matches!(again.0, SmcEffect::StartCore { core: 2, .. }));
+        assert_eq!(partitions(), 2);
     }
 
     #[test]

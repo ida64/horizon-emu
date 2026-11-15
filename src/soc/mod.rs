@@ -106,6 +106,10 @@ const I2C1_INTID: u32 = 32 + 38;
 /// I2C5: power management IC and real-time clock.
 const I2C5_BASE: u64 = 0x7000_D000;
 const I2C5_INTID: u32 = 32 + 53;
+/// The power management IC's interrupt output (pcv binds this interrupt,
+/// level-triggered, when it starts; Linux's `tegra210.dtsi` has it as the
+/// PMC's, shared interrupt 86).
+const PMU_INTID: u32 = 32 + 86;
 
 /// SDMMC1: the microSD slot's port (base and interrupt as in the public
 /// Linux `tegra210.dtsi`). The filesystem process starts it once the
@@ -263,8 +267,14 @@ const FUSE_USB_CALIB_EXT: u64 = 0x350;
 /// as a headphone inserted (text `0x6be90`); nothing is plugged in, so
 /// the pin reads high and never changes. The port's other input pins read
 /// low, which is an assumption.
-const GPIO_INPUTS: [(usize, u8); 7] = [
+///
+/// Ports D and G: the Joy-Con rails' CTS lines on D4 and G3
+/// ([`joycon::LEFT_CTS`], [`joycon::RIGHT_CTS`]), high on an empty rail.
+/// The ports' other pins read low, which is an assumption.
+const GPIO_INPUTS: [(usize, u8); 9] = [
+    (3, 0x10),
     (4, 0x40),
+    (6, 0x08),
     (7, 0x40),
     (10, 0x10),
     (18, 0x08),
@@ -295,6 +305,11 @@ pub struct Soc {
     pub touch_input: Arc<touch::TouchInput>,
     /// The pair of Joy-Con: where they are and what is held on them.
     pub joycons: Arc<joycon::Controls>,
+    /// The power management IC: the power key, the clock's alarms, and
+    /// the interrupt output that wakes a sleeping console.
+    pub pmic: max77620::Max77620,
+    /// The power management controller, where wake events arrive.
+    pmc: Arc<Pmc>,
     /// The WiFi function of the radio, for placing an access point around
     /// it (`--wifi-ssid`); set once the PCIe root complex is built.
     pub wifi: std::sync::OnceLock<Arc<bcm4356::Bcm4356Wifi>>,
@@ -401,6 +416,8 @@ impl Soc {
             gpio,
             touch_input,
             joycons: Arc::default(),
+            pmic: max77620::Max77620::new(line(gic, PMU_INTID)),
+            pmc: Arc::new(Pmc::new()),
             wifi: std::sync::OnceLock::new(),
             gic: Arc::clone(gic),
             dc: controller(DC_INTID),
@@ -532,7 +549,7 @@ impl Soc {
         pcie.attach(Arc::clone(&wifi) as Arc<dyn pcie_endpoint::PcieFunction>);
         let _ = soc.wifi.set(wifi);
         bus.map("PWM", PWM_BASE, PWM_SIZE, Box::new(Arc::clone(&soc.pwm)));
-        bus.map("PMC", pmc::BASE, pmc::SIZE, Box::new(Pmc::new()));
+        bus.map("PMC", pmc::BASE, pmc::SIZE, Box::new(Arc::clone(&soc.pmc)));
         bus.map(
             "pin multiplexer",
             PINMUX_BASE,
@@ -726,12 +743,8 @@ impl Soc {
             Box::new(spi::Spi::new(soc.line(spi::INTID), Arc::clone(&soc.notes))),
         );
         let i2c5 = [
-            soc.byte_registers("PMIC", max77620::PMIC_ADDRESS, max77620::Pmic::new()),
-            soc.byte_registers(
-                "RTC",
-                max77620::RTC_ADDRESS,
-                max77620::Rtc::following_host(),
-            ),
+            soc.byte_registers("PMIC", max77620::PMIC_ADDRESS, soc.pmic.power_block()),
+            soc.byte_registers("RTC", max77620::RTC_ADDRESS, soc.pmic.clock_block()),
             soc.byte_registers("CPU regulator", max77621::CPU_ADDRESS, Max77621::cpu()),
             soc.byte_registers("GPU regulator", max77621::GPU_ADDRESS, Max77621::gpu()),
         ];
@@ -784,10 +797,25 @@ impl Soc {
     /// rail's detect pin low while it is on.
     pub fn seat_joycons(&self, seated: bool) {
         self.joycons.set_seated(seated);
-        for (port, pin) in [joycon::LEFT_DETECT, joycon::RIGHT_DETECT] {
+        for (port, pin) in [
+            joycon::LEFT_DETECT,
+            joycon::RIGHT_DETECT,
+            joycon::LEFT_CTS,
+            joycon::RIGHT_CTS,
+        ] {
             // Both ports have their inputs listed.
             let _ = self.gpio.set_input(port, pin, !seated);
         }
+    }
+
+    /// Whether something wakes the sleeping console, which the power
+    /// management controller then has on record. One wake source is
+    /// modeled: the power management IC's interrupt output, which carries
+    /// the power key and the clock's alarms. A Joy-Con on a rail, the
+    /// radios, the charger, the card slot and the dock are wake sources of
+    /// the console that are not.
+    pub fn wake_pending(&self) -> bool {
+        self.pmic.interrupt() && self.pmc.wake(pmc::WAKE_EVENT_PMIC, false)
     }
 
     /// Where each GPU channel stands, a line each.

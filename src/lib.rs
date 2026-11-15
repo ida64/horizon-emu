@@ -37,6 +37,7 @@ pub mod maxwell;
 pub mod memory;
 pub mod nand;
 pub mod net;
+pub mod pmu;
 pub mod sdcard;
 pub mod secmon;
 pub mod soc;

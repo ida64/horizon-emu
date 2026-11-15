@@ -74,8 +74,9 @@ const UTMIP_PLL_CFG0: u64 = 0x480;
 /// * [`OSCILLATOR_AND_BUSES`], [`RUNNING_PLLS`], [`CLOCK_ENABLES`],
 ///   [`RESETS`], [`CLOCK_GATE_OVERRIDES`], [`MODULE_SOURCES`],
 ///   [`PLL_CONTROLS`]: values with evidence;
-/// * [`ASSUMED_ZERO`] and [`GATED_MODULE_SOURCES`]: registers whose entry
-///   value nothing public pins down, which read zero.
+/// * [`ASSUMED_ZERO`], [`GATED_MODULE_SOURCES`] and [`SAVED_FOR_SLEEP`]:
+///   registers whose entry value nothing public pins down, which read
+///   zero.
 const ENTRY_STATE: [&[(u64, u32)]; 8] = [
     &OSCILLATOR_AND_BUSES,
     &RUNNING_PLLS,
@@ -125,6 +126,7 @@ const OSCILLATOR_AND_BUSES: [(u64, u32); 8] = [
 /// |---|---|---|---|
 /// | `0x0a0` | `PLLP_BASE` | `0x4800_5508` | 408 MHz from 38.4 MHz: M 8, N 85, P 1, the reference table of Linux `clk-tegra210.c` (`pll_p_freq_table`); set up by the boot ROM. M even meets `pcv`'s check of bit 0 |
 /// | `0x0a8` | `PLLP_OUTB` | `0x0003_0003` | outputs 3 and 4 enabled and out of reset, no overrides: hekate `hw_init.c:393` |
+/// | `0x67c` | `PLLP_OUTC` | `0x0003_0000` | output 5 likewise. No boot stage is known to write it; `pcv` says so: after sleep it writes this and the `PLLP_OUTB` value above where it puts back what the boot chain set up (text `0x43b88`), works out every clock source's rate from the registers again (output 5: 204 MHz with both bits set, off otherwise, text `0x49460`) and fails the wake unless each is what it was before sleep (`NvQryClockSourceResumeVerify`, text `0x4edd0`); those two are its only accesses to the register by address |
 /// | `0x0e0` | `PLLX_BASE` | `0x4840_4e02` | M 2, N 78, P index 4 (/5): fusee `fusee_cpu.cpp:90-101`, which starts the CPU |
 /// | `0x090` | `PLLM_BASE` | `0x4800_2201` | M 1, N 34, enabled by SDRAM bring-up: hekate `sdram.c:227-231` with the dividers of `sdram_config.inl:25-29` |
 /// | `0x09c` | `PLLM_MISC2` | `0x0` | hekate `sdram.c:224` |
@@ -139,9 +141,10 @@ const OSCILLATOR_AND_BUSES: [(u64, u32); 8] = [
 /// `UTMIP_PLL_CFG0[23:8]` is `0x1901` (`boot` text `0x1cb0`). Both enabled
 /// and locked; `pcv` takes the UTMI PLL as running because
 /// `UTMIP_PLL_CFG1` bit 14 (force power-down) is clear.
-const RUNNING_PLLS: [(u64, u32); 10] = [
+const RUNNING_PLLS: [(u64, u32); 11] = [
     (0x0A0, 0x4800_5508),
     (0x0A8, 0x0003_0003),
+    (0x67C, 0x0003_0000),
     (0x0E0, 0x4840_4E02),
     (0x090, 0x4800_2201),
     (0x09C, 0x0000_0000),
@@ -259,9 +262,9 @@ const MODULE_SOURCES: [(u64, u32); 8] = [
 ///   `PLLA_OUT 0x0b4`, `PLLA1_BASE 0x6a4`, and the audio DSP cluster's
 ///   `ACLK_BURST_POLICY 0x6e0` and `SUPER_ACLK_DIVIDER 0x6e4`.
 /// * Outputs and controls of running PLLs nobody documents:
-///   `PLLU_OUTA 0x0c4` and `PLLP_OUTC 0x67c` (outputs off; `pcv` requires
-///   their override bits clear), `PLLU_MISC1 0x0c8`, `PLLP_MISC0 0x0ac`
-///   (IDDQ clear: PLLP runs), `PLLP_MISC1 0x680`.
+///   `PLLU_OUTA 0x0c4` (outputs off; `pcv` requires its override bits
+///   clear), `PLLU_MISC1 0x0c8`, `PLLP_MISC0 0x0ac` (IDDQ clear: PLLP
+///   runs), `PLLP_MISC1 0x680`.
 /// * Clock sources `pcv` reads unconditionally, of modules without an
 ///   enable bit (XUSB core host/falcon/FS/core device/SS
 ///   `0x600-0x610`, DVFS reference and SoC `0x62c`, `0x630`, SPDIF input
@@ -279,7 +282,12 @@ const MODULE_SOURCES: [(u64, u32); 8] = [
 ///   that PLL's state and enables the PLL by read-modify-write the way Linux
 ///   does (`NvQryClockXusbIoPllEnable`, text `0x4eaa0`: clear bits 0 and 2,
 ///   set 6 and 13; bit names `XUSBIO_PLL_CFG0_*` in Linux `clk-tegra210.c`).
+/// * `RST_SOURCE 0x000`, the watchdogs' reset routing, which nothing
+///   sets up. `pcv` reads it for the bus access alone, between the steps
+///   of putting the block back after sleep (text `0x44334`, the value
+///   dropped, as Linux's `fence_udelay` does).
 const ASSUMED_ZERO: [(u64, u32); 36] = [
+    (0x000, 0),
     (0x51C, 0),
     (0x0EC, 0),
     (0x068, 0),
@@ -302,7 +310,6 @@ const ASSUMED_ZERO: [(u64, u32); 36] = [
     (0x6E0, 0),
     (0x6E4, 0),
     (0x0C4, 0),
-    (0x67C, 0),
     (0x0C8, 0),
     (0x0AC, 0),
     (0x680, 0),
@@ -326,6 +333,7 @@ const ASSUMED_ZERO: [(u64, u32); 36] = [
 /// |---|---|---|---|
 /// | `0x4ec`, `0x500`, `0x6a8` | `PLLC2/PLLC3/PLLA1_MISC0` | `0x4008_0000` | Linux `clk-tegra210.c` `PLLCX_MISC0_DEFAULT_VALUE` (PLL held in reset) |
 /// | `0x4f0`, `0x504`, `0x6ac` | `PLLC2/PLLC3/PLLA1_MISC1` | `0x0800_0000` | `PLLCX_MISC1_DEFAULT_VALUE` (IDDQ: powered down) |
+/// | `0x088`, `0x08c` | `PLLC_MISC0`, `PLLC_MISC1` | `0x4008_0000`, `0x0800_0000` | the same kind of PLL, likewise unused; `pcv` first reads these after sleep, to switch off again a PLL nothing asked for (`NvQryClockPLLResumeDisable`, text `0x4ef30`) |
 /// | `0x4c8` | `PLLRE_MISC0` | `0x4100_0000` | `PLLRE_MISC0_DEFAULT_VALUE` (IDDQ, lock enable) |
 /// | `0x570` | `PLLD2_MISC1` | `0x1000_0000` | `PLLD2_MISC1_CFG_DEFAULT_VALUE` |
 /// | `0x578` | `PLLD2_MISC3` | `0x0` | `PLLD2_MISC3_CTRL2_DEFAULT_VALUE` |
@@ -342,7 +350,9 @@ const ASSUMED_ZERO: [(u64, u32); 36] = [
 /// programs and checks unused PLLs against; that a PLL nobody used still
 /// holds them at kernel entry is an assumption (they are what `pcv` itself
 /// writes back, text `sub_4ad90` family).
-const PLL_CONTROLS: [(u64, u32); 20] = [
+const PLL_CONTROLS: [(u64, u32); 22] = [
+    (0x088, 0x4008_0000),
+    (0x08C, 0x0800_0000),
     (0x594, 0x4000_0020),
     (0x59C, 0xF400_F0DA),
     (0x5A0, 0x2004_F400),
@@ -380,6 +390,25 @@ const GATED_MODULE_SOURCES: [u64; 41] = [
     0x534, 0x1F4,
 ];
 
+/// Registers `pcv` first reads when the console goes to sleep, one after
+/// another from `CPU_SOFTRST_CTRL 0x380` on: its copy of the block to
+/// write back after waking, as Linux keeps one (`clk-tegra210.c`,
+/// `tegra210_clk_suspend`: `CLK_MASK_ARM 0x044`, `MISC_CLK_ENB 0x048`,
+/// the three `CPU_SOFTRST_CTRL` and the clock sources). They are sources
+/// of modules nothing here uses and controls nothing here acts on, and
+/// their entry values are not public; they read zero, an assumption that
+/// goes no further than being written back. That saving is all `pcv` does
+/// with them is an inference from the pattern.
+const SAVED_FOR_SLEEP: [u64; 95] = [
+    0x044, 0x048, 0x114, 0x120, 0x12C, 0x130, 0x140, 0x144, 0x148, 0x14C, 0x158, 0x15C, 0x160,
+    0x168, 0x16C, 0x170, 0x174, 0x184, 0x188, 0x18C, 0x190, 0x194, 0x1A4, 0x1A8, 0x1AC, 0x1B0,
+    0x1C4, 0x1C8, 0x1D0, 0x1DC, 0x1E0, 0x1E4, 0x1E8, 0x1EC, 0x1F0, 0x1F8, 0x380, 0x384, 0x388,
+    0x3B8, 0x3C8, 0x3CC, 0x3D4, 0x3D8, 0x3DC, 0x3E0, 0x3F0, 0x3F4, 0x3F8, 0x404, 0x408, 0x40C,
+    0x414, 0x418, 0x41C, 0x420, 0x424, 0x49C, 0x4B4, 0x560, 0x564, 0x614, 0x618, 0x61C, 0x624,
+    0x634, 0x638, 0x63C, 0x640, 0x648, 0x64C, 0x650, 0x654, 0x658, 0x660, 0x668, 0x670, 0x674,
+    0x6B8, 0x6BC, 0x6C8, 0x6D0, 0x6DC, 0x6E8, 0x6EC, 0x6F0, 0x6F4, 0x6F8, 0x6FC, 0x700, 0x704,
+    0x708, 0x70C, 0x714, 0x718,
+];
 /// `(set register, register it sets bits in)`; the matching clear register
 /// follows each set register.
 const SET_CLEAR_PAIRS: [(u64, u64); 14] = [
@@ -497,11 +526,12 @@ impl Car {
     pub fn new() -> Self {
         Self {
             registers: RegisterFile::strict(
-                ENTRY_STATE
-                    .into_iter()
-                    .flatten()
-                    .copied()
-                    .chain(GATED_MODULE_SOURCES.map(|register| (register, 0))),
+                ENTRY_STATE.into_iter().flatten().copied().chain(
+                    GATED_MODULE_SOURCES
+                        .into_iter()
+                        .chain(SAVED_FOR_SLEEP)
+                        .map(|register| (register, 0)),
+                ),
             ),
             emc_clock_change: None,
             reset_hooks: Vec::new(),

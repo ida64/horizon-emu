@@ -132,7 +132,8 @@ options:
                       starts and let go HOLD_MS milliseconds later (default
                       100); may be given more than once. BUTTON is one of a
                       b x y l r zl zr plus minus home capture up down left
-                      right lstick rstick
+                      right lstick rstick, or power, the console's own
+                      button: it puts the console to sleep and wakes it
   --script FILE       do to the console what FILE says, a step per line, each
                       when the one before is over (# starts a comment):
                         wait X,Y RRGGBB      until that pixel of the screen
@@ -677,6 +678,7 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
                 match input {
                     Input::Seat(seated) => machine.seat_joycons(seated),
                     Input::Press(button, held) => machine.press(button, held),
+                    Input::Power(held) => machine.press_power(held),
                     Input::Touch(finger) => {
                         if !machine.set_touch(finger)
                             && let Some((x, y)) = finger
@@ -845,6 +847,8 @@ enum Input {
     Seat(bool),
     /// A button of the Joy-Con is held, or let go of.
     Press(Button, bool),
+    /// The console's power button is held, or let go of.
+    Power(bool),
 }
 
 /// When something starts and when, `HOLD_MS` later, it ends: the parts of
@@ -881,6 +885,9 @@ fn parse_touch(touch: &str) -> Result<[(Duration, Input); 2], String> {
 fn parse_press(press: &str) -> Result<[(Duration, Input); 2], String> {
     parse_timed(press)
         .and_then(|(at, button, until)| {
+            if button == "power" {
+                return Some([(at, Input::Power(true)), (until, Input::Power(false))]);
+            }
             let button = Button::named(button)?;
             Some([
                 (at, Input::Press(button, true)),
@@ -996,10 +1003,15 @@ fn write_event(out: &mut impl Write, event: TraceEvent, tracing: &Tracing) -> io
             results,
             effect,
         } => {
-            if tracing.verbose
-                && let SmcEffect::StartCore { core: started, .. } = effect
-            {
-                writeln!(out, "core {started} started by core {core}")?;
+            if tracing.verbose {
+                match effect {
+                    SmcEffect::StartCore { core: started, .. } => {
+                        writeln!(out, "core {started} started by core {core}")?;
+                    }
+                    SmcEffect::PowerOff => writeln!(out, "core {core} switched off")?,
+                    SmcEffect::Sleep { .. } => writeln!(out, "console asleep")?,
+                    _ => {}
+                }
             }
             if !tracing.smc {
                 return Ok(());
@@ -1107,6 +1119,7 @@ fn write_event(out: &mut impl Write, event: TraceEvent, tracing: &Tracing) -> io
             if is_write { "<-" } else { "->" },
             width = usize::from(size) * 2 + 2
         ),
+        TraceEvent::Woke { core } => writeln!(out, "console woke, core {core} runs"),
         TraceEvent::Unmodeled {
             core,
             device,

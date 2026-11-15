@@ -27,6 +27,7 @@ use crate::{
     ipc,
     keys::KeySet,
     memory::GuestRam,
+    pmu::Pmu,
     secmon::{self, SecureMonitor, SmcEffect, Unimplemented},
     soc::{
         Screen, Soc,
@@ -314,6 +315,8 @@ pub enum TraceEvent<'a> {
         is_write: bool,
         value: u64,
     },
+    /// The console woke from sleep; `core` runs again.
+    Woke { core: usize },
     /// A survey answered a device access that nothing models.
     Unmodeled {
         core: usize,
@@ -406,6 +409,9 @@ impl fmt::Display for CoreStop {
             }
             Self::UnimplementedSmc(Unimplemented::Crypto(what)) => {
                 write!(f, "secure monitor key operation is not available: {what}")
+            }
+            Self::UnimplementedSmc(Unimplemented::Abort(why)) => {
+                write!(f, "the secure monitor aborts: {why}")
             }
             Self::UnimplementedSmc(Unimplemented::Register { address, is_write }) => {
                 write!(
@@ -576,6 +582,8 @@ pub struct Machine {
     bus: Bus,
     gic: Arc<Gic>,
     timers: Timers,
+    /// Each core's performance monitor registers.
+    pmus: [Mutex<Pmu>; CORE_COUNT],
     soc: Soc,
     signals: Arc<CoreSignals>,
 }
@@ -642,6 +650,7 @@ impl Machine {
             bus,
             gic,
             timers,
+            pmus: Default::default(),
             soc,
             signals,
         })
@@ -686,6 +695,11 @@ impl Machine {
         self.soc.joycons.press(button, held);
     }
 
+    /// Holds the console's power button, or lets go of it.
+    pub fn press_power(&self, held: bool) {
+        self.soc.pmic.power_key(held);
+    }
+
     /// The WiFi function of the console's radio.
     pub fn wifi(&self) -> &std::sync::Arc<crate::soc::bcm4356::Bcm4356Wifi> {
         self.soc
@@ -717,6 +731,7 @@ impl Machine {
             processes: Mutex::new(HashMap::new()),
             stop: AtomicBool::new(false),
             started: AtomicUsize::new(0),
+            switches: Default::default(),
             reports,
             smc_counts: Mutex::new(BTreeMap::new()),
         };
@@ -818,11 +833,21 @@ impl Machine {
         let vcpu = Vcpu::new(&self.vm)?;
         vcpu.set_sys_reg(SysReg::MIDR_EL1, boot::MIDR_EL1)?;
         vcpu.set_sys_reg(SysReg::MPIDR_EL1, boot::mpidr_el1(core))?;
+        self.start_vcpu(&vcpu, entry)?;
+        Ok(vcpu)
+    }
+
+    /// Puts a core where the monitor hands it to the kernel: at `entry`
+    /// with the MMU off and interrupts masked. That is all the kernel
+    /// relies on, when a core first starts and when one starts again
+    /// after having been switched off; the rest of its state it sets up
+    /// itself, so what a core that starts again still holds from before
+    /// does not matter.
+    fn start_vcpu(&self, vcpu: &Vcpu, entry: CoreEntry) -> Result<(), HvError> {
         vcpu.set_sys_reg(SysReg::SCTLR_EL1, boot::ENTRY_SCTLR_EL1)?;
         vcpu.set_pstate(boot::ENTRY_PSTATE)?;
         vcpu.set_pc(entry.pc)?;
-        vcpu.set_gpr(0, entry.x0)?;
-        Ok(vcpu)
+        vcpu.set_gpr(0, entry.x0)
     }
 
     fn translation_regime(&self, vcpu: &Vcpu) -> Result<TranslationRegime, HvError> {
@@ -1003,16 +1028,22 @@ impl Machine {
 
     /// Value of a system register whose reads trap to the host.
     fn read_system_register(&self, core: usize, register: SysReg) -> Option<u64> {
-        Some(match register {
-            SysReg::CPUACTLR_EL1 => boot::CPUACTLR_EL1,
-            SysReg::CPUECTLR_EL1 => boot::CPUECTLR_EL1,
-            _ => self.timers.read(core, timer_register(register)?),
-        })
+        match register {
+            SysReg::CPUACTLR_EL1 => Some(boot::CPUACTLR_EL1),
+            SysReg::CPUECTLR_EL1 => Some(boot::CPUECTLR_EL1),
+            _ => match timer_register(register) {
+                Some(timer) => Some(self.timers.read(core, timer)),
+                None => self.pmus[core].lock().unwrap().read(register),
+            },
+        }
     }
 
     /// Applies a trapped system register write.
     fn write_system_register(&self, core: usize, register: SysReg, value: u64) -> Option<()> {
-        self.timers.write(core, timer_register(register)?, value)
+        match timer_register(register) {
+            Some(timer) => self.timers.write(core, timer, value),
+            None => self.pmus[core].lock().unwrap().write(register, value),
+        }
     }
 }
 
@@ -1119,6 +1150,9 @@ struct Session<'a> {
     paced_until: Option<Instant>,
     stop: AtomicBool,
     started: AtomicUsize,
+    /// Per core: whether it has a thread, and what a thread whose core was
+    /// switched off is to start it with.
+    switches: [Mutex<(bool, Option<CoreEntry>)>; CORE_COUNT],
     reports: mpsc::Sender<CoreReport>,
     smc_counts: Mutex<BTreeMap<&'static str, u64>>,
     /// Relocated minus image address of the kernel, once a core has been
@@ -1174,6 +1208,9 @@ struct Probes {
 /// How long a core runs guest code at most before it pays its pacing debt.
 const PACING_SLICE: Duration = Duration::from_micros(100);
 
+/// How often a sleeping console looks for what would wake it.
+const WAKE_POLL: Duration = Duration::from_millis(5);
+
 /// Addresses of the two breakpoints supervisor call tracing takes.
 #[derive(Clone, Copy)]
 struct SvcProbes {
@@ -1196,6 +1233,7 @@ impl<'env> Session<'env> {
         entry: CoreEntry,
     ) {
         self.started.fetch_add(1, Ordering::SeqCst);
+        self.switches[core].lock().unwrap().0 = true;
         scope.spawn(move || {
             // A core that dies without reporting would leave `run` waiting
             // for it forever, so a panic is reported before it propagates.
@@ -1635,6 +1673,7 @@ impl<'env> Session<'env> {
         let arguments = registers;
         let machine = self.machine;
         let effect = machine.secmon.call(
+            core,
             immediate,
             &mut registers,
             &machine.bus,
@@ -1653,26 +1692,57 @@ impl<'env> Session<'env> {
             });
         }
 
-        match effect {
+        let restart = match effect {
             SmcEffect::Panic { code } => return Ok(Some(CoreStop::KernelPanic { code })),
             SmcEffect::Unimplemented(what) => return Ok(Some(CoreStop::UnimplementedSmc(what))),
-            SmcEffect::Resume | SmcEffect::StartCore { .. } => {}
-        }
-        for (index, &register) in registers.iter().enumerate() {
-            vcpu.set_gpr(index as u8, register)?;
-        }
-        // An SMC trapped to the hypervisor reports the SMC itself as the
-        // return address, unlike HVC.
-        skip_instruction(vcpu)?;
-        if let SmcEffect::StartCore {
-            core,
-            entry,
-            context,
-        } = effect
-        {
-            self.start_core(scope, core, CoreEntry::secondary(entry, context));
-        }
-        Ok(None)
+            SmcEffect::PowerOff => loop {
+                if self.stop.load(Ordering::SeqCst) {
+                    return Ok(Some(CoreStop::Requested));
+                }
+                if let Some(entry) = self.switches[core].lock().unwrap().1.take() {
+                    break entry;
+                }
+                machine.signals.wait(core);
+            },
+            SmcEffect::Sleep { entry, context } => {
+                while !machine.soc.wake_pending() {
+                    if self.stop.load(Ordering::SeqCst) {
+                        return Ok(Some(CoreStop::Requested));
+                    }
+                    thread::sleep(WAKE_POLL);
+                }
+                (self.options.trace)(TraceEvent::Woke { core });
+                CoreEntry::secondary(entry, context)
+            }
+            SmcEffect::Resume | SmcEffect::StartCore { .. } => {
+                for (index, &register) in registers.iter().enumerate() {
+                    vcpu.set_gpr(index as u8, register)?;
+                }
+                // An SMC trapped to the hypervisor reports the SMC itself
+                // as the return address, unlike HVC.
+                skip_instruction(vcpu)?;
+                if let SmcEffect::StartCore {
+                    core,
+                    entry,
+                    context,
+                } = effect
+                {
+                    let entry = CoreEntry::secondary(entry, context);
+                    let mut switch = self.switches[core].lock().unwrap();
+                    if switch.0 {
+                        // Its thread is waiting for this.
+                        switch.1 = Some(entry);
+                        drop(switch);
+                        machine.signals.notify(core);
+                    } else {
+                        drop(switch);
+                        self.start_core(scope, core, entry);
+                    }
+                }
+                return Ok(None);
+            }
+        };
+        machine.start_vcpu(vcpu, restart).map(|()| None)
     }
 
     /// Emulates a trapped system register access: CPU identification and

@@ -65,6 +65,16 @@ const AFI_MSI_EN_VEC: usize = AFI + 0x8c;
 const AFI_INTR_MASK: usize = AFI + 0xb4;
 const AFI_INTR_MASK_MSI: u32 = 1 << 8;
 const AFI_PEX_CTRL: [usize; 2] = [AFI + 0x110, AFI + 0x118];
+/// AFI_PCIE_PME (AFI + 0xf0): per port, a bit that sends PME_Turn_Off down
+/// the link and one that reports the PME_TO_Ack coming back (Linux
+/// `pci-tegra.c`, `tegra_pcie_pme_turnoff` and the port table this SoC
+/// shares with Tegra20: turn-off bits 0 and 8, acknowledge bits 5 and 10).
+/// `pcie` does this before the console sleeps (read at +0x38f0). A
+/// function on a trained link acknowledges, as the specification requires
+/// of every function (PCIe Base 5.3.3.2.1); a port with no link never
+/// does.
+const PME_TURN_OFF: [u32; 2] = [1 << 0, 1 << 8];
+const PME_ACK: [u32; 2] = [1 << 5, 1 << 10];
 /// FPCI addresses from here up are the AFI's own spaces (configuration,
 /// I/O, MSI), not memory a function decodes (Linux's FPCI map).
 const FPCI_SPECIAL: u64 = 0xfc_0000_0000;
@@ -183,7 +193,7 @@ impl Pcie {
             )
         } else {
             matches!(offset, 0x30c8 | 0x30d0 | 0x3800..=0x3844 |
-                0x3860..=0x38c8 | 0x38f8 | 0x3904 | 0x3910 | 0x3918 |
+                0x3860..=0x38c8 | 0x38f0 | 0x38f8 | 0x3904 | 0x3910 | 0x3918 |
                 0x3934..=0x3954 | 0x3960 | 0x3968)
         }
     }
@@ -226,6 +236,10 @@ impl MmioDevice for Pcie {
             0x1f00 if up(1) => regs[index] | 1 << 30,
             0x090 if up(0) => regs[index] | LINK_STATUS_UP,
             0x1090 if up(1) => regs[index] | LINK_STATUS_UP,
+            0x38f0 => (0..2).fold(regs[index], |value, port| {
+                let acknowledged = regs[index] & PME_TURN_OFF[port] != 0 && up(port);
+                value & !PME_ACK[port] | if acknowledged { PME_ACK[port] } else { 0 }
+            }),
             _ => regs[index],
         };
         Some(u64::from((value >> shift) & mask))

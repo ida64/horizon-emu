@@ -149,7 +149,16 @@ fn decode(offset: u64) -> (usize, u64, bool) {
 
 impl MmioDevice for Gpio {
     fn read(&self, _core: usize, offset: u64, size: u8) -> Option<u64> {
-        let (index, row, masked) = decode(word(offset, size)?);
+        // A one-byte load at a register's address gets its low byte, where
+        // every row but `INT_LVL` has all it holds: the driver saves the
+        // debounce enables that way before the console sleeps (Bus, read
+        // at 0x6000d0b0).
+        let offset = match size {
+            1 => word(offset, 4)?,
+            _ => word(offset, size)?,
+        };
+        let low_end = if size == 1 { 0xFF } else { u32::MAX };
+        let (index, row, masked) = decode(offset);
         let port = self.ports.lock().unwrap()[index];
         let value = match row {
             DEBOUNCE_ENABLE if masked => port.debounce_enable.into(),
@@ -178,7 +187,7 @@ impl MmioDevice for Gpio {
             INT_CLR if !masked => 0,
             _ => return None,
         };
-        Some(value.into())
+        Some((value & low_end).into())
     }
 
     fn write(&self, _core: usize, offset: u64, size: u8, value: u64) -> Option<()> {
