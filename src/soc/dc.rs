@@ -207,6 +207,21 @@ const COLOR_DEPTH_R8G8B8A8: u32 = 13;
 /// this format (`PIXEL_FORMAT_RGB_565`); seen for `hello-world.nro` run
 /// from hbmenu.
 const COLOR_DEPTH_B5G6R5: u32 = 6;
+/// 16 bits per pixel, four each: red in bits 3:0, green in 7:4, blue in
+/// 11:8, alpha in 15:12 (Linux `dc.c` gives this depth to
+/// `DRM_FORMAT_ABGR4444`). The `fatal` program draws its error screen in
+/// this format.
+const COLOR_DEPTH_R4G4B4A4: u32 = 27;
+
+/// The 16-bit pixel formats: where each of red, green, blue and alpha is
+/// in the pixel (lowest bit, width); no alpha is opaque.
+#[derive(Clone, Copy)]
+struct Narrow([(u32, u32); 3], Option<(u32, u32)>);
+
+impl Narrow {
+    const B5G6R5: Self = Self([(11, 5), (5, 6), (0, 5)], None);
+    const R4G4B4A4: Self = Self([(0, 4), (4, 4), (8, 4)], Some((12, 4)));
+}
 
 /// Surface kinds (Linux `dc.h`): pitch-linear, or the GPU's block-linear
 /// layout with the block height in GOBs, as a power of two, in bits 6:4.
@@ -632,13 +647,15 @@ impl Window<'_> {
     /// `scratch.fetched`, and says where each pixel of the window is there.
     fn fetch(&self, memory: &DeviceMemory, scratch: &mut Scratch) -> Result<Layout, NoFrame> {
         let halves = |value: u32| (value & 0xFFFF, value >> 16);
-        // Red first among the 32-bit formats; `None` for 16 bits a pixel.
-        let red_first = match self.value(register::WIN_COLOR_DEPTH) {
-            COLOR_DEPTH_B8G8R8A8 => Some(false),
-            COLOR_DEPTH_R8G8B8A8 => Some(true),
-            COLOR_DEPTH_B5G6R5 => None,
+        // Red first among the 32-bit formats, or the layout of 16 bits.
+        let depth = match self.value(register::WIN_COLOR_DEPTH) {
+            COLOR_DEPTH_B8G8R8A8 => Ok(false),
+            COLOR_DEPTH_R8G8B8A8 => Ok(true),
+            COLOR_DEPTH_B5G6R5 => Err(Narrow::B5G6R5),
+            COLOR_DEPTH_R4G4B4A4 => Err(Narrow::R4G4B4A4),
             depth => return Err(NoFrame::Unsupported(format!("color depth {depth}"))),
         };
+        let red_first = depth.ok();
         let pixel_bytes: u32 = if red_first.is_some() { 4 } else { 2 };
         let byte_swap = self.value(register::WIN_BYTE_SWAP);
         if byte_swap > BYTE_SWAP_SWAP4 || (pixel_bytes == 2 && byte_swap > BYTE_SWAP_SWAP2) {
@@ -742,13 +759,14 @@ impl Window<'_> {
             BYTE_SWAP_SWAP4 => [3, 2, 1, 0],
             _ => [0, 1, 2, 3],
         };
-        let order = match red_first {
-            Some(true) => swapped,
-            Some(false) => [swapped[2], swapped[1], swapped[0], swapped[3]],
-            None => {
+        let order = match depth {
+            Ok(true) => swapped,
+            Ok(false) => [swapped[2], swapped[1], swapped[0], swapped[3]],
+            Err(format) => {
                 widen(
                     narrow,
                     fetched,
+                    format,
                     byte_swap == BYTE_SWAP_SWAP2,
                     options & COLOR_EXPAND != 0,
                 );
@@ -922,20 +940,18 @@ fn copy(
     }
 }
 
-/// Widens 16-bit `B5G6R5` pixels into red, green, blue and opaque alpha
-/// bytes. With `expand` (the window's `COLOR_EXPAND` option) each
-/// component's top bits are repeated into the low bits it lacks, so white
-/// stays white; without it the low bits are zero. That is what the option's
-/// name and Linux's use of it (always set for 16-bit windows) suggest
-/// [assumption: the TRM's description of the option is not at hand].
-fn widen(narrow: &[u8], pixels: &mut [[u8; 4]], swapped: bool, expand: bool) {
-    let grow = |value: u16, bits: u32| {
-        let high = (value << (8 - bits)) as u8;
-        if expand {
-            high | (value >> (2 * bits - 8)) as u8
-        } else {
-            high
-        }
+/// Widens 16-bit pixels into red, green, blue and alpha bytes. With
+/// `expand` (the window's `COLOR_EXPAND` option) each component's top bits
+/// are repeated into the low bits it lacks, so white stays white; without
+/// it the low bits are zero. That is what the option's name and Linux's
+/// use of it (always set for 16-bit windows) suggest [assumption: the
+/// TRM's description of the option is not at hand].
+fn widen(narrow: &[u8], pixels: &mut [[u8; 4]], format: Narrow, swapped: bool, expand: bool) {
+    let Narrow(colors, alpha) = format;
+    let grow = |value: u16, (low, bits): (u32, u32)| {
+        let value = u32::from(value) >> low & ((1 << bits) - 1);
+        let high = value << (8 - bits);
+        (if expand { high | high >> bits } else { high }) as u8
     };
     for (pixel, two) in pixels.iter_mut().zip(narrow.as_chunks::<2>().0) {
         let value = if swapped {
@@ -944,10 +960,10 @@ fn widen(narrow: &[u8], pixels: &mut [[u8; 4]], swapped: bool, expand: bool) {
             u16::from_le_bytes(*two)
         };
         *pixel = [
-            grow(value >> 11, 5),
-            grow(value >> 5 & 0x3F, 6),
-            grow(value & 0x1F, 5),
-            0xFF,
+            grow(value, colors[0]),
+            grow(value, colors[1]),
+            grow(value, colors[2]),
+            alpha.map_or(0xFF, |alpha| grow(value, alpha)),
         ];
     }
 }
@@ -1749,6 +1765,17 @@ mod tests {
             shown(COLOR_EXPAND),
             [255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255]
         );
+        // The same four as `R4G4B4A4`: 0xFFFF is white, 0xF800 blue 8 with
+        // full alpha, 0x07E0 green 14 and blue 7, 0x001F red 15 and green 1.
+        let dc = configured();
+        write(&dc, register::WIN_COLOR_DEPTH, COLOR_DEPTH_R4G4B4A4);
+        write(&dc, register::WIN_PRESCALED_SIZE, 2 << 16 | 4);
+        write(&dc, register::WIN_OPTIONS, WIN_ENABLE | COLOR_EXPAND);
+        write(&dc, register::DISPLAY_COMMAND, DISPLAY_MODE_CONTINUOUS);
+        write(&dc, register::STATE_CONTROL, 0x003);
+        let rgb = dc.frame(&memory).unwrap().rgb();
+        assert_eq!(rgb[15..21], [255, 255, 255, 0, 0, 0x88]);
+        assert_eq!(rgb[27..33], [0, 0xEE, 0x77, 0xFF, 0x11, 0]);
         assert_eq!(shown(0), [248, 252, 248, 248, 0, 0, 0, 252, 0, 0, 0, 248]);
     }
 
