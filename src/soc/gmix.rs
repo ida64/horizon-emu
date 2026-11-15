@@ -26,6 +26,20 @@
 //! releases them because closing first plays out every queued buffer
 //! (`0x80503158`, which consumes each whole buffer, `0x8050317C`).
 //!
+//! # Devices
+//!
+//! `audio` opens, starts and closes `gmix`'s two output devices (target 7,
+//! index 0 the speaker, index 1 the second device) with the same commands.
+//! Each device has an area in `gmix`'s shared memory, `0x2B2B8` and
+//! `0x2BBD0` (`0x80500DB4`; `audio` text `0x135bc` and `0x136bc` keep the
+//! same addresses), whose word at `0x910` is the device's state: `Open`
+//! (`0x80503828`) sets it to 2 and `Close` (`0x805038B0`) to 1, after
+//! counting the close (`0x80502C46`, which asserts the device is open).
+//! When the system goes to sleep, `audio`'s power-state handler closes the
+//! speaker (text `0x15680`, on psc's request for minimum awake) and polls
+//! every 5 ms, without a time limit, until that word is 1; psc does not
+//! let the sleep go on before `audio` acknowledges.
+//!
 //! # Playing
 //!
 //! `gmix` mixes the sessions into the speaker output (target 7, index 0,
@@ -47,8 +61,8 @@
 //! repeat that sessions played.
 //!
 //! Commands for other targets (renderer, capture, near-voice and game
-//! recording sessions, the second device) are taken without effect, as
-//! before; no client of those is modeled.
+//! recording sessions) are taken without effect, as before; no client of
+//! those is modeled.
 
 /// `gmix`'s shared memory, as the DSP reaches it.
 pub trait Shared {
@@ -64,6 +78,12 @@ const QUEUE_SLOTS: usize = 4;
 /// Descriptor of output session `n`: `0x2B060 + 24 n` (176224 in
 /// `0x80500DB4`).
 const DESCRIPTORS: u32 = 0x2_B060;
+/// Each device's area in `gmix`'s shared memory (`0x80500DB4`), and the
+/// offset of its state word in it.
+const DEVICE_AREAS: [u32; 2] = [0x2_B2B8, 0x2_BBD0];
+const DEVICE_STATE: u32 = 0x910;
+const DEVICE_OPEN: u32 = 2;
+const DEVICE_CLOSED: u32 = 1;
 /// One period of the speaker's DMA, in frames.
 pub const PERIOD_FRAMES: u32 = 240;
 /// The notification record of a period in which output sessions played.
@@ -142,13 +162,14 @@ struct Session {
 pub struct Streams {
     default_device: u32,
     sessions: [Session; OUTPUT_SESSIONS],
-    speaker: Counts,
+    /// The devices' counts; index 0 is the speaker.
+    devices: [Counts; 2],
 }
 
 impl Streams {
     /// Whether the speaker plays, so that periods pass.
     pub fn playing(&self) -> bool {
-        self.speaker.playing()
+        self.devices[0].playing()
     }
 
     /// One command record (opcode first, without the word count).
@@ -168,18 +189,26 @@ impl Streams {
             OPEN..=RELEASE_ALL => (word(1)?, word(2)? as usize),
             _ => return Ok(()),
         };
-        if target == DEVICE_TARGET && index == 0 {
+        if target == DEVICE_TARGET {
+            let counts = self
+                .devices
+                .get_mut(index)
+                .ok_or_else(|| format!("gmix has no device {index}"))?;
+            let state = DEVICE_AREAS[index] + DEVICE_STATE;
             return match opcode {
                 OPEN => {
-                    self.speaker.open += 1;
-                    Ok(())
+                    counts.open += 1;
+                    shared.write(state, DEVICE_OPEN)
                 }
-                CLOSE => self.speaker.close(),
-                START | STOP | PAUSE | RESUME => self.speaker.count(opcode),
+                CLOSE => {
+                    counts.close()?;
+                    shared.write(state, DEVICE_CLOSED)
+                }
+                START | STOP | PAUSE | RESUME => counts.count(opcode),
                 // Gains and the mute setting (`0x80502CFA`): no sound.
                 GAIN | GAIN_RAMP | GAIN_RAMP_2 => Ok(()),
                 _ => Err(format!(
-                    "gmix command {opcode} for the speaker is not modeled"
+                    "gmix command {opcode} for device {index} is not modeled"
                 )),
             };
         }
@@ -391,5 +420,23 @@ mod tests {
         streams.command(&[RELEASE_ALL, 2, 3], &mut memory).unwrap();
         streams.period(&mut memory).unwrap();
         assert_eq!(memory.read(D + 4).unwrap(), 3);
+    }
+
+    /// `audio` waits without a time limit for a closed device's state word
+    /// before it lets the system sleep.
+    #[test]
+    fn devices_report_open_and_closed_in_their_state_word() {
+        let (mut streams, mut memory) = (Streams::default(), Memory::default());
+        let speaker = 0x2_B2B8 + 0x910;
+        streams.command(&[OPEN, 7, 0], &mut memory).unwrap();
+        assert_eq!(memory.read(speaker).unwrap(), 2);
+        streams.command(&[START, 7, 0], &mut memory).unwrap();
+        streams.command(&[CLOSE, 7, 0], &mut memory).unwrap();
+        assert_eq!(memory.read(speaker).unwrap(), 1);
+        assert!(!streams.playing(), "closing the last reference stops it");
+        streams.command(&[OPEN, 7, 1], &mut memory).unwrap();
+        assert_eq!(memory.read(0x2_BBD0 + 0x910).unwrap(), 2);
+        assert!(streams.command(&[CLOSE, 7, 0], &mut memory).is_err());
+        assert!(streams.command(&[OPEN, 7, 2], &mut memory).is_err());
     }
 }

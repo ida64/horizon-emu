@@ -72,9 +72,15 @@
 //!   record holding the mailbox channel it opened. `audio` polls for that
 //!   record (text `0x12580`) and then sends commands: a record in the
 //!   command queue and its opcode as message (text `0x124f0`). No command
-//!   needs an answer. Its audio output sessions play into nothing in real
-//!   time and give their buffers back ([`super::gmix`]); its other
-//!   commands carry no sound here and are taken without effect.
+//!   is answered with a message. Its audio output sessions play into
+//!   nothing in real time and give their buffers back, and its devices
+//!   report being open or closed in its shared memory ([`super::gmix`]);
+//!   its other commands carry no sound here and are taken without effect.
+//!   Command 0 (`0x80500B0C`) ends its dispatch loop (`0x80500A9A`): its
+//!   main returns (`0x8050088C`) and the OS reports the exit as for the
+//!   renderer. `audio` sends it when the system goes to sleep, after
+//!   closing the speaker, and waits for that exit (text `0x13c10`, then
+//!   `0x195b0`).
 //! * `AudioRenderer` executes the command lists `audio`'s renderers build.
 //!   On channel 50 it answers 22 with 22 and then 32, each 42 (render) with
 //!   32 once the frame is done, and 52 (stop) with 52, after which the
@@ -98,8 +104,13 @@
 //!   into the image (`0x8052A32C`: the SILK decoder's `0x2168` bytes, the
 //!   CELT decoder's `(0x2030 + 4 * 120) * channels + 16 * 21 + 0x58` for
 //!   its 48 kHz mode, `0x50` for the Opus state) plus the dispatcher's
-//!   `0x14` (`0x80520518`). Decoding itself (messages 22 onwards) is not
-//!   modeled and refuses.
+//!   `0x14` (`0x80520518`). Message 2 ends the dispatcher thread
+//!   (`0x80520456`); the decoder's main then joins it, leaves its result
+//!   (0) at `0xFC0`, answers 12 and closes the channel (`0x80520464`), and
+//!   returns without an exit report (the OS started it, `0x805245B4`).
+//!   `audio` sends it when the system goes to sleep and waits at most a
+//!   second for the 12 (text `0x96220`), else it fails with 2111-0259.
+//!   Decoding itself (messages 22 onwards) is not modeled and refuses.
 use std::{
     collections::VecDeque,
     sync::{Arc, Condvar, Mutex, MutexGuard, Weak},
@@ -210,6 +221,8 @@ const LAUNCH_SHARED_DRAM: usize = 5;
 const STATUS_STARTED: u32 = 4;
 /// The application's main returned (`0x80524950`).
 const STATUS_EXITED: u32 = 5;
+/// `gmix`'s command to end its dispatch loop (`0x80500B0C`).
+const GMIX_QUIT: u32 = 0;
 
 /// `gmix`'s shared memory (`0x80500DB4`).
 const GMIX_SIZE: usize = 0x2_EDC8;
@@ -227,6 +240,8 @@ const GMIX_BUFFERS: [(u32, u32, u32); 3] = [
 /// Opus decoder messages on channel 70 (`0x8051FB00`, `0x8051FD08`).
 const OPUS_START: u32 = 1;
 const OPUS_STARTED: u32 = 11;
+const OPUS_STOP: u32 = 2;
+const OPUS_STOPPED: u32 = 12;
 const OPUS_WORK_SIZE: u32 = 21;
 const OPUS_WORK_SIZE_DONE: u32 = 41;
 /// Where in the shared buffer the decoder leaves its results.
@@ -251,6 +266,8 @@ enum Opus {
     Ready(u32),
     /// Got a work buffer size request; waiting for the channel count.
     WorkSize(u32),
+    /// The decoder's main has returned.
+    Stopped,
 }
 
 /// Renderer messages on channel 50 (`0x80504140`).
@@ -277,7 +294,10 @@ struct State {
     control: u32,
     /// `gmix`'s shared memory, once launched.
     gmix: Option<u32>,
-    /// `gmix`'s output sessions and speaker (see [`super::gmix`]).
+    /// The host's pointer to its instance of `gmix`, from the launch
+    /// request, which the exit status hands back.
+    gmix_instance: [u32; 2],
+    /// `gmix`'s output sessions and devices (see [`super::gmix`]).
     streams: Streams,
     /// When the speaker's next period ends, while it plays.
     period_due: Option<Instant>,
@@ -322,6 +342,7 @@ impl Adsp {
                 outbox: VecDeque::new(),
                 control: 0,
                 gmix: None,
+                gmix_instance: [0; 2],
                 streams: Streams::default(),
                 period_due: None,
                 renderer: None,
@@ -591,6 +612,8 @@ impl Inner {
             GMIX_APP => {
                 self.start_gmix(shared)?;
                 state.gmix = Some(shared);
+                state.gmix_instance = [request[1], request[2]];
+                state.streams = Streams::default();
             }
             RENDERER_APP => {
                 state.renderer = Some(shared);
@@ -633,6 +656,17 @@ impl Inner {
             .ok_or_else(|| format!("gmix command {opcode} without a record"))?;
         if command.first() != Some(&opcode) {
             return Err(format!("gmix command {opcode} with record {command:x?}"));
+        }
+        // Its main returns and the OS reports the exit: status record 5
+        // with the host's instance pointer and message 5 on the application
+        // service channel (`0x80524950`).
+        if opcode == GMIX_QUIT {
+            state.gmix = None;
+            state.period_due = None;
+            let [low, high] = state.gmix_instance;
+            self.enqueue(DSP_QUEUE, &[5, STATUS_EXITED, low, high, 0, 0])?;
+            self.send(state, APP_SERVICE, STATUS_EXITED);
+            return Ok(());
         }
         let mut memory = GmixMemory { inner: self, base };
         state.streams.command(&command, &mut memory)?;
@@ -680,6 +714,11 @@ impl Inner {
                 Opus::Ready(buffer)
             }
             (Opus::Ready(buffer), OPUS_WORK_SIZE) => Opus::WorkSize(buffer),
+            (Opus::Ready(buffer), OPUS_STOP) => {
+                self.write_word(buffer + OPUS_RESULT, 0)?;
+                self.send(state, OPUS, OPUS_STOPPED);
+                Opus::Stopped
+            }
             (Opus::WorkSize(buffer), channels @ (1 | 2)) => {
                 self.write_word(buffer + OPUS_RESULT, opus_work_size(channels))?;
                 self.send(state, OPUS, OPUS_WORK_SIZE_DONE);
@@ -1004,6 +1043,49 @@ mod tests {
         assert!(adsp.0.state.lock().unwrap().period_due.is_none());
     }
 
+    /// What `audio` does when the system goes to sleep: it closes the
+    /// speaker and waits for its state word, then has `gmix` quit and waits
+    /// for the exit.
+    #[test]
+    fn gmix_closes_the_speaker_and_quits() {
+        let (adsp, ram, agic, _) = dsp();
+        adsp.release();
+        receive(&adsp, &agic);
+        while host_dequeue(&ram, DSP_QUEUE).is_some() {}
+        let base = 0x8080_0000;
+        let mut request = [0u32; 1 + LAUNCH_WORDS];
+        request[0] = LAUNCH_WORDS as u32;
+        request[1] = GMIX_APP;
+        request[2] = 0x9ABC;
+        request[1 + LAUNCH_SHARED_DRAM] = base;
+        request[1 + LAUNCH_COMMAND] = LAUNCH_RUN;
+        adsp.0.enqueue(HOST_QUEUE, &request).unwrap();
+        send(&adsp, &agic, APP_SERVICE, 0);
+        receive(&adsp, &agic);
+        while host_dequeue(&ram, DSP_QUEUE).is_some() {}
+        let state = base + 0x2_B2B8 + 0x910;
+        for (record, word) in [(&[3, 8, 7, 0], 2), (&[3, 9, 7, 0], 1)] {
+            adsp.0.enqueue(base, record).unwrap();
+            send(&adsp, &agic, GMIX, record[1]);
+            assert_eq!(word_at(&ram, state), word);
+        }
+        adsp.0.enqueue(base, &[1, GMIX_QUIT]).unwrap();
+        send(&adsp, &agic, GMIX, GMIX_QUIT);
+        assert_eq!(
+            receive(&adsp, &agic),
+            FULL | APP_SERVICE << 20 | STATUS_EXITED
+        );
+        assert_eq!(
+            host_dequeue(&ram, DSP_QUEUE),
+            Some(vec![STATUS_EXITED, 0x9ABC, 0, 0, 0])
+        );
+        // Its channel is gone.
+        assert_eq!(
+            adsp.write(0, TO_DSP, 4, u64::from(FULL | GMIX << 20 | 1)),
+            None
+        );
+    }
+
     #[test]
     fn opus_start_and_work_sizes() {
         let (adsp, ram, agic, _) = dsp();
@@ -1028,6 +1110,14 @@ mod tests {
         }
         assert_eq!(
             adsp.write(0, TO_DSP, 4, u64::from(FULL | OPUS << 20 | 24)),
+            None
+        );
+        // Stop: the decoder answers 12 with result 0 and closes the channel.
+        send(&adsp, &agic, OPUS, OPUS_STOP);
+        assert_eq!(receive(&adsp, &agic), FULL | OPUS << 20 | OPUS_STOPPED);
+        assert_eq!(word_at(&ram, buffer + OPUS_RESULT), 0);
+        assert_eq!(
+            adsp.write(0, TO_DSP, 4, u64::from(FULL | OPUS << 20 | OPUS_WORK_SIZE)),
             None
         );
     }
