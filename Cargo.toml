@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 aes = "0.8"
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+bincode = "1.3.3"
 font8x8 = { version = "0.3", default-features = false }
 hmac = "0.12"
 libc = "0.2"

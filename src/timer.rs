@@ -3,18 +3,24 @@
 //! The kernel drives everything time-related from `CNTPCT_EL0` and
 //! `CNTP_CTL_EL0`/`CNTP_CVAL_EL0` (`0x800ceea0`), and assumes the console's
 //! 19.2 MHz counter without ever reading `CNTFRQ_EL0`. The host counter runs
-//! at another rate, so the counter is synthesized from host time instead of
-//! exposing the host's.
+//! at another rate, so the counter is synthesized from guest time
+//! ([`GuestClock`]) instead of exposing the host's.
 
 use std::{
     sync::{
-        Condvar, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use crate::boot::CORE_COUNT;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    boot::CORE_COUNT,
+    clock::GuestClock,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 /// System counter frequency of the console.
 pub const COUNTER_HZ: u64 = 19_200_000;
@@ -37,7 +43,7 @@ pub enum TimerRegister {
     CompareValue,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 struct PhysicalTimer {
     /// ENABLE and IMASK only; ISTATUS is derived.
     control: u64,
@@ -61,7 +67,7 @@ impl PhysicalTimer {
 pub type TimerLine = Box<dyn Fn(usize, bool) + Send + Sync>;
 
 pub struct Timers {
-    epoch: Instant,
+    clock: Arc<GuestClock>,
     line: TimerLine,
     /// Held across every `line` call so that the levels reach the interrupt
     /// controller in the order they were computed.
@@ -70,10 +76,11 @@ pub struct Timers {
 }
 
 impl Timers {
-    /// The counter starts at zero now and advances with host time.
-    pub fn new(line: TimerLine) -> Self {
+    /// The counter counts guest time ([`GuestClock`]): zero when the machine
+    /// is built.
+    pub fn new(clock: Arc<GuestClock>, line: TimerLine) -> Self {
         Self {
-            epoch: Instant::now(),
+            clock,
             line,
             timers: Mutex::new([PhysicalTimer::default(); CORE_COUNT]),
             changed: Condvar::new(),
@@ -81,7 +88,7 @@ impl Timers {
     }
 
     pub fn count(&self) -> u64 {
-        ticks(self.epoch.elapsed())
+        ticks(self.clock.now())
     }
 
     /// Reads a register as `core` sees it.
@@ -132,14 +139,12 @@ impl Timers {
             let next_deadline = timers
                 .iter()
                 .filter(|timer| timer.control == CONTROL_ENABLE && timer.compare_value > count)
-                .map(|timer| timer.compare_value - count)
+                .map(|timer| timer.compare_value)
                 .min();
             timers = match next_deadline {
-                Some(ticks) => {
-                    self.changed
-                        .wait_timeout(timers, duration(ticks))
-                        .unwrap()
-                        .0
+                Some(compare_value) => {
+                    let wait = self.clock.until(duration(compare_value));
+                    self.changed.wait_timeout(timers, wait).unwrap().0
                 }
                 None => self.changed.wait(timers).unwrap(),
             };
@@ -152,6 +157,18 @@ impl Timers {
         // notification cannot fall between that check and the wait.
         let _timers = self.timers.lock().unwrap();
         self.changed.notify_all();
+    }
+}
+
+impl Snapshot for Timers {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&*self.timers.lock().unwrap())
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        *self.timers.lock().unwrap() = decode("CNTP timers", state)?;
+        self.changed.notify_all();
+        Ok(())
     }
 }
 

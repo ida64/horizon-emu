@@ -52,15 +52,12 @@ pub mod wifi_ap;
 pub mod xusb_device;
 pub mod xusb_padctl;
 
-use std::{
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Instant,
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 
-use crate::{boot::BootParams, bus::Bus, gic::Gic, memory::GuestRam};
+use crate::{boot::BootParams, bus::Bus, clock::GuestClock, gic::Gic, memory::GuestRam};
 
 use self::{
     bq24193::Bq24193,
@@ -314,6 +311,8 @@ pub struct Soc {
     /// The WiFi function of the radio, for placing an access point around
     /// it (`--wifi-ssid`); set once the PCIe root complex is built.
     pub wifi: std::sync::OnceLock<Arc<bcm4356::Bcm4356Wifi>>,
+    /// Guest time, which the SoC's clocks count.
+    pub clock: Arc<GuestClock>,
     gic: Arc<Gic>,
     dc: Arc<Dc>,
     /// The external output's display controller; nothing is attached to it.
@@ -335,6 +334,7 @@ impl Soc {
         params: &BootParams,
         gic: &Arc<Gic>,
         ram: &Arc<GuestRam>,
+        clock: &Arc<GuestClock>,
         emmc: Option<EmmcImages>,
         sd_card: Option<SdCardImage>,
         bus: &mut Bus,
@@ -344,11 +344,14 @@ impl Soc {
         let violations = Arc::clone(&notes);
         mc.on_violation(Box::new(move |violation| violations.add(violation)));
         let syncpoints = Arc::new(Syncpoints::new(line(gic, HOST1X_SYNCPT_INTID)));
-        let built = Instant::now();
+        let elapsed = |clock: &Arc<GuestClock>| {
+            let clock = Arc::clone(clock);
+            Box::new(move || clock.now())
+        };
         let controller = |intid| {
             Arc::new(Dc::new(
                 Arc::clone(&syncpoints),
-                Box::new(move || built.elapsed()),
+                elapsed(clock),
                 line(gic, intid),
             ))
         };
@@ -359,7 +362,7 @@ impl Soc {
                 line(gic, gm20b::STALL_INTID),
                 line(gic, gm20b::NONSTALL_INTID),
             ],
-            Box::new(move || built.elapsed()),
+            elapsed(clock),
             gm20b::maxwell_engines(Arc::clone(&syncpoints)),
             Arc::clone(&notes),
         );
@@ -422,6 +425,7 @@ impl Soc {
             pmic: max77620::Max77620::new(line(gic, PMU_INTID)),
             pmc: Arc::new(Pmc::new()),
             wifi: std::sync::OnceLock::new(),
+            clock: Arc::clone(clock),
             gic: Arc::clone(gic),
             dc: controller(DC_INTID),
             dcb: controller(DCB_INTID),
@@ -670,7 +674,7 @@ impl Soc {
             "timers",
             tmr::BASE,
             tmr::SIZE,
-            Box::new(Timers::new(Box::new(move || built.elapsed()))),
+            Box::new(Timers::new(elapsed(clock))),
         );
         bus.map(
             "chip ID",
@@ -819,6 +823,14 @@ impl Soc {
     /// the console that are not.
     pub fn wake_pending(&self) -> bool {
         self.pmic.interrupt() && self.pmc.wake(pmc::WAKE_EVENT_PMIC, false)
+    }
+
+    /// Parts with state that no bus device saves, keyed by a name unique
+    /// within the SoC: devices reached only through [`Soc`]'s fields, and
+    /// state a bus device's [`MmioDevice::snapshot`](crate::bus::MmioDevice::snapshot)
+    /// leaves to another part.
+    pub fn snapshot_parts(&self) -> Vec<(&'static str, &dyn crate::snapshot::Snapshot)> {
+        Vec::new()
     }
 
     /// Where each GPU channel stands, a line each.

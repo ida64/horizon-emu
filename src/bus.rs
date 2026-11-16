@@ -2,6 +2,8 @@
 
 use std::{ops::Range, sync::Arc};
 
+use crate::snapshot::{Snapshot, SnapshotError};
+
 /// A memory-mapped device. Accesses arrive from the core threads, so devices
 /// synchronize internally.
 ///
@@ -12,6 +14,12 @@ pub trait MmioDevice: Send + Sync {
     fn read(&self, core: usize, offset: u64, size: u8) -> Option<u64>;
     /// Writes the low `size` bytes of `value` at `offset`.
     fn write(&self, core: usize, offset: u64, size: u8, value: u64) -> Option<()>;
+    /// Saves and restores the device's state; `None` until the device can,
+    /// which makes a snapshot of the machine fail. A device without state,
+    /// or whose state another part saves, answers [`NoState`].
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        None
+    }
 }
 
 impl<T: MmioDevice + ?Sized> MmioDevice for Arc<T> {
@@ -21,6 +29,30 @@ impl<T: MmioDevice + ?Sized> MmioDevice for Arc<T> {
 
     fn write(&self, core: usize, offset: u64, size: u8, value: u64) -> Option<()> {
         (**self).write(core, offset, size, value)
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        (**self).snapshot()
+    }
+}
+
+/// The [`Snapshot`] of a device with no state of its own, or one whose
+/// state another part of the machine saves.
+pub struct NoState;
+
+impl Snapshot for NoState {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        Ok(Vec::new())
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        if state.is_empty() {
+            Ok(())
+        } else {
+            Err(SnapshotError::Corrupt(
+                "state for a device that has none".into(),
+            ))
+        }
     }
 }
 
@@ -84,6 +116,17 @@ impl Bus {
             .iter()
             .find(|region| region.range.contains(&address))
             .map(|region| region.name)
+    }
+
+    /// Every mapped device with the key its state is saved under: its
+    /// name and base address (a device type may be mapped more than once).
+    pub fn devices(&self) -> impl Iterator<Item = (String, &dyn MmioDevice)> {
+        self.regions.iter().map(|region| {
+            (
+                format!("{}@{:#x}", region.name, region.range.start),
+                region.device.as_ref(),
+            )
+        })
     }
 
     fn route<T>(

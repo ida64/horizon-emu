@@ -18,6 +18,7 @@ use crate::{
     arm64::{DataAbort, LoadStore, SysReg, SysRegAccess, TranslationRegime, exception_class},
     boot::{self, BootParams, CORE_COUNT, CoreEntry},
     bus::{Access, Bus, MmioDevice},
+    clock::GuestClock,
     gic::Gic,
     hvf::{
         Exit, HvError, Vcpu, VcpuHandle, Vm,
@@ -693,6 +694,8 @@ pub struct Machine {
     engine_memory: DeviceMemory,
     bus: Bus,
     gic: Arc<Gic>,
+    /// Guest time, which every clock the guest sees counts.
+    clock: Arc<GuestClock>,
     timers: Timers,
     /// Each core's performance monitor registers.
     pmus: [Mutex<Pmu>; CORE_COUNT],
@@ -727,7 +730,8 @@ impl Machine {
             let signals = Arc::clone(&signals);
             Box::new(move |core| signals.notify(core))
         }));
-        let timers = Timers::new({
+        let clock = Arc::new(GuestClock::new());
+        let timers = Timers::new(Arc::clone(&clock), {
             let gic = Arc::clone(&gic);
             Box::new(move |core, level| gic.set_line(core, PHYSICAL_TIMER_INTID, level))
         });
@@ -750,8 +754,8 @@ impl Machine {
             GIC_CPU_INTERFACE_SIZE,
             Box::new(GicCpuInterface(Arc::clone(&gic))),
         );
-        let soc =
-            Soc::new(params, &gic, &ram, emmc, sd_card, &mut bus).map_err(MachineError::Emmc)?;
+        let soc = Soc::new(params, &gic, &ram, &clock, emmc, sd_card, &mut bus)
+            .map_err(MachineError::Emmc)?;
 
         Ok(Self {
             vm,
@@ -761,6 +765,7 @@ impl Machine {
             secmon: SecureMonitor::new(params, keys),
             bus,
             gic,
+            clock,
             timers,
             pmus: Default::default(),
             soc,
