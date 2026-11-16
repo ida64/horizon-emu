@@ -1,4 +1,6 @@
+mod control;
 mod homebrew_options;
+mod mcp;
 mod script;
 mod window;
 
@@ -162,6 +164,8 @@ options:
                         sleep SECONDS
                         press BUTTON [HOLD_MS]    (default 300)
                         touch X,Y [HOLD_MS]
+                        type TEXT            the rest of the line, key by key
+                                             on the open on-screen keyboard
                         joycons on|off
                         screenshot FILE
                       A press or touch line may end in
@@ -206,6 +210,10 @@ taken as it is, such as one inside a process):
                       modules (base, size, path, build ID), with each code
                       address as module+offset. Watches every supervisor
                       call, like --verbose
+  --control SOCKET    serve requests on a Unix socket at SOCKET while the
+                      machine runs: script steps, screenshots, pixels,
+                      status, stop (one JSON object per line; what
+                      `horizon-emu mcp` drives runs with)
   --survey            do not stop at device accesses nothing models: answer
                       reads with zero, drop writes, and print each. Not a
                       faithful run; it lists what the guest wants
@@ -234,10 +242,15 @@ fn main() -> ExitCode {
 
 /// The whole usage message: the general options and those of homebrew.
 fn usage() -> String {
-    format!("{USAGE}\n\n{}", homebrew_options::USAGE)
+    format!("{USAGE}\n\n{}\n\n{}", homebrew_options::USAGE, mcp::USAGE)
 }
 
 fn run(arguments: &[String]) -> Result<(), String> {
+    if let [command, flags @ ..] = arguments
+        && command == "mcp"
+    {
+        return mcp::serve(flags);
+    }
     let [command, path, flags @ ..] = arguments else {
         return Err(usage());
     };
@@ -407,6 +420,7 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
     let (mut trace_ipc, mut trace_times, mut verbose) = (false, false, false);
     let mut survey = false;
     let mut crash_dump = None::<PathBuf>;
+    let mut control = None::<String>;
     let mut cpu_slowdown = None;
     let (mut breakpoints, mut tracepoints) = (Vec::new(), Vec::new());
     let mut pokes = Vec::new();
@@ -558,6 +572,7 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
             "--trace-times" => trace_times = true,
             "--verbose" => verbose = true,
             "--crash-dump" => crash_dump = Some(PathBuf::from(value()?)),
+            "--control" => control = Some(value()?.clone()),
             "--trace-devices" => trace_devices = true,
             "--survey" => survey = true,
             "--break" => breakpoints.push(value()?),
@@ -629,9 +644,19 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
     for line in homebrew.install_keys(&mut image)?.iter().chain(&replaced) {
         println!("{line}");
     }
-    // A machine somebody is watching runs for as long as they watch.
-    let timeout = timeout.or((!show_window).then_some(Duration::from_secs(5)));
+    // A machine somebody is watching, or something drives, runs for as
+    // long as they do.
+    let timeout = timeout.or((!show_window && control.is_none()).then_some(Duration::from_secs(5)));
 
+    // Bound before the machine is built: a client may connect at once,
+    // and is answered once the machine runs.
+    let control = control
+        .map(|path| {
+            let _ = std::fs::remove_file(&path);
+            std::os::unix::net::UnixListener::bind(&path)
+                .map_err(|error| format!("--control {path}: {error}"))
+        })
+        .transpose()?;
     let machine = Machine::new(image, &params, keys, emmc, sd_card, Box::new(io::stderr()))
         .map_err(|error| error.to_string())?;
     if let Some(ssid) = &wifi_ssid {
@@ -734,9 +759,19 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
     timed_screenshots.sort_by_key(|&(at, _)| at);
     let mut timed_screenshots = timed_screenshots.into_iter().peekable();
     let started = Instant::now();
+    let ended = AtomicBool::new(false);
     let report = thread::scope(|scope| {
         // A window needs this thread, so the machine gets another.
         let run = scope.spawn(|| machine.run(options));
+        if let Some(listener) = control {
+            let controlled = control::Controlled {
+                machine: &machine,
+                stop: &stop,
+                started,
+                ended: &ended,
+            };
+            scope.spawn(move || control::serve(listener, &controlled));
+        }
         while !run.is_finished() {
             watch_screen();
             match &mut window {
@@ -782,8 +817,11 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
                 });
             }
         }
-        run.join()
-            .unwrap_or_else(|payload| panic::resume_unwind(payload))
+        let report = run
+            .join()
+            .unwrap_or_else(|payload| panic::resume_unwind(payload));
+        ended.store(true, Ordering::SeqCst);
+        report
     });
 
     let ended = match report.ended {
@@ -792,7 +830,7 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
             "machine stopped by timeout after {:?}",
             timeout.unwrap_or_default()
         ),
-        RunEnd::Requested => "machine stopped: the window was closed".into(),
+        RunEnd::Requested => "machine stopped: asked to (window closed or stop requested)".into(),
     };
     println!("{ended}");
     log.push(&ended);
@@ -891,8 +929,8 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn write_png(file: File, frame: &Frame) -> Result<(), png::EncodingError> {
-    let mut encoder = png::Encoder::new(io::BufWriter::new(file), frame.width, frame.height);
+fn write_png(writer: impl Write, frame: &Frame) -> Result<(), png::EncodingError> {
+    let mut encoder = png::Encoder::new(io::BufWriter::new(writer), frame.width, frame.height);
     encoder.set_color(png::ColorType::Rgb);
     encoder.set_depth(png::BitDepth::Eight);
     encoder.write_header()?.write_image_data(&frame.rgb())

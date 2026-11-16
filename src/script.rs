@@ -100,7 +100,7 @@ pub struct Script {
 }
 
 impl Script {
-    /// Reads a script: a step per line, nothing after `#`.
+    /// Reads a script: a step per line, nothing after `#` (but in `type`).
     ///
     /// ```text
     /// wait X,Y RRGGBB       until that pixel of the 1280x720 screen is that colour
@@ -110,12 +110,26 @@ impl Script {
     /// touch X,Y [HOLD_MS] [until X,Y RRGGBB [SECONDS]]
     ///                       with `until`: again every SECONDS (3) until
     ///                       that pixel is that colour; not at all if it is
+    /// type TEXT             the rest of the line, on the open on-screen
+    ///                       keyboard, key by key
     /// joycons on|off
     /// screenshot FILE
     /// ```
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut steps = Vec::new();
         for (index, line) in text.lines().enumerate() {
+            // What `type` types is the rest of its line, `#` and spaces too.
+            if let Some(typed) = line.trim_start().strip_prefix("type ") {
+                let touches = keyboard_touches(typed)
+                    .map_err(|error| format!("line {}: {error}", index + 1))?;
+                // Only the last touch reports the line as done.
+                let count = touches.len();
+                for (at, touch) in touches.into_iter().enumerate() {
+                    let text = if at + 1 == count { line.trim() } else { "" };
+                    steps.push((index + 1, text.to_string(), touch));
+                }
+                continue;
+            }
             let line = line.split('#').next().unwrap_or_default().trim();
             if line.is_empty() {
                 continue;
@@ -216,7 +230,9 @@ impl Script {
 
     fn finish(&mut self, report: &mut impl FnMut(Event)) {
         let (line, text, _) = &self.steps[self.next];
-        report(Event::Done { line: *line, text });
+        if !text.is_empty() {
+            report(Event::Done { line: *line, text });
+        }
         self.next += 1;
     }
 
@@ -242,6 +258,61 @@ fn shows(machine: &Machine, x: u32, y: u32, rgb: [u8; 3]) -> bool {
         .into_iter()
         .zip(rgb)
         .all(|(shown, wanted)| shown.abs_diff(wanted) <= TOLERANCE)
+}
+
+/// The key pages of the system's on-screen keyboard (US English), as the
+/// four key rows above the space bar: the lower case page, the shifted
+/// page and the `#+=` page. Keys are 96 pixels apart from x = 99; the rows
+/// are at y = 363, 428, 492 and 556 (measured on the keyboard System
+/// Settings opens for a proxy server).
+const KEYBOARD_PAGES: [[&str; 4]; 3] = [
+    ["1234567890@", "qwertyuiop+", "asdfghjkl_:", "zxcvbnm,.-/"],
+    ["1234567890@", "QWERTYUIOP=", "ASDFGHJKL&;", "ZXCVBNM*#!?"],
+    ["1234567890-", "!@#$%^&*()_", "~`=\\+{}|[]", "<>;:\"',.?/"],
+];
+const KEY_ROWS: [u16; 4] = [363, 428, 492, 556];
+const KEY_X: (u16, u16) = (99, 96);
+const SPACE_KEY: (u16, u16) = (723, 619);
+/// Shift (one character), and the key that switches between the letters
+/// and the `#+=` page (it reads `ABC` there).
+const SHIFT_KEY: (u16, u16) = (195, 619);
+const SYMBOLS_KEY: (u16, u16) = (291, 619);
+/// How long a key is touched, and the pause after it.
+const KEY_HOLD: Duration = Duration::from_millis(120);
+const KEY_GAP: Duration = Duration::from_millis(300);
+
+/// The touches that type `text` on the on-screen keyboard, from its lower
+/// case page and leaving it there. A character on the lower case page is
+/// one touch; one on the shifted page is shift and then it (shift lasts one
+/// character); one only on the `#+=` page goes there and back.
+fn keyboard_touches(text: &str) -> Result<Vec<Step>, String> {
+    let find = |page: usize, character: char| {
+        KEYBOARD_PAGES[page]
+            .iter()
+            .enumerate()
+            .find_map(|(row, keys)| {
+                let column = keys.chars().position(|key| key == character)?;
+                Some((KEY_X.0 + KEY_X.1 * column as u16, KEY_ROWS[row]))
+            })
+    };
+    let mut keys = Vec::new();
+    for character in text.chars() {
+        if character == ' ' {
+            keys.push(SPACE_KEY);
+        } else if let Some(key) = find(0, character) {
+            keys.push(key);
+        } else if let Some(key) = find(1, character) {
+            keys.extend([SHIFT_KEY, key]);
+        } else if let Some(key) = find(2, character) {
+            keys.extend([SYMBOLS_KEY, key, SYMBOLS_KEY]);
+        } else {
+            return Err(format!("{character:?} is on no page of the keyboard"));
+        }
+    }
+    Ok(keys
+        .into_iter()
+        .flat_map(|key| [Step::Touch(key, KEY_HOLD), Step::Sleep(KEY_GAP)])
+        .collect())
 }
 
 fn parse_step(line: &str) -> Option<Step> {
@@ -375,5 +446,39 @@ mod tests {
             let error = Script::parse(&format!("sleep 1\n{bad}\n")).err().unwrap();
             assert_eq!(error, format!("line 2: not a script step: {bad}"));
         }
+    }
+
+    #[test]
+    fn typed_text_keeps_hashes_and_takes_each_page_its_way() {
+        let script = Script::parse("type a#A~\n").unwrap();
+        let touched: Vec<_> = (script.steps.iter())
+            .filter_map(|(_, _, step)| match step {
+                Step::Touch(place, _) => Some(*place),
+                _ => None,
+            })
+            .collect();
+        // `a`; shift, `#`; shift, `A`; `~` there and back from `#+=`.
+        assert_eq!(
+            touched,
+            [
+                (99, 492),
+                SHIFT_KEY,
+                (867, 556),
+                SHIFT_KEY,
+                (99, 492),
+                SYMBOLS_KEY,
+                (99, 492),
+                SYMBOLS_KEY
+            ]
+        );
+        // The line is reported done once, by its last touch's pause.
+        let reported: Vec<_> = (script.steps.iter())
+            .filter(|(_, text, _)| !text.is_empty())
+            .collect();
+        assert_eq!(reported.len(), 1);
+        assert_eq!(
+            Script::parse("sleep 1\ntype é\n").err().unwrap(),
+            "line 2: 'é' is on no page of the keyboard"
+        );
     }
 }
