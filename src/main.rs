@@ -1171,6 +1171,22 @@ fn write_event(out: &mut impl Write, event: TraceEvent, tracing: &Tracing) -> io
             width = usize::from(size) * 2 + 2
         ),
         TraceEvent::Woke { core } => writeln!(out, "console woke, core {core} runs"),
+        TraceEvent::SecureAccess {
+            core,
+            block,
+            address,
+            is_write,
+        } => {
+            if !(tracing.verbose || tracing.svc) {
+                return Ok(());
+            }
+            let what = if is_write { "write to" } else { "read of" };
+            writeln!(
+                out,
+                "core {core}: {what} secure-only {block} at {address:#x} from the non-secure \
+                 world: external abort"
+            )
+        }
         TraceEvent::Unmodeled {
             core,
             device,

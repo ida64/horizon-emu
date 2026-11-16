@@ -6,6 +6,7 @@ pub mod agic;
 pub mod ahub;
 pub mod alc5639;
 pub mod apb_dma;
+pub mod apb_security;
 pub mod bcm4356;
 pub mod bh1730;
 pub mod bluetooth_uart;
@@ -340,6 +341,8 @@ impl Soc {
     ) -> Result<Self, ImageError> {
         let mc = Arc::new(Mc::new(params.dram));
         let notes: Arc<Notes> = Arc::default();
+        let violations = Arc::clone(&notes);
+        mc.on_violation(Box::new(move |violation| violations.add(violation)));
         let syncpoints = Arc::new(Syncpoints::new(line(gic, HOST1X_SYNCPT_INTID)));
         let built = Instant::now();
         let controller = |intid| {

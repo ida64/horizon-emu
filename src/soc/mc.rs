@@ -1,11 +1,22 @@
-//! Memory controller: DRAM size and the SMMU that maps device-visible
-//! addresses to DRAM.
+//! Memory controller: DRAM size, the SMMU that maps device-visible
+//! addresses to DRAM, and the kernel carveouts that keep devices out of the
+//! kernel's memory.
 //!
 //! The kernel never maps this block; it reaches it through the secure
 //! monitor's register call. It reads `MC_EMEM_CFG` for the DRAM size
 //! (`0x800d2560`) and programs the SMMU (`0x800cf120`): one page directory
 //! per address space ID through the `PTB_ASID`/`PTB_DATA` pair, and one
 //! ASID register per client device.
+//!
+//! The kernel carveouts are general security carveouts the secure monitor
+//! programs and locks when the kernel asks for them (ConfigureCarveout):
+//! DRAM ranges only the clients of a fixed list may reach (exosphere
+//! `secmon_setup.cpp`, `SetupKernelCarveouts`, the client access masks).
+//! Every client here is on it but the GPU. A
+//! blocked client's reads get zeros and its writes are dropped, and the
+//! memory controller records a violation \[assumption: what a blocked
+//! request returns is not public\]; here the violation becomes a note.
+//! The processor itself is on the list.
 
 use std::sync::{Arc, Mutex};
 
@@ -80,14 +91,80 @@ pub struct Mc {
     /// the initial contents.
     registers: RegisterFile,
     page_directories: Mutex<[u32; ASID_COUNT]>,
+    /// The two kernel carveouts, `(base, size)`; a size of zero is none.
+    kernel_carveouts: Mutex<[(u64, u64); KERNEL_CARVEOUT_COUNT]>,
+    /// Told about each request a carveout blocks.
+    on_violation: Mutex<Option<ViolationReport>>,
 }
+
+/// What the memory controller tells about a request a carveout blocked.
+pub type ViolationReport = Box<dyn Fn(String) + Send + Sync>;
+
+/// How many kernel carveouts there are.
+pub const KERNEL_CARVEOUT_COUNT: usize = 2;
+
+/// The clients the kernel carveouts let through, by their ASID register:
+/// the display controllers, host1x, VIC, the SDMMC ports, APB DMA (its
+/// `PPCS` AHB master), PCIe (`AFI`), the audio processor (`APE`), HDA and
+/// the security engine (`spl` hands it buffers in system memory, which
+/// the carveout covers). The GPU is not on the list.
+const KERNEL_CARVEOUT_CLIENTS: [u64; 12] = [
+    SMMU_DC_ASID,
+    SMMU_HOST1X_ASID,
+    SMMU_VIC_ASID,
+    SMMU_SDMMC1A_ASID,
+    SMMU_SDMMC2A_ASID,
+    SMMU_SDMMC4A_ASID,
+    SMMU_SE_ASID,
+    0x270, // PPCS: APB DMA
+    0x238, // AFI: PCIe
+    0xAB8, // APE
+    0x254, // HDA
+    0x244, // DCB: the second display controller
+];
 
 impl Mc {
     pub fn new(dram: DramSize) -> Self {
         Self {
             registers: RegisterFile::zeroed([(EMEM_CFG, dram.megabytes())]),
             page_directories: Mutex::new([0; ASID_COUNT]),
+            kernel_carveouts: Mutex::new([(0, 0); KERNEL_CARVEOUT_COUNT]),
+            on_violation: Mutex::new(None),
         }
+    }
+
+    /// Programs kernel carveout `index` (the secure monitor does this for
+    /// the kernel).
+    pub fn set_kernel_carveout(&self, index: usize, base: u64, size: u64) {
+        self.kernel_carveouts.lock().unwrap()[index] = (base, size);
+    }
+
+    /// Has `report` told about each request a carveout blocks.
+    pub fn on_violation(&self, report: ViolationReport) {
+        *self.on_violation.lock().unwrap() = Some(report);
+    }
+
+    /// Whether a carveout keeps `client` from the physical range starting
+    /// at `physical`, `len` bytes long, reporting it if so.
+    fn blocked(&self, client: u64, physical: u64, len: usize, is_write: bool) -> bool {
+        if KERNEL_CARVEOUT_CLIENTS.contains(&client) {
+            return false;
+        }
+        let end = physical + len as u64;
+        let hit = self
+            .kernel_carveouts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|&(base, size)| size != 0 && physical < base + size && base < end);
+        if hit && let Some(report) = &*self.on_violation.lock().unwrap() {
+            let what = if is_write { "write to" } else { "read of" };
+            report(format!(
+                "memory controller: client {client:#x} blocked: {what} {physical:#x}..{end:#x} \
+                 in a kernel carveout"
+            ));
+        }
+        hit
     }
 
     fn selected_asid(&self) -> usize {
@@ -154,6 +231,11 @@ impl DeviceMemory {
         &self.ram
     }
 
+    /// The memory controller this client's requests go through.
+    pub fn mc(&self) -> &Mc {
+        &self.mc
+    }
+
     /// Splits `len` bytes at device address `address` into physically
     /// contiguous pieces: `piece(physical, offset, len)`.
     fn pieces(
@@ -178,17 +260,27 @@ impl DeviceMemory {
         Some(())
     }
 
-    /// `None` if any of the range is unmapped or outside DRAM.
+    /// `None` if any of the range is unmapped or outside DRAM. What a
+    /// kernel carveout keeps from this client reads as zeros.
     pub fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
         self.pieces(address, buffer.len(), |physical, offset, len| {
-            self.ram.read(physical, &mut buffer[offset..offset + len])
+            let piece = &mut buffer[offset..offset + len];
+            if self.mc.blocked(self.client, physical, len, false) {
+                piece.fill(0);
+                return Some(());
+            }
+            self.ram.read(physical, piece)
         })
     }
 
     /// `None` if any of the range is unmapped or outside DRAM; pieces before
-    /// the failing one have been written.
+    /// the failing one have been written. What a kernel carveout keeps
+    /// from this client is dropped.
     pub fn write(&self, address: u64, data: &[u8]) -> Option<()> {
         self.pieces(address, data.len(), |physical, offset, len| {
+            if self.mc.blocked(self.client, physical, len, true) {
+                return Some(());
+            }
             self.ram.write(physical, &data[offset..offset + len])
         })
     }
@@ -285,5 +377,29 @@ mod tests {
             mc.translate(SMMU_DC_ASID, 0x1_C000_2ABC, read),
             Some(0x9ABC_DABC)
         );
+    }
+
+    #[test]
+    fn kernel_carveouts_keep_out_the_gpu_only() {
+        let mc = Mc::new(DramSize::Gb4);
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let report = Arc::clone(&reported);
+        mc.on_violation(Box::new(move |line| report.lock().unwrap().push(line)));
+        // Nothing set yet.
+        assert!(!mc.blocked(SMMU_GPU_ASID, 0x8006_0000, 4, false));
+        mc.set_kernel_carveout(0, 0x8006_0000, 0x1038_0000);
+        assert!(mc.blocked(SMMU_GPU_ASID, 0x8006_0000, 4, false));
+        assert!(
+            mc.blocked(SMMU_GPU_ASID, 0x903D_FFFC, 8, true),
+            "overlapping its end"
+        );
+        assert!(!mc.blocked(SMMU_SE_ASID, 0x8006_0000, 4, true));
+        assert!(
+            !mc.blocked(SMMU_GPU_ASID, 0x903E_0000, 4, false),
+            "just past it"
+        );
+        assert!(!mc.blocked(SMMU_DC_ASID, 0x8006_0000, 4, false));
+        assert!(!mc.blocked(SMMU_SDMMC4A_ASID, 0x8006_0000, 4, true));
+        assert_eq!(reported.lock().unwrap().len(), 2);
     }
 }

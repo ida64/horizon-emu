@@ -169,6 +169,34 @@ impl<'vm> Vcpu<'vm> {
         self.set_reg(sys::HV_REG_CPSR, value)
     }
 
+    /// Takes the synchronous external abort a bus error gives the core at
+    /// the instruction it is on, to EL1 in the guest's own vectors, as the
+    /// CPU would: `ESR_EL1` (data abort from a lower or the same EL, fault
+    /// status 0x10, `WnR` for a store), `FAR_EL1` = `address`, `ELR_EL1` =
+    /// the instruction, `SPSR_EL1` = the current PSTATE; then EL1 on
+    /// `SP_EL1` with all of `DAIF` masked at the synchronous vector (Arm
+    /// ARM D1.10.2). On the console a store's error may arrive later as an
+    /// SError instead, since stores to devices are posted; here both kinds
+    /// of access abort at once, a simplification.
+    pub fn take_external_abort(&self, address: u64, is_write: bool) -> Result<(), HvError> {
+        const MODE_EL1H: u64 = 0b0101;
+        const DFSC_EXTERNAL_ABORT: u64 = 0x10;
+        let pstate = self.pstate()?;
+        let (class, vector) = match pstate & 0xF {
+            0 => (0x24, 0x400),
+            _ if pstate & 1 != 0 => (0x25, 0x200),
+            _ => (0x25, 0x000),
+        };
+        let write_not_read = if is_write { 1 << 6 } else { 0 };
+        let syndrome = class << 26 | 1 << 25 | write_not_read | DFSC_EXTERNAL_ABORT;
+        self.set_sys_reg(SysReg::ESR_EL1, syndrome)?;
+        self.set_sys_reg(SysReg::FAR_EL1, address)?;
+        self.set_sys_reg(SysReg::ELR_EL1, self.pc()?)?;
+        self.set_sys_reg(SysReg::SPSR_EL1, pstate)?;
+        self.set_pstate(0xF << 6 | MODE_EL1H)?;
+        self.set_pc(self.sys_reg(SysReg::VBAR_EL1)?.wrapping_add(vector))
+    }
+
     pub fn sys_reg(&self, register: SysReg) -> Result<u64, HvError> {
         let mut value = 0;
         // SAFETY: the vCPU is live and owned by this thread; `value` is valid.

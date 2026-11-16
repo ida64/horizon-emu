@@ -615,6 +615,31 @@ fn guest_brk_reaches_the_guest_unchanged(vm: &Vm, loader: &Loader) {
     }
 }
 
+/// A load from an address with nothing behind it (the security engine's,
+/// which the non-secure world may not reach) exits to the host, which
+/// hands the guest the external abort the bus would: the guest's EL0
+/// synchronous vector runs with the registers a CPU sets.
+fn an_external_abort_reaches_the_guest_vectors(vm: &Vm, loader: &Loader) {
+    const SECURE: u64 = 0x7001_2000;
+    let user = loader.code(&[ldr(1, 2), NOP]);
+    let vectors = loader.vectors(&[(VECTOR_SYNC_EL0, &[hvc(7)])]);
+    let mut core = Core::new_el0(vm, loader, user, vectors);
+    core.vcpu.set_gpr(2, SECURE).unwrap();
+
+    let syndrome = match core.resume() {
+        Event::Other(syndrome) => syndrome,
+        other => panic!("expected the load to exit, got {other:?}"),
+    };
+    assert_eq!(exception_class(syndrome), exception_class::DATA_ABORT_LOWER);
+    assert_eq!(core.pc(), user);
+    core.vcpu.take_external_abort(SECURE, false).unwrap();
+    assert_eq!(core.resume(), Event::Hvc(7));
+    let [pstate, elr, spsr, esr, far] = core.exception_registers();
+    assert_eq!(pstate & 0x3CF, EL1H_MASKED);
+    assert_eq!((elr, spsr, far), (user, EL0T, SECURE));
+    assert_eq!(esr, 0x24 << 26 | 1 << 25 | 0x10);
+}
+
 fn an_interrupt_can_preempt_the_step_off_a_breakpoint(vm: &Vm, loader: &Loader) {
     let handlers: [(u64, &[u32]); 1] = [(VECTOR_IRQ_EL1H, &[hvc(0x66), ERET])];
 
@@ -715,6 +740,7 @@ fn guest_debug() {
     breakpoint_and_steps_at_el0_across_an_svc(&vm, &loader);
     a_step_into_a_fault_leaves_no_trace_in_the_guest(&vm, &loader);
     guest_brk_reaches_the_guest_unchanged(&vm, &loader);
+    an_external_abort_reaches_the_guest_vectors(&vm, &loader);
     an_interrupt_can_preempt_the_step_off_a_breakpoint(&vm, &loader);
     breakpoints_match_virtual_addresses_with_the_mmu_on(&vm, &loader);
     drop(vm);

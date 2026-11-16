@@ -17,10 +17,6 @@ const AES_KEK_GENERATION_SOURCE: &str = "aes_kek_generation_source";
 const MASTER_KEY_PREFIX: &str = "master_key_";
 const DEVICE_KEY: &str = "device_key";
 const RETAIL_SPECIFIC_AES_KEY_SOURCE: &str = "retail_specific_aes_key_source";
-/// The monitor's static source for keks sealed for `DecryptDeviceUniqueData`
-/// (key type 0 combined with that seal key's mask, as Atmosphère's
-/// `secmon_smc_aes.cpp` describes `GenerateAesKek`).
-const RSA_PRIVATE_KEK_GENERATION_SOURCE: &str = "rsa_private_kek_generation_source";
 /// Lines whose value `ssl` hands the monitor to unwrap the console's TLS
 /// client key: the kek source (`ssl` data `0x2633E0`) and the key source of
 /// a retail console (`ssl` text `0x36080`).
@@ -47,6 +43,9 @@ const SAVE_MAC_KEK_SOURCE: &str = "save_mac_kek_source";
 /// A key file holds two; this one keys the CMAC of the system saves the
 /// filesystem process wrote itself, the other does not.
 const SAVE_MAC_KEY_SOURCE: &str = "save_mac_key_source_00";
+/// The monitor's source of the title key's ES common key: decrypted with a
+/// master key it gives that generation's `titlekek`.
+const TITLEKEK_SOURCE: &str = "titlekek_source";
 
 #[derive(Debug)]
 pub enum KeyError {
@@ -81,7 +80,6 @@ pub struct KeySet {
     aes_kek_generation_source: Option<Key>,
     device_key: Option<Key>,
     retail_specific_aes_key_source: Option<Key>,
-    rsa_private_kek_generation_source: Option<Key>,
     ssl_rsa_kekek_source: Option<Key>,
     ssl_rsa_kek_source: Option<Key>,
     aes_key_generation_source: Option<Key>,
@@ -92,6 +90,7 @@ pub struct KeySet {
     key_area_key_sources: [Option<Key>; KEY_AREA_KEY_SOURCES.len()],
     save_mac_kek_source: Option<Key>,
     save_mac_key_source: Option<Key>,
+    titlekek_source: Option<Key>,
 }
 
 /// Key values stay out of logs.
@@ -107,10 +106,6 @@ impl fmt::Debug for KeySet {
             .field(
                 "retail_specific_aes_key_source",
                 &self.retail_specific_aes_key_source.is_some(),
-            )
-            .field(
-                "rsa_private_kek_generation_source",
-                &self.rsa_private_kek_generation_source.is_some(),
             )
             .field("ssl_rsa_kekek_source", &self.ssl_rsa_kekek_source.is_some())
             .field("ssl_rsa_kek_source", &self.ssl_rsa_kek_source.is_some())
@@ -131,6 +126,7 @@ impl fmt::Debug for KeySet {
             )
             .field("save_mac_kek_source", &self.save_mac_kek_source.is_some())
             .field("save_mac_key_source", &self.save_mac_key_source.is_some())
+            .field("titlekek_source", &self.titlekek_source.is_some())
             .finish()
     }
 }
@@ -155,8 +151,6 @@ impl KeySet {
                 keys.device_key = Some(key()?);
             } else if name == RETAIL_SPECIFIC_AES_KEY_SOURCE {
                 keys.retail_specific_aes_key_source = Some(key()?);
-            } else if name == RSA_PRIVATE_KEK_GENERATION_SOURCE {
-                keys.rsa_private_kek_generation_source = Some(key()?);
             } else if name == SSL_RSA_KEKEK_SOURCE {
                 keys.ssl_rsa_kekek_source = Some(key()?);
             } else if name == SSL_RSA_KEK_SOURCE {
@@ -182,6 +176,8 @@ impl KeySet {
                 keys.save_mac_kek_source = Some(key()?);
             } else if name == SAVE_MAC_KEY_SOURCE {
                 keys.save_mac_key_source = Some(key()?);
+            } else if name == TITLEKEK_SOURCE {
+                keys.titlekek_source = Some(key()?);
             } else if let Some(generation) = name
                 .strip_prefix(MASTER_KEY_PREFIX)
                 .and_then(|digits| u8::from_str_radix(digits, 16).ok())
@@ -215,12 +211,6 @@ impl KeySet {
     /// consoles (`GenerateSpecificAesKey`).
     pub fn retail_specific_aes_key_source(&self) -> Option<&Key> {
         self.retail_specific_aes_key_source.as_ref()
-    }
-
-    /// What takes the place of `aes_kek_generation_source` in the ladder
-    /// when the kek is sealed for `DecryptDeviceUniqueData`.
-    pub fn rsa_private_kek_generation_source(&self) -> Option<&Key> {
-        self.rsa_private_kek_generation_source.as_ref()
     }
 
     /// The kek source `ssl` asks the monitor for when it unwraps the TLS
@@ -276,6 +266,11 @@ impl KeySet {
     /// `save_mac_key_source_00`.
     pub fn save_mac_key_source(&self) -> Option<&Key> {
         self.save_mac_key_source.as_ref()
+    }
+
+    /// `titlekek_source`.
+    pub fn titlekek_source(&self) -> Option<&Key> {
+        self.titlekek_source.as_ref()
     }
 }
 

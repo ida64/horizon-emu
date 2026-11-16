@@ -375,7 +375,6 @@ pub(super) mod tests {
             "aes_key_generation_source",
             "bis_kek_source",
             "master_key_00",
-            "rsa_private_kek_generation_source",
             "ssl_rsa_kekek_source",
             "ssl_rsa_kek_source",
         ]
@@ -464,7 +463,7 @@ pub(super) mod tests {
 
         // What `ssl` and `spl` do with it: an access key for the kek
         // source, then the data before the generation.
-        let crypto = Crypto::new(keys.clone(), [0x5A; 16]);
+        let mut crypto = Crypto::new(keys.clone(), [0x5A; 16]);
         let source = |name: Option<&Key>| *name.unwrap();
         let access_key = crypto
             .generate_aes_kek(
@@ -476,6 +475,7 @@ pub(super) mod tests {
         let mut wrapped = data[..0x130].to_vec();
         crypto
             .decrypt_device_unique_data(
+                0,
                 &access_key,
                 &source(keys.ssl_rsa_kek_source()),
                 &mut wrapped,
@@ -496,6 +496,7 @@ pub(super) mod tests {
         assert!(
             crypto
                 .decrypt_device_unique_data(
+                    0,
                     &access_key,
                     &source(keys.ssl_rsa_kek_source()),
                     &mut wrapped,

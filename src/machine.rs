@@ -318,6 +318,14 @@ pub enum TraceEvent<'a> {
         /// Return addresses from the frame records on its stack.
         callers: &'a [u64],
     },
+    /// The non-secure world reached for a secure-only peripheral or
+    /// memory; the core takes an external abort into its own vectors.
+    SecureAccess {
+        core: usize,
+        block: &'static str,
+        address: u64,
+        is_write: bool,
+    },
     /// A tracepoint, or a breakpoint about to be stepped from, was reached.
     Reached {
         core: usize,
@@ -363,6 +371,9 @@ pub enum CoreStop {
         code: u32,
     },
     UnimplementedSmc(Unimplemented),
+    /// The secure monitor gave up, as the console's would: on the console
+    /// it stops everything with an error of its own.
+    MonitorAbort(secmon::Abort),
     UnimplementedSysReg(SysRegAccess),
     /// Data access to a guest-physical address with nothing behind it.
     UnmappedAccess {
@@ -427,9 +438,7 @@ impl fmt::Display for CoreStop {
             Self::UnimplementedSmc(Unimplemented::Crypto(what)) => {
                 write!(f, "secure monitor key operation is not available: {what}")
             }
-            Self::UnimplementedSmc(Unimplemented::Abort(why)) => {
-                write!(f, "the secure monitor aborts: {why}")
-            }
+            Self::MonitorAbort(why) => write!(f, "the secure monitor aborts: {why}"),
             Self::UnimplementedSmc(Unimplemented::Register { address, is_write }) => {
                 write!(
                     f,
@@ -1659,15 +1668,15 @@ impl<'env> Session<'env> {
         debug: &mut GuestDebug,
         exit: Exit,
     ) -> Result<Option<CoreStop>, HvError> {
-        let (syndrome, physical_address) = match exit {
+        let (syndrome, physical_address, virtual_address) = match exit {
             Exit::Canceled => return Ok(None),
             Exit::VtimerActivated => return Ok(Some(CoreStop::VirtualTimer)),
             Exit::Unknown(reason) => return Ok(Some(CoreStop::UnknownExit(reason))),
             Exit::Exception {
                 syndrome,
                 physical_address,
-                ..
-            } => (syndrome, physical_address),
+                virtual_address,
+            } => (syndrome, physical_address, virtual_address),
         };
         match exception_class(syndrome) {
             exception_class::SMC64 => self.secure_monitor_call(scope, core, vcpu, syndrome as u16),
@@ -1675,7 +1684,7 @@ impl<'env> Session<'env> {
                 self.system_register(core, vcpu, debug, SysRegAccess::from_syndrome(syndrome))
             }
             exception_class::DATA_ABORT_LOWER => {
-                self.device_access(core, vcpu, syndrome, physical_address)
+                self.device_access(core, vcpu, syndrome, physical_address, virtual_address)
             }
             exception_class::WFX => {
                 // ISS bit 0 distinguishes WFE, which may always complete at once.
@@ -1734,6 +1743,7 @@ impl<'env> Session<'env> {
         let restart = match effect {
             SmcEffect::Panic { code } => return Ok(Some(CoreStop::KernelPanic { code })),
             SmcEffect::Unimplemented(what) => return Ok(Some(CoreStop::UnimplementedSmc(what))),
+            SmcEffect::Abort(why) => return Ok(Some(CoreStop::MonitorAbort(why))),
             SmcEffect::PowerOff => loop {
                 if self.stop.load(Ordering::SeqCst) {
                     return Ok(Some(CoreStop::Requested));
@@ -1823,9 +1833,23 @@ impl<'env> Session<'env> {
         vcpu: &Vcpu,
         syndrome: u64,
         address: u64,
+        virtual_address: u64,
     ) -> Result<Option<CoreStop>, HvError> {
         let abort = DataAbort::from_syndrome(syndrome);
         let is_write = abort.is_write;
+        // The non-secure world reaching for the secure world's: the bus
+        // refuses it, and the core takes an external abort.
+        if let Some(block) = crate::soc::apb_security::secure_only(address) {
+            (self.options.trace)(TraceEvent::SecureAccess {
+                core,
+                block,
+                address,
+                is_write,
+            });
+            return vcpu
+                .take_external_abort(virtual_address, is_write)
+                .map(|()| None);
+        }
         let described = abort
             .transfer
             .map(|transfer| LoadStore::single(!is_write, transfer));
