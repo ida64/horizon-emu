@@ -8,7 +8,9 @@
 //! output going to a log file there. Its eMMC image is a copy (a clone on
 //! APFS) of the one asked for, written to by the guest, so base images stay
 //! as they are. Tools then reach the run through the socket (script steps,
-//! screenshots, pixels, status, stop) or its files (log, crash dumps).
+//! screenshots, pixels, status, stop, snapshots) or its files (log, crash
+//! dumps). A run started from a snapshot is a `horizon-emu restore` child
+//! instead, its images cloned into its own directory.
 //!
 //! Requests are served on threads of their own, so a long `drive` of one
 //! run does not hold up another. Standard output carries protocol messages
@@ -41,7 +43,8 @@ horizon-emu mcp [--kernel FILE] [--keys FILE] [--emmc FILE] [--runs-dir DIR]
   start machines (each a `boot` child with the options asked for), drive
   them (buttons, touches, script steps, pixels, screenshots) and read
   their logs and crash dumps. The flags are defaults for start_run; runs
-  live in DIR (/tmp/horizon-emu-runs unless given), one directory each";
+  live in DIR (/tmp/horizon-emu-runs unless given), one directory each,
+  and snapshots taken with save_state in DIR/snapshots";
 
 /// Protocol version answered when the client names none.
 const PROTOCOL_VERSION: &str = "2025-06-18";
