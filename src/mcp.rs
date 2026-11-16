@@ -666,13 +666,16 @@ impl Server {
             .lock()
             .unwrap()
             .insert(id.clone(), Arc::clone(&run));
-        // A restored machine answers once it is running and has had a
-        // second to settle. \[observed\] A 150 ms press given as a
-        // restored machine starts went unnoticed (5 tries of 5, one
-        // snapshot), while the same press 0.2 s or more after the control
-        // socket first answered was taken (7 of 7); why is not known.
+        // A restored machine answers once it runs: its control socket
+        // answers only then, and restoring takes well under a second.
+        // \[observed\] Short presses can still go unnoticed while the host
+        // is busy with another emulator (one shutting down, say): a
+        // press lasts its time in host time, guest time runs on, and a
+        // starved guest may not sample the buttons within it. A restored
+        // machine with the host to itself took a 150 ms press made at
+        // once 6 times of 6.
         if restore.is_some() {
-            run.script("sleep 1", SOCKET_WAIT.as_secs_f64())
+            run.control(&json!({"op": "status"}), SOCKET_WAIT)
                 .map_err(|error| format!("the restored run did not start: {error}"))?;
         }
         if arguments["stay_awake"] == false {
