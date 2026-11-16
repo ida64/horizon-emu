@@ -107,6 +107,13 @@ options:
                       from the router. The only way in: the router lets
                       nothing else through to the console. May be given
                       more than once
+  --dns ADDRESS[:PORT]
+                      with --wifi-ssid: the router's DNS server asks this
+                      resolver (port 53 unless given) instead of the
+                      host's. A resolver that answers the console's
+                      connection test host (ctest.cdn.nintendo.net) with
+                      the address of a web server puts that server in front
+                      of the console as a captive portal
   --window            show the console's screen in a window. Closing it
                       stops the machine and ends the program; when the
                       machine stops by itself, the window stays, showing
@@ -399,6 +406,7 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
     let mut homebrew = HomebrewOptions::default();
     let (mut wifi_ssid, mut wifi_passphrase) = (None::<String>, None::<String>);
     let mut forwards = Vec::new();
+    let mut dns = None;
     if maxwell::metal::available() {
         maxwell::select_renderer(maxwell::RendererKind::Metal);
     }
@@ -508,6 +516,13 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
             "--sd-writable" => sd_writable = true,
             "--wifi-ssid" => wifi_ssid = Some(value()?.clone()),
             "--wifi-passphrase" => wifi_passphrase = Some(value()?.clone()),
+            "--dns" => {
+                let value = value()?.as_str();
+                let address = value
+                    .parse::<std::net::SocketAddr>()
+                    .or_else(|_| value.parse().map(|ip| std::net::SocketAddr::new(ip, 53)));
+                dns = Some(address.map_err(|_| format!("--dns {value}: not ADDRESS[:PORT]"))?);
+            }
             "--forward" => {
                 let value = value()?.as_str();
                 let (host, console) = value.split_once(':').unwrap_or((value, value));
@@ -607,7 +622,7 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
         let ap = AccessPoint::new(ssid, wifi_passphrase.as_deref())
             .map_err(|error| format!("--wifi-ssid: {error}"))?;
         let wifi = std::sync::Arc::clone(machine.wifi());
-        let router = net::Router::new(Box::new(move |frame| wifi.from_network(&frame)));
+        let router = net::Router::new(Box::new(move |frame| wifi.from_network(&frame)), dns);
         // One line per DHCP lease, DNS query, new flow and plain-HTTP
         // exchange: what the console does on the network, never payload.
         router.set_trace(Box::new(|line| eprintln!("net: {line}")));
@@ -623,6 +638,8 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
         return Err("--wifi-passphrase needs --wifi-ssid".into());
     } else if !forwards.is_empty() {
         return Err("--forward needs --wifi-ssid".into());
+    } else if dns.is_some() {
+        return Err("--dns needs --wifi-ssid".into());
     }
     let mut window = show_window.then(ScreenWindow::open).transpose()?;
     let stop = AtomicBool::new(false);

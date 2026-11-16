@@ -1258,6 +1258,11 @@ impl State {
                 }
                 dongle.flow_rings.retain(|(other, _)| *other != id);
                 dongle.flow_rings.push((id, ring));
+                // A new ring is read from its first item. The host starts
+                // writing there too; a ring ID can be deleted and created
+                // again, and what was read of the old ring must not carry
+                // over.
+                self.set_ram_u16(dongle.h2d_read + u32::from(id) * INDEX_SIZE, 0);
                 let mut reply = header(MSG_FLOW_RING_CREATE_CMPLT, if_id, request_id);
                 reply[10..12].copy_from_slice(&id.to_le_bytes());
                 self.complete(dongle, RING_D2H_CONTROL, &reply, upstream)?;

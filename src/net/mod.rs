@@ -17,10 +17,11 @@
 //!   the source address of every frame it sends.
 //! * **DHCP** (RFC 2131/2132): a single-lease server; see `dhcp.rs`.
 //! * **DNS** (RFC 1035): UDP queries to `DNS:53` are relayed unchanged to the
-//!   host's resolver (the first parsable `nameserver` line of
-//!   `/etc/resolv.conf`, falling back to 8.8.8.8 only when there is none) and
-//!   the answers are relayed back from `DNS:53`, so ids and ports are
-//!   preserved. TCP to `DNS:53` is spliced to the same resolver.
+//!   resolver given to [`Router::new`], else the host's (the first parsable
+//!   `nameserver` line of `/etc/resolv.conf`, falling back to 8.8.8.8 only
+//!   when there is none), and the answers are relayed back from `DNS:53`,
+//!   so ids and ports are preserved. TCP to `DNS:53` is spliced to the same
+//!   resolver.
 //! * **UDP** (RFC 768): every other unicast datagram is sent from a host
 //!   `UdpSocket` dedicated to the (console port, destination) pair; replies
 //!   from that destination come back with the destination as their source.
@@ -134,14 +135,19 @@ impl Router {
     /// Starts the router thread. `deliver` is called (from that thread) with
     /// every Ethernet frame destined for the console.
     ///
-    /// DNS queries are relayed to the first `nameserver` in
-    /// `/etc/resolv.conf`, read once here; 8.8.8.8 is used only if the file
-    /// has none.
-    pub fn new(deliver: Box<dyn Fn(Vec<u8>) + Send + Sync>) -> Arc<Router> {
+    /// DNS queries are relayed to `resolver`, or when it is `None` to the
+    /// first `nameserver` in `/etc/resolv.conf`, read once here; 8.8.8.8 is
+    /// used only if the file has none. A resolver of one's own is how a
+    /// captive portal is put in front of the console: it answers the
+    /// console's connection test host with the portal's address.
+    pub fn new(
+        deliver: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+        resolver: Option<SocketAddr>,
+    ) -> Arc<Router> {
         Self::with_settings(
             deliver,
             Settings {
-                dns_upstream: dns::host_resolver(),
+                dns_upstream: resolver.unwrap_or_else(dns::host_resolver),
                 loopback_alias: None,
             },
         )
