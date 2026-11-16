@@ -72,9 +72,55 @@ struct Run {
     child: Mutex<Child>,
     /// Screenshots taken, to name the next.
     screenshots: AtomicUsize,
+    /// What keeping the console awake has done, for `run_status`.
+    kept_awake: Mutex<Vec<String>>,
 }
 
+/// From the lock screen to the HOME menu: wait for the lock screen's home
+/// icon, then the presses that wake the screen and unlock it.
+const UNLOCK: &str = "wait 820,330 2d2d2d\nsleep 2\npress a 300\nsleep 2\npress a 150\n\
+                      sleep 0.6\npress a 150\nsleep 0.6\npress a 150\nsleep 3";
+/// How often the log is looked at for the console going to sleep.
+const AWAKE_POLL: Duration = Duration::from_secs(2);
+
 impl Run {
+    fn note_awake(&self, what: String) {
+        let line = format!("{:.0} s: {what}", self.started.elapsed().as_secs_f64());
+        self.kept_awake.lock().unwrap().push(line);
+    }
+
+    /// Keeps the console on the HOME menu's side of sleep: unlocks it once
+    /// the lock screen shows (then calls `unlocked`), and afterwards,
+    /// whenever the log says it went to sleep (the lock screen sleeps after
+    /// half a minute untouched; a maintenance wake goes back to sleep with
+    /// the screen off), presses power and unlocks it again. Runs until the
+    /// run ends.
+    fn keep_awake(&self, unlocked: impl FnOnce()) {
+        match self.script(UNLOCK, 300.0) {
+            Ok(_) => self.note_awake("unlocked".into()),
+            Err(error) => self.note_awake(format!("could not unlock: {error}")),
+        }
+        unlocked();
+        let asleep = |run: &Run| {
+            run.log_lines()
+                .iter()
+                .filter(|line| line.contains("console asleep"))
+                .count()
+        };
+        let mut seen = asleep(self);
+        while self.exited().is_none() {
+            thread::sleep(AWAKE_POLL);
+            if asleep(self) == seen {
+                continue;
+            }
+            match self.script(&format!("press power 200\n{UNLOCK}"), 120.0) {
+                Ok(_) => self.note_awake("woke and unlocked after sleep".into()),
+                Err(error) => self.note_awake(format!("could not wake: {error}")),
+            }
+            seen = asleep(self);
+        }
+    }
+
     /// `None` while running, else how the process ended.
     fn exited(&self) -> Option<String> {
         let status = self.child.lock().unwrap().try_wait().ok()??;
@@ -316,6 +362,7 @@ impl Server {
                     "log_lines": lines.len(),
                     "stopped": stopped,
                     "crash_dumps": run.crash_dumps(),
+                    "kept_awake": *run.kept_awake.lock().unwrap(),
                     "dir": run.dir,
                 })))
             }
@@ -538,9 +585,26 @@ impl Server {
             started: Instant::now(),
             child: Mutex::new(child),
             screenshots: AtomicUsize::new(0),
+            kept_awake: Mutex::default(),
         });
-        self.runs.lock().unwrap().insert(id.clone(), run);
-        Ok(json!({"run": id, "dir": dir, "log": log, "args": args}))
+        self.runs
+            .lock()
+            .unwrap()
+            .insert(id.clone(), Arc::clone(&run));
+        if arguments["stay_awake"] == false {
+            return Ok(json!({"run": id, "dir": dir, "log": log, "args": args}));
+        }
+        // Answered once the console is on the HOME menu; kept there.
+        let keeper = Arc::clone(&run);
+        let (unlocked, ready) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            keeper.keep_awake(move || {
+                let _ = unlocked.send(());
+            })
+        });
+        let _ = ready.recv();
+        let state = run.kept_awake.lock().unwrap().first().cloned();
+        Ok(json!({"run": id, "dir": dir, "log": log, "args": args, "awake": state}))
     }
 
     fn stop_all(&self) {
@@ -602,8 +666,10 @@ a b x y l r zl zr plus minus home capture up down left right, or power), touch, 
 wait_pixel and drive (several script steps: wait X,Y RRGGBB / sleep S / press \
 BUTTON [MS] / touch X,Y [MS] / type TEXT / joycons on|off / screenshot FILE, \
 press and touch optionally `until X,Y RRGGBB` to repeat). type_text types on \
-the on-screen keyboard once it is open. On the lock screen, the home icon is \
-at 820,330 colour 2d2d2d: wait for it, then press a four times. screenshot \
+the on-screen keyboard once it is open. start_run answers once the console is \
+on the HOME menu, unlocked, and the server keeps it awake: if it ever goes to \
+sleep it is woken and unlocked again (run_status lists this as kept_awake; \
+pass stay_awake false to drive the lock screen yourself). screenshot \
 shows the screen. read_log pages the emulator's narration (since/next \
 cursors, contains filters, tail); crash_dumps lists and reads the full \
 register and module dump of each process crash. stop_run ends a run.";
@@ -634,6 +700,7 @@ fn tools() -> Value {
                 "timeout_seconds": number("stop the machine after this long (default: never)"),
                 "window": {"type": "boolean", "description": "also show the screen in a window on this Mac"},
                 "verbose": {"type": "boolean", "description": "narrate the boot in the log (default true)"},
+                "stay_awake": {"type": "boolean", "description": "unlock the console and keep it awake, waking and unlocking it if it sleeps; start_run then answers once the HOME menu shows (default true)"},
                 "args": {"type": "array", "items": {"type": "string"}, "description": "further `horizon-emu boot` flags"}
             }}
         },
