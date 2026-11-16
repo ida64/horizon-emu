@@ -41,11 +41,11 @@
 //! (Ryujinx `Blender.cs` formula, MIT), soft clamp, sRGB degamma/regamma
 //! (mode 1), planar/constant alpha, the blending factor selections (libdrm
 //! `vic.h` enum names), override and mask, alpha fill modes opaque,
-//! background and composited (DXVA-HD names in libdrm `vic.h`).
-//! Everything else (scaling and its filters, YUV formats, deinterlacing and
-//! denoise, luma key, gamut matrix, gamma modes 2-3, clear rectangles,
-//! decompression, flips and transposition, downsampling) refuses with the
-//! field named.
+//! background and composited (DXVA-HD names in libdrm `vic.h`), and the
+//! output flips. Everything else (scaling and its filters, YUV formats,
+//! deinterlacing and denoise, luma key, gamut matrix, gamma modes 2-3,
+//! clear rectangles, decompression, output transposition, downsampling)
+//! refuses with the field named.
 //!
 //! # The submission seen
 //!
@@ -784,8 +784,13 @@ fn compose_config(
     if !matches!(regamma, 0 | GAMMA_SRGB) {
         return Err(format!("regamma mode {regamma}"));
     }
-    if field(output, 48, 3) != 0 {
-        return Err(format!("output flip/transpose {:#x}", field(output, 48, 3)));
+    // OutputFlipX, OutputFlipY, OutputTranspose (libdrm `vic.h`
+    // `OutputConfig`). The flips mirror the composed picture within the
+    // target rectangle [inference: the rectangle is what is written];
+    // the browser's frames come bottom-up and are flipped vertically.
+    let (flip_x, flip_y) = (flag(output, 48), flag(output, 49));
+    if flag(output, 50) {
+        return Err("output transpose".into());
     }
     if !matches!(alpha_fill, 0 | 1 | 4) {
         return Err(format!("alpha fill mode {alpha_fill}"));
@@ -849,7 +854,16 @@ fn compose_config(
                 1 => background[3],
                 _ => color[3],
             };
-            surface.put(&mut rows, area.left + x as u32, area.top + y as u32, color);
+            let (out_x, out_y) = (
+                if flip_x { width - 1 - x } else { x },
+                if flip_y { height - 1 - y } else { y },
+            );
+            surface.put(
+                &mut rows,
+                area.left + out_x as u32,
+                area.top + out_y as u32,
+                color,
+            );
         }
     }
     memory
