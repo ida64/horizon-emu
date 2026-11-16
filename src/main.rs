@@ -6,23 +6,29 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Write},
     panic,
-    path::Path,
+    path::{Path, PathBuf},
     process::ExitCode,
     sync::{
         Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
 
 use horizon_emu::{
-    arm64::{exception_class, exception_class::INSTRUCTION_ABORT_LOWER},
+    arm64::{
+        exception_class,
+        exception_class::{DATA_ABORT_LOWER, INSTRUCTION_ABORT_LOWER},
+    },
     boot::{BootParams, DramSize},
     image::KernelImage,
     ipc::{Client, ResultCode, Tracker},
     keys::KeySet,
-    machine::{Caller, CodeAddress, Machine, Place, Poke, Process, RunEnd, RunOptions, TraceEvent},
+    machine::{
+        Caller, CodeAddress, ExceptionState, Machine, Module, Place, Poke, Process, RunEnd,
+        RunOptions, TraceEvent,
+    },
     maxwell, nand, net, sdcard,
     secmon::{self, SmcEffect},
     soc::{dc::Frame, emmc::EmmcImages, joycon::Button, sdcard::SdCardImage, wifi_ap::AccessPoint},
@@ -192,6 +198,14 @@ taken as it is, such as one inside a process):
                       themselves, fatal errors reported, kernel debug text.
                       Like --trace-svc it watches every supervisor call,
                       which slows the guest
+  --crash-dump DIR    each time a process takes an exception the firmware
+                      treats as a crash (abort, alignment fault, undefined
+                      instruction, BRK), write DIR/crash-NNN-NAME.txt: the
+                      fault address and syndrome, PC, LR, SP, PSTATE,
+                      X0-X30, the frame-record call chain and the process's
+                      modules (base, size, path, build ID), with each code
+                      address as module+offset. Watches every supervisor
+                      call, like --verbose
   --survey            do not stop at device accesses nothing models: answer
                       reads with zero, drop writes, and print each. Not a
                       faithful run; it lists what the guest wants
@@ -392,6 +406,7 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
     let (mut trace_smc, mut trace_svc, mut trace_devices) = (false, false, false);
     let (mut trace_ipc, mut trace_times, mut verbose) = (false, false, false);
     let mut survey = false;
+    let mut crash_dump = None::<PathBuf>;
     let mut cpu_slowdown = None;
     let (mut breakpoints, mut tracepoints) = (Vec::new(), Vec::new());
     let mut pokes = Vec::new();
@@ -542,6 +557,7 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
             "--trace-ipc" => trace_ipc = true,
             "--trace-times" => trace_times = true,
             "--verbose" => verbose = true,
+            "--crash-dump" => crash_dump = Some(PathBuf::from(value()?)),
             "--trace-devices" => trace_devices = true,
             "--survey" => survey = true,
             "--break" => breakpoints.push(value()?),
@@ -653,6 +669,22 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
         verbose,
         times: (trace_times || verbose).then(Instant::now),
         overlay: window.is_some().then_some(&log),
+        crash_dumps: crash_dump
+            .map(|directory| {
+                std::fs::create_dir_all(&directory)
+                    .map_err(|error| format!("--crash-dump {}: {error}", directory.display()))?;
+                // Numbered after the dumps of earlier runs, never over them.
+                let earlier = std::fs::read_dir(&directory)
+                    .map_err(|error| format!("--crash-dump {}: {error}", directory.display()))?
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_name().to_string_lossy().starts_with("crash-"))
+                    .count();
+                Ok::<_, String>(CrashDumps {
+                    directory,
+                    written: AtomicUsize::new(earlier),
+                })
+            })
+            .transpose()?,
     };
     let cpu_slowdown = cpu_slowdown.unwrap_or((10, Some(Duration::from_secs(12))));
     let options = RunOptions {
@@ -661,7 +693,7 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
         trace_smc: trace_smc || verbose,
         // Requests and answers are read off the supervisor calls that carry
         // them.
-        trace_svc: trace_svc || trace_ipc || verbose,
+        trace_svc: trace_svc || trace_ipc || verbose || tracing.crash_dumps.is_some(),
         trace_devices,
         survey,
         cpu_slowdown: cpu_slowdown.0,
@@ -1004,6 +1036,139 @@ struct Tracing<'a> {
     times: Option<Instant>,
     /// Where every printed line also goes, to be shown in the window.
     overlay: Option<&'a LogOverlay>,
+    /// Where crash dumps go, with `--crash-dump`.
+    crash_dumps: Option<CrashDumps>,
+}
+
+/// The directory `--crash-dump` names, and how many dumps went there.
+struct CrashDumps {
+    directory: PathBuf,
+    written: AtomicUsize,
+}
+
+/// What a user exception was, from its syndrome.
+fn exception_kind(syndrome: u64) -> &'static str {
+    match exception_class(syndrome) {
+        INSTRUCTION_ABORT_LOWER => "an instruction abort",
+        DATA_ABORT_LOWER if syndrome & 1 << 6 != 0 => "a data abort writing",
+        DATA_ABORT_LOWER => "a data abort reading",
+        exception_class::PC_ALIGNMENT => "a PC alignment fault",
+        exception_class::SP_ALIGNMENT => "an SP alignment fault",
+        exception_class::BRK64 => "a BRK",
+        _ => "an undefined instruction",
+    }
+}
+
+/// Process code addresses are below 2^39; the bits above may carry a
+/// return-address tag (the browser engine XORs one into bits 40 and up).
+const USER_ADDRESS_MASK: u64 = (1 << 39) - 1;
+
+/// `module+0x…` for a code address, its tag bits stripped, if a module
+/// holds it.
+fn module_offset(address: u64, modules: &[Module]) -> Option<String> {
+    let address = address & USER_ADDRESS_MASK;
+    let (index, module) = (modules.iter().enumerate())
+        .find(|(_, module)| (module.base..module.base + module.size).contains(&address))?;
+    let name = module
+        .name
+        .as_deref()
+        .and_then(|path| path.rsplit(['/', '\\']).next())
+        .map_or_else(|| format!("module{index}"), str::to_string);
+    Some(format!("{name}+{:#x}", address - module.base))
+}
+
+/// The text of a crash dump.
+fn crash_report(
+    core: usize,
+    caller: Caller,
+    process: Option<Process>,
+    state: &ExceptionState,
+) -> String {
+    use std::fmt::Write as _;
+    let at = |address: u64| {
+        let stripped = address & USER_ADDRESS_MASK;
+        let tag = (stripped != address).then(|| format!(" (untagged {stripped:#x})"));
+        let module = module_offset(address, &state.modules).map(|place| format!(" {place}"));
+        format!(
+            "{address:#018x}{}{}",
+            tag.unwrap_or_default(),
+            module.unwrap_or_default()
+        )
+    };
+    let mut text = String::new();
+    let _ = writeln!(text, "horizon-emu crash dump");
+    match process {
+        Some(process) => {
+            let _ = writeln!(
+                text,
+                "process:   {} (program {:016x}, process ID {})",
+                process.name(),
+                process.program_id,
+                process.id
+            );
+        }
+        None => {
+            let _ = writeln!(text, "process:   ?");
+        }
+    }
+    let _ = writeln!(
+        text,
+        "thread:    TLS {:#x}, context {:#x}, core {core}",
+        caller.thread, caller.context
+    );
+    let _ = writeln!(
+        text,
+        "exception: {} (ESR {:#010x}, class {:#04x})",
+        exception_kind(state.syndrome),
+        state.syndrome,
+        exception_class(state.syndrome)
+    );
+    let _ = writeln!(text, "far:       {:#018x}", state.address);
+    let _ = writeln!(text, "pc:        {}", at(state.pc));
+    let _ = writeln!(text, "lr:        {}", at(state.registers[30]));
+    let _ = writeln!(text, "sp:        {:#018x}", state.sp);
+    let _ = writeln!(text, "pstate:    {:#010x}", state.pstate);
+    let _ = writeln!(text, "\nregisters:");
+    for (index, value) in state.registers.iter().enumerate() {
+        let _ = writeln!(text, "  x{index:<2} {}", at(*value));
+    }
+    let _ = writeln!(text, "\ncall chain (frame records from x29):");
+    for (depth, address) in state.callers.iter().enumerate() {
+        let _ = writeln!(text, "  #{depth:<2} {}", at(*address));
+    }
+    let _ = writeln!(text, "\nmodules:");
+    for (index, module) in state.modules.iter().enumerate() {
+        let build_id = module.build_id.as_ref().map(|id| {
+            id.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        });
+        let _ = writeln!(
+            text,
+            "  {index:<2} {:#012x}-{:#012x} text {:#x}{} build {} {}",
+            module.base,
+            module.base + module.size,
+            module.text_size,
+            if module.mod0 { "" } else { " (no MOD0)" },
+            build_id.as_deref().unwrap_or("?"),
+            module.name.as_deref().unwrap_or("?")
+        );
+    }
+    text
+}
+
+impl CrashDumps {
+    /// Writes one dump; its path.
+    fn write(&self, process: Option<Process>, report: &str) -> io::Result<PathBuf> {
+        let number = self.written.fetch_add(1, Ordering::Relaxed);
+        let name = process.as_ref().map_or("unknown", Process::name);
+        let name: String = (name.chars())
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let path = self.directory.join(format!("crash-{number:03}-{name}.txt"));
+        std::fs::write(&path, report)?;
+        Ok(path)
+    }
 }
 
 /// Prints the trace lines for one event to stderr. A closed stderr must not
@@ -1067,29 +1232,36 @@ fn write_event(out: &mut impl Write, event: TraceEvent, tracing: &Tracing) -> io
                 results
             )
         }
-        TraceEvent::UserAbort {
+        TraceEvent::UserException {
             core,
-            syndrome,
-            address,
-            pc,
-            lr,
             caller,
             process,
-            callers,
+            state,
         } => {
+            if let Some(dumps) = &tracing.crash_dumps {
+                let report = crash_report(core, caller, process, state);
+                match dumps.write(process, &report) {
+                    Ok(path) => writeln!(out, "core {core}: crash dump {}", path.display())?,
+                    Err(error) => writeln!(out, "core {core}: crash dump not written: {error}")?,
+                }
+            }
             if !(tracing.verbose || tracing.svc) {
                 return Ok(());
             }
-            let kind = match exception_class(syndrome) {
-                INSTRUCTION_ABORT_LOWER => "an instruction abort",
-                _ if syndrome & 1 << 6 != 0 => "a data abort writing",
-                _ => "a data abort reading",
-            };
+            let place = module_offset(state.pc, &state.modules)
+                .map(|place| format!(" ({place})"))
+                .unwrap_or_default();
             writeln!(
                 out,
-                "core {core}: {} took {kind} at {address:#x}, pc {pc:#x}, lr {lr:#x}, \
-                 callers {callers:x?} (syndrome {syndrome:#x})",
-                describe_caller(caller, process)
+                "core {core}: {} took {} at {:#x}, pc {:#x}{place}, lr {:#x}, \
+                 callers {:x?} (syndrome {:#x})",
+                describe_caller(caller, process),
+                exception_kind(state.syndrome),
+                state.address,
+                state.pc,
+                state.registers[30],
+                state.callers,
+                state.syndrome
             )
         }
         TraceEvent::SupervisorCall {

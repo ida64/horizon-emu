@@ -5,12 +5,17 @@ use std::fmt;
 
 /// Exception class, `ESR_ELx[31:26]`.
 pub mod exception_class {
+    /// An undefined or otherwise unallocated instruction.
+    pub const UNKNOWN: u32 = 0x00;
     pub const WFX: u32 = 0x01;
     pub const SVC64: u32 = 0x15;
     pub const SMC64: u32 = 0x17;
     pub const SYSTEM_REGISTER: u32 = 0x18;
     pub const INSTRUCTION_ABORT_LOWER: u32 = 0x20;
+    pub const PC_ALIGNMENT: u32 = 0x22;
     pub const DATA_ABORT_LOWER: u32 = 0x24;
+    pub const SP_ALIGNMENT: u32 = 0x26;
+    pub const BRK64: u32 = 0x3C;
 }
 
 pub const fn exception_class(syndrome: u64) -> u32 {
@@ -33,6 +38,7 @@ impl SysReg {
     pub const ELR_EL1: Self = Self::new(3, 0, 4, 0, 1);
     pub const ESR_EL1: Self = Self::new(3, 0, 5, 2, 0);
     pub const FAR_EL1: Self = Self::new(3, 0, 6, 0, 0);
+    pub const SP_EL0: Self = Self::new(3, 0, 4, 1, 0);
     pub const VBAR_EL1: Self = Self::new(3, 0, 12, 0, 0);
     pub const CPUACTLR_EL1: Self = Self::new(3, 1, 15, 2, 0);
     pub const CPUECTLR_EL1: Self = Self::new(3, 1, 15, 2, 1);
@@ -328,6 +334,43 @@ impl TranslationRegime {
             table = descriptor & ADDRESS;
         }
         unreachable!("level 3 always returns")
+    }
+
+    /// Every page or block the lower half (`TTBR0`) maps, in address
+    /// order: `(virtual address, size, descriptor)`. Only the 4 KiB granule
+    /// is implemented; with the MMU off or another granule, nothing.
+    pub fn lower_mappings(&self, read_u64: impl Fn(u64) -> Option<u64>) -> Vec<(u64, u64, u64)> {
+        const ADDRESS: u64 = 0x0000_FFFF_FFFF_F000;
+        let size_offset = self.tcr & 0x3F;
+        if self.sctlr & 1 == 0 || self.tcr >> 14 & 3 != 0 || !(16..=39).contains(&size_offset) {
+            return Vec::new();
+        }
+        let va_bits = 64 - size_offset as u32;
+        let first_level = 4 - (va_bits - 12).div_ceil(9);
+        let mut mappings = Vec::new();
+        // (table, level, base virtual address of the table)
+        let mut tables = vec![(self.ttbr0 & ADDRESS, first_level, 0u64)];
+        while let Some((table, level, base)) = tables.pop() {
+            let shift = 12 + 9 * (3 - level);
+            let entries = 1u64 << (va_bits - shift).min(9);
+            for index in (0..entries).rev() {
+                let Some(descriptor) = read_u64(table + index * 8) else {
+                    continue;
+                };
+                let va = base + (index << shift);
+                let is_table_or_page = descriptor & 2 != 0;
+                if descriptor & 1 == 0 || (level == 3 && !is_table_or_page) {
+                    continue;
+                }
+                if level < 3 && is_table_or_page {
+                    tables.push((descriptor & ADDRESS, level + 1, va));
+                } else {
+                    mappings.push((va, 1u64 << shift, descriptor));
+                }
+            }
+        }
+        mappings.sort_unstable_by_key(|&(va, _, _)| va);
+        mappings
     }
 }
 

@@ -138,6 +138,49 @@ impl Process {
     }
 }
 
+/// A code module of a process (its main program, an SDK library, an NRO),
+/// found the way the firmware's crash reporter finds them: an executable
+/// region of the process's address space is a module's code, and the
+/// regions that follow it until the next code are its data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Module {
+    pub base: u64,
+    /// Bytes of its code.
+    pub text_size: u64,
+    /// Bytes from `base` to the end of its last data region.
+    pub size: u64,
+    /// The path the linker recorded at the start of its read-only data,
+    /// if it did.
+    pub name: Option<String>,
+    /// The GNU build ID note in its read-only data, if there is one.
+    pub build_id: Option<Vec<u8>>,
+    /// Whether `base + [base + 4]` holds the `MOD0` header every Horizon
+    /// module has: an executable region without it is not a module.
+    pub mod0: bool,
+}
+
+/// What a core held when a thread of a process took an exception the
+/// firmware does not service (anything but a supervisor call).
+#[derive(Debug, Clone)]
+pub struct ExceptionState {
+    /// `ESR_EL1` of the exception.
+    pub syndrome: u64,
+    /// `FAR_EL1`: the address an abort or alignment fault reached for.
+    pub address: u64,
+    /// `ELR_EL1`: where the thread was.
+    pub pc: u64,
+    /// `X0`-`X30`.
+    pub registers: [u64; 31],
+    /// `SP_EL0`.
+    pub sp: u64,
+    /// `SPSR_EL1`: the thread's PSTATE.
+    pub pstate: u64,
+    /// Return addresses from the frame records on its stack.
+    pub callers: Vec<u64>,
+    /// The process's modules, by address.
+    pub modules: Vec<Module>,
+}
+
 /// The thread that makes a supervisor call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Caller {
@@ -301,22 +344,15 @@ pub enum TraceEvent<'a> {
         /// answer brings or has filled.
         buffers: &'a [ipc::Contents],
     },
-    /// A thread took an instruction or data abort: it reached memory it
-    /// does not have. Seen where supervisor calls are (with what watches
-    /// those).
-    UserAbort {
+    /// A thread took an exception the kernel does not service as a call:
+    /// an abort, an alignment fault, an undefined instruction or a `BRK`.
+    /// The firmware treats each as a crash. Seen where supervisor calls
+    /// are (with what watches those).
+    UserException {
         core: usize,
-        /// `ESR_EL1` of the abort.
-        syndrome: u64,
-        /// The address the thread reached for.
-        address: u64,
-        /// Where it did, and its `X30` there.
-        pc: u64,
-        lr: u64,
         caller: Caller,
         process: Option<Process>,
-        /// Return addresses from the frame records on its stack.
-        callers: &'a [u64],
+        state: &'a ExceptionState,
     },
     /// The non-secure world reached for a secure-only peripheral or
     /// memory; the core takes an external abort into its own vectors.
@@ -596,6 +632,56 @@ pub struct CallInProgress {
 /// frame records.
 const FRAME_CHAIN_LIMIT: usize = 16;
 
+/// How much of a module's read-only data is searched for its path and
+/// build ID.
+const MODULE_IDENTITY_BYTES: usize = 0x2000;
+/// How far back from the end of a module's read-only pages its build ID
+/// note is searched for.
+const BUILD_ID_SEARCH_BYTES: u64 = 8 << 20;
+
+/// The name at the start of a module's read-only data (where the firmware's
+/// crash reporter reads module names), in either layout seen: a zero word,
+/// the length, then the path; or (firmware 23.5.0's system modules, e.g.
+/// `bsdsocket`) a one word, three more words, the length at `0x10` and the
+/// name at `0x14`. `None` if the data starts neither way.
+fn module_path(rodata: &[u8]) -> Option<String> {
+    let word = |at: usize| Some(u32::from_le_bytes(rodata.get(at..at + 4)?.try_into().ok()?));
+    let at = match word(0)? {
+        0 => 4,
+        1 => 0x10,
+        _ => return None,
+    };
+    let len = word(at)? as usize;
+    if !(1..=0x200).contains(&len) {
+        return None;
+    }
+    let bytes = rodata.get(at + 4..at + 4 + len)?;
+    let bytes = &bytes[..bytes.iter().position(|&byte| byte == 0).unwrap_or(len)];
+    (!bytes.is_empty()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() || *byte == b' '))
+    .then(|| String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// The descriptor of the first GNU build ID note (`NT_GNU_BUILD_ID`, name
+/// `GNU`) in `rodata`.
+fn build_id(rodata: &[u8]) -> Option<Vec<u8>> {
+    let word = |at: usize| u32::from_le_bytes(rodata[at..at + 4].try_into().unwrap());
+    (0..rodata.len().saturating_sub(16))
+        .step_by(4)
+        .find_map(|at| {
+            let len = word(at + 4) as usize;
+            let found = word(at) == 4
+                && word(at + 8) == 3
+                && (16..=32).contains(&len)
+                && &rodata[at + 12..at + 16] == b"GNU\0";
+            found
+                .then(|| rodata.get(at + 16..at + 16 + len).map(<[u8]>::to_vec))
+                .flatten()
+        })
+}
+
 pub struct Machine {
     // Dropped first: the VM must be gone before the memory it maps, which
     // lives until the last device sharing it is dropped.
@@ -853,6 +939,106 @@ impl Machine {
             fp = next;
         }
         callers
+    }
+
+    /// The modules of the process whose address space `regime` is.
+    fn modules(&self, regime: &TranslationRegime) -> Vec<Module> {
+        /// Descriptor bits: `AP[1]` (EL0 may access), `AP[2]` (read-only)
+        /// and `UXN`.
+        const EL0: u64 = 1 << 6;
+        const READ_ONLY: u64 = 1 << 7;
+        const UXN: u64 = 1 << 54;
+        // Runs of contiguous pages the process reaches with one kind of
+        // access: (start, end, executable, read-only).
+        let mut runs: Vec<(u64, u64, bool, bool)> = Vec::new();
+        for (va, size, descriptor) in regime.lower_mappings(|table| self.ram.read_u64(table)) {
+            if descriptor & EL0 == 0 {
+                continue;
+            }
+            let kind = (descriptor & UXN == 0, descriptor & READ_ONLY != 0);
+            match runs.last_mut() {
+                Some((_, end, executable, read_only))
+                    if *end == va && (*executable, *read_only) == kind =>
+                {
+                    *end = va + size
+                }
+                _ => runs.push((va, va + size, kind.0, kind.1)),
+            }
+        }
+        let read = |address: u64, len: u64| {
+            let mut bytes = vec![0; len as usize];
+            let filled = self.read_virtual(regime, address, &mut bytes);
+            bytes.truncate(filled);
+            bytes
+        };
+        let read_u32 = |address: u64| {
+            let bytes = read(address, 4);
+            Some(u32::from_le_bytes(bytes.try_into().ok()?))
+        };
+        let mut modules = Vec::new();
+        for (index, &(base, text_end, executable, _)) in runs.iter().enumerate() {
+            if !executable {
+                continue;
+            }
+            // Its data: the runs right after it up to the next code; the
+            // first, if read-only, is its read-only data.
+            let mut end = text_end;
+            let mut rodata_end = None;
+            for &(start, run_end, next_executable, read_only) in &runs[index + 1..] {
+                if start != end || next_executable {
+                    break;
+                }
+                if end == text_end && read_only {
+                    rodata_end = Some(run_end);
+                }
+                end = run_end;
+            }
+            let has_mod0 = |base: u64| {
+                read_u32(base + 4).and_then(|offset| read_u32(base + u64::from(offset)))
+                    == Some(u32::from_le_bytes(*b"MOD0"))
+            };
+            // An NRO's first page, its header, is mapped without execute
+            // permission (seen for the browser's `.nrs` modules): the module
+            // starts there, where its MOD0 offset is.
+            let header = base - PAGE_SIZE;
+            let base =
+                if !has_mod0(base) && index > 0 && runs[index - 1].1 == base && has_mod0(header) {
+                    header
+                } else {
+                    base
+                };
+            let mod0 = has_mod0(base);
+            // The path is at the start of the read-only data. The build ID
+            // note ends the read-only data segment, but the run of
+            // read-only pages also holds the data the program made
+            // read-only after relocating itself (`bsdsocket`: 9 pages), so
+            // it is searched for from the run's end back, a bounded amount.
+            let (name, build_id) = match rodata_end {
+                Some(rodata_end) => {
+                    let chunk = MODULE_IDENTITY_BYTES as u64;
+                    let head = read(text_end, (rodata_end - text_end).min(chunk));
+                    let found = build_id(&head).or_else(|| {
+                        (1..=BUILD_ID_SEARCH_BYTES / chunk).find_map(|step| {
+                            let at = rodata_end.checked_sub(step * chunk)?.max(text_end);
+                            // Overlapping by a note's size, so that none
+                            // straddles two chunks unseen.
+                            build_id(&read(at, chunk + 64))
+                        })
+                    });
+                    (module_path(&head), found)
+                }
+                None => (None, None),
+            };
+            modules.push(Module {
+                base,
+                text_size: text_end - base,
+                size: end - base,
+                name,
+                build_id,
+                mod0,
+            });
+        }
+        modules
     }
 
     fn create_vcpu(&self, core: usize, entry: CoreEntry) -> Result<Vcpu<'_>, HvError> {
@@ -1526,24 +1712,38 @@ impl<'env> Session<'env> {
         let class = exception_class(syndrome);
         if class != exception_class::SVC64 {
             // The firmware maps a process's memory before the process
-            // touches it: an abort from EL0 is a crash.
-            let aborted = [
+            // touches it and never expects these from a process: each is
+            // a crash.
+            let crashes = [
+                exception_class::UNKNOWN,
                 exception_class::INSTRUCTION_ABORT_LOWER,
+                exception_class::PC_ALIGNMENT,
                 exception_class::DATA_ABORT_LOWER,
+                exception_class::SP_ALIGNMENT,
+                exception_class::BRK64,
             ];
-            if aborted.contains(&class) {
+            if crashes.contains(&class) {
                 let caller = Caller::current(vcpu)?;
                 let regime = self.machine.translation_regime(vcpu)?;
-                let callers = self.machine.frame_chain(&regime, vcpu.gpr(29)?);
-                (self.options.trace)(TraceEvent::UserAbort {
-                    core,
+                let mut registers = [0; 31];
+                for (index, register) in (0u8..).zip(&mut registers) {
+                    *register = vcpu.gpr(index)?;
+                }
+                let state = ExceptionState {
                     syndrome,
                     address: vcpu.sys_reg(SysReg::FAR_EL1)?,
                     pc: vcpu.sys_reg(SysReg::ELR_EL1)?,
-                    lr: vcpu.gpr(30)?,
+                    registers,
+                    sp: vcpu.sys_reg(SysReg::SP_EL0)?,
+                    pstate: vcpu.sys_reg(SysReg::SPSR_EL1)?,
+                    callers: self.machine.frame_chain(&regime, registers[29]),
+                    modules: self.machine.modules(&regime),
+                };
+                (self.options.trace)(TraceEvent::UserException {
+                    core,
                     caller,
                     process: self.process(vcpu, caller.context)?,
-                    callers: &callers,
+                    state: &state,
                 });
             }
             return Ok(None);
