@@ -226,6 +226,10 @@ pub fn serve(flags: &[String]) -> Result<(), String> {
         }));
         workers.retain(|worker| !worker.is_finished());
     }
+    // Requests already received are answered before the runs are stopped.
+    for worker in workers {
+        let _ = worker.join();
+    }
     server.stop_all();
     Ok(())
 }
