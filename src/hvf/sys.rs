@@ -22,6 +22,8 @@ pub const HV_MEMORY_EXEC: hv_memory_flags_t = 1 << 2;
 
 pub const HV_REG_X0: hv_reg_t = 0;
 pub const HV_REG_PC: hv_reg_t = 31;
+pub const HV_REG_FPCR: hv_reg_t = 32;
+pub const HV_REG_FPSR: hv_reg_t = 33;
 pub const HV_REG_CPSR: hv_reg_t = 34;
 
 pub const HV_EXIT_REASON_CANCELED: u32 = 0;
@@ -77,6 +79,13 @@ unsafe extern "C" {
     ) -> hv_return_t;
     pub fn hv_vcpu_set_trap_debug_exceptions(vcpu: hv_vcpu_t, value: bool) -> hv_return_t;
     pub fn hv_vcpu_set_trap_debug_reg_accesses(vcpu: hv_vcpu_t, value: bool) -> hv_return_t;
+    /// `value` points at the 16 bytes of `Q<reg>`.
+    pub fn hv_vcpu_get_simd_fp_reg(vcpu: hv_vcpu_t, reg: u32, value: *mut c_void) -> hv_return_t;
+    /// Takes the register's 16 bytes by value in a vector register, which
+    /// stable Rust cannot pass over FFI: called through
+    /// [`hv_vcpu_set_simd_fp_reg_bytes`]. Declared without its parameters
+    /// only so that its address can be named.
+    fn hv_vcpu_set_simd_fp_reg();
 
     /// Returns a retained `hv_vcpu_config_t`, to be released with [`os_release`].
     pub fn hv_vcpu_config_create() -> *mut c_void;
@@ -95,6 +104,40 @@ unsafe extern "C" {
 pub struct mach_timebase_info_data_t {
     pub numer: u32,
     pub denom: u32,
+}
+
+/// `hv_vcpu_set_simd_fp_reg(vcpu, reg, value)` with `value` the register's
+/// 16 bytes in memory order, passed in `V0` as the C ABI passes a
+/// `simd_uchar16`.
+///
+/// # Safety
+/// As for any Hypervisor.framework call: `vcpu` is live and owned by the
+/// calling thread.
+pub unsafe fn hv_vcpu_set_simd_fp_reg_bytes(
+    vcpu: hv_vcpu_t,
+    reg: u32,
+    value: [u8; 16],
+) -> hv_return_t {
+    let low = u64::from_le_bytes(value[..8].try_into().unwrap());
+    let high = u64::from_le_bytes(value[8..].try_into().unwrap());
+    let result: u64;
+    // SAFETY: a call that follows the C ABI: arguments in X0, W1 and V0,
+    // the result in W0; every register the ABI lets the callee change is
+    // declared clobbered.
+    unsafe {
+        std::arch::asm!(
+            "fmov d0, {low}",
+            "mov v0.d[1], {high}",
+            "bl {function}",
+            low = in(reg) low,
+            high = in(reg) high,
+            function = sym hv_vcpu_set_simd_fp_reg,
+            inout("x0") vcpu => result,
+            in("x1") u64::from(reg),
+            clobber_abi("C"),
+        );
+    }
+    result as hv_return_t
 }
 
 unsafe extern "C" {

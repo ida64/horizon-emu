@@ -30,6 +30,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use super::{Notes, i2c::I2cDevice};
+use crate::snapshot::{SnapshotError, decode, encode};
 
 pub const ADDRESS: u8 = 0x1C;
 
@@ -222,6 +223,16 @@ impl I2cDevice for Alc5639 {
             _ => return self.refuse(format!("a read of {} bytes", data.len())),
         }
         Some(true)
+    }
+
+    /// The registers, the private registers written and the pointer.
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&(&self.registers, &self.private, self.pointer))
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError> {
+        (self.registers, self.private, self.pointer) = decode("ALC5639", state)?;
+        Ok(())
     }
 }
 

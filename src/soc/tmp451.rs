@@ -8,6 +8,7 @@
 //! The physical situation is a board at 32 C and an idle SoC at 35 C;
 //! integer temperatures have zero fractional parts. No thermal alarm.
 use super::i2c::RegisterMap;
+use crate::snapshot::{SnapshotError, decode, encode};
 pub const ADDRESS: u8 = 0x4c;
 /// TI manufacturer identity (TMP451 datasheet); ptm reads but does not compare it.
 const MANUFACTURER: u8 = 0x55;
@@ -42,6 +43,17 @@ impl RegisterMap for Tmp451 {
         };
         self.registers[target as usize] = value;
         Some(())
+    }
+    /// The configuration and limit registers; the temperatures are constant.
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&self.registers.as_slice())
+    }
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError> {
+        let registers: Vec<u8> = decode("TMP451", state)?;
+        self.registers = registers.try_into().map_err(|registers: Vec<u8>| {
+            SnapshotError::Corrupt(format!("TMP451: {} registers saved", registers.len()))
+        })?;
+        Ok(())
     }
 }
 #[cfg(test)]

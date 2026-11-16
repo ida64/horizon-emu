@@ -6,8 +6,13 @@
 
 use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
+
 use super::regs::word;
-use crate::bus::MmioDevice;
+use crate::{
+    bus::MmioDevice,
+    snapshot::{self, Snapshot, SnapshotError, encode},
+};
 
 pub const BASE: u64 = 0x6000_D000;
 pub const SIZE: u64 = 0x800;
@@ -38,7 +43,7 @@ const MASKED: u64 = 0x80;
 const DEBOUNCE_ENABLE: u64 = IN;
 const DEBOUNCE_COUNT: u64 = INT_CLR;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 struct Port {
     /// 1: the pin is a GPIO rather than its special function.
     configuration: u8,
@@ -223,6 +228,26 @@ impl MmioDevice for Gpio {
             }
         }
         Some(())
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+/// Saves every port: configuration, outputs, interrupt setup and status,
+/// debounce, and the levels the board puts on its inputs. The bank
+/// interrupt lines are levels the interrupt controller saves, and the
+/// devices that observe outputs save what they made of them, so restoring
+/// drives nothing.
+impl Snapshot for Gpio {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&*self.ports.lock().unwrap())
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        *self.ports.lock().unwrap() = snapshot::decode("GPIO", state)?;
+        Ok(())
     }
 }
 

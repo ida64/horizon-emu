@@ -1,6 +1,9 @@
 //! The emulated console: DRAM holding the kernel image, the secure monitor,
 //! the devices the kernel drives, and one host thread per started core.
 
+mod snapshot;
+
+pub use self::snapshot::SaveReport;
 use std::{
     collections::{BTreeMap, HashMap},
     fmt, io,
@@ -17,12 +20,12 @@ use std::{
 use crate::{
     arm64::{DataAbort, LoadStore, SysReg, SysRegAccess, TranslationRegime, exception_class},
     boot::{self, BootParams, CORE_COUNT, CoreEntry},
-    bus::{Access, Bus, MmioDevice},
+    bus::{Access, Bus, MmioDevice, NoState},
     clock::GuestClock,
     gic::Gic,
     hvf::{
-        Exit, HvError, Vcpu, VcpuHandle, Vm,
-        debug::{BreakpointError, DebugExit, GuestDebug},
+        Exit, HvError, Vcpu, VcpuHandle, VcpuState, Vm,
+        debug::{BreakpointError, DebugExit, GuestDebug, GuestRegisters},
     },
     image::{KernelImage, PAGE_SIZE},
     ipc,
@@ -30,6 +33,7 @@ use crate::{
     memory::GuestRam,
     pmu::Pmu,
     secmon::{self, SecureMonitor, SmcEffect, Unimplemented},
+    snapshot::Snapshot,
     soc::{
         Screen, Soc,
         dc::NoFrame,
@@ -701,6 +705,10 @@ pub struct Machine {
     pmus: [Mutex<Pmu>; CORE_COUNT],
     soc: Soc,
     signals: Arc<CoreSignals>,
+    /// Parks the cores for a snapshot.
+    pause: Pause,
+    /// Where the cores of a restored machine pick up, for the next run.
+    restored: Mutex<Option<[Option<ParkedCore>; CORE_COUNT]>>,
 }
 
 impl Machine {
@@ -770,6 +778,8 @@ impl Machine {
             pmus: Default::default(),
             soc,
             signals,
+            pause: Pause::default(),
+            restored: Mutex::new(None),
         })
     }
 
@@ -866,7 +876,23 @@ impl Machine {
                     }
                 });
             }
-            session.start_core(scope, 0, CoreEntry::primary(self.image.load_address()));
+            match self.restored.lock().unwrap().take() {
+                // A restored machine's guest time stood still since the
+                // state was loaded; it goes on as its cores do.
+                Some(parked) => {
+                    for (core, parked) in parked.into_iter().enumerate() {
+                        if let Some(ParkedCore::Running { cpu, debug }) = parked {
+                            session.start_core(scope, core, Start::Restored { cpu, debug });
+                        }
+                    }
+                    self.clock.resume();
+                }
+                None => session.start_core(
+                    scope,
+                    0,
+                    Start::Entry(CoreEntry::primary(self.image.load_address())),
+                ),
+            }
             let deadline = options.timeout.map(|timeout| Instant::now() + timeout);
             ended = loop {
                 let left =
@@ -893,6 +919,7 @@ impl Machine {
                 cores.extend(finished.recv_timeout(KICK_INTERVAL).ok());
             }
         });
+        self.pause.state.lock().unwrap().threads = [false; CORE_COUNT];
         cores.sort_by_key(|report| report.core);
         let stopped = Instant::now();
         let processes = session.processes.into_inner().unwrap();
@@ -1046,11 +1073,14 @@ impl Machine {
         modules
     }
 
-    fn create_vcpu(&self, core: usize, entry: CoreEntry) -> Result<Vcpu<'_>, HvError> {
+    fn create_vcpu(&self, core: usize, start: &Start) -> Result<Vcpu<'_>, HvError> {
         let vcpu = Vcpu::new(&self.vm)?;
         vcpu.set_sys_reg(SysReg::MIDR_EL1, boot::MIDR_EL1)?;
         vcpu.set_sys_reg(SysReg::MPIDR_EL1, boot::mpidr_el1(core))?;
-        self.start_vcpu(&vcpu, entry)?;
+        match start {
+            Start::Entry(entry) => self.start_vcpu(&vcpu, *entry)?,
+            Start::Restored { cpu, .. } => vcpu.load_state(cpu)?,
+        }
         Ok(vcpu)
     }
 
@@ -1284,6 +1314,11 @@ impl MmioDevice for GicDistributor {
         self.0
             .distributor_write(core, offset, size, u32::try_from(value).ok()?)
     }
+
+    /// Saved once for the machine, as `gic`.
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(&NoState)
+    }
 }
 
 struct GicCpuInterface(Arc<Gic>);
@@ -1297,6 +1332,11 @@ impl MmioDevice for GicCpuInterface {
         self.0
             .cpu_interface_write(core, offset, size, u32::try_from(value).ok()?)
     }
+
+    /// Saved once for the machine, as `gic`.
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(&NoState)
+    }
 }
 
 struct UartPort(Uart);
@@ -1308,6 +1348,10 @@ impl MmioDevice for UartPort {
 
     fn write(&self, _core: usize, offset: u64, size: u8, value: u64) -> Option<()> {
         self.0.write(offset, size, u32::try_from(value).ok()?)
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(&self.0)
     }
 }
 
@@ -1356,6 +1400,65 @@ impl CoreSignals {
             .wait_while(signal.notified.lock().unwrap(), |notified| !*notified)
             .unwrap();
         *notified = false;
+    }
+}
+
+/// What a core left when it parked for a snapshot.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum ParkedCore {
+    /// Running guest code: its registers.
+    Running {
+        cpu: Box<VcpuState>,
+        debug: Box<GuestRegisters>,
+    },
+    /// Switched off (CPU_OFF), waiting to be started again.
+    Off,
+    /// The console asleep, waiting for a wake event.
+    Asleep,
+}
+
+/// Parks the cores at a safe point: between two entries into the guest,
+/// or where a core waits (switched off, asleep), and lets them go again.
+#[derive(Default)]
+struct Pause {
+    state: Mutex<PauseState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct PauseState {
+    requested: bool,
+    /// Cores with a thread in the current run.
+    threads: [bool; CORE_COUNT],
+    parked: [Option<ParkedCore>; CORE_COUNT],
+}
+
+/// How a core's thread starts it.
+enum Start {
+    /// Where the monitor hands it to the kernel.
+    Entry(CoreEntry),
+    /// Where it was when a snapshot was taken.
+    Restored {
+        cpu: Box<VcpuState>,
+        debug: Box<GuestRegisters>,
+    },
+}
+
+impl Pause {
+    fn requested(&self) -> bool {
+        self.state.lock().unwrap().requested
+    }
+
+    /// Called by `core`'s thread when it sees a pause requested: records
+    /// what it leaves and blocks until the pause ends.
+    fn park(&self, core: usize, parked: ParkedCore) {
+        let mut state = self.state.lock().unwrap();
+        state.parked[core] = Some(parked);
+        self.changed.notify_all();
+        while state.requested {
+            state = self.changed.wait(state).unwrap();
+        }
+        state.parked[core] = None;
     }
 }
 
@@ -1447,15 +1550,16 @@ impl<'env> Session<'env> {
         &'env self,
         scope: &'scope thread::Scope<'scope, 'env>,
         core: usize,
-        entry: CoreEntry,
+        start: Start,
     ) {
         self.started.fetch_add(1, Ordering::SeqCst);
         self.switches[core].lock().unwrap().0 = true;
+        self.machine.pause.state.lock().unwrap().threads[core] = true;
         scope.spawn(move || {
             // A core that dies without reporting would leave `run` waiting
             // for it forever, so a panic is reported before it propagates.
             let outcome =
-                panic::catch_unwind(AssertUnwindSafe(|| self.run_core(scope, core, entry)));
+                panic::catch_unwind(AssertUnwindSafe(|| self.run_core(scope, core, start)));
             let report = outcome.as_ref().copied().unwrap_or(CoreReport {
                 core,
                 stop: CoreStop::HostPanic,
@@ -1473,7 +1577,7 @@ impl<'env> Session<'env> {
         &'env self,
         scope: &'scope thread::Scope<'scope, 'env>,
         core: usize,
-        entry: CoreEntry,
+        start: Start,
     ) -> CoreReport {
         let machine = self.machine;
         let failed = |error| CoreReport {
@@ -1481,7 +1585,7 @@ impl<'env> Session<'env> {
             stop: CoreStop::Backend(error),
             state: None,
         };
-        let vcpu = match machine.create_vcpu(core, entry) {
+        let vcpu = match machine.create_vcpu(core, &start) {
             Ok(vcpu) => vcpu,
             Err(error) => return failed(error),
         };
@@ -1496,10 +1600,24 @@ impl<'env> Session<'env> {
             },
             Err(error) => return failed(error),
         };
+        if let Start::Restored { debug, .. } = start {
+            probes.debug.set_guest_registers(*debug);
+        }
         machine.signals.attach(core, Some(vcpu.handle()));
         let stop = loop {
             if self.stop.load(Ordering::SeqCst) {
                 break CoreStop::Requested;
+            }
+            if machine.pause.requested() {
+                let parked = match vcpu.save_state() {
+                    Ok(cpu) => ParkedCore::Running {
+                        cpu: Box::new(cpu),
+                        debug: Box::new(probes.debug.guest_registers()),
+                    },
+                    Err(error) => break CoreStop::Backend(error),
+                };
+                machine.pause.park(core, parked);
+                continue;
             }
             match self.enter_guest(scope, core, &vcpu, &mut probes) {
                 Ok(None) => {}
@@ -1907,10 +2025,14 @@ impl<'env> Session<'env> {
     }
 
     /// WFI: parks the core until its interrupt input is asserted, whatever
-    /// its PSTATE masks, or the machine stops.
+    /// its PSTATE masks, the machine stops or a snapshot wants the core
+    /// parked (a WFI may complete early).
     fn wait_for_interrupt(&self, core: usize) {
         let machine = self.machine;
-        while !machine.gic.irq_asserted(core) && !self.stop.load(Ordering::SeqCst) {
+        while !machine.gic.irq_asserted(core)
+            && !self.stop.load(Ordering::SeqCst)
+            && !machine.pause.requested()
+        {
             machine.signals.wait(core);
         }
     }
@@ -1956,12 +2078,20 @@ impl<'env> Session<'env> {
                 if let Some(entry) = self.switches[core].lock().unwrap().1.take() {
                     break entry;
                 }
+                if machine.pause.requested() {
+                    machine.pause.park(core, ParkedCore::Off);
+                    continue;
+                }
                 machine.signals.wait(core);
             },
             SmcEffect::Sleep { entry, context } => {
                 while !machine.soc.wake_pending() {
                     if self.stop.load(Ordering::SeqCst) {
                         return Ok(Some(CoreStop::Requested));
+                    }
+                    if machine.pause.requested() {
+                        machine.pause.park(core, ParkedCore::Asleep);
+                        continue;
                     }
                     thread::sleep(WAKE_POLL);
                 }
@@ -1990,7 +2120,7 @@ impl<'env> Session<'env> {
                         machine.signals.notify(core);
                     } else {
                         drop(switch);
-                        self.start_core(scope, core, entry);
+                        self.start_core(scope, core, Start::Entry(entry));
                     }
                 }
                 return Ok(None);

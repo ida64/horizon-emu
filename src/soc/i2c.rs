@@ -16,8 +16,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use serde::{Deserialize, Serialize};
+
 use super::{Notes, regs::word};
-use crate::bus::MmioDevice;
+use crate::{
+    bus::MmioDevice,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 pub const SIZE: u64 = 0x100;
 
@@ -67,11 +72,20 @@ const HEADER_WORDS: usize = 3;
 ///
 /// `None` from either method means the device does not model what was asked
 /// of it, which stops the machine; `Some(false)` is a missing acknowledge.
+///
+/// The controller a device is on saves it with itself in a machine
+/// snapshot, through [`I2cDevice::save`] and [`I2cDevice::restore`].
 pub trait I2cDevice: Send {
     /// A write transfer: `data` is everything after the address byte.
     fn write(&mut self, data: &[u8]) -> Option<bool>;
     /// A read transfer filling `data`.
     fn read(&mut self, data: &mut [u8]) -> Option<bool>;
+    /// The device's state, encoded: everything that decides what it
+    /// answers from now on ([`Snapshot::save`]).
+    fn save(&self) -> Result<Vec<u8>, SnapshotError>;
+    /// Takes back what [`I2cDevice::save`] of the same device, in a machine
+    /// built the same way, returned ([`Snapshot::restore`]).
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError>;
 }
 
 /// Called with the level of the controller's interrupt output.
@@ -84,7 +98,13 @@ pub struct I2cController {
     notes: Arc<Notes>,
 }
 
+/// Everything but the devices is the controller's own state, which a
+/// snapshot saves as is; the devices save theirs through [`I2cDevice`].
+#[derive(Serialize, Deserialize)]
 struct State {
+    /// Wiring: the restoring machine has the same devices at the same
+    /// addresses.
+    #[serde(skip)]
     devices: HashMap<u8, Box<dyn I2cDevice>>,
     /// Plain configuration registers.
     configuration: HashMap<u64, u32>,
@@ -280,6 +300,51 @@ impl MmioDevice for I2cController {
         self.update_interrupt(&state);
         Some(())
     }
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+/// The controller's registers and FIFOs, the packet it is assembling, and
+/// each device's state by address. The interrupt output follows from the
+/// registers at the next access and is not driven on restore.
+impl Snapshot for I2cController {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        let state = self.state.lock().unwrap();
+        let mut devices = state
+            .devices
+            .iter()
+            .map(|(&address, device)| Ok((address, device.save()?)))
+            .collect::<Result<Vec<(u8, Vec<u8>)>, SnapshotError>>()?;
+        devices.sort_unstable_by_key(|&(address, _)| address);
+        encode(&(&*state, devices))
+    }
+
+    fn restore(&self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let (saved, devices): (State, Vec<(u8, Vec<u8>)>) = decode(self.name, bytes)?;
+        let mut state = self.state.lock().unwrap();
+        let mut addresses: Vec<u8> = state.devices.keys().copied().collect();
+        addresses.sort_unstable();
+        if !devices
+            .iter()
+            .map(|&(address, _)| address)
+            .eq(addresses.iter().copied())
+        {
+            return Err(SnapshotError::Corrupt(format!(
+                "{}: devices at {addresses:02x?}, saved with others",
+                self.name
+            )));
+        }
+        for (address, device) in &devices {
+            if let Some(target) = state.devices.get_mut(address) {
+                target.restore(device)?;
+            }
+        }
+        let wiring = std::mem::take(&mut state.devices);
+        *state = saved;
+        state.devices = wiring;
+        Ok(())
+    }
 }
 
 /// A device made of byte registers behind a register pointer: a write sets
@@ -297,6 +362,10 @@ pub struct ByteRegisters<R> {
 pub trait RegisterMap: Send {
     fn read(&mut self, register: u8) -> Option<u8>;
     fn write(&mut self, register: u8, value: u8) -> Option<()>;
+    /// The registers' state, encoded, as [`I2cDevice::save`].
+    fn save(&self) -> Result<Vec<u8>, SnapshotError>;
+    /// Takes back what [`RegisterMap::save`] returned.
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError>;
 }
 
 impl<R: RegisterMap> ByteRegisters<R> {
@@ -348,6 +417,18 @@ impl<R: RegisterMap> I2cDevice for ByteRegisters<R> {
         }
         Some(true)
     }
+
+    /// The register pointer and the registers.
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&(self.pointer, self.registers.save()?))
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError> {
+        let (pointer, registers): (u8, Vec<u8>) = decode(self.name, state)?;
+        self.registers.restore(&registers)?;
+        self.pointer = pointer;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -367,6 +448,18 @@ mod tests {
         fn write(&mut self, register: u8, value: u8) -> Option<()> {
             self.0[usize::from(register)] = value;
             Some(())
+        }
+
+        fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+            encode(&self.0.as_slice())
+        }
+
+        fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError> {
+            let registers: Vec<u8> = decode("scratch", state)?;
+            self.0 = registers
+                .try_into()
+                .map_err(|_| SnapshotError::Corrupt("scratch".into()))?;
+            Ok(())
         }
     }
 
@@ -480,5 +573,48 @@ mod tests {
         bench.header(0x3C, 1, false).unwrap();
         bench.write(TX_PACKET_FIFO, 0x7F).unwrap();
         assert_eq!(bench.header(0x3C, 1, true), None);
+    }
+
+    #[test]
+    fn a_restored_controller_completes_the_packet_and_drains_the_reads_of_the_saved_one() {
+        let saved = Bench::new();
+        saved.write(INTERRUPT_MASK, 0x8C).unwrap();
+        // Registers 0x10..0x13 written; then a read of two bytes, its
+        // answer left in the RX FIFO; then half of another write's header.
+        saved.header(0x3C, 5, false).unwrap();
+        saved.write(TX_PACKET_FIFO, 0x0302_0110).unwrap();
+        saved.write(TX_PACKET_FIFO, 0x04).unwrap();
+        saved.header(0x3C, 1, false).unwrap();
+        saved.write(TX_PACKET_FIFO, 0x11).unwrap();
+        saved.header(0x3C, 2, true).unwrap();
+        saved.write(TX_PACKET_FIFO, 0x10).unwrap();
+        saved.write(TX_PACKET_FIFO, 0x0).unwrap();
+
+        let restored = Bench::new();
+        restored
+            .controller
+            .restore(&saved.controller.save().unwrap())
+            .unwrap();
+        assert!(
+            !restored.line.load(Ordering::SeqCst),
+            "not driven on restore"
+        );
+        assert_eq!(restored.read(INTERRUPT_MASK), 0x8C);
+        assert_eq!(restored.read(FIFO_STATUS) & 0xF, 1);
+        assert_eq!(restored.read(RX_FIFO), 0x0302);
+        // The rest of the header: a one-byte write of the pointer, 0x13.
+        restored
+            .write(TX_PACKET_FIFO, 1 << 17 | u32::from(0x3Cu8) << 1)
+            .unwrap();
+        restored.write(TX_PACKET_FIFO, 0x13).unwrap();
+        restored.header(0x3C, 1, true).unwrap();
+        assert_eq!(restored.read(RX_FIFO), 0x04);
+
+        // A controller with other devices does not take it.
+        let wrong = I2cController::new("other", [], Box::new(|_| {}), Arc::default());
+        assert!(matches!(
+            wrong.restore(&saved.controller.save().unwrap()),
+            Err(SnapshotError::Corrupt(_))
+        ));
     }
 }

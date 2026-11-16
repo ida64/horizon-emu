@@ -10,15 +10,21 @@
 
 mod hci;
 
+use serde::{Deserialize, Serialize};
+
 use super::serial::Peer;
+use crate::snapshot::{SnapshotError, decode, encode};
 
 pub const BASE: u64 = 0x7000_6300;
 /// UARTD interrupt, public Tegra210 device tree SPI 90.
 pub const INTID: u32 = 32 + 90;
 
 /// The controller's end of the line: collects a command, has it executed
-/// and answers with its completion event.
+/// and answers with its completion event. A snapshot saves all of it: the
+/// command half received and the controller's state.
+#[derive(Serialize, Deserialize)]
 pub struct Line {
+    #[serde(with = "crate::snapshot::array")]
     command: [u8; 259],
     used: usize,
     controller: hci::Controller,
@@ -70,6 +76,21 @@ impl Peer for Line {
     /// CTS is asserted by the powered, present controller.
     fn clear_to_send(&self) -> bool {
         true
+    }
+
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(self)
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError> {
+        let saved: Self = decode("Bluetooth controller", state)?;
+        if saved.used > saved.command.len() {
+            return Err(SnapshotError::Corrupt(
+                "Bluetooth controller: command longer than its buffer".into(),
+            ));
+        }
+        *self = saved;
+        Ok(())
     }
 }
 

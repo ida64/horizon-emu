@@ -6,6 +6,7 @@
 //! nothing plugged into its USB port.
 
 use super::i2c::RegisterMap;
+use crate::snapshot::{SnapshotError, decode, encode};
 
 pub const ADDRESS: u8 = 0x6B;
 
@@ -68,6 +69,16 @@ impl RegisterMap for Bq24193 {
             _ => *self.configuration.get_mut(usize::from(register))? = value,
         }
         Some(())
+    }
+
+    /// The configuration registers; the status registers are constant.
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&self.configuration)
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError> {
+        self.configuration = decode("BQ24193", state)?;
+        Ok(())
     }
 }
 

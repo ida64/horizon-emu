@@ -19,7 +19,14 @@
 //! and no stage of the boot chain is known to use the unit, so they read
 //! zero, with `PMCR_EL0` at the Cortex-A57's reset value.
 
-use crate::arm64::SysReg;
+use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    arm64::SysReg,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 /// `PMCR_EL0` out of reset on a Cortex-A57 (its Technical Reference
 /// Manual, `0x41013000`): implemented by Arm, ID code 1, six event
@@ -98,7 +105,7 @@ fn slot(register: SysReg) -> Option<Slot> {
 }
 
 /// One core's performance monitor registers.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct Pmu {
     control: u64,
     enabled: u64,
@@ -167,6 +174,19 @@ impl Pmu {
             Slot::EventType(index) => self.event_types[index] = value & 0xFFFF_FFFF,
         }
         Some(())
+    }
+}
+
+/// Saves every register of the core's unit; nothing counts, so the values
+/// are all there is.
+impl Snapshot for Mutex<Pmu> {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&*self.lock().unwrap())
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        *self.lock().unwrap() = decode("performance monitors", state)?;
+        Ok(())
     }
 }
 

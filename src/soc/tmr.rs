@@ -8,7 +8,8 @@
 use std::time::Duration;
 
 use super::regs::word;
-use crate::bus::MmioDevice;
+use crate::bus::{MmioDevice, NoState};
+use crate::snapshot::Snapshot;
 
 pub const BASE: u64 = 0x6000_5000;
 pub const SIZE: u64 = 0x400;
@@ -37,6 +38,12 @@ impl MmioDevice for Timers {
 
     fn write(&self, _core: usize, _offset: u64, _size: u8, _value: u64) -> Option<()> {
         None
+    }
+
+    /// The counter is guest time, which the machine's clock saves; the block
+    /// holds nothing else.
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(&NoState)
     }
 }
 

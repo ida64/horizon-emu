@@ -20,13 +20,19 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use serde::{Deserialize, Serialize};
+
 use super::Notes;
-use crate::bus::MmioDevice;
+use crate::{
+    bus::MmioDevice,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 /// Register block of one port.
 pub const SIZE: u64 = 0x40;
 
-/// What a UART's lines lead to.
+/// What a UART's lines lead to. The port saves it with itself in a machine
+/// snapshot, through [`Peer::save`] and [`Peer::restore`].
 pub trait Peer: Send {
     /// A byte arrives from the console. `Ok` is what the peer sends back
     /// because of it, often nothing; `Err` says what it was given that is
@@ -35,15 +41,25 @@ pub trait Peer: Send {
 
     /// Whether the peer holds the console's CTS input asserted.
     fn clear_to_send(&self) -> bool;
+
+    /// The peer's state, encoded: everything that decides what it answers
+    /// from now on ([`Snapshot::save`]).
+    fn save(&self) -> Result<Vec<u8>, SnapshotError>;
+
+    /// Takes back what [`Peer::save`] of the same peer, in a machine built
+    /// the same way, returned ([`Snapshot::restore`]).
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError>;
 }
 
+/// The port's own state, which a snapshot saves as is; the peer saves its
+/// own through [`Peer`].
+#[derive(Serialize, Deserialize)]
 struct State {
     regs: [u32; 11],
     divisor: [u8; 2],
     receive: VecDeque<u8>,
     /// End of received data, until acknowledged.
     eord: bool,
-    peer: Box<dyn Peer>,
 }
 
 impl State {
@@ -66,6 +82,8 @@ impl State {
 
 pub struct Serial {
     state: Mutex<State>,
+    /// Locked after `state`, while it is held.
+    peer: Mutex<Box<dyn Peer>>,
     interrupt: Box<dyn Fn(bool) + Send + Sync>,
     notes: Arc<Notes>,
 }
@@ -82,8 +100,8 @@ impl Serial {
                 divisor: [0; 2],
                 receive: VecDeque::with_capacity(1024),
                 eord: false,
-                peer,
             }),
+            peer: Mutex::new(peer),
             interrupt,
             notes,
         }
@@ -111,7 +129,7 @@ impl MmioDevice for Serial {
             4 | 12 | 16 | 28 | 32 | 40 => s.regs[(offset / 4) as usize],
             8 => s.iir(),
             20 => 0x60 | if s.receive.is_empty() { 0x200 } else { 1 },
-            24 => u32::from(s.peer.clear_to_send()) << 4,
+            24 => u32::from(self.peer.lock().unwrap().clear_to_send()) << 4,
             _ => return None,
         };
         self.update(&s);
@@ -125,7 +143,7 @@ impl MmioDevice for Serial {
         let mut s = self.state.lock().unwrap();
         match offset {
             0 | 4 if s.regs[3] & 0x80 != 0 => s.divisor[(offset / 4) as usize] = value as u8,
-            0 => match s.peer.byte(value as u8) {
+            0 => match self.peer.lock().unwrap().byte(value as u8) {
                 Ok(answer) => {
                     s.eord |= !answer.is_empty();
                     s.receive.extend(answer);
@@ -154,6 +172,29 @@ impl MmioDevice for Serial {
         self.update(&s);
         Some(())
     }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+/// The registers, the receive FIFO and what is on the other end of the
+/// lines. The interrupt output follows from them at the next access and
+/// is not driven on restore.
+impl Snapshot for Serial {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        let state = self.state.lock().unwrap();
+        let peer = self.peer.lock().unwrap().save()?;
+        encode(&(&*state, peer))
+    }
+
+    fn restore(&self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let (saved, peer): (State, Vec<u8>) = decode("UART", bytes)?;
+        let mut state = self.state.lock().unwrap();
+        self.peer.lock().unwrap().restore(&peer)?;
+        *state = saved;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -173,6 +214,14 @@ pub(crate) mod tests {
 
         fn clear_to_send(&self) -> bool {
             true
+        }
+
+        fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+            crate::bus::NoState.save()
+        }
+
+        fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError> {
+            crate::bus::NoState.restore(state)
         }
     }
 

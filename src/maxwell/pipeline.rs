@@ -10,6 +10,8 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use super::blend::{Blend, Factor, Operation};
 use super::raster::{self, Backend, BandSet, ColorOutput, Compare, DepthOutput, Triangle};
 use super::resources::{DrawTextures, Pools, ProgramCache, TextureCache};
@@ -63,7 +65,7 @@ fn require(
 }
 
 /// Primitive topologies (`BEGIN_OP`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Topology {
     Triangles,
     TriangleStrip,
@@ -92,7 +94,7 @@ impl Topology {
 }
 
 /// One vertex of a draw: where to fetch it from, or a primitive restart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Element {
     Vertex {
         /// Vertex fetch index: index buffer value plus
@@ -105,7 +107,7 @@ pub enum Element {
 }
 
 /// A batch of vertices between `BEGIN` and `END`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Batch {
     pub topology: Topology,
     /// Instance ID the shader reads (a\[0x2f8\]).
@@ -117,7 +119,7 @@ pub struct Batch {
 }
 
 /// A constant buffer binding: address and size in bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConstantBuffer {
     pub address: u64,
     pub size: u32,

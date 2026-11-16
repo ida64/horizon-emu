@@ -55,10 +55,16 @@ impl std::fmt::Display for SnapshotError {
 /// Saving and restoring happen with the machine paused: the cores parked
 /// and guest time ([`crate::clock::GuestClock`]) standing still.
 pub trait Snapshot: Send + Sync {
-    /// Brings work the part does on its own, not on a timer, to a point
-    /// where its state is complete in what `save` sees (the GPU finishes
-    /// the channel it is running and writes its render targets back to
-    /// memory). Called for every part before any part saves.
+    /// Brings the part to a state nothing changes while the machine stands
+    /// still: work it does on its own finishes (the GPU finishes the
+    /// channel it is running and writes its render targets back to
+    /// memory), and what was due by the paused guest time and is done by a
+    /// thread of its own whenever that thread gets to it (a frame boundary,
+    /// a timer) is done now; work a part's thread holds back while guest
+    /// time stands still can stay pending, saved as such. Otherwise a
+    /// thread could change the part, and the interrupt lines it drives,
+    /// after the interrupt controller was saved. Called for every part
+    /// before any part saves.
     fn quiesce(&self) -> Result<(), SnapshotError> {
         Ok(())
     }

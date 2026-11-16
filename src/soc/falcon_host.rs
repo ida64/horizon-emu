@@ -14,15 +14,23 @@ use super::{
     mc::DeviceMemory,
     vic::{self, Vic},
 };
-use crate::bus::MmioDevice;
+use crate::{
+    bus::MmioDevice,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
 pub const VIC_BASE: u64 = 0x5434_0000;
 pub const SIZE: u64 = 0x40000;
 
+#[derive(Serialize, Deserialize)]
 struct State {
+    #[serde(with = "crate::snapshot::array")]
     regs: [u32; 0x1610 / 4],
+    #[serde(with = "crate::snapshot::array")]
     imem: [u8; 0x10000],
+    #[serde(with = "crate::snapshot::array")]
     dmem: [u8; 0x10000],
 }
 impl Default for State {
@@ -132,6 +140,27 @@ impl MmioDevice for HostFalcon {
         }
         s.regs[offset as usize / 4] = v;
         Some(())
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+/// Saves the boot interface registers and the firmware loaded into IMEM
+/// and DMEM, and with them the [`Vic`] engine's own state.
+impl Snapshot for HostFalcon {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        let host = encode(&*self.state.lock().unwrap())?;
+        encode(&(host, self.engine.save()?))
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        let (host, engine): (Vec<u8>, Vec<u8>) = decode("VIC host", state)?;
+        let host: State = decode("VIC host", &host)?;
+        self.engine.restore(&engine)?;
+        *self.state.lock().unwrap() = host;
+        Ok(())
     }
 }
 

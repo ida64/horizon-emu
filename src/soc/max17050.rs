@@ -16,6 +16,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use super::{Notes, i2c::I2cDevice};
+use crate::snapshot::{SnapshotError, decode, encode};
 
 pub const ADDRESS: u8 = 0x36;
 
@@ -240,6 +241,17 @@ impl I2cDevice for Max17050 {
             self.pointer = self.pointer.wrapping_add(1);
         }
         Some(true)
+    }
+
+    /// The register pointer and the registers written. The battery is
+    /// what the machine is built with.
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&(self.pointer, &self.registers))
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError> {
+        (self.pointer, self.registers) = decode("MAX17050", state)?;
+        Ok(())
     }
 }
 

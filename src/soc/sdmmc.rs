@@ -36,17 +36,28 @@
 //! Programmed I/O through the buffer data port and ADMA descriptor tables
 //! are not modeled; a transfer that asks for either stops the machine with
 //! a note. The capabilities report only what the driver insists on.
+//!
+//! A machine snapshot saves the registers, the transfer paused at a buffer
+//! boundary, what the driver is yet to be told and the guest time it is
+//! due at, and the card's state ([`Card::save`]); the restored controller's
+//! thread tells the driver at that same guest time.
 
 use std::{
     mem,
     ops::Range,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Condvar, Mutex, PoisonError},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
+
 use super::{Notes, mc::DeviceMemory};
-use crate::bus::MmioDevice;
+use crate::{
+    bus::MmioDevice,
+    clock::GuestClock,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 /// What a card answers to a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +96,15 @@ pub trait Card: Send {
 
     /// The card's supply was switched on or off.
     fn power(&mut self, _on: bool) {}
+
+    /// The card's state, for a machine snapshot: everything that decides
+    /// what it answers next, and what the run changed of its storage
+    /// (the image files behind it are not saved here).
+    fn save(&self) -> Result<Vec<u8>, SnapshotError>;
+
+    /// Takes back what [`Self::save`] of a card built the same way
+    /// returned.
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError>;
 }
 
 /// Register block of one controller.
@@ -190,6 +210,10 @@ const CAPABILITIES_VALUE: u32 = 1 << 28;
 /// Called with the level of the controller's interrupt output.
 pub type InterruptLine = Box<dyn Fn(bool) + Send + Sync>;
 
+/// How long the completion thread sleeps before it looks again while guest
+/// time stands still.
+const PAUSED_POLL: Duration = Duration::from_millis(20);
+
 /// How long the card in the slot takes over data.
 #[derive(Clone, Copy)]
 pub struct Timing {
@@ -233,14 +257,20 @@ impl Timing {
 }
 
 pub struct Sdmmc {
-    host: Arc<Mutex<Host>>,
+    shared: Arc<Shared>,
     interrupt: Arc<dyn Fn(bool) + Send + Sync>,
     memory: DeviceMemory,
     notes: Arc<Notes>,
-    /// Where the end of each wait for the card is sent, for the interrupt
-    /// line to follow at that time. `None` with a card that never makes
-    /// the controller wait.
-    waits: Option<mpsc::Sender<Instant>>,
+    clock: Arc<GuestClock>,
+}
+
+/// What the controller shares with the thread that raises the interrupt
+/// line once the card is done.
+struct Shared {
+    host: Mutex<Host>,
+    /// Signalled when what is held back changes, and when the controller
+    /// goes.
+    changed: Condvar,
 }
 
 struct Host {
@@ -253,19 +283,25 @@ struct Host {
     tuning_commands: u32,
     timing: Timing,
     /// How long the card takes over what the driver has just started,
-    /// added up while the registers are brought to its outcome.
+    /// added up while the registers are brought to its outcome. Zero
+    /// between register accesses, so never saved.
     busy: Duration,
     /// What the driver is told once the card is done.
     held: Option<Held>,
+    /// The controller is gone; the completion thread ends.
+    closed: bool,
 }
 
 /// Interrupt status bits of an operation the card is still busy with.
+#[derive(Clone, Serialize, Deserialize)]
 struct Held {
     normal: u16,
     error: u16,
-    due: Instant,
+    /// Guest time the card is done at.
+    due: Duration,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 struct Transfer {
     to_host: bool,
     blocks_left: u32,
@@ -281,6 +317,31 @@ struct Transfer {
     /// Bytes of the address register in use. Writing the last of them
     /// resumes the transfer.
     address_register: Range<usize>,
+}
+
+/// The controller's state in a machine snapshot. Its timing is not saved:
+/// a machine built the same way has the same card.
+#[derive(Serialize, Deserialize)]
+struct Saved {
+    #[serde(with = "crate::snapshot::array")]
+    registers: [u8; SIZE as usize],
+    /// [`Card::save`] of the card in the slot.
+    card: Option<Vec<u8>>,
+    transfer: Option<Transfer>,
+    tuning_commands: u32,
+    held: Option<Held>,
+}
+
+impl Transfer {
+    /// Whether the controller can go on with it: what a restore checks of
+    /// saved bytes before the transfer runs on them.
+    fn is_sound(&self) -> bool {
+        self.moved <= self.block.len()
+            && self.boundary != 0
+            && self.address_register.start <= self.address_register.end
+            && self.address_register.end <= SIZE as usize
+            && self.address_register.len() <= 8
+    }
 }
 
 fn u16_at(registers: &[u8], offset: usize) -> u16 {
@@ -343,38 +404,43 @@ impl Host {
         )
     }
 
-    /// Shows the driver what was held back if the card is done by now,
-    /// or `regardless`.
-    fn settle(&mut self, regardless: bool) {
-        let now = Instant::now();
-        if let Some(held) = self.held.take_if(|held| regardless || held.due <= now) {
-            let (normal, error) = self.status();
-            set_u16(
-                &mut self.registers,
-                NORMAL_INTERRUPT_STATUS,
-                normal | held.normal,
-            );
-            set_u16(
-                &mut self.registers,
-                ERROR_INTERRUPT_STATUS,
-                error | held.error,
-            );
-        }
+    /// Shows the driver what was held back if the card is done by guest
+    /// time `now`, or `regardless`. Returns whether it showed anything,
+    /// for the caller to update the interrupt line: whoever settles a
+    /// completion raises it, since the completion thread finds nothing
+    /// held afterwards.
+    fn settle(&mut self, now: Duration, regardless: bool) -> bool {
+        let Some(held) = self.held.take_if(|held| regardless || held.due <= now) else {
+            return false;
+        };
+        let (normal, error) = self.status();
+        set_u16(
+            &mut self.registers,
+            NORMAL_INTERRUPT_STATUS,
+            normal | held.normal,
+        );
+        set_u16(
+            &mut self.registers,
+            ERROR_INTERRUPT_STATUS,
+            error | held.error,
+        );
+        true
     }
 
     /// Holds back the status bits set since `before` for as long as the
-    /// card was found to take. Returns when it is done.
-    fn hold(&mut self, before: (u16, u16)) -> Option<Instant> {
+    /// card was found to take from guest time `now`. Returns whether it
+    /// holds any.
+    fn hold(&mut self, before: (u16, u16), now: Duration) -> bool {
         let busy = mem::take(&mut self.busy);
         if busy.is_zero() {
-            return None;
+            return false;
         }
         let (normal, error) = self.status();
-        let held = Held {
+        self.held = Some(Held {
             normal: normal & !before.0,
             error: error & !before.1,
-            due: Instant::now() + busy,
-        };
+            due: now + busy,
+        });
         set_u16(
             &mut self.registers,
             NORMAL_INTERRUPT_STATUS,
@@ -385,9 +451,7 @@ impl Host {
             ERROR_INTERRUPT_STATUS,
             error & before.1,
         );
-        let due = held.due;
-        self.held = Some(held);
-        Some(due)
+        true
     }
 
     /// Bytes of the register holding the SDMA address.
@@ -412,56 +476,81 @@ impl Host {
 
 impl Sdmmc {
     /// `memory` is what the controller reaches when it masters the bus;
-    /// `card` is the card in the slot, if one is fitted.
+    /// `card` is the card in the slot, if one is fitted. The card's time
+    /// passes in guest time, on `clock`.
     pub fn new(
         interrupt: InterruptLine,
         memory: DeviceMemory,
         card: Option<Box<dyn Card>>,
         timing: Timing,
         notes: Arc<Notes>,
+        clock: Arc<GuestClock>,
     ) -> Self {
-        let host = Arc::new(Mutex::new(Host {
-            registers: reset_state(),
-            card,
-            transfer: None,
-            tuning_commands: 0,
-            timing,
-            busy: Duration::ZERO,
-            held: None,
-        }));
+        let shared = Arc::new(Shared {
+            host: Mutex::new(Host {
+                registers: reset_state(),
+                card,
+                transfer: None,
+                tuning_commands: 0,
+                timing,
+                busy: Duration::ZERO,
+                held: None,
+                closed: false,
+            }),
+            changed: Condvar::new(),
+        });
         let interrupt: Arc<dyn Fn(bool) + Send + Sync> = Arc::from(interrupt);
-        let instant = [timing.access, timing.block_read, timing.block_write]
-            .iter()
-            .all(Duration::is_zero);
-        let waits = (!instant).then(|| {
-            let (waits, ends) = mpsc::channel::<Instant>();
-            let (host, interrupt) = (Arc::clone(&host), Arc::clone(&interrupt));
-            // Ends with the controller: the channel closes when it goes.
-            thread::spawn(move || {
-                for end in ends {
-                    thread::sleep(end.saturating_duration_since(Instant::now()));
-                    let mut host = host.lock().unwrap();
-                    host.settle(false);
-                    Self::update_interrupt(&*interrupt, &host.registers);
-                }
-            });
-            waits
+        let (thread_shared, thread_clock, thread_interrupt) = (
+            Arc::clone(&shared),
+            Arc::clone(&clock),
+            Arc::clone(&interrupt),
+        );
+        // Ends with the controller (`Drop`).
+        thread::spawn(move || {
+            Self::tell_when_done(&thread_shared, &thread_clock, &*thread_interrupt)
         });
         Self {
-            host,
+            shared,
             interrupt,
             memory,
             notes,
-            waits,
+            clock,
+        }
+    }
+
+    /// The completion thread: raises the interrupt line at the guest time
+    /// the card is done, without the driver looking. Does nothing while
+    /// guest time stands still.
+    fn tell_when_done(
+        shared: &Shared,
+        clock: &GuestClock,
+        interrupt: &(dyn Fn(bool) + Send + Sync),
+    ) {
+        let mut host = shared.host.lock().unwrap();
+        while !host.closed {
+            let Some(due) = host.held.as_ref().map(|held| held.due) else {
+                host = shared.changed.wait(host).unwrap();
+                continue;
+            };
+            let wait = match clock.is_paused() {
+                true => PAUSED_POLL,
+                false => clock.until(due),
+            };
+            if wait.is_zero() {
+                host.settle(clock.now(), false);
+                Self::update_interrupt(interrupt, &host.registers);
+            } else {
+                host = shared.changed.wait_timeout(host, wait).unwrap().0;
+            }
         }
     }
 
     /// What switches the supply of the card in the slot: the board's
     /// regulator enable, for whoever models the pin that drives it.
     pub fn card_supply(&self) -> Box<dyn Fn(bool) + Send + Sync> {
-        let host = Arc::clone(&self.host);
+        let shared = Arc::clone(&self.shared);
         Box::new(move |on| {
-            if let Some(card) = host.lock().unwrap().card.as_mut() {
+            if let Some(card) = shared.host.lock().unwrap().card.as_mut() {
                 card.power(on);
             }
         })
@@ -668,14 +757,79 @@ impl Sdmmc {
     }
 }
 
+impl Drop for Sdmmc {
+    fn drop(&mut self) {
+        let mut host = self
+            .shared
+            .host
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        host.closed = true;
+        self.shared.changed.notify_all();
+    }
+}
+
+impl Snapshot for Sdmmc {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        let host = self.shared.host.lock().unwrap();
+        encode(&Saved {
+            registers: host.registers,
+            card: host.card.as_ref().map(|card| card.save()).transpose()?,
+            transfer: host.transfer.clone(),
+            tuning_commands: host.tuning_commands,
+            held: host.held.clone(),
+        })
+    }
+
+    /// Puts back what is held for the driver; the completion thread tells
+    /// it at the saved guest time. The interrupt line is left as the
+    /// interrupt controller restores it.
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        let saved: Saved = decode("SD/MMC host controller", state)?;
+        if saved
+            .transfer
+            .as_ref()
+            .is_some_and(|transfer| !transfer.is_sound())
+        {
+            return Err(SnapshotError::Corrupt(
+                "SD/MMC host controller: a saved transfer it cannot go on with".into(),
+            ));
+        }
+        let mut host = self.shared.host.lock().unwrap();
+        match (host.card.as_mut(), &saved.card) {
+            (Some(card), Some(state)) => card.restore(state)?,
+            (None, None) => {}
+            (Some(_), None) => {
+                return Err(SnapshotError::Corrupt(
+                    "SD/MMC host controller: a card in the slot, saved without one".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(SnapshotError::Corrupt(
+                    "SD/MMC host controller: no card in the slot, saved with one".into(),
+                ));
+            }
+        }
+        host.registers = saved.registers;
+        host.transfer = saved.transfer;
+        host.tuning_commands = saved.tuning_commands;
+        host.busy = Duration::ZERO;
+        host.held = saved.held;
+        self.shared.changed.notify_all();
+        Ok(())
+    }
+}
+
 impl MmioDevice for Sdmmc {
     fn read(&self, _core: usize, offset: u64, size: u8) -> Option<u64> {
         let (offset, size) = (offset as usize, usize::from(size));
         if !offset.is_multiple_of(size) || size > 4 {
             return None;
         }
-        let mut host = self.host.lock().unwrap();
-        host.settle(false);
+        let mut host = self.shared.host.lock().unwrap();
+        if host.settle(self.clock.now(), false) {
+            Self::update_interrupt(&*self.interrupt, &host.registers);
+        }
         let registers = &host.registers;
         let mut bytes = [0; 8];
         bytes[..size].copy_from_slice(&registers[offset..offset + size]);
@@ -713,9 +867,10 @@ impl MmioDevice for Sdmmc {
         if !offset.is_multiple_of(size) || size > 4 {
             return None;
         }
-        let mut guard = self.host.lock().unwrap();
+        let now = self.clock.now();
+        let mut guard = self.shared.host.lock().unwrap();
         let host = &mut *guard;
-        host.settle(false);
+        host.settle(now, false);
         let clock_was_running = host.registers[CLOCK_CONTROL] & CLOCK_SD_ENABLE != 0;
         for (index, byte) in value.to_le_bytes()[..size].iter().copied().enumerate() {
             let at = offset + index;
@@ -778,7 +933,7 @@ impl MmioDevice for Sdmmc {
         let issued = written.contains(&(COMMAND + 1));
         // A driver that goes on before the card is done has stopped
         // waiting for it; what it missed is there for it to find.
-        host.settle(issued || resumed);
+        host.settle(now, issued || resumed);
         let before = host.status();
         let outcome = if issued {
             // The command goes out when the upper byte of its register is
@@ -789,14 +944,15 @@ impl MmioDevice for Sdmmc {
         } else {
             Some(())
         };
-        if let Some(due) = host.hold(before)
-            && let Some(waits) = &self.waits
-        {
-            // The receiving thread lives as long as this controller.
-            let _ = waits.send(due);
+        if host.hold(before, now) {
+            self.shared.changed.notify_all();
         }
         Self::update_interrupt(&*self.interrupt, &host.registers);
         outcome
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
     }
 }
 
@@ -819,6 +975,7 @@ mod tests {
         sdmmc: Sdmmc,
         line: Arc<AtomicBool>,
         ram: Arc<GuestRam>,
+        clock: Arc<GuestClock>,
     }
 
     impl Bench {
@@ -859,14 +1016,21 @@ mod tests {
             }
             let line = Arc::new(AtomicBool::new(false));
             let output = Arc::clone(&line);
+            let clock = Arc::new(GuestClock::new());
             let sdmmc = Sdmmc::new(
                 Box::new(move |level| output.store(level, Ordering::SeqCst)),
                 DeviceMemory::new(&memory_controller, &ram, mc::SMMU_SDMMC4A_ASID),
                 card,
                 timing,
                 Arc::default(),
+                Arc::clone(&clock),
             );
-            let bench = Self { sdmmc, line, ram };
+            let bench = Self {
+                sdmmc,
+                line,
+                ram,
+                clock,
+            };
             bench.write(NORMAL_STATUS_ENABLE, 2, 0xFFFF);
             bench.write(ERROR_STATUS_ENABLE, 2, 0xFFFF);
             bench.write(NORMAL_SIGNAL_ENABLE, 2, 0x000B);
@@ -929,9 +1093,10 @@ mod tests {
                 ..Timing::INSTANT
             },
         );
-        let issued = Instant::now();
+        let issued = bench.clock.now();
+        let elapsed = || bench.clock.now() - issued;
         bench.transfer(18, 8, 1, BUFFER, true);
-        if issued.elapsed() < access {
+        if elapsed() < access {
             assert_eq!(bench.read(NORMAL_INTERRUPT_STATUS, 4), 0);
             assert_eq!(
                 bench.read(PRESENT_STATE, 4),
@@ -941,15 +1106,98 @@ mod tests {
         }
         // The line rises by itself, without the driver looking.
         while !bench.line.load(Ordering::SeqCst) {
-            assert!(issued.elapsed() < Duration::from_secs(10), "never done");
+            assert!(elapsed() < Duration::from_secs(10), "never done");
             thread::sleep(Duration::from_millis(1));
         }
-        assert!(issued.elapsed() >= access);
+        assert!(elapsed() >= access);
         assert_eq!(bench.read(PRESENT_STATE, 4), u64::from(PRESENT_STATE_IDLE));
         assert_eq!(
             bench.take_status(),
             u32::from(NORMAL_COMMAND_COMPLETE | NORMAL_TRANSFER_COMPLETE)
         );
+    }
+
+    #[test]
+    fn a_completion_saved_while_the_card_is_busy_comes_at_the_same_guest_time_after_restore() {
+        let access = Duration::from_millis(50);
+        let timing = Timing {
+            access,
+            ..Timing::INSTANT
+        };
+        let issued = Duration::from_secs(3);
+        let due = issued + access;
+        let done = u32::from(NORMAL_COMMAND_COMPLETE | NORMAL_TRANSFER_COMPLETE);
+        /// Lets guest time run from `due` and waits for the line to rise.
+        fn complete(bench: &Bench, due: Duration) {
+            bench.clock.set(due);
+            bench.clock.resume();
+            let waiting = std::time::Instant::now();
+            while !bench.line.load(Ordering::SeqCst) {
+                assert!(waiting.elapsed() < Duration::from_secs(10), "never done");
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let saved = Bench::timed(true, timing);
+        saved.clock.pause();
+        saved.clock.set(issued);
+        saved.transfer(18, 8, 1, BUFFER, true);
+        let state = saved.sdmmc.save().unwrap();
+
+        // A controller built the same way, its card fresh from start-up.
+        let restored = Bench::timed(true, timing);
+        restored.clock.pause();
+        restored.clock.set(due - Duration::from_nanos(1));
+        restored.sdmmc.restore(&state).unwrap();
+        // Short of the saved deadline the card is still busy, and nothing
+        // happens while guest time stands still.
+        thread::sleep(PAUSED_POLL * 2);
+        assert!(!restored.line.load(Ordering::SeqCst));
+        assert_eq!(restored.read(NORMAL_INTERRUPT_STATUS, 4), 0);
+        assert_eq!(
+            restored.read(PRESENT_STATE, 4),
+            u64::from(PRESENT_STATE_IDLE) | u64::from(PRESENT_STATE_INHIBIT)
+        );
+
+        // At the deadline, both raise the line by themselves and report
+        // the same outcome.
+        complete(&restored, due);
+        complete(&saved, due);
+        assert_eq!(restored.take_status(), done);
+        assert_eq!(saved.take_status(), done);
+        assert_eq!(
+            restored.read(PRESENT_STATE, 4),
+            u64::from(PRESENT_STATE_IDLE)
+        );
+
+        // The card was restored too: its next command finds it in the
+        // transfer state the automatic STOP_TRANSMISSION left it in.
+        restored.write(ARGUMENT, 4, 2 << 16);
+        restored.write(COMMAND, 2, 13 << 8 | 0x1A);
+        assert_eq!(restored.read(RESPONSE, 4) >> 9 & 0xF, 4);
+    }
+
+    #[test]
+    fn a_completion_the_driver_reads_before_the_thread_raises_the_line() {
+        let access = Duration::from_millis(50);
+        let bench = Bench::timed(
+            true,
+            Timing {
+                access,
+                ..Timing::INSTANT
+            },
+        );
+        // Guest time stands still, so only the driver's read can find
+        // the card done; the line must rise all the same.
+        bench.clock.pause();
+        let issued = bench.clock.now();
+        bench.transfer(18, 8, 1, BUFFER, true);
+        bench.clock.set(issued + access);
+        assert_eq!(
+            bench.read(NORMAL_INTERRUPT_STATUS, 2),
+            u64::from(NORMAL_COMMAND_COMPLETE | NORMAL_TRANSFER_COMPLETE)
+        );
+        assert!(bench.line.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -115,8 +115,10 @@ use std::{
     collections::VecDeque,
     sync::{Arc, Condvar, Mutex, MutexGuard, Weak},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+use serde::{Deserialize, Serialize};
 
 use super::{
     Notes,
@@ -125,7 +127,11 @@ use super::{
     mc::DeviceMemory,
     regs::{RegisterFile, word},
 };
-use crate::bus::MmioDevice;
+use crate::{
+    bus::MmioDevice,
+    clock::GuestClock,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 /// AMISC: `audio` maps `0x2000` bytes here for the mailboxes (text
 /// `0x16b80`) and the activity monitor (text `0x17940`).
@@ -256,7 +262,7 @@ fn opus_work_size(channels: u32) -> u32 {
 }
 
 /// Where the Opus decoder's conversation with `audio` stands.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 enum Opus {
     /// Waiting for the start message.
     Idle,
@@ -283,6 +289,9 @@ const FRAME: Duration = Duration::from_millis(5);
 const SESSIONS: u32 = 2;
 const SESSION_BYTES: u32 = 40;
 
+/// Everything the DSP holds that `audio` can observe, saved whole by
+/// [`Adsp`]'s [`Snapshot`]. Deadlines are guest time ([`GuestClock`]).
+#[derive(Serialize, Deserialize)]
 struct State {
     /// Out of reset.
     running: bool,
@@ -300,7 +309,7 @@ struct State {
     /// `gmix`'s output sessions and devices (see [`super::gmix`]).
     streams: Streams,
     /// When the speaker's next period ends, while it plays.
-    period_due: Option<Instant>,
+    period_due: Option<Duration>,
     /// The renderer's shared memory, once launched.
     renderer: Option<u32>,
     /// The host's pointer to its instance of the renderer, from the launch
@@ -308,9 +317,12 @@ struct State {
     renderer_instance: [u32; 2],
     opus: Opus,
     /// When the renderer's frame in progress is done.
-    frame_due: Option<Instant>,
-    last_frame: Option<Instant>,
+    frame_due: Option<Duration>,
+    last_frame: Option<Duration>,
 }
+
+/// The activity monitor's registers (see [`Adsp::new`]).
+const MONITOR: [u64; 5] = [0x800, 0x818, 0x820, 0x824, 0x828];
 
 struct Inner {
     state: Mutex<State>,
@@ -320,6 +332,8 @@ struct Inner {
     /// The activity monitor (AMISC `0x800`...).
     monitor: RegisterFile,
     notes: Arc<Notes>,
+    /// Guest time, which renderer frames and the speaker's periods follow.
+    clock: Arc<GuestClock>,
 }
 
 /// The DSP and its AMISC block, as mapped at [`AMISC_BASE`].
@@ -334,7 +348,12 @@ impl Adsp {
     /// counts no busy cycles: the count and the status stay zero and the
     /// monitor never interrupts. The control and settings start at zero,
     /// which is an assumption; `audio` sets the bits it needs.
-    pub fn new(memory: DeviceMemory, agic: Arc<Agic>, notes: Arc<Notes>) -> Self {
+    pub fn new(
+        memory: DeviceMemory,
+        agic: Arc<Agic>,
+        notes: Arc<Notes>,
+        clock: &Arc<GuestClock>,
+    ) -> Self {
         let inner = Arc::new(Inner {
             state: Mutex::new(State {
                 running: false,
@@ -354,14 +373,9 @@ impl Adsp {
             wake: Condvar::new(),
             memory,
             agic,
-            monitor: RegisterFile::strict([
-                (0x800, 0),
-                (0x818, 0),
-                (0x820, 0),
-                (0x824, 0),
-                (0x828, 0),
-            ]),
+            monitor: RegisterFile::strict(MONITOR.map(|offset| (offset, 0))),
             notes,
+            clock: Arc::clone(clock),
         });
         let weak = Arc::downgrade(&inner);
         thread::Builder::new()
@@ -394,30 +408,35 @@ impl Adsp {
     }
 }
 
-/// Completes renderer frames and the speaker's periods when they are due.
+/// Completes renderer frames and the speaker's periods when they are due
+/// in guest time. While the machine is paused it changes nothing: guest
+/// time stands still, and a deadline that fell due just before the pause
+/// waits for the resume (or, in a restored machine, for its first run).
 fn keep_time(inner: Weak<Inner>) {
     while let Some(inner) = inner.upgrade() {
         let mut state = inner.state.lock().unwrap();
-        let now = Instant::now();
-        if let Some(due) = state.frame_due.filter(|&due| due <= now) {
-            state.frame_due = None;
-            state.last_frame = Some(due);
-            if let Err(what) = inner.finish_frame(&mut state) {
-                inner.notes.add(format!("ADSP: renderer: {what}"));
+        if !inner.clock.is_paused() {
+            let now = inner.clock.now();
+            if let Some(due) = state.frame_due.filter(|&due| due <= now) {
+                state.frame_due = None;
+                state.last_frame = Some(due);
+                if let Err(what) = inner.finish_frame(&mut state) {
+                    inner.notes.add(format!("ADSP: renderer: {what}"));
+                }
             }
-        }
-        if let Some(due) = state.period_due.filter(|&due| due <= now) {
-            // A host that fell far behind does not get a burst of periods.
-            state.period_due = Some((due + PERIOD).max(now));
-            if let Err(what) = inner.speaker_period(&mut state) {
-                inner.notes.add(format!("ADSP: gmix: {what}"));
-                state.period_due = None;
+            if let Some(due) = state.period_due.filter(|&due| due <= now) {
+                // A host that fell far behind does not get a burst of periods.
+                state.period_due = Some((due + PERIOD).max(now));
+                if let Err(what) = inner.speaker_period(&mut state) {
+                    inner.notes.add(format!("ADSP: gmix: {what}"));
+                    state.period_due = None;
+                }
             }
         }
         let wait = [state.frame_due, state.period_due]
             .into_iter()
             .flatten()
-            .map(|due| due.saturating_duration_since(now))
+            .map(|due| inner.clock.until(due))
             .fold(Duration::from_millis(100), Duration::min);
         drop(inner.wake.wait_timeout(state, wait).unwrap());
     }
@@ -672,7 +691,7 @@ impl Inner {
         state.streams.command(&command, &mut memory)?;
         match (state.streams.playing(), state.period_due) {
             (true, None) => {
-                state.period_due = Some(Instant::now() + PERIOD);
+                state.period_due = Some(self.clock.now() + PERIOD);
                 self.wake.notify_all();
             }
             (false, Some(_)) => state.period_due = None,
@@ -736,7 +755,7 @@ impl Inner {
                 self.send(state, RENDERER, RENDER_DONE);
             }
             RENDER if state.frame_due.is_none() => {
-                let now = Instant::now();
+                let now = self.clock.now();
                 let due = state.last_frame.map_or(now, |last| (last + FRAME).max(now));
                 state.frame_due = Some(due);
                 self.wake.notify_all();
@@ -847,13 +866,57 @@ impl MmioDevice for Adsp {
             Err(what) => self.0.refuse(what),
         }
     }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+/// Saves the DSP as `audio` sees it: the mailboxes and the messages queued
+/// behind mailbox 0, AMISC's control word, the activity monitor's
+/// registers, which applications run where (with the host's instance
+/// pointers), `gmix`'s sessions and devices with their buffer queues, the
+/// Opus decoder's conversation, and the guest times the renderer's frame
+/// and the speaker's next period are due. The interrupts it raises are
+/// edge pulses the AGIC latched, so it drives no level of its own. Its
+/// queues and shared memories live in guest memory, which the machine
+/// saves.
+impl Snapshot for Adsp {
+    /// Waits for the time-keeping thread to finish a frame or period it
+    /// began before the pause: it does that under the state lock, and
+    /// begins none while the clock stands still.
+    fn quiesce(&self) -> Result<(), SnapshotError> {
+        drop(self.0.lock());
+        Ok(())
+    }
+
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        let state = self.0.lock();
+        let monitor = MONITOR.map(|offset| self.0.monitor.get(offset).unwrap_or(0));
+        encode(&(&*state, monitor))
+    }
+
+    /// The time-keeping thread is woken to wait for the restored deadlines.
+    fn restore(&self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let (restored, monitor): (State, [u32; 5]) = decode("ADSP", bytes)?;
+        let mut state = self.0.lock();
+        *state = restored;
+        for (offset, value) in MONITOR.into_iter().zip(monitor) {
+            self.0.monitor.set(offset, value);
+        }
+        self.0.wake.notify_all();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{boot::DramSize, memory::GuestRam, soc::mc::Mc};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        time::Instant,
+    };
 
     #[test]
     fn descriptor_records_match_the_image_table() {
@@ -869,10 +932,16 @@ mod tests {
         assert_eq!(descriptor(None)[1..], [0; 48]);
     }
 
-    /// A DSP whose memory is DRAM seen one to one: the test's SMMU maps the
-    /// engine's addresses `0x8000_0000..` onto DRAM at the same address.
+    /// A DSP whose memory is DRAM seen one to one, on a running clock.
     fn dsp() -> (Adsp, Arc<GuestRam>, Arc<Agic>, Arc<AtomicBool>) {
         let ram = Arc::new(GuestRam::new(0x8000_0000, 0x200_0000).unwrap());
+        let (adsp, agic, line) = dsp_on(&ram, &Arc::new(GuestClock::new()));
+        (adsp, ram, agic, line)
+    }
+
+    /// A DSP on `ram` and `clock`: the test's SMMU maps the engine's
+    /// addresses `0x8000_0000..` onto DRAM at the same address.
+    fn dsp_on(ram: &Arc<GuestRam>, clock: &Arc<GuestClock>) -> (Adsp, Arc<Agic>, Arc<AtomicBool>) {
         let mc = Arc::new(Mc::new(DramSize::Gb4));
         // Address space 1: a directory at 0x81000000 of 4 MiB sections.
         for index in 0x200..0x208u32 {
@@ -900,9 +969,10 @@ mod tests {
         gicd.write(0, 0, 4, 3).unwrap();
         gicc.write(0, 4, 4, 0xFF).unwrap();
         gicc.write(0, 0, 4, 0x1F).unwrap();
-        let memory = DeviceMemory::new(&mc, &ram, SMMU_ASID);
+        let memory = DeviceMemory::new(&mc, ram, SMMU_ASID);
         let notes = Arc::new(Notes::default());
-        (Adsp::new(memory, Arc::clone(&agic), notes), ram, agic, line)
+        let adsp = Adsp::new(memory, Arc::clone(&agic), notes, clock);
+        (adsp, agic, line)
     }
 
     fn word_at(ram: &GuestRam, address: u32) -> u32 {
@@ -1179,5 +1249,69 @@ mod tests {
             receive(&adsp, &agic),
             FULL | APP_SERVICE << 20 | STATUS_STARTED
         );
+    }
+
+    /// A DSP saved while the speaker plays and restored into one built the
+    /// same way, on the same memory, plays the period that was due at the
+    /// same guest time, and not while the clock stands still.
+    #[test]
+    fn restored_period_is_due_at_the_saved_guest_time() {
+        let ram = Arc::new(GuestRam::new(0x8000_0000, 0x200_0000).unwrap());
+        let clock = Arc::new(GuestClock::new());
+        let (adsp, agic, _) = dsp_on(&ram, &clock);
+        adsp.release();
+        receive(&adsp, &agic);
+        while host_dequeue(&ram, DSP_QUEUE).is_some() {}
+        let base = 0x8080_0000;
+        let mut request = [0u32; 1 + LAUNCH_WORDS];
+        request[0] = LAUNCH_WORDS as u32;
+        request[1] = GMIX_APP;
+        request[1 + LAUNCH_SHARED_DRAM] = base;
+        request[1 + LAUNCH_COMMAND] = LAUNCH_RUN;
+        adsp.0.enqueue(HOST_QUEUE, &request).unwrap();
+        send(&adsp, &agic, APP_SERVICE, 0);
+        receive(&adsp, &agic);
+        while host_dequeue(&ram, base + GMIX_NOTIFICATIONS).is_some() {}
+        // Paused as the speaker starts: its first period is due 5 ms of
+        // guest time later.
+        clock.pause();
+        for record in [
+            &[2, 1, 7][..],
+            &[3, 8, 7, 0],
+            &[3, 10, 7, 0],
+            &[6, 8, 2, 0, 0, 2, 0],
+            &[3, 10, 2, 0],
+            &[5, 15, 2, 0, 0x8100_0000, 960],
+        ] {
+            adsp.0.enqueue(base, record).unwrap();
+            send(&adsp, &agic, GMIX, record[1]);
+        }
+        let due = clock.now() + PERIOD;
+        adsp.quiesce().unwrap();
+        let saved = adsp.save().unwrap();
+
+        let restored_clock = Arc::new(GuestClock::new());
+        restored_clock.pause();
+        restored_clock.set(clock.now());
+        let (restored, agic, _) = dsp_on(&ram, &restored_clock);
+        restored.restore(&saved).unwrap();
+        assert_eq!(restored.0.lock().period_due, Some(due));
+        thread::sleep(4 * PERIOD);
+        assert_eq!(
+            restored.read(0, TO_HOST, 4),
+            Some(0),
+            "nothing while paused"
+        );
+        restored_clock.resume();
+        while agic.cpu_interface().read(0, 0x18, 4) != Some(u64::from(TO_HOST_FULL)) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(restored_clock.now() >= due);
+        assert_eq!(receive(&restored, &agic), FULL | GMIX << 20 | 1);
+        assert_eq!(
+            host_dequeue(&ram, base + GMIX_NOTIFICATIONS),
+            Some(gmix::NOTIFICATION[1..].to_vec())
+        );
+        assert_eq!(word_at(&ram, base + 0x2_B064), 1, "played and released");
     }
 }

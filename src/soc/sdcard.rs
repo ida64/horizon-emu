@@ -62,11 +62,14 @@
 
 use std::{fmt, fs::File, io, mem, sync::Arc};
 
+use serde::{Deserialize, Serialize};
+
 use super::{
     Notes,
-    medium::{Medium, SECTOR_SIZE},
+    medium::{Medium, MediumState, SECTOR_SIZE},
     sdmmc::{Card, Response},
 };
+use crate::snapshot::{SnapshotError, decode, encode};
 
 /// The device name in notes and messages about its image.
 const DEVICE: &str = "microSD card";
@@ -192,7 +195,7 @@ impl SdCardImage {
 /// Card states (§4.3) with their `CURRENT_STATE` encoding. The
 /// programming and disconnect states are never entered: writes finish at
 /// once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum State {
     Idle = 0,
     Ready = 1,
@@ -206,7 +209,7 @@ enum State {
     Inactive = 15,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Signaling {
     V3_3,
     /// Between `VOLTAGE_SWITCH` and a clock that comes back at 1.8 V:
@@ -216,6 +219,7 @@ enum Signaling {
 }
 
 /// What moves over the data lines after a command.
+#[derive(Clone, Serialize, Deserialize)]
 enum Data {
     /// A register or status block the card sends.
     Block(Vec<u8>),
@@ -248,6 +252,25 @@ pub struct SdCard {
     block_count: Option<u32>,
     data: Option<Data>,
     notes: Arc<Notes>,
+}
+
+/// The card's state in a machine snapshot: everything but its notes, with
+/// what the run changed of its contents.
+#[derive(Serialize, Deserialize)]
+struct Saved<'a> {
+    medium: MediumState<'a>,
+    powered: bool,
+    state: State,
+    rca: u16,
+    interface_checked: bool,
+    signaling: Signaling,
+    switch_granted: bool,
+    application: bool,
+    wide_bus: bool,
+    functions: [u8; FUNCTION_GROUPS],
+    errors: u32,
+    block_count: Option<u32>,
+    data: Option<Data>,
 }
 
 impl SdCard {
@@ -673,6 +696,42 @@ impl Card for SdCard {
             self.signaling = Signaling::V3_3;
         }
         self.powered = on;
+    }
+
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&Saved {
+            medium: self.medium.save(),
+            powered: self.powered,
+            state: self.state,
+            rca: self.rca,
+            interface_checked: self.interface_checked,
+            signaling: self.signaling,
+            switch_granted: self.switch_granted,
+            application: self.application,
+            wide_bus: self.wide_bus,
+            functions: self.functions,
+            errors: self.errors,
+            block_count: self.block_count,
+            data: self.data.clone(),
+        })
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError> {
+        let saved: Saved = decode(DEVICE, state)?;
+        self.medium.restore(saved.medium)?;
+        self.powered = saved.powered;
+        self.state = saved.state;
+        self.rca = saved.rca;
+        self.interface_checked = saved.interface_checked;
+        self.signaling = saved.signaling;
+        self.switch_granted = saved.switch_granted;
+        self.application = saved.application;
+        self.wide_bus = saved.wide_bus;
+        self.functions = saved.functions;
+        self.errors = saved.errors;
+        self.block_count = saved.block_count;
+        self.data = saved.data;
+        Ok(())
     }
 }
 

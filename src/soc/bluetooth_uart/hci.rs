@@ -202,8 +202,9 @@ fn supported_commands() -> [u8; 64] {
 /// at most eight controllers.
 const MAX_LINK_KEYS: usize = 8;
 
-/// Controller state the host can set and read back.
-#[derive(Default)]
+/// Controller state the host can set and read back; all of it is what a
+/// snapshot saves of the controller.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Controller {
     /// Between Download Minidriver and Launch RAM.
     download: bool,

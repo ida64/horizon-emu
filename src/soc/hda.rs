@@ -60,8 +60,13 @@
 //! support their reset bit, which is all start-up uses.
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use super::{Notes, mc::DeviceMemory, regs::RegisterFile};
-use crate::bus::MmioDevice;
+use crate::{
+    bus::MmioDevice,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 /// The wrapper and configuration space, then the controller at `+0x8000`.
 pub const BASE: u64 = 0x7003_0000;
@@ -93,7 +98,7 @@ const RIRB_INTERRUPT: u32 = 1 << 0;
 const RIRB_RUN: u32 = 1 << 1;
 const RIRB_RESPONSE: u32 = 1 << 0;
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct State {
     control: u32,
     wake_enable: u32,
@@ -329,6 +334,27 @@ impl MmioDevice for Hda {
         }
         self.update(&state);
         Some(())
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+/// Saves the wrapper registers and the controller: its control, interrupt
+/// setup, both rings' bases, pointers and status, and the stream
+/// descriptors. Commands run as the guest writes them, so none is in
+/// flight; the interrupt line is a level the interrupt controller saves.
+impl Snapshot for Hda {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&(self.wrapper.save()?, &*self.state.lock().unwrap()))
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        let (wrapper, controller): (Vec<u8>, State) = decode("HD Audio", state)?;
+        self.wrapper.restore(&wrapper)?;
+        *self.state.lock().unwrap() = controller;
+        Ok(())
     }
 }
 

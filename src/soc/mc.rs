@@ -21,7 +21,12 @@
 use std::sync::{Arc, Mutex};
 
 use super::regs::{RegisterFile, word};
-use crate::{boot::DramSize, bus::MmioDevice, memory::GuestRam};
+use crate::{
+    boot::DramSize,
+    bus::MmioDevice,
+    memory::GuestRam,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 pub const BASE: u64 = 0x7001_9000;
 pub const SIZE: u64 = 0x1000;
@@ -306,6 +311,40 @@ impl MmioDevice for Mc {
             register => self.registers.set(register, value as u32),
         }
         Some(())
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+/// Saves the registers, every address space's page directory and the
+/// kernel carveouts. Translations are read from guest memory on each
+/// access, so nothing is cached to drop.
+impl Snapshot for Mc {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        let page_directories = self.page_directories.lock().unwrap();
+        encode(&(
+            self.registers.save()?,
+            &page_directories[..],
+            *self.kernel_carveouts.lock().unwrap(),
+        ))
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        type Saved = (Vec<u8>, Vec<u32>, [(u64, u64); KERNEL_CARVEOUT_COUNT]);
+        let (registers, page_directories, kernel_carveouts): Saved =
+            decode("memory controller", state)?;
+        let count = page_directories.len();
+        let page_directories: [u32; ASID_COUNT] = page_directories.try_into().map_err(|_| {
+            SnapshotError::Corrupt(format!(
+                "memory controller: {count} address spaces saved, {ASID_COUNT} here"
+            ))
+        })?;
+        self.registers.restore(&registers)?;
+        *self.page_directories.lock().unwrap() = page_directories;
+        *self.kernel_carveouts.lock().unwrap() = kernel_carveouts;
+        Ok(())
     }
 }
 

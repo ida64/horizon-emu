@@ -49,8 +49,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use serde::{Deserialize, Serialize};
+
 use super::regs::word;
-use crate::bus::MmioDevice;
+use crate::{
+    bus::{MmioDevice, NoState},
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 pub const BASE: u64 = 0x7001_B000;
 pub const CHANNEL_BASES: [u64; 2] = [0x7001_E000, 0x7001_F000];
@@ -124,6 +129,7 @@ const ENTRY_STATE: [(u64, u32); 9] = [
 /// value is an assumption.
 const MODE_REGISTERS: [(u32, u32); 2] = [(18, 0x0000), (19, 0x0505)];
 
+#[derive(Serialize, Deserialize)]
 struct State {
     channels: [HashMap<u64, u32>; 2],
     /// Whether each channel's DLL has locked since power-on.
@@ -167,6 +173,20 @@ impl Emc {
             }
         }
         state.interrupts |= CLKCHANGE_COMPLETE;
+    }
+}
+
+/// Saves both channels' registers, DLL lock, the interrupt status, the
+/// clock-change FIFO not yet run and the mode register reads not yet
+/// collected.
+impl Snapshot for Emc {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&*self.state.lock().unwrap())
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        *self.state.lock().unwrap() = decode("EMC", state)?;
+        Ok(())
     }
 }
 
@@ -267,6 +287,15 @@ impl MmioDevice for EmcPort {
             (View::Channel(channel), _) => write_channel(&mut state, channel, register, value),
         }
         Some(())
+    }
+
+    /// The block is saved once, through its broadcast range; the channel
+    /// ranges are views of the same state.
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        match self.view {
+            View::Broadcast => Some(&*self.emc),
+            View::Channel(_) => Some(&NoState),
+        }
     }
 }
 

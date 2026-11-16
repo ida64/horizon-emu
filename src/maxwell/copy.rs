@@ -12,6 +12,8 @@
 //! Pitch surfaces start at the offset and step by the pitch. Without
 //! `MULTI_LINE_ENABLE` it is a single line at the offsets.
 
+use serde::{Deserialize, Serialize};
+
 use super::surface::{Layout, Rect, Surface, Window};
 use super::texture::layout::BlockLinear;
 use super::three_d::release_semaphore;
@@ -41,7 +43,8 @@ const SET_REMAP_COMPONENTS: usize = m(0x708);
 const SET_DST_BLOCK_SIZE: usize = m(0x70c);
 const SET_SRC_BLOCK_SIZE: usize = m(0x728);
 
-/// The copy engine of a channel.
+/// The copy engine of a channel; saved whole in machine snapshots.
+#[derive(Serialize, Deserialize)]
 pub struct Copy {
     registers: Vec<u32>,
     render_enable: bool,
@@ -105,6 +108,11 @@ impl Remap {
 }
 
 impl Copy {
+    /// Whether a restored register file has the size methods index.
+    pub(super) fn fits(&self) -> bool {
+        self.registers.len() == METHODS
+    }
+
     pub fn method(
         &mut self,
         method: u32,

@@ -35,6 +35,8 @@
 
 use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
+
 use super::super::mc::DeviceMemory;
 use crate::maxwell::{GpuMemory, Unmodeled};
 
@@ -117,7 +119,7 @@ impl BusMemory for SmmuBus {
 }
 
 /// Size of the big pages of an address space.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BigPage {
     K64,
     K128,
@@ -138,7 +140,7 @@ impl BigPage {
 }
 
 /// One GPU virtual address space, as an instance block describes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddressSpace {
     /// Bus address of the page directory.
     pub directory: u64,

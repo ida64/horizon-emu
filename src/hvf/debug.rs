@@ -192,9 +192,10 @@ enum Plan {
     },
 }
 
-/// What the guest last wrote to the registers it no longer owns.
-#[derive(Debug, Clone)]
-struct GuestRegisters {
+/// What the guest last wrote to the registers it no longer owns: the part
+/// of a core's state that [`GuestDebug`] holds, which a snapshot saves.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GuestRegisters {
     mdscr: u64,
     /// `OSLSR_EL1.OSLK`.
     os_lock: bool,
@@ -619,6 +620,17 @@ impl GuestDebug {
             }
         }
         Some(())
+    }
+
+    /// The guest's view of the debug registers.
+    pub fn guest_registers(&self) -> GuestRegisters {
+        self.guest.clone()
+    }
+
+    /// Gives the guest back a view [`GuestDebug::guest_registers`] took;
+    /// the hardware follows on the next entry.
+    pub fn set_guest_registers(&mut self, guest: GuestRegisters) {
+        self.guest = guest;
     }
 }
 

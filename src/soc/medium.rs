@@ -6,8 +6,18 @@
 //! every run starts from the same contents. Whatever an image does not
 //! cover reads as zeros, the erased state. Contents handed over in memory
 //! belong to the run and are written in place.
+//!
+//! A machine snapshot saves what the run changed ([`MediumState`]): the
+//! sectors kept in host memory, the overlay as it stands, and contents held
+//! in memory. A file the run writes to is not saved here; the snapshot
+//! keeps a copy of the file beside it, and the restored machine is built
+//! over that copy.
 
-use std::{collections::HashMap, fs::File, io, os::unix::fs::FileExt};
+use std::{borrow::Cow, collections::HashMap, fs::File, io, os::unix::fs::FileExt};
+
+use serde::{Deserialize, Serialize};
+
+use crate::snapshot::SnapshotError;
 
 pub const SECTOR_SIZE: usize = 512;
 
@@ -32,6 +42,58 @@ pub struct Medium {
     overlay: HashMap<u64, Box<[u8; SECTOR_SIZE]>>,
     /// Names the device in the message of a failing host file.
     device: &'static str,
+}
+
+/// What a run has changed of a medium, saved in a machine snapshot.
+/// Sectors are borrowed from the medium while it is saved.
+#[derive(Serialize, Deserialize)]
+pub struct MediumState<'a> {
+    sectors: u64,
+    backing: BackingState<'a>,
+    /// Sectors in ascending order, each [`SECTOR_SIZE`] bytes.
+    written: Vec<(u64, Cow<'a, [u8]>)>,
+    overlay: Vec<(u64, Cow<'a, [u8]>)>,
+}
+
+#[derive(Serialize, Deserialize)]
+enum BackingState<'a> {
+    Erased,
+    /// The file itself is not saved: the snapshot keeps a copy of it.
+    File {
+        write_through: bool,
+    },
+    /// Contents held in memory, as the runs of sectors that are not all
+    /// zeros (first sector, bytes): a card made in memory is mostly
+    /// erased, and gigabytes of zeros are not worth saving.
+    Memory(Vec<(u64, Cow<'a, [u8]>)>),
+}
+
+/// The runs of whole sectors of `memory` that are not all zeros.
+fn nonzero_runs(memory: &[u8]) -> Vec<(u64, Cow<'_, [u8]>)> {
+    let mut runs = Vec::new();
+    let mut first = None;
+    let sectors = memory.len() / SECTOR_SIZE;
+    for (index, sector) in memory.as_chunks::<SECTOR_SIZE>().0.iter().enumerate() {
+        let erased = sector.iter().all(|&byte| byte == 0);
+        match (erased, first) {
+            (false, None) => first = Some(index),
+            (true, Some(start)) => {
+                runs.push((
+                    start as u64,
+                    Cow::Borrowed(&memory[start * SECTOR_SIZE..index * SECTOR_SIZE]),
+                ));
+                first = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = first {
+        runs.push((
+            start as u64,
+            Cow::Borrowed(&memory[start * SECTOR_SIZE..sectors * SECTOR_SIZE]),
+        ));
+    }
+    runs
 }
 
 impl Medium {
@@ -136,6 +198,95 @@ impl Medium {
             }
         }
         Some(())
+    }
+
+    /// What the run has changed, borrowing the sectors.
+    pub fn save(&self) -> MediumState<'_> {
+        fn sorted(map: &HashMap<u64, Box<[u8; SECTOR_SIZE]>>) -> Vec<(u64, Cow<'_, [u8]>)> {
+            let mut sectors: Vec<_> = map
+                .iter()
+                .map(|(&sector, bytes)| (sector, Cow::Borrowed(&bytes[..])))
+                .collect();
+            sectors.sort_unstable_by_key(|&(sector, _)| sector);
+            sectors
+        }
+        let backing = match &self.backing {
+            Backing::Erased => BackingState::Erased,
+            Backing::File { write_through, .. } => BackingState::File {
+                write_through: *write_through,
+            },
+            Backing::Memory(memory) => BackingState::Memory(nonzero_runs(memory)),
+        };
+        MediumState {
+            sectors: self.sectors,
+            backing,
+            written: sorted(&self.written),
+            overlay: sorted(&self.overlay),
+        }
+    }
+
+    /// Takes back what [`Self::save`] of a medium built the same way
+    /// returned: of the same size, over the same kind of backing.
+    pub fn restore(&mut self, state: MediumState<'_>) -> Result<(), SnapshotError> {
+        let device = self.device;
+        let corrupt = |what: &str| SnapshotError::Corrupt(format!("{device} medium: {what}"));
+        if state.sectors != self.sectors {
+            return Err(corrupt(&format!(
+                "{} sectors saved, {} here",
+                state.sectors, self.sectors
+            )));
+        }
+        let sectors = self.sectors;
+        let sector = |(index, bytes): (u64, Cow<'_, [u8]>)| {
+            let bytes: [u8; SECTOR_SIZE] = bytes[..]
+                .try_into()
+                .map_err(|_| corrupt("a saved sector is not a sector long"))?;
+            if index >= sectors {
+                return Err(corrupt("a saved sector beyond the end"));
+            }
+            Ok((index, Box::new(bytes)))
+        };
+        let written = state
+            .written
+            .into_iter()
+            .map(sector)
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        let overlay = state
+            .overlay
+            .into_iter()
+            .map(sector)
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        match (&mut self.backing, state.backing) {
+            (Backing::Erased, BackingState::Erased) => {}
+            (
+                Backing::File { write_through, .. },
+                BackingState::File {
+                    write_through: saved,
+                },
+            ) if *write_through == saved => {}
+            (Backing::Memory(memory), BackingState::Memory(runs)) => {
+                let fits = |(first, bytes): &(u64, Cow<'_, [u8]>)| {
+                    bytes.len().is_multiple_of(SECTOR_SIZE)
+                        && usize::try_from(*first)
+                            .ok()
+                            .and_then(|first| first.checked_mul(SECTOR_SIZE))
+                            .and_then(|start| start.checked_add(bytes.len()))
+                            .is_some_and(|end| end <= memory.len())
+                };
+                if !runs.iter().all(fits) {
+                    return Err(corrupt("saved contents beyond the end"));
+                }
+                memory.fill(0);
+                for (first, bytes) in runs {
+                    let start = first as usize * SECTOR_SIZE;
+                    memory[start..start + bytes.len()].copy_from_slice(&bytes);
+                }
+            }
+            _ => return Err(corrupt("saved over another kind of image")),
+        }
+        self.written = written;
+        self.overlay = overlay;
+        Ok(())
     }
 }
 

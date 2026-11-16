@@ -31,12 +31,15 @@
 //!
 //! # Frames
 //!
-//! Frames pass at the panel's pace by the clock. The model brings itself up
+//! Frames pass at the panel's pace by guest time. The model brings itself up
 //! to date whenever it is accessed, and [`keep_time`] does so at every frame
 //! boundary for whoever waits on its interrupt. At a boundary the pending
 //! activations take effect, syncpoint increments waiting for them happen,
 //! the frame-end and vertical-blank interrupt status bits are set, and the
-//! frame is counted on the syncpoint `CONT_SYNCPT_VSYNC` names.
+//! frame is counted on the syncpoint `CONT_SYNCPT_VSYNC` names. Frames are
+//! counted from when the controller started sending, so a controller
+//! restored from a snapshot ([`Dc`]'s [`Snapshot`]) with guest time set to
+//! the saved time reaches its next boundary when the saved one would have.
 //!
 //! Nothing is scanned out continuously. [`Dc::frame`] produces the picture
 //! the controller would be sending at that moment from the active copy:
@@ -53,12 +56,18 @@ use std::{
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
+
 use super::{
     host1x::{InterruptLine, Syncpoints},
     mc::DeviceMemory,
     regs::word,
 };
-use crate::bus::MmioDevice;
+use crate::{
+    bus::MmioDevice,
+    clock::GuestClock,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 /// DC0, the panel's controller.
 pub const BASE: u64 = 0x5420_0000;
@@ -317,7 +326,7 @@ impl std::fmt::Display for NoFrame {
 }
 
 /// One copy of the double-buffered registers.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct Copy {
     general: HashMap<u64, u32>,
     windows: [HashMap<u64, u32>; WINDOW_COUNT],
@@ -343,7 +352,8 @@ impl Copy {
     }
 }
 
-#[derive(Default)]
+/// Everything the controller holds; what its [`Snapshot`] saves.
+#[derive(Default, Serialize, Deserialize)]
 struct Registers {
     /// The command registers, which have one copy.
     command: HashMap<u64, u32>,
@@ -365,6 +375,7 @@ struct Registers {
     running: Option<Running>,
 }
 
+#[derive(Serialize, Deserialize)]
 struct Running {
     since: Duration,
     frames: u128,
@@ -459,18 +470,15 @@ impl Dc {
         self.settle(&mut registers);
     }
 
-    /// Time until the next frame boundary, if the controller sends frames.
+    /// Guest time of the next frame boundary, if the controller sends
+    /// frames.
     fn next_frame(&self) -> Option<Duration> {
         let registers = self.registers.lock().unwrap();
         let running = registers.running.as_ref()?;
         let boundary = (running.frames + 1) * NANOS_PER_SECOND / REFRESH_RATE;
-        let elapsed = (self.clock)().saturating_sub(running.since).as_nanos();
-        Some(Duration::from_nanos(
-            boundary
-                .saturating_sub(elapsed)
-                .try_into()
-                .unwrap_or(u64::MAX),
-        ))
+        Some(running.since.saturating_add(Duration::from_nanos(
+            boundary.try_into().unwrap_or(u64::MAX),
+        )))
     }
 
     /// Handles the frame boundaries passed since the last look, then starts
@@ -1309,22 +1317,55 @@ impl MmioDevice for Dc {
         self.settle(&mut registers);
         Some(())
     }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
 }
 
-/// Keeps the controllers' frames going by the clock, so that whoever waits
-/// on their interrupts or syncpoints sees them, until `stop` is set. Run on
-/// a dedicated thread; it notices `stop` within a frame.
-pub fn keep_time(controllers: &[&Dc], stop: &AtomicBool) {
+/// Saves the command and the assembly, armed and active registers, the
+/// activations pending for the next frame boundary and the syncpoint
+/// increments waiting for them, the interrupt status and the level last
+/// driven onto the line, and, while it sends frames, since when (guest
+/// time) and how many it has sent. The picture buffers are host scratch,
+/// dropped on restore. The line is not driven again: the interrupt
+/// controller saves its own level.
+impl Snapshot for Dc {
+    /// Counts the frames sent by the paused guest time, which the frame
+    /// thread might otherwise do in the middle of the save.
+    fn quiesce(&self) -> Result<(), SnapshotError> {
+        self.count_frames();
+        Ok(())
+    }
+
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&*self.registers.lock().unwrap())
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        let registers = decode("display controller", state)?;
+        *self.registers.lock().unwrap() = registers;
+        *self.scratch.lock().unwrap() = Scratch::default();
+        Ok(())
+    }
+}
+
+/// Keeps the controllers' frames going by guest time, so that whoever
+/// waits on their interrupts or syncpoints sees them, until `stop` is set.
+/// `clock` is the one the controllers count frames by. Run on a dedicated
+/// thread; it notices `stop` within a frame of guest time, or a short poll
+/// while the clock stands still, when no frame passes.
+pub fn keep_time(controllers: &[&Dc], clock: &GuestClock, stop: &AtomicBool) {
     let frame = Duration::from_nanos((NANOS_PER_SECOND / REFRESH_RATE) as u64);
     while !stop.load(Ordering::SeqCst) {
         controllers.iter().for_each(|dc| dc.count_frames());
+        let latest = clock.now() + frame;
         let next = controllers
             .iter()
             .filter_map(|dc| dc.next_frame())
             .min()
-            .unwrap_or(frame)
-            .min(frame);
-        thread::sleep(next.max(Duration::from_micros(100)));
+            .map_or(latest, |next| next.min(latest));
+        thread::sleep(clock.until(next).max(Duration::from_micros(100)));
     }
 }
 
@@ -2000,5 +2041,50 @@ mod tests {
         // Fully transparent.
         assert_eq!(pixel(3, 1), [0, 0, 0]);
         assert_eq!(pixel(2, 2), [200, 200, 200]);
+    }
+
+    #[test]
+    fn a_restored_controller_reaches_its_next_boundary_at_the_saved_guest_time() {
+        let saved = Bench::new();
+        let dc = &saved.dc;
+        write(dc, register::CONT_SYNCPT_VSYNC, 0x109);
+        write(dc, register::DISPLAY_COMMAND, DISPLAY_MODE_CONTINUOUS);
+        commit(dc);
+        saved.advance(20);
+        assert_eq!(saved.count(9), 1);
+        // A stop committed for the next boundary, and an increment waiting
+        // for it.
+        write(dc, register::DISPLAY_COMMAND, 0);
+        commit(dc);
+        write(
+            dc,
+            register::INCR_SYNCPT[0],
+            CONDITION_REG_WR_SAFE << 8 | 12,
+        );
+        write(dc, register::INT_STATUS, !0);
+        let state = dc.save().unwrap();
+
+        let restored = Bench::new();
+        *restored.now.lock().unwrap() = Duration::from_millis(20);
+        // The syncpoints are host1x's to restore.
+        restored.syncpoints.add(9, 1);
+        restored.dc.restore(&state).unwrap();
+        for bench in [&saved, &restored] {
+            assert_eq!(
+                bench.dc.next_frame(),
+                Some(Duration::from_nanos(33_333_333))
+            );
+            bench.advance(13);
+            assert_eq!((bench.count(9), bench.count(12)), (1, 0));
+            assert_eq!(read(&bench.dc, register::INT_STATUS), Some(0));
+            bench.advance(1);
+            assert_eq!((bench.count(9), bench.count(12)), (2, 1));
+            assert_eq!(
+                read(&bench.dc, register::INT_STATUS),
+                Some(FRAME_END_INT | VBLANK_INT)
+            );
+            bench.advance(100);
+            assert_eq!(bench.count(9), 2, "the committed stop took effect");
+        }
     }
 }

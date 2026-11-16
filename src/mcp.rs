@@ -90,15 +90,17 @@ impl Run {
     }
 
     /// Keeps the console on the HOME menu's side of sleep: unlocks it once
-    /// the lock screen shows (then calls `unlocked`), and afterwards,
-    /// whenever the log says it went to sleep (the lock screen sleeps after
-    /// half a minute untouched; a maintenance wake goes back to sleep with
-    /// the screen off), presses power and unlocks it again. Runs until the
-    /// run ends.
-    fn keep_awake(&self, unlocked: impl FnOnce()) {
-        match self.script(UNLOCK, 300.0) {
-            Ok(_) => self.note_awake("unlocked".into()),
-            Err(error) => self.note_awake(format!("could not unlock: {error}")),
+    /// the lock screen shows, if `unlock_first` (then calls `unlocked`),
+    /// and afterwards, whenever the log says it went to sleep (the lock
+    /// screen sleeps after half a minute untouched; a maintenance wake goes
+    /// back to sleep with the screen off), presses power and unlocks it
+    /// again. Runs until the run ends.
+    fn keep_awake(&self, unlock_first: bool, unlocked: impl FnOnce()) {
+        if unlock_first {
+            match self.script(UNLOCK, 300.0) {
+                Ok(_) => self.note_awake("unlocked".into()),
+                Err(error) => self.note_awake(format!("could not unlock: {error}")),
+            }
         }
         unlocked();
         let asleep = |run: &Run| {
@@ -443,6 +445,42 @@ impl Server {
                     }).to_string()}),
                 ])
             }
+            "save_state" => {
+                let run = self.run(arguments)?;
+                let name = match arguments["name"].as_str() {
+                    Some(name) if !name.is_empty() && !name.contains('/') => name.to_string(),
+                    Some(name) => {
+                        return Err(format!("{name:?}: a snapshot name is one path component"));
+                    }
+                    None => format!(
+                        "{}-{}",
+                        arguments["run"].as_str().unwrap_or_default(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |since| since.as_secs())
+                    ),
+                };
+                let dir = self.snapshot_dir(&name);
+                let request = json!({"op": "save_state", "path": dir});
+                let answer = run.control(&request, Duration::from_secs(300))?;
+                Ok(text(json!({
+                    "snapshot": name,
+                    "path": dir,
+                    "guest_seconds": answer["guest_seconds"],
+                    "paused_seconds": answer["paused_seconds"],
+                })))
+            }
+            "list_snapshots" => {
+                let mut names: Vec<String> = fs::read_dir(self.snapshot_dir(""))
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.path().join("boot.json").exists())
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect();
+                names.sort();
+                Ok(text(json!(names)))
+            }
             "read_log" => {
                 let run = self.run(arguments)?;
                 let lines = run.log_lines();
@@ -488,6 +526,11 @@ impl Server {
         }
     }
 
+    /// Where snapshot `name` lives: `snapshots/` beside the runs.
+    fn snapshot_dir(&self, name: &str) -> PathBuf {
+        self.defaults.runs_dir.join("snapshots").join(name)
+    }
+
     fn start_run(&self, arguments: &Value) -> Result<Value, String> {
         let path = |key: &str, default: &Option<PathBuf>| {
             arguments[key]
@@ -495,10 +538,28 @@ impl Server {
                 .map(PathBuf::from)
                 .or_else(|| default.clone())
         };
-        let kernel = path("kernel", &self.defaults.kernel)
-            .ok_or("no kernel: pass `kernel` or start the server with --kernel")?;
-        let keys = path("keys", &self.defaults.keys)
-            .ok_or("no keys: pass `keys` or start the server with --keys")?;
+        // A snapshot by name, or a directory.
+        let restore = arguments["restore"].as_str().map(|snapshot| {
+            if snapshot.contains('/') {
+                PathBuf::from(snapshot)
+            } else {
+                self.snapshot_dir(snapshot)
+            }
+        });
+        if let Some(snapshot) = &restore
+            && !snapshot.join("boot.json").exists()
+        {
+            return Err(format!("{}: not a snapshot", snapshot.display()));
+        }
+        let kernel = path("kernel", &self.defaults.kernel);
+        let keys = path("keys", &self.defaults.keys);
+        if restore.is_none() {
+            kernel
+                .as_ref()
+                .ok_or("no kernel: pass `kernel` or start the server with --kernel")?;
+            keys.as_ref()
+                .ok_or("no keys: pass `keys` or start the server with --keys")?;
+        }
         let number = self.next_run.fetch_add(1, Ordering::Relaxed);
         let id = format!("run-{number}");
         let dir = self.defaults.runs_dir.join(format!(
@@ -511,49 +572,60 @@ impl Server {
         let socket = dir.join("control.sock");
         let log = dir.join("log.txt");
         let crashes = dir.join("crashes");
-        let mut args: Vec<String> = vec!["boot".into(), display(&kernel)];
+        let mut args: Vec<String> = match &restore {
+            Some(snapshot) => vec!["restore".into(), display(snapshot)],
+            None => vec!["boot".into(), display(&kernel.clone().unwrap_or_default())],
+        };
         let mut flag = |name: &str, value: String| {
             args.push(name.into());
             args.push(value);
         };
-        flag("--keys", display(&keys));
         flag("--control", display(&socket));
         flag("--crash-dump", display(&crashes));
-        if let Some(emmc) = path("emmc", &self.defaults.emmc) {
-            // A copy the guest writes to; on APFS a clone, made at once.
-            let copy = dir.join("emmc.img");
-            fs::copy(&emmc, &copy).map_err(|error| format!("{}: {error}", emmc.display()))?;
-            flag("--emmc", display(&copy));
+        // What the snapshot fixes is not given to a restore.
+        if restore.is_some() {
+            flag("--workdir", display(&dir));
+        } else {
+            flag("--keys", display(&keys.clone().unwrap_or_default()));
+            if let Some(emmc) = path("emmc", &self.defaults.emmc) {
+                // A copy the guest writes to; on APFS a clone, made at once.
+                let copy = dir.join("emmc.img");
+                fs::copy(&emmc, &copy).map_err(|error| format!("{}: {error}", emmc.display()))?;
+                flag("--emmc", display(&copy));
+            }
+            for key in [
+                "sd",
+                "wifi_ssid",
+                "wifi_passphrase",
+                "homebrew",
+                "hbl",
+                "homebrew_app",
+                "homebrew_in",
+            ] {
+                if let Some(value) = arguments[key].as_str() {
+                    flag(&format!("--{}", key.replace('_', "-")), value.to_string());
+                }
+            }
+            // The Joy-Con slide onto the rails as the machine starts, so
+            // that buttons work, unless asked not to.
+            if arguments["joycons"] != false {
+                flag("--joycons", "0".into());
+            }
         }
-        for key in [
-            "sd",
-            "wifi_ssid",
-            "wifi_passphrase",
-            "dns",
-            "homebrew",
-            "hbl",
-            "homebrew_app",
-            "homebrew_in",
-            "symbols",
-        ] {
+        for key in ["dns", "symbols"] {
             if let Some(value) = arguments[key].as_str() {
-                flag(&format!("--{}", key.replace('_', "-")), value.to_string());
+                flag(&format!("--{key}"), value.to_string());
             }
         }
         if let Some(seconds) = arguments["timeout_seconds"].as_f64() {
             flag("--timeout", format!("{seconds}"));
-        }
-        // The Joy-Con slide onto the rails as the machine starts, so that
-        // buttons work, unless asked not to.
-        if arguments["joycons"] != false {
-            flag("--joycons", "0".into());
         }
         for port in arguments["forward"].as_array().into_iter().flatten() {
             if let Some(port) = port.as_str() {
                 flag("--forward", port.to_string());
             }
         }
-        if arguments["emmc"].is_string() || self.defaults.emmc.is_some() {
+        if restore.is_none() && (arguments["emmc"].is_string() || self.defaults.emmc.is_some()) {
             args.push("--emmc-writable".into());
         }
         if arguments["verbose"] != false {
@@ -591,14 +663,26 @@ impl Server {
             .lock()
             .unwrap()
             .insert(id.clone(), Arc::clone(&run));
+        // A restored machine answers once it is running and has had a
+        // second to settle. \[observed\] A 150 ms press given as a
+        // restored machine starts went unnoticed (5 tries of 5, one
+        // snapshot), while the same press 0.2 s or more after the control
+        // socket first answered was taken (7 of 7); why is not known.
+        if restore.is_some() {
+            run.script("sleep 1", SOCKET_WAIT.as_secs_f64())
+                .map_err(|error| format!("the restored run did not start: {error}"))?;
+        }
         if arguments["stay_awake"] == false {
             return Ok(json!({"run": id, "dir": dir, "log": log, "args": args}));
         }
         // Answered once the console is on the HOME menu; kept there.
         let keeper = Arc::clone(&run);
         let (unlocked, ready) = std::sync::mpsc::channel();
+        // A restored console is where it was saved: on the HOME menu, or
+        // past it, if it was kept awake.
+        let unlock_first = restore.is_none();
         thread::spawn(move || {
-            keeper.keep_awake(move || {
+            keeper.keep_awake(unlock_first, move || {
                 let _ = unlocked.send(());
             })
         });
@@ -672,7 +756,12 @@ sleep it is woken and unlocked again (run_status lists this as kept_awake; \
 pass stay_awake false to drive the lock screen yourself). screenshot \
 shows the screen. read_log pages the emulator's narration (since/next \
 cursors, contains filters, tail); crash_dumps lists and reads the full \
-register and module dump of each process crash. stop_run ends a run.";
+register and module dump of each process crash. stop_run ends a run. \
+save_state snapshots a running machine (it stands still for a moment) \
+under a name; start_run with restore set to that name starts a new run \
+from it in a few seconds instead of booting, as many times as wanted. \
+Network connections of the saved machine are gone after a restore; \
+the console makes new ones.";
 
 fn tools() -> Value {
     let run = json!({"type": "string", "description": "run id from start_run"});
@@ -681,8 +770,9 @@ fn tools() -> Value {
     json!([
         {
             "name": "start_run",
-            "description": "Boot a new machine. Returns its run id, directory and log path. The eMMC image is copied first; the original is not written.",
+            "description": "Boot a new machine, or with `restore` go on from a snapshot. Returns its run id, directory and log path. The eMMC image is copied first; the original is not written.",
             "inputSchema": {"type": "object", "properties": {
+                "restore": string("snapshot name from save_state (or a snapshot directory): start from it instead of booting. The snapshot fixes kernel, keys, images, WiFi network, homebrew and Joy-Con; dns, forward, symbols, timeout_seconds, window, verbose, stay_awake and args still apply"),
                 "kernel": string("kernel ELF (default: the server's --kernel)"),
                 "keys": string("key file (default: the server's --keys)"),
                 "emmc": string("raw eMMC user image to copy and boot (default: the server's --emmc)"),
@@ -767,6 +857,15 @@ fn tools() -> Value {
             "description": "What the screen shows, as a PNG image (also saved in the run's directory).",
             "inputSchema": {"type": "object", "properties": {"run": run}, "required": ["run"]}
         },
+        {
+            "name": "save_state",
+            "description": "Snapshot the running machine (memory, processors, every device) for start_run's `restore`. Returns the snapshot name and how long the machine stood still. Refused while the console sleeps.",
+            "inputSchema": {"type": "object", "properties": {
+                "run": run,
+                "name": string("snapshot name, one path component; an existing snapshot of that name is replaced (default: run id and time)")
+            }, "required": ["run"]}
+        },
+        {"name": "list_snapshots", "description": "Names of the snapshots start_run can restore.", "inputSchema": {"type": "object", "properties": {}}},
         {
             "name": "read_log",
             "description": "Lines of the run's log (boot narration, programs loaded, network flows, crashes, fatal errors), numbered. Lines of spl are left out: they carry key material.",

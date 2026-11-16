@@ -5,7 +5,11 @@
 //! Transfers complete synchronously; RDY and FIFO occupancy reflect actual
 //! transferred bytes, never a fabricated all-ready register value.
 use super::{Notes, lsm6ds3::Lsm6ds3};
-use crate::bus::MmioDevice;
+use crate::{
+    bus::MmioDevice,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 pub const BASE: u64 = 0x7000_da00;
 pub const SIZE: u64 = 0x200;
@@ -17,10 +21,14 @@ pub struct Spi {
     interrupt: Box<dyn Fn(bool) + Send + Sync>,
     notes: Arc<Notes>,
 }
+/// Everything a snapshot saves: registers, both FIFOs and the sensor.
+#[derive(Serialize, Deserialize)]
 struct State {
     configuration: [u32; 10],
+    #[serde(with = "crate::snapshot::array")]
     tx: [u32; 64],
     tx_len: usize,
+    #[serde(with = "crate::snapshot::array")]
     rx: [u32; 64],
     rx_len: usize,
     rx_pos: usize,
@@ -184,6 +192,29 @@ impl MmioDevice for Spi {
         }
         self.update(&s);
         Some(())
+    }
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+/// The interrupt output follows from the registers at the next access and
+/// is not driven on restore.
+impl Snapshot for Spi {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&*self.state.lock().unwrap())
+    }
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        let saved: State = decode("SPI4", state)?;
+        if saved.tx_len > saved.tx.len()
+            || saved.rx_pos > saved.rx_len
+            || saved.rx_len > saved.rx.len()
+        {
+            return Err(SnapshotError::Corrupt(
+                "SPI4: FIFO counts out of range".into(),
+            ));
+        }
+        *self.state.lock().unwrap() = saved;
+        Ok(())
     }
 }
 

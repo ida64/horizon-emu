@@ -22,6 +22,8 @@
 //! replaced. nvservices' own words are all new-form incrementing headers
 //! (`0x2001001C`: count 1, subchannel 0, method 0x1C; spec §4.8).
 
+use serde::{Deserialize, Serialize};
+
 use crate::maxwell::Unmodeled;
 
 /// What a header word starts.
@@ -45,7 +47,7 @@ pub enum Header {
 }
 
 /// Which method each argument word goes to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
     /// The first to `method`, each following to the next method.
     Increasing,
@@ -111,7 +113,7 @@ impl Header {
 }
 
 /// The arguments of a header still to come.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MethodRun {
     pub subchannel: u8,
     /// Method of the next argument.

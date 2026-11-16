@@ -8,6 +8,8 @@
 //! GPIO assignments (reset J7, active-low IRQ X1): public Atmosphere
 //! `gpio_internal_pad_map_combination.inc`, consulted rather than copied.
 use super::{Notes, i2c::I2cDevice};
+use crate::snapshot::{Snapshot, SnapshotError, decode, encode};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 pub const ADDRESS: u8 = 0x49;
 /// Public FTM4CD60D identity; hid 0xde410 compares the bytes 36 70.
@@ -43,6 +45,10 @@ impl Default for TouchInput {
         Self::new(Box::new(|_| {}))
     }
 }
+/// The controller's state, and the finger the host holds on the glass,
+/// which a snapshot saves with it: a restored console is touched where the
+/// saved one was.
+#[derive(Serialize, Deserialize)]
 struct State {
     contact: Option<(u16, u16)>,
     events: [[u8; 8]; 32],
@@ -140,6 +146,18 @@ impl TouchInput {
         }
         s.reset_high = high;
         self.update(&s);
+    }
+}
+/// Saved by the SoC ([`super::Soc::snapshot_parts`]): the controller's
+/// event queue, modes and the contact held at the time. The interrupt pin
+/// is the GPIO's input, which the GPIO saves; it is not driven on restore.
+impl Snapshot for TouchInput {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&*self.state.lock().unwrap())
+    }
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        *self.state.lock().unwrap() = decode("touch input", state)?;
+        Ok(())
     }
 }
 pub struct Touch {
@@ -253,6 +271,14 @@ impl I2cDevice for Touch {
         }
         self.input.update(&s);
         Some(true)
+    }
+    /// The command being read; the rest is [`TouchInput`]'s.
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&self.command)
+    }
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError> {
+        self.command = decode("touch", state)?;
+        Ok(())
     }
 }
 #[cfg(test)]

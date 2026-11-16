@@ -64,6 +64,8 @@
 //! recording sessions) are taken without effect, as before; no client of
 //! those is modeled.
 
+use serde::{Deserialize, Serialize};
+
 /// `gmix`'s shared memory, as the DSP reaches it.
 pub trait Shared {
     fn read(&self, offset: u32) -> Result<u32, String>;
@@ -104,7 +106,7 @@ const DEFAULT_DEVICE: u32 = 1;
 
 /// Open, start and pause counts as the DSP keeps them for a session or a
 /// device (object offsets 4, 72 and 76).
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Serialize, Deserialize)]
 struct Counts {
     open: u32,
     started: u32,
@@ -145,7 +147,7 @@ impl Counts {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct Session {
     counts: Counts,
     /// Routing: 0 (the default device), 7 or 8.
@@ -158,7 +160,10 @@ struct Session {
     release_all: bool,
 }
 
-#[derive(Default)]
+/// `gmix`'s output sessions and devices. The ADSP saves it whole with its
+/// own state: every count, routing and queued buffer size affects what the
+/// next periods play and release.
+#[derive(Default, Serialize, Deserialize)]
 pub struct Streams {
     default_device: u32,
     sessions: [Session; OUTPUT_SESSIONS],

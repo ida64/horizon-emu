@@ -77,6 +77,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use serde::{Deserialize, Serialize};
+
+use crate::snapshot::{Snapshot, SnapshotError, decode, encode};
+
 /// Interrupt IDs the Tegra X1 distributor implements (`GICD_TYPER.ITLinesNumber` = 6).
 pub const INTERRUPT_COUNT: u32 = 224;
 /// ID `GICC_IAR` and `GICC_HPPIR` return when there is no interrupt to report.
@@ -173,7 +177,7 @@ mod gicc {
 
 /// Distributor state of one peripheral interrupt, or of one SGI on one CPU
 /// interface (which uses only `enabled`, `active` and `priority`).
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 struct Interrupt {
     enabled: bool,
     /// Pending state that outlives the input: a captured edge or a
@@ -198,6 +202,7 @@ impl Interrupt {
 }
 
 /// One CPU interface and the distributor state banked for its processor.
+#[derive(Serialize, Deserialize)]
 struct Cpu {
     /// Non-secure `GICC_CTLR`.
     control: u32,
@@ -284,10 +289,12 @@ fn bitmap_first_intid(offset: usize) -> usize {
     offset % 0x80 * 8
 }
 
+#[derive(Serialize, Deserialize)]
 struct State {
     /// Non-secure `GICD_CTLR.EnableGrp1`.
     forwarding: bool,
     cpus: Box<[Cpu]>,
+    #[serde(with = "crate::snapshot::array")]
     spis: [Interrupt; SPI_COUNT],
 }
 
@@ -847,6 +854,42 @@ impl Gic {
     /// Current level of the IRQ signal to `core`'s processor.
     pub fn irq_asserted(&self, core: usize) -> bool {
         self.outputs[core].load(Ordering::SeqCst)
+    }
+}
+
+/// Saves the distributor and every CPU interface (each interrupt's enable,
+/// latched pending, active, priority, targets and trigger mode, and the level
+/// of its input line), and the IRQ level last driven to each core.
+///
+/// The IRQ outputs are put back as they were, without reporting them through
+/// `irq_raised`: the restored cores sample them on entry, as the saved ones
+/// did.
+impl Snapshot for Gic {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        let state = self.state.lock().unwrap();
+        let outputs = self
+            .outputs
+            .iter()
+            .map(|output| output.load(Ordering::SeqCst))
+            .collect::<Vec<_>>();
+        encode(&(&*state, outputs))
+    }
+
+    fn restore(&self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let (saved, outputs): (State, Vec<bool>) = decode("GIC", bytes)?;
+        if saved.cpus.len() != self.outputs.len() || outputs.len() != self.outputs.len() {
+            return Err(SnapshotError::Corrupt(format!(
+                "GIC: {} CPU interfaces saved, {} here",
+                saved.cpus.len(),
+                self.outputs.len()
+            )));
+        }
+        let mut state = self.state.lock().unwrap();
+        *state = saved;
+        for (output, level) in self.outputs.iter().zip(outputs) {
+            output.store(level, Ordering::SeqCst);
+        }
+        Ok(())
     }
 }
 
@@ -1552,5 +1595,45 @@ mod tests {
         bench.d_write(0, GICD_ISENABLER, 1 << TIMER_PPI);
         assert_eq!(bench.take_raised(), [0]);
         assert_eq!(bench.acknowledge(0), TIMER_PPI);
+    }
+
+    #[test]
+    fn restored_controller_keeps_pending_and_active_interrupts_on_their_cores() {
+        let saved = Bench::enabled();
+        // SPI 40: level-sensitive, held asserted, routed to core 2.
+        saved.route_spi(40, 0x80, 1 << 2);
+        saved.gic.set_line(0, 40, true);
+        // SPI 41: an edge on core 1, acknowledged and not yet ended.
+        saved.make_edge_triggered(41);
+        saved.route_spi(41, 0x40, 1 << 1);
+        saved.gic.set_line(0, 41, true);
+        saved.gic.set_line(0, 41, false);
+        assert_eq!(saved.acknowledge(1), 41);
+        // SPI 42: an edge latched behind 41 on core 1, at a priority 41's
+        // handling does not let through.
+        saved.make_edge_triggered(42);
+        saved.route_spi(42, 0x60, 1 << 1);
+        saved.gic.set_line(0, 42, true);
+        saved.gic.set_line(0, 42, false);
+        assert_eq!(saved.asserted(), [false, false, true, false]);
+
+        let restored = Bench::reset();
+        restored.gic.restore(&saved.gic.save().unwrap()).unwrap();
+        assert_eq!(restored.asserted(), [false, false, true, false]);
+        assert!(restored.take_raised().is_empty());
+        let active = restored.d_read(1, GICD_ISACTIVER + 4);
+        assert_eq!(active, 1 << (41 - 32));
+        assert!(restored.pending_bit(1, 42));
+
+        // Ending 41 lets the latched 42 through to core 1.
+        restored.end(1, 41);
+        assert_eq!(restored.take_raised(), [1]);
+        assert_eq!(restored.acknowledge(1), 42);
+        // 40's line is still held: after it is handled it is pending again.
+        assert_eq!(restored.acknowledge(2), 40);
+        restored.end(2, 40);
+        assert_eq!(restored.take_raised(), [2]);
+        restored.gic.set_line(0, 40, false);
+        assert_eq!(restored.asserted(), [false, false, false, false]);
     }
 }

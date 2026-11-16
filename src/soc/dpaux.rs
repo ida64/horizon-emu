@@ -19,7 +19,7 @@
 //! firmware does not use.
 
 use super::regs::{RegisterFile, word};
-use crate::bus::MmioDevice;
+use crate::{bus::MmioDevice, snapshot::Snapshot};
 
 pub const BASE: u64 = 0x5404_0000;
 /// Up to the last register nvservices uses, the hybrid pad spare register
@@ -67,5 +67,10 @@ impl MmioDevice for Dpaux {
             register => self.registers.set(register, value),
         }
         Some(())
+    }
+
+    /// All there is: the configuration registers.
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(&self.registers)
     }
 }

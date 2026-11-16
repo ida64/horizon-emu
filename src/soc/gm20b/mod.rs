@@ -37,6 +37,16 @@
 //! When a channel meets something the model does not do, the GPU stops:
 //! the reason is left as a note, and every later access to either window
 //! is refused with it, which stops the machine.
+//!
+//! Machine snapshots: [`Gm20b`] is the part that saves (BAR0 and BAR1 on
+//! the bus answer [`NoState`]): BAR0 registers, the method-init list, the
+//! falcons, the host's registers, CCSR table and runlist, and every
+//! channel's [`Context`] with its engines' state. Before saving, the host
+//! thread is brought to rest: the channel it executes stops between
+//! methods as for a preemption, every channel's engines write back what
+//! they hold (render targets on the host GPU), and no channel starts while
+//! guest time stands still. Nothing on the host GPU is saved; a restored
+//! machine rebuilds its caches from guest memory.
 
 pub mod falcon;
 pub mod fifo;
@@ -55,15 +65,19 @@ use std::{
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
+
 use self::{
     falcon::{Fecs, Gpccs, Pmu},
-    fifo::{Context, Env, Fifo, Outcome},
+    fifo::{Context, Env, Fifo, Outcome, SavedContext},
     mmu::{AddressSpace, BusMemory, SmmuBus},
 };
 use super::{Notes, host1x::Syncpoints, mc::DeviceMemory, regs::word};
 use crate::{
-    bus::MmioDevice,
+    bus::{MmioDevice, NoState},
+    clock::GuestClock,
     maxwell::{self, Engines, Unmodeled},
+    snapshot::{Snapshot, SnapshotError, decode, encode},
 };
 
 pub const BAR0_BASE: u64 = 0x5700_0000;
@@ -78,11 +92,12 @@ pub const NONSTALL_INTID: u32 = 32 + 158;
 /// How often a channel waiting for a syncpoint or semaphore looks again.
 /// Nothing tells the host when a syncpoint moves, so waits are polled.
 const WAIT_POLL: Duration = Duration::from_micros(500);
+/// How often the host looks whether the machine runs again while it is
+/// paused.
+const PAUSED_POLL: Duration = Duration::from_millis(20);
 
 /// Called with the level of an interrupt output.
 pub type InterruptLine = Box<dyn Fn(bool) + Send + Sync>;
-/// Time since the GPU's timer started.
-pub type Clock = Box<dyn Fn() -> Duration + Send + Sync>;
 /// Makes the engines of a new channel, given the method-init list the
 /// driver loaded into the graphics engine (`(index, value)`, index =
 /// method << 16 | class) and the GPU timer in nanoseconds.
@@ -298,6 +313,8 @@ const LTC_OPERATIONS: [(u32, u32, u32); 4] = [
 const LTC_STRIDE: u32 = 0x2000;
 const LTS_STRIDE: u32 = 0x200;
 
+/// The GPU. Its [`Snapshot`] saves the whole GPU; the BAR windows on the
+/// bus answer [`NoState`].
 pub struct Gm20b {
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
@@ -307,6 +324,8 @@ struct Shared {
     state: Mutex<State>,
     /// The worker waits here for work.
     wake: Condvar,
+    /// The worker announces here that it left a channel.
+    left: Condvar,
     /// Asks the worker to stop the channel it executes between methods.
     attention: AtomicBool,
     bus: Box<dyn BusMemory>,
@@ -314,6 +333,9 @@ struct Shared {
     notes: Arc<Notes>,
     stall: InterruptLine,
     nonstall: InterruptLine,
+    /// Guest time: the GPU timer counts it, and the host starts no channel
+    /// while it stands still.
+    clock: Arc<GuestClock>,
     nanoseconds: Arc<dyn Fn() -> u64 + Send + Sync>,
     engines: EngineFactory,
 }
@@ -340,12 +362,13 @@ struct State {
 }
 
 impl Gm20b {
-    /// `memory` is memory as the GPU's SMMU client reaches it.
+    /// `memory` is memory as the GPU's SMMU client reaches it; the GPU
+    /// timer counts guest time from `clock`.
     pub fn new(
         memory: DeviceMemory,
         syncpoints: Arc<Syncpoints>,
         [stall, nonstall]: [InterruptLine; 2],
-        clock: Clock,
+        clock: Arc<GuestClock>,
         engines: EngineFactory,
         notes: Arc<Notes>,
     ) -> Self {
@@ -363,7 +386,7 @@ impl Gm20b {
         bus: Box<dyn BusMemory>,
         syncpoints: Arc<Syncpoints>,
         [stall, nonstall]: [InterruptLine; 2],
-        clock: Clock,
+        clock: Arc<GuestClock>,
         engines: EngineFactory,
         notes: Arc<Notes>,
     ) -> Self {
@@ -383,13 +406,18 @@ impl Gm20b {
                 lines: (false, false),
             }),
             wake: Condvar::new(),
+            left: Condvar::new(),
             attention: AtomicBool::new(false),
             bus,
             syncpoints,
             notes,
             stall,
             nonstall,
-            nanoseconds: Arc::new(move || clock().as_nanos() as u64),
+            nanoseconds: {
+                let clock = Arc::clone(&clock);
+                Arc::new(move || clock.now().as_nanos() as u64)
+            },
+            clock,
             engines,
         });
         let worker = {
@@ -471,6 +499,174 @@ impl Drop for Gm20b {
     }
 }
 
+/// The GPU as a machine snapshot holds it.
+#[derive(Serialize, Deserialize)]
+struct Saved {
+    registers: HashMap<u32, u32>,
+    fifo: Fifo,
+    pmu: Pmu,
+    fecs: Fecs,
+    gpccs: Gpccs,
+    method_init: Vec<(u32, u32)>,
+    holding: Option<usize>,
+    failure: Option<String>,
+    /// The interrupt line levels the GPU drove (the GIC saves its own).
+    lines: (bool, bool),
+    /// Every channel's state, by instance block address.
+    contexts: Vec<(u64, SavedContext)>,
+}
+
+/// The whole GPU: BAR0 registers, the method-init list, the falcons, the
+/// host's registers, CCSR table and runlist, and every channel's execution
+/// state with its engines' state. Not saved: anything on the host GPU and
+/// any cache of guest memory (prefetched pushbuffer words, decoded
+/// programs and textures), which a restored GPU builds again.
+impl Snapshot for Gm20b {
+    /// Stops the channel being executed between methods, as a preemption
+    /// does, and has every channel's engines write back what they hold
+    /// (render targets on the host GPU) to guest memory. Needs guest time
+    /// standing still, which keeps the host from starting a channel again
+    /// until the machine runs on.
+    fn quiesce(&self) -> Result<(), SnapshotError> {
+        let shared = &self.shared;
+        if !shared.clock.is_paused() {
+            return Err(SnapshotError::Unsupported(
+                "the GPU while guest time runs: its host would start channels again".into(),
+            ));
+        }
+        let mut state = shared.state.lock().unwrap();
+        while state.fifo.executing.is_some() {
+            shared.attention.store(true, Ordering::SeqCst);
+            state = shared.left.wait(state).unwrap();
+        }
+        if state.failure.is_some() {
+            return Ok(());
+        }
+        let bus = shared.bus.as_ref();
+        let mut instances: Vec<u64> = state.fifo.contexts.keys().copied().collect();
+        instances.sort_unstable();
+        for instance in instances {
+            let context = state
+                .fifo
+                .contexts
+                .get_mut(&instance)
+                .expect("listed above");
+            if let Err(Unmodeled(what)) = context.write_back(bus) {
+                // What the channel's next signal would have met.
+                let what = format!("channel instance {instance:#x}: {what}");
+                shared.fail(&mut state, Unmodeled(what));
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        let state = self.shared.state.lock().unwrap();
+        if state.fifo.executing.is_some() {
+            return Err(SnapshotError::Unsupported(
+                "the GPU while its host executes a channel (not quiesced)".into(),
+            ));
+        }
+        let mut contexts = state
+            .fifo
+            .contexts
+            .iter()
+            .map(|(&instance, context)| Ok((instance, context.save()?)))
+            .collect::<Result<Vec<_>, SnapshotError>>()?;
+        contexts.sort_unstable_by_key(|&(instance, _)| instance);
+        let State {
+            registers,
+            fifo,
+            pmu,
+            fecs,
+            gpccs,
+            method_init,
+            holding,
+            failure,
+            lines,
+            ..
+        } = &*state;
+        // `Saved` field for field, borrowed: the state stays in place.
+        #[derive(Serialize)]
+        struct View<'a> {
+            registers: &'a HashMap<u32, u32>,
+            fifo: &'a Fifo,
+            pmu: &'a Pmu,
+            fecs: &'a Fecs,
+            gpccs: &'a Gpccs,
+            method_init: &'a Vec<(u32, u32)>,
+            holding: &'a Option<usize>,
+            failure: &'a Option<String>,
+            lines: &'a (bool, bool),
+            contexts: Vec<(u64, SavedContext)>,
+        }
+        encode(&View {
+            registers,
+            fifo,
+            pmu,
+            fecs,
+            gpccs,
+            method_init,
+            holding,
+            failure,
+            lines,
+            contexts,
+        })
+    }
+
+    /// Puts the GPU back as saved; each channel gets engines made as for a
+    /// new channel (from the restored method-init list) and then given its
+    /// saved state. The host looks at every channel once the machine runs.
+    fn restore(&self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let shared = &self.shared;
+        let saved: Saved = decode("GM20B", bytes)?;
+        if !saved.fifo.fits() || saved.holding.is_some_and(|chid| chid >= fifo::CHANNELS) {
+            return Err(SnapshotError::Corrupt(
+                "GM20B: channel IDs outside the CCSR table".into(),
+            ));
+        }
+        let mut state = shared.state.lock().unwrap();
+        if state.fifo.executing.is_some() {
+            return Err(SnapshotError::Unsupported(
+                "the GPU while its host executes a channel".into(),
+            ));
+        }
+        let mut contexts = HashMap::with_capacity(saved.contexts.len());
+        for (instance, context) in saved.contexts {
+            let nanoseconds = Arc::clone(&shared.nanoseconds);
+            let engines = (shared.engines)(&saved.method_init, Box::new(move || nanoseconds()))
+                .map_err(|Unmodeled(what)| {
+                    SnapshotError::Corrupt(format!(
+                        "GM20B channel instance {instance:#x}: engines: {what}"
+                    ))
+                })?;
+            contexts.insert(instance, Context::restore(context, engines)?);
+        }
+        let mut fifo = saved.fifo;
+        fifo.contexts = contexts;
+        state.method_init_at = saved
+            .method_init
+            .iter()
+            .enumerate()
+            .map(|(at, &(index, _))| (index, at))
+            .collect();
+        state.registers = saved.registers;
+        state.fifo = fifo;
+        state.pmu = saved.pmu;
+        state.fecs = saved.fecs;
+        state.gpccs = saved.gpccs;
+        state.method_init = saved.method_init;
+        state.holding = saved.holding;
+        state.failure = saved.failure;
+        state.lines = saved.lines;
+        state.kicked = true;
+        shared.attention.store(false, Ordering::SeqCst);
+        shared.wake.notify_all();
+        Ok(())
+    }
+}
+
 struct Bar0(Arc<Shared>);
 struct Bar1(Arc<Shared>);
 
@@ -489,6 +685,11 @@ impl MmioDevice for Bar0 {
         self.0.update_lines(&mut state);
         drop(state);
         self.0.refuse(done)
+    }
+
+    /// Saved by [`Gm20b`]'s [`Snapshot`], with the rest of the GPU.
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(&NoState)
     }
 }
 
@@ -514,6 +715,12 @@ impl MmioDevice for Bar1 {
         // This may have been a channel's GP_PUT: the host looks.
         self.0.kick();
         Some(())
+    }
+
+    /// BAR1 holds nothing: it maps memory through the address space
+    /// `bus_bar1_block` names, saved by [`Gm20b`]'s [`Snapshot`].
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(&NoState)
     }
 }
 
@@ -579,12 +786,18 @@ impl Shared {
         state.failure = Some(what);
     }
 
-    /// The host's thread: runs channels whenever there may be work.
+    /// The host's thread: runs channels whenever there may be work, while
+    /// guest time runs. While the machine is paused it starts nothing; a
+    /// kick that arrived meanwhile is served once time runs again.
     fn work(&self) {
         let mut state = self.state.lock().unwrap();
         loop {
             if state.stop {
                 return;
+            }
+            if self.clock.is_paused() {
+                state = self.wake.wait_timeout(state, PAUSED_POLL).unwrap().0;
+                continue;
             }
             state.kicked = false;
             drop(state);
@@ -609,6 +822,12 @@ impl Shared {
         loop {
             let mut state = self.state.lock().unwrap();
             if state.failure.is_some() || state.stop {
+                return false;
+            }
+            // Paused: no channel starts (checked under the lock that
+            // `quiesce` takes, so none starts after it looked).
+            if self.clock.is_paused() {
+                state.kicked = true;
                 return false;
             }
             let fifo = &state.fifo;
@@ -656,6 +875,7 @@ impl Shared {
             }
             state.fifo.contexts.insert(instance, context);
             state.fifo.left(chid);
+            self.left.notify_all();
             if state.holding == Some(chid) {
                 state.holding = None;
             }
@@ -959,6 +1179,7 @@ mod tests {
         bar0: Box<dyn MmioDevice>,
         bar1: Box<dyn MmioDevice>,
         bus: Arc<TestBus>,
+        clock: Arc<GuestClock>,
         syncpoints: Arc<Syncpoints>,
         notes: Arc<Notes>,
         nonstall: Arc<AtomicBool>,
@@ -970,12 +1191,33 @@ mod tests {
         fn call(&mut self, _: u8, method: u32, _: u32, _: &dyn GpuMemory) -> Result<(), Unmodeled> {
             Err(Unmodeled(format!("engine method {method:#x}")))
         }
+
+        fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+            Ok(Vec::new())
+        }
+
+        fn restore(&mut self, _: &[u8]) -> Result<(), SnapshotError> {
+            Ok(())
+        }
     }
 
     impl Bench {
         fn new() -> Self {
-            let bus = Arc::new(TestBus::default());
-            let syncpoints: Arc<Syncpoints> = Arc::default();
+            Self::on(
+                Arc::new(TestBus::default()),
+                Arc::new(GuestClock::new()),
+                Arc::default(),
+                Box::new(|_, _| Ok(Box::new(NoEngines))),
+            )
+        }
+
+        /// A GPU on `bus`, keeping time with `clock`.
+        fn on(
+            bus: Arc<TestBus>,
+            clock: Arc<GuestClock>,
+            syncpoints: Arc<Syncpoints>,
+            engines: EngineFactory,
+        ) -> Self {
             let notes: Arc<Notes> = Arc::default();
             let nonstall = Arc::new(AtomicBool::new(false));
             let line = Arc::clone(&nonstall);
@@ -986,8 +1228,8 @@ mod tests {
                     Box::new(|_| {}),
                     Box::new(move |level| line.store(level, Ordering::SeqCst)),
                 ],
-                Box::new(Duration::default),
-                Box::new(|_, _| Ok(Box::new(NoEngines))),
+                Arc::clone(&clock),
+                engines,
                 Arc::clone(&notes),
             );
             Self {
@@ -995,6 +1237,7 @@ mod tests {
                 bar1: gpu.bar1(),
                 gpu,
                 bus,
+                clock,
                 syncpoints,
                 notes,
                 nonstall,
@@ -1025,6 +1268,50 @@ mod tests {
             self.bus.big_table(directory, table);
             self.bus.page(table + 8, IOVA | 0x7_0000);
             self.write(reg::BAR1_BLOCK, ((instance >> 12) as u32) | BAR1_VIRTUAL);
+        }
+
+        /// Channel 0 as the driver brings one up (after [`Self::bar1_space`]):
+        /// USERD at IOVA 0x70000 (BAR1 VA 0x10000), a 16-entry ring at VA
+        /// 0x1000 whose entry 0 holds `words` at VA 0x2000, a page at VA
+        /// 0x3000 (IOVA 0xB3000) for semaphores; on the runlist, bound and
+        /// enabled. Its instance block address.
+        fn channel(&self, words: &[u32]) -> u64 {
+            let userd = IOVA | 0x7_0000;
+            let instance = IOVA | 0x8_0000;
+            let directory = IOVA | 0x9_0000;
+            let table = IOVA | 0xA_0000;
+            self.bus
+                .instance(instance, directory, mmu::BigPage::K128, 1 << 37);
+            self.bus.small_table(directory, table);
+            for page in 1..4 {
+                self.bus
+                    .page(table + page * 8, IOVA | (0xB_0000 + page * 0x1000));
+            }
+            self.bus.put(instance + 0x08, userd as u32);
+            self.bus.put(instance + 0x0C, (userd >> 32) as u32);
+            self.bus.put(instance + 0x48, 0x1000);
+            self.bus.put(instance + 0x4C, 4 << 16);
+            for (index, word) in words.iter().enumerate() {
+                self.bus.put(IOVA | (0xB_2000 + index as u64 * 4), *word);
+            }
+            self.bus.put(IOVA | 0xB_1000, 0x2000);
+            self.bus.put(IOVA | 0xB_1004, (words.len() as u32) << 10);
+            // Runlist with channel 0, then CCSR bind and enable.
+            self.bus.put(IOVA | 0xC_0000, 0);
+            self.write(0x2270, ((IOVA | 0xC_0000) >> 12) as u32);
+            self.write(0x2274, 1);
+            self.write(0x80_0000, ((instance >> 12) as u32) | 1 << 31);
+            self.write(0x80_0004, 0x400);
+            instance
+        }
+
+        /// Waits up to five seconds for `done`.
+        fn wait_for(&self, what: &str, done: impl Fn() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done() {
+                assert!(Instant::now() < deadline, "{what}: {:?}", self.notes.take());
+                thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 
@@ -1137,33 +1424,7 @@ mod tests {
     fn a_submission_through_bar1_signals_its_fence() {
         let bench = Bench::new();
         bench.bar1_space();
-        let userd = IOVA | 0x7_0000;
-        let instance = IOVA | 0x8_0000;
-        let directory = IOVA | 0x9_0000;
-        let table = IOVA | 0xA_0000;
-        bench
-            .bus
-            .instance(instance, directory, mmu::BigPage::K128, 1 << 37);
-        bench.bus.small_table(directory, table);
-        // Ring at VA 0x1000 (16 entries), pushbuffer at VA 0x2000.
-        bench.bus.page(table + 8, IOVA | 0xB_1000);
-        bench.bus.page(table + 16, IOVA | 0xB_2000);
-        bench.bus.put(instance + 0x08, userd as u32);
-        bench.bus.put(instance + 0x0C, (userd >> 32) as u32);
-        bench.bus.put(instance + 0x48, 0x1000);
-        bench.bus.put(instance + 0x4C, 4 << 16);
-        let fence = [0x2001_001C, 0, 0x2001_001D, 0x18 << 8 | 1];
-        for (index, word) in fence.iter().enumerate() {
-            bench.bus.put(IOVA | (0xB_2000 + index as u64 * 4), *word);
-        }
-        bench.bus.put(IOVA | 0xB_1000, 0x2000);
-        bench.bus.put(IOVA | 0xB_1004, 4 << 10);
-        // Runlist with channel 0, then CCSR bind and enable.
-        bench.bus.put(IOVA | 0xC_0000, 0);
-        bench.write(0x2270, ((IOVA | 0xC_0000) >> 12) as u32);
-        bench.write(0x2274, 1);
-        bench.write(0x80_0000, ((instance >> 12) as u32) | 1 << 31);
-        bench.write(0x80_0004, 0x400);
+        bench.channel(&[0x2001_001C, 0, 0x2001_001D, 0x18 << 8 | 1]);
         // GP_PUT through BAR1.
         bench.bar1.write(0, 0x1_008C, 4, 1).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1193,5 +1454,76 @@ mod tests {
                 .any(|note| note.contains("engine method 0x40"))
         );
         assert_eq!(bench.read(0), None);
+    }
+
+    /// A channel saved while it waits for a syncpoint in the middle of a
+    /// segment, with 3D state set before the wait, goes on in a restored
+    /// GPU from the method it waits at: what came before is not executed
+    /// again, and the 3D engine still has its object and registers.
+    #[test]
+    fn a_restored_gpu_resumes_a_waiting_channel_where_it_stopped() {
+        let bus = Arc::new(TestBus::default());
+        let on = |clock: Arc<GuestClock>| {
+            let syncpoints: Arc<Syncpoints> = Arc::default();
+            let engines = maxwell_engines(Arc::clone(&syncpoints));
+            Bench::on(Arc::clone(&bus), clock, syncpoints, engines)
+        };
+        let host_release = IOVA | 0xB_3000;
+        let report = IOVA | 0xB_3010;
+        let gp_get = IOVA | 0x7_0088;
+        let saved = on(Arc::new(GuestClock::new()));
+        saved.bar1_space();
+        let instance = saved.channel(&[
+            // 3D on subchannel 0; its report semaphore at VA 0x3010 with
+            // payload 0xBEEF.
+            0x2001_0000,
+            0xB197,
+            0x2003_06C0,
+            0,
+            0x3010,
+            0xBEEF,
+            // Host semaphore release of 1 at VA 0x3000 (4 bytes).
+            0x2004_0004,
+            0,
+            0x3000,
+            1,
+            1 << 24 | 2,
+            // Wait for syncpoint 0x18 to reach 1.
+            0x2001_001C,
+            1,
+            0x2001_001D,
+            0x18 << 8,
+            // The 3D report (one word).
+            0x2001_06C3,
+            1 << 28,
+        ]);
+        saved.bar1.write(0, 0x1_008C, 4, 1).unwrap();
+        let blocked = || {
+            let state = saved.gpu.shared.state.lock().unwrap();
+            let context = state.fifo.contexts.get(&instance);
+            matches!(context.and_then(|c| c.last), Some(Outcome::Blocked(_)))
+        };
+        saved.wait_for("the channel waits", blocked);
+        assert_eq!(saved.bus.get(host_release), 1);
+        saved.clock.pause();
+        saved.gpu.quiesce().unwrap();
+        let state = saved.gpu.save().unwrap();
+        let at = saved.clock.now();
+        drop(saved);
+
+        // Memory is the machine's, restored with it; the release before
+        // the wait is erased to show it is not executed again.
+        bus.put(host_release, 0);
+        let clock = Arc::new(GuestClock::new());
+        clock.pause();
+        clock.set(at);
+        let restored = on(clock);
+        restored.gpu.restore(&state).unwrap();
+        restored.syncpoints.add(0x18, 1);
+        restored.clock.resume();
+        restored.wait_for("the 3D report", || restored.bus.get(report) == 0xBEEF);
+        restored.wait_for("GP_GET moves on", || restored.bus.get(gp_get) == 1);
+        assert_eq!(restored.bus.get(host_release), 0);
+        assert!(restored.gpu.shared.state.lock().unwrap().failure.is_none());
     }
 }

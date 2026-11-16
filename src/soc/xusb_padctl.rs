@@ -13,7 +13,11 @@
 //! USB2 mux, capability and OTG pad controls; `0x63c0` changes VBUS/ID
 //! override +0xc60. These registers retain software configuration.
 
-use crate::bus::MmioDevice;
+use super::regs::{restore_words, save_words};
+use crate::{
+    bus::MmioDevice,
+    snapshot::{Snapshot, SnapshotError},
+};
 use std::sync::Mutex;
 
 pub const BASE: u64 = 0x7009_f000;
@@ -77,6 +81,21 @@ impl MmioDevice for XusbPadctl {
         }
         self.registers.lock().unwrap()[index] = value;
         Some(())
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+/// Saves the pad configuration, calibration status included.
+impl Snapshot for XusbPadctl {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        save_words(&self.registers)
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        restore_words("XUSB pads", &self.registers, state)
     }
 }
 

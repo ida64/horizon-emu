@@ -9,7 +9,11 @@
 //! No cable means PORTSC has no connection, speed, or change bits and
 //! no event TRBs are produced. Endpoint reload completes synchronously;
 //! pause changes raise EP_STCHG bits, which software acknowledges W1C.
-use crate::bus::MmioDevice;
+use super::regs::{restore_words, save_words};
+use crate::{
+    bus::MmioDevice,
+    snapshot::{Snapshot, SnapshotError},
+};
 use std::sync::Mutex;
 pub const BASE: u64 = 0x700d_0000;
 pub const SIZE: u64 = 0xa000;
@@ -65,6 +69,21 @@ impl MmioDevice for XusbDevice {
             _ => registers[index] = value as u32,
         }
         Some(())
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+/// Saves the configuration registers and the endpoint state-change bits.
+impl Snapshot for XusbDevice {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        save_words(&self.registers)
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        restore_words("XUSB device", &self.registers, state)
     }
 }
 

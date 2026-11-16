@@ -66,6 +66,10 @@ use std::{
     sync::Mutex,
 };
 
+use serde::{Deserialize, Serialize};
+
+use crate::snapshot::{Snapshot, SnapshotError, decode, encode};
+
 /// Physical base of UART-A, the port the kernel logs to (`0x80061014`).
 pub const UART_A_BASE: u64 = 0x7000_6000;
 
@@ -116,6 +120,12 @@ struct State {
     sink: Box<dyn Write + Send>,
     /// First failure of the sink since it was last collected.
     sink_error: Option<io::Error>,
+    registers: Registers,
+}
+
+/// What the guest sees of the port: everything but the host-side sink.
+#[derive(Default, Serialize, Deserialize)]
+struct Registers {
     divisor_low: u8,
     divisor_high: u8,
     interrupt_enable: u8,
@@ -136,14 +146,7 @@ impl Uart {
             state: Mutex::new(State {
                 sink,
                 sink_error: None,
-                divisor_low: 0,
-                divisor_high: 0,
-                interrupt_enable: 0,
-                fifo_enabled: false,
-                line_control: 0,
-                modem_control: 0,
-                scratch: 0,
-                thr_empty_event: false,
+                registers: Registers::default(),
             }),
         }
     }
@@ -153,16 +156,16 @@ impl Uart {
     /// happened.
     pub fn read(&self, offset: u64, size: u8) -> Option<u32> {
         let width = width_mask(size)?;
-        let mut state = self.state.lock().unwrap();
+        let registers = &mut self.state.lock().unwrap().registers;
         let value = match offset {
-            THR_RBR_DLL if state.divisor_latch() => state.divisor_low.into(),
-            IER_DLM if state.divisor_latch() => state.divisor_high.into(),
-            IER_DLM => state.interrupt_enable.into(),
-            IIR_FCR => state.read_interrupt_identification().into(),
-            LCR => state.line_control.into(),
-            MCR => state.modem_control.into(),
+            THR_RBR_DLL if registers.divisor_latch() => registers.divisor_low.into(),
+            IER_DLM if registers.divisor_latch() => registers.divisor_high.into(),
+            IER_DLM => registers.interrupt_enable.into(),
+            IIR_FCR => registers.read_interrupt_identification().into(),
+            LCR => registers.line_control.into(),
+            MCR => registers.modem_control.into(),
             LSR => LSR_IDLE,
-            SPR => state.scratch.into(),
+            SPR => registers.scratch.into(),
             _ => return None,
         };
         Some(value & width)
@@ -174,17 +177,20 @@ impl Uart {
     pub fn write(&self, offset: u64, size: u8, value: u32) -> Option<()> {
         let value = value & width_mask(size)?;
         let mut state = self.state.lock().unwrap();
+        let registers = &mut state.registers;
         match offset {
-            THR_RBR_DLL if state.divisor_latch() => state.divisor_low = defined(value, 0xFF)?,
+            THR_RBR_DLL if registers.divisor_latch() => {
+                registers.divisor_low = defined(value, 0xFF)?
+            }
             THR_RBR_DLL => state.transmit(defined(value, 0xFF)?),
-            IER_DLM if state.divisor_latch() => state.divisor_high = defined(value, 0xFF)?,
-            IER_DLM => state.set_interrupt_enable(defined(value, IER_DEFINED)?),
+            IER_DLM if registers.divisor_latch() => registers.divisor_high = defined(value, 0xFF)?,
+            IER_DLM => registers.set_interrupt_enable(defined(value, IER_DEFINED)?),
             // Trigger levels and the self-clearing FIFO resets act on FIFO
             // contents, and both FIFOs are always empty.
-            IIR_FCR => state.fifo_enabled = defined(value, FCR_MODELED)? & FCR_EN_FIFO != 0,
-            LCR => state.line_control = defined(value, 0xFF)?,
-            MCR => state.modem_control = defined(value, MCR_MODELED)?,
-            SPR => state.scratch = defined(value, 0xFF)?,
+            IIR_FCR => registers.fifo_enabled = defined(value, FCR_MODELED)? & FCR_EN_FIFO != 0,
+            LCR => registers.line_control = defined(value, 0xFF)?,
+            MCR => registers.modem_control = defined(value, MCR_MODELED)?,
+            SPR => registers.scratch = defined(value, 0xFF)?,
             _ => return None,
         }
         Some(())
@@ -192,7 +198,7 @@ impl Uart {
 
     /// Level of the port's interrupt output.
     pub fn interrupt(&self) -> bool {
-        self.state.lock().unwrap().interrupt()
+        self.state.lock().unwrap().registers.interrupt()
     }
 
     /// Takes the first error the sink has returned since the last call. The
@@ -203,7 +209,21 @@ impl Uart {
     }
 }
 
-impl State {
+/// Saves the port's registers and its pending THR-empty event; the host sink
+/// and its errors stay with the restoring machine. Its interrupt output is
+/// derived from the registers, so nothing else is driven on restore.
+impl Snapshot for Uart {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&self.state.lock().unwrap().registers)
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        self.state.lock().unwrap().registers = decode("UART-A", state)?;
+        Ok(())
+    }
+}
+
+impl Registers {
     /// DLAB: offsets 0 and 4 address the divisor instead of data and IER.
     fn divisor_latch(&self) -> bool {
         self.line_control & LCR_DLAB != 0
@@ -233,7 +253,9 @@ impl State {
         }
         self.interrupt_enable = value;
     }
+}
 
+impl State {
     /// The flush is what makes the idle line status true: once the guest is
     /// told the transmitter has drained, the byte has left the emulator.
     fn transmit(&mut self, byte: u8) {
@@ -244,7 +266,7 @@ impl State {
         if let Err(error) = sent {
             self.sink_error.get_or_insert(error);
         }
-        self.thr_empty_event = true;
+        self.registers.thr_empty_event = true;
     }
 }
 

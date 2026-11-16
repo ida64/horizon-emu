@@ -2,7 +2,10 @@
 
 use std::{collections::HashMap, sync::Mutex};
 
-use crate::bus::MmioDevice;
+use crate::{
+    bus::MmioDevice,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 /// Offset of the register a device access addresses, for blocks that only
 /// support whole, aligned 32-bit accesses.
@@ -74,4 +77,41 @@ impl MmioDevice for RegisterFile {
         self.set(word(offset, size)?, value as u32);
         Some(())
     }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+/// Saves every register that holds a value, written or initial. What an
+/// unwritten register reads as is the block's construction, not state.
+impl Snapshot for RegisterFile {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&*self.registers.lock().unwrap())
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        *self.registers.lock().unwrap() = decode("register file", state)?;
+        Ok(())
+    }
+}
+
+/// Saves a block kept as a plain array of registers; see [`restore_words`].
+pub fn save_words<const N: usize>(words: &Mutex<[u32; N]>) -> Result<Vec<u8>, SnapshotError> {
+    encode(&&words.lock().unwrap()[..])
+}
+
+/// Takes back what [`save_words`] saved of a block of the same size;
+/// `what` names the block for the error.
+pub fn restore_words<const N: usize>(
+    what: &str,
+    words: &Mutex<[u32; N]>,
+    state: &[u8],
+) -> Result<(), SnapshotError> {
+    let saved: Vec<u32> = decode(what, state)?;
+    let len = saved.len();
+    *words.lock().unwrap() = saved
+        .try_into()
+        .map_err(|_| SnapshotError::Corrupt(format!("{what}: {len} registers saved, {N} here")))?;
+    Ok(())
 }

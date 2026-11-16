@@ -9,7 +9,55 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use std::{fmt, ptr};
 
+use serde::{Deserialize, Serialize};
+
 use crate::arm64::SysReg;
+
+/// A core's state as [`Vcpu::save_state`] takes it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VcpuState {
+    pub x: [u64; 31],
+    pub pc: u64,
+    pub cpsr: u64,
+    pub fpcr: u64,
+    pub fpsr: u64,
+    #[serde(with = "crate::snapshot::array")]
+    pub q: [u128; 32],
+    /// [`SAVED_SYS_REGS`] by encoding, with their values.
+    pub sys: Vec<(u16, u64)>,
+}
+
+/// The EL0/EL1 system registers Hypervisor.framework holds for the guest
+/// that a snapshot saves (`hv_vcpu_types.h`, `HV_SYS_REG_*`): translation,
+/// exception, thread, context and virtual timer state. Identification
+/// registers are set when a core is made; debug registers are shadowed.
+pub const SAVED_SYS_REGS: [SysReg; 25] = [
+    SysReg::new(3, 0, 1, 0, 0),  // SCTLR_EL1
+    SysReg::new(3, 0, 1, 0, 2),  // CPACR_EL1
+    SysReg::new(3, 0, 2, 0, 0),  // TTBR0_EL1
+    SysReg::new(3, 0, 2, 0, 1),  // TTBR1_EL1
+    SysReg::new(3, 0, 2, 0, 2),  // TCR_EL1
+    SysReg::new(3, 0, 4, 0, 0),  // SPSR_EL1
+    SysReg::new(3, 0, 4, 0, 1),  // ELR_EL1
+    SysReg::new(3, 0, 4, 1, 0),  // SP_EL0
+    SysReg::new(3, 0, 5, 1, 0),  // AFSR0_EL1
+    SysReg::new(3, 0, 5, 1, 1),  // AFSR1_EL1
+    SysReg::new(3, 0, 5, 2, 0),  // ESR_EL1
+    SysReg::new(3, 0, 6, 0, 0),  // FAR_EL1
+    SysReg::new(3, 0, 7, 4, 0),  // PAR_EL1
+    SysReg::new(3, 0, 10, 2, 0), // MAIR_EL1
+    SysReg::new(3, 0, 10, 3, 0), // AMAIR_EL1
+    SysReg::new(3, 0, 12, 0, 0), // VBAR_EL1
+    SysReg::new(3, 0, 13, 0, 1), // CONTEXTIDR_EL1
+    SysReg::new(3, 0, 13, 0, 4), // TPIDR_EL1
+    SysReg::new(3, 0, 14, 1, 0), // CNTKCTL_EL1
+    SysReg::new(3, 2, 0, 0, 0),  // CSSELR_EL1
+    SysReg::new(3, 3, 13, 0, 2), // TPIDR_EL0
+    SysReg::new(3, 3, 13, 0, 3), // TPIDRRO_EL0
+    SysReg::new(3, 3, 14, 3, 1), // CNTV_CTL_EL0
+    SysReg::new(3, 3, 14, 3, 2), // CNTV_CVAL_EL0
+    SysReg::new(3, 4, 4, 1, 0),  // SP_EL1
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvError {
@@ -211,6 +259,57 @@ impl<'vm> Vcpu<'vm> {
         check("hv_vcpu_set_sys_reg", unsafe {
             sys::hv_vcpu_set_sys_reg(self.id, register.0, value)
         })
+    }
+
+    /// Everything of the core's architectural state that a running guest
+    /// can have changed and Hypervisor.framework holds: the general and
+    /// SIMD registers, PSTATE, FPCR/FPSR and [`SAVED_SYS_REGS`]. Not the
+    /// debug registers, which [`debug::GuestDebug`] shadows, nor the
+    /// physical timer, which the machine emulates.
+    pub fn save_state(&self) -> Result<VcpuState, HvError> {
+        let mut state = VcpuState::default();
+        for (index, register) in (0u8..).zip(&mut state.x) {
+            *register = self.gpr(index)?;
+        }
+        state.pc = self.pc()?;
+        state.cpsr = self.pstate()?;
+        state.fpcr = self.reg("hv_vcpu_get_reg(FPCR)", sys::HV_REG_FPCR)?;
+        state.fpsr = self.reg("hv_vcpu_get_reg(FPSR)", sys::HV_REG_FPSR)?;
+        for (index, register) in (0u32..).zip(&mut state.q) {
+            let mut value = [0u8; 16];
+            // SAFETY: the vCPU is live and owned by this thread; `value`
+            // is a valid 16-byte buffer, the size of the register.
+            check("hv_vcpu_get_simd_fp_reg", unsafe {
+                sys::hv_vcpu_get_simd_fp_reg(self.id, index, value.as_mut_ptr().cast())
+            })?;
+            *register = u128::from_le_bytes(value);
+        }
+        state.sys = SAVED_SYS_REGS
+            .iter()
+            .map(|&register| Ok((register.0, self.sys_reg(register)?)))
+            .collect::<Result<_, HvError>>()?;
+        Ok(state)
+    }
+
+    /// Puts back what [`Vcpu::save_state`] returned.
+    pub fn load_state(&self, state: &VcpuState) -> Result<(), HvError> {
+        for (index, &register) in (0u8..).zip(&state.x) {
+            self.set_gpr(index, register)?;
+        }
+        self.set_pc(state.pc)?;
+        self.set_pstate(state.cpsr)?;
+        self.set_reg(sys::HV_REG_FPCR, state.fpcr)?;
+        self.set_reg(sys::HV_REG_FPSR, state.fpsr)?;
+        for (index, &register) in (0u32..).zip(&state.q) {
+            // SAFETY: the vCPU is live and owned by this thread.
+            check("hv_vcpu_set_simd_fp_reg", unsafe {
+                sys::hv_vcpu_set_simd_fp_reg_bytes(self.id, index, register.to_le_bytes())
+            })?;
+        }
+        for &(register, value) in &state.sys {
+            self.set_sys_reg(SysReg(register), value)?;
+        }
+        Ok(())
     }
 
     /// How long the guest's code has run on this vCPU since it was made,

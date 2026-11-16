@@ -176,10 +176,22 @@ pub enum CipherMode {
 /// An RSA private key the monitor keeps. A modulus that arrived without
 /// its key (Lotus, TLS) is provisional until a test exponentiation with
 /// it succeeds; the ES keys bring theirs.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct StoredRsaKey {
+    #[serde(with = "crate::snapshot::array")]
     exponent: RsaBlock,
+    #[serde(with = "crate::snapshot::array")]
     modulus: RsaBlock,
     committed: bool,
+}
+
+/// What userland has put into the monitor's keeping since boot: key slots
+/// and RSA keys. The key file and the seal key follow from the boot
+/// parameters, so a snapshot does not hold them.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct SavedCrypto {
+    slots: [Option<Key>; USER_SLOT_COUNT],
+    rsa_keys: [StoredRsaKey; 4],
 }
 
 const NO_RSA_KEY: StoredRsaKey = StoredRsaKey {
@@ -428,6 +440,18 @@ impl Crypto {
             slots: [None; USER_SLOT_COUNT],
             rsa_keys: [NO_RSA_KEY, NO_RSA_KEY, NO_RSA_KEY, NO_RSA_KEY],
         }
+    }
+
+    pub fn save_state(&self) -> SavedCrypto {
+        SavedCrypto {
+            slots: self.slots,
+            rsa_keys: self.rsa_keys.clone(),
+        }
+    }
+
+    pub fn restore_state(&mut self, saved: SavedCrypto) {
+        self.slots = saved.slots;
+        self.rsa_keys = saved.rsa_keys;
     }
 
     /// The key access keys for operation `seal` are sealed with, so that one

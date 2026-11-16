@@ -15,6 +15,11 @@
 //!     seconds since the machine started and whether the screen is lit
 //! {"op":"stop"}
 //!     stops the machine, as closing its window does
+//! {"op":"save_state","path":"/tmp/snap"}
+//!     a snapshot of the machine as it is into that directory (created if
+//!     missing; a snapshot already there is replaced), for
+//!     `horizon-emu restore`; answered with the guest time it was taken
+//!     at, how long the machine stood still and how much DRAM was written
 //! ```
 //!
 //! Every answer has `"ok"`: true, with the request's results, or false
@@ -30,6 +35,9 @@ use std::{
 };
 
 use horizon_emu::machine::Machine;
+use std::path::Path;
+
+use crate::Snapshotter;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -57,15 +65,19 @@ enum Request {
     },
     Status,
     Stop,
+    SaveState {
+        path: String,
+    },
 }
 
-/// What a request reaches: the machine, its stop switch, when it started
-/// and whether it has ended.
+/// What a request reaches: the machine, its stop switch, when it started,
+/// whether it has ended and what takes its snapshots.
 pub struct Controlled<'a> {
     pub machine: &'a Machine,
     pub stop: &'a AtomicBool,
     pub started: Instant,
     pub ended: &'a AtomicBool,
+    pub snapshot: &'a Snapshotter,
 }
 
 /// Serves `listener` until the machine has ended.
@@ -194,6 +206,15 @@ fn answer(request: Request, controlled: &Controlled) -> Result<Value, String> {
         Request::Stop => {
             controlled.stop.store(true, Ordering::SeqCst);
             Ok(json!({}))
+        }
+        Request::SaveState { path } => {
+            let report = controlled.snapshot.save(machine, Path::new(&path))?;
+            Ok(json!({
+                "path": path,
+                "guest_seconds": report.guest_time.as_secs_f64(),
+                "paused_seconds": report.paused_for.as_secs_f64(),
+                "ram_bytes": report.ram_bytes,
+            }))
         }
     }
 }

@@ -50,7 +50,7 @@
 //! 38.4 MHz.
 
 use super::regs::{RegisterFile, word};
-use crate::bus::MmioDevice;
+use crate::{bus::MmioDevice, snapshot::Snapshot};
 
 pub const BASE: u64 = 0x6000_6000;
 pub const SIZE: u64 = 0x1000;
@@ -666,6 +666,13 @@ impl MmioDevice for Car {
             clock_change();
         }
         Some(())
+    }
+
+    /// All there is: the registers. PLL lock is derived from them, and the
+    /// modules the hooks tell about save their own state, so restoring
+    /// calls no hook.
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(&self.registers)
     }
 }
 

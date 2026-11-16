@@ -5,6 +5,8 @@
 //! `classes/3d/clb197.h`, `classes/compute/clb1c0.h`], so one model serves
 //! all three.
 
+use serde::{Deserialize, Serialize};
+
 use super::texture::layout::{BlockLinear, block_linear_offset};
 use super::{GpuMemory, Unmodeled};
 
@@ -34,15 +36,16 @@ const SET_I2M_SPARE_NOOP00: u32 = 0x1F0 / 4;
 const SET_I2M_SPARE_NOOP03: u32 = 0x1FC / 4;
 
 /// A transfer whose `LAUNCH_DMA` has been seen and whose data is arriving.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Transfer {
     launch: u32,
     data: Vec<u8>,
     expected: usize,
 }
 
-/// The inline-to-memory state of one class instance.
-#[derive(Debug, Default)]
+/// The inline-to-memory state of one class instance, saved whole in
+/// machine snapshots, a transfer in flight included.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct InlineToMemory {
     registers: [u32; (LAST_METHOD - FIRST_METHOD + 1) as usize],
     transfer: Option<Transfer>,

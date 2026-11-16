@@ -28,7 +28,10 @@
 use std::sync::Mutex;
 
 use super::regs::{RegisterFile, word};
-use crate::bus::MmioDevice;
+use crate::{
+    bus::MmioDevice,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 pub const BASE: u64 = 0x7011_0000;
 pub const SIZE: u64 = 0x400;
@@ -155,6 +158,24 @@ impl MmioDevice for ClDvfs {
             _ => self.registers.set(register, value),
         }
         Some(())
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+/// Saves the registers and the output index last sent to the regulator.
+impl Snapshot for ClDvfs {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&(self.registers.save()?, *self.last_output.lock().unwrap()))
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        let (registers, last_output): (Vec<u8>, u32) = decode("CL-DVFS", state)?;
+        self.registers.restore(&registers)?;
+        *self.last_output.lock().unwrap() = last_output;
+        Ok(())
     }
 }
 

@@ -31,10 +31,16 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
-    time::Instant,
+    time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
+
 use super::serial::Peer;
+use crate::{
+    clock::GuestClock,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 /// UART-B, which the right rail's serial lines lead to.
 pub const RIGHT_UART_BASE: u64 = 0x7000_6040;
@@ -146,6 +152,23 @@ impl Controls {
             true => self.buttons.fetch_or(button.0, Ordering::SeqCst),
             false => self.buttons.fetch_and(!button.0, Ordering::SeqCst),
         };
+    }
+}
+
+/// Saved by the SoC ([`super::Soc::snapshot_parts`]): whether the pair is
+/// on the rails and which buttons are held, so that a restored console has
+/// them where the saved one had them. The detect and CTS pins they drive
+/// are GPIO inputs, which the GPIO saves.
+impl Snapshot for Controls {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&(self.seated(), self.buttons.load(Ordering::SeqCst)))
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        let (seated, buttons): (bool, u32) = decode("Joy-Con controls", state)?;
+        self.set_seated(seated);
+        self.buttons.store(buttons, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -353,6 +376,14 @@ fn packet(command: u8, subcommand: u8, status: u8, payload: &[u8]) -> Vec<u8> {
 struct JoyCon {
     side: Side,
     controls: Arc<Controls>,
+    clock: Arc<GuestClock>,
+    session: Session,
+}
+
+/// What the Joy-Con holds of its session with the console: everything a
+/// snapshot saves of it.
+#[derive(Serialize, Deserialize)]
+struct Session {
     /// The packet being received.
     incoming: Vec<u8>,
     /// The last few packets answered, a run of the same one counted once:
@@ -366,14 +397,14 @@ struct JoyCon {
     processor: bool,
     /// Put to sleep by the console (subcommand 6); the handshake wakes it.
     asleep: bool,
-    powered: Instant,
+    /// Guest time at which it was powered, which its report timer counts
+    /// from.
+    powered: Duration,
 }
 
-impl JoyCon {
-    fn new(side: Side, controls: Arc<Controls>) -> Self {
+impl Session {
+    fn new(now: Duration) -> Self {
         Self {
-            side,
-            controls,
             incoming: Vec::new(),
             answered: Vec::new(),
             reporting: false,
@@ -381,13 +412,24 @@ impl JoyCon {
             vibration: false,
             processor: false,
             asleep: false,
-            powered: Instant::now(),
+            powered: now,
+        }
+    }
+}
+
+impl JoyCon {
+    fn new(side: Side, controls: Arc<Controls>, clock: Arc<GuestClock>) -> Self {
+        Self {
+            side,
+            controls,
+            session: Session::new(clock.now()),
+            clock,
         }
     }
 
     /// The session ends when the Joy-Con leaves the rail.
     fn unplug(&mut self) {
-        *self = Self::new(self.side, Arc::clone(&self.controls));
+        self.session = Session::new(self.clock.now());
     }
 
     fn refuse<T>(&self, what: impl std::fmt::Display) -> Result<T, String> {
@@ -397,38 +439,39 @@ impl JoyCon {
     fn byte(&mut self, byte: u8) -> Result<Vec<u8>, String> {
         // Between packets only the start of one means anything: the wake
         // bytes, `A1 A2 A3 A4`, are not part of any.
-        if self.incoming.is_empty() && byte != TO_JOYCON[0] {
+        if self.session.incoming.is_empty() && byte != TO_JOYCON[0] {
             return Ok(Vec::new());
         }
-        self.incoming.push(byte);
-        let Some(header) = self.incoming.first_chunk::<5>() else {
+        self.session.incoming.push(byte);
+        let Some(header) = self.session.incoming.first_chunk::<5>() else {
             return Ok(Vec::new());
         };
         let length = usize::from(u16::from_le_bytes([header[3], header[4]]));
-        if self.incoming.len() < 5 + length {
+        if self.session.incoming.len() < 5 + length {
             return Ok(Vec::new());
         }
-        let received = std::mem::take(&mut self.incoming);
+        let received = std::mem::take(&mut self.session.incoming);
         let refusal = |joycon: &Self| {
             joycon.refuse(format_args!(
                 "the packet {received:02x?}, after {:02x?},",
-                joycon.answered
+                joycon.session.answered
             ))
         };
         if received[..3] != TO_JOYCON || length < ENVELOPE {
             return refusal(self);
         }
-        let answered = std::mem::take(&mut self.answered);
+        let answered = std::mem::take(&mut self.session.answered);
         let answer = self.packet(&received[5..]).or_else(|()| {
-            self.answered = answered.clone();
+            self.session.answered = answered.clone();
             refusal(self)
         })?;
         // The list outlasts a handshake that starts the Joy-Con over.
-        self.answered = answered;
-        if self.answered.last() != Some(&received) {
-            self.answered.push(received);
-            let excess = self.answered.len().saturating_sub(ANSWERED_KEPT);
-            self.answered.drain(..excess);
+        self.session.answered = answered;
+        let kept = &mut self.session.answered;
+        if kept.last() != Some(&received) {
+            kept.push(received);
+            let excess = kept.len().saturating_sub(ANSWERED_KEPT);
+            kept.drain(..excess);
         }
         Ok(answer)
     }
@@ -439,7 +482,7 @@ impl JoyCon {
         let (envelope, payload) = body.split_at(ENVELOPE);
         if envelope == HANDSHAKE && payload.is_empty() {
             // A sleeping Joy-Con starts over, as one just slid on.
-            if self.asleep {
+            if self.session.asleep {
                 self.unplug();
             }
             let mut answer = TO_CONSOLE.to_vec();
@@ -448,7 +491,7 @@ impl JoyCon {
             return Ok(answer);
         }
         // Asleep, it listens for nothing else [assumption].
-        if self.asleep {
+        if self.session.asleep {
             return Ok(Vec::new());
         }
         let [
@@ -483,11 +526,11 @@ impl JoyCon {
             // End of controller reports. The captured answer has status
             // 0x0F.
             (COMMAND, 0x11, []) => {
-                self.reporting = false;
+                self.session.reporting = false;
                 Ok(packet(COMMAND_ANSWER, 0x11, 0x0F, &[]))
             }
             (COMMAND, 0x10, []) => {
-                self.reporting = true;
+                self.session.reporting = true;
                 Ok(packet(COMMAND_ANSWER, 0x10, 0, &[]))
             }
             // Interval of reports in milliseconds; they are sent when asked
@@ -502,7 +545,7 @@ impl JoyCon {
             (COMMAND, 0x02, [0x00 | 0x04 | 0x10 | 0x14, 0, 0, 0]) => {
                 Ok(packet(COMMAND_ANSWER, 0x02, 0, &[]))
             }
-            (REPORT, 0x00, output) if self.reporting => {
+            (REPORT, 0x00, output) if self.session.reporting => {
                 let report = self.report(output)?;
                 Ok(packet(REPORT, 0x00, 0, &report))
             }
@@ -530,12 +573,13 @@ impl JoyCon {
         };
         // Per side: vibration enabled, and room for more of it. Seen in
         // the notes' captures: 7 while off, 0xC while on.
-        let vibrator = match self.vibration {
+        let vibrator = match self.session.vibration {
             true => 0xC,
             false => 0x7,
         } << [4, 0][side];
-        // In units of 5 ms.
-        let timer = (self.powered.elapsed().as_millis() / 5) as u8;
+        // In units of 5 ms of guest time.
+        let powered_for = self.clock.now().saturating_sub(self.session.powered);
+        let timer = (powered_for.as_millis() / 5) as u8;
         let mut report = vec![0, timer, Identity::BATTERY << 4];
         report.extend(&buttons.to_le_bytes()[..3]);
         report.extend(sticks.concat());
@@ -553,7 +597,7 @@ impl JoyCon {
             [0x10, _, _, _, _, _, _, _, _, _] | [0x1F] => {
                 report[0] = 0x30;
                 // Three samples of the motion sensor: at rest.
-                let sample = match self.motion {
+                let sample = match self.session.motion {
                     true => {
                         let mut sample = words(&Identity::AT_REST[side]);
                         sample.extend([0; 6]);
@@ -642,7 +686,7 @@ impl JoyCon {
             // are assumptions. The other states (reboot into reconnecting
             // or pairing over Bluetooth) are not modeled.
             0x06 if argument(0)? == 0 => {
-                self.asleep = true;
+                self.session.asleep = true;
                 DONE
             }
             // Flash memory read: address, size.
@@ -660,7 +704,7 @@ impl JoyCon {
             // The right Joy-Con's NFC and infrared processor: suspend (0),
             // resume (1).
             0x22 if self.side == Side::Right && argument(0)? <= 1 => {
-                self.processor = argument(0)? == 1;
+                self.session.processor = argument(0)? == 1;
                 DONE
             }
             // A command for that processor. Only the one asking how it is
@@ -672,7 +716,7 @@ impl JoyCon {
             // (CRC-8, polynomial 7) of the rest. State 1 is standby in
             // public descriptions of the protocol; that the processor is
             // there at once after being resumed is an assumption.
-            0x21 if self.processor && arguments.first_chunk() == Some(&[0x21, 0, 0]) => {
+            0x21 if self.session.processor && arguments.first_chunk() == Some(&[0x21, 0, 0]) => {
                 let [major, minor] = Identity::PROCESSOR_FIRMWARE.map(u16::to_be_bytes);
                 let mut status = vec![0x01, 0, 0, major[0], major[1], minor[0], minor[1], 0x01];
                 status.resize(33, 0);
@@ -690,7 +734,7 @@ impl JoyCon {
             0x38 if self.side == Side::Right => DONE,
             // Motion sensor on or off.
             0x40 => {
-                self.motion = argument(0)? != 0;
+                self.session.motion = argument(0)? != 0;
                 DONE
             }
             // Motion sensor sensitivity and filters: the samples here are
@@ -698,7 +742,7 @@ impl JoyCon {
             0x41 => DONE,
             // Vibration on or off.
             0x48 => {
-                self.vibration = argument(0)? != 0;
+                self.session.vibration = argument(0)? != 0;
                 DONE
             }
             // Battery voltage, in units of 2.5 mV: 4.0 V, within the range
@@ -715,9 +759,10 @@ pub struct Rail {
 }
 
 impl Rail {
-    pub fn new(side: Side, controls: Arc<Controls>) -> Self {
+    /// The Joy-Con's report timer counts guest time from `clock`.
+    pub fn new(side: Side, controls: Arc<Controls>, clock: Arc<GuestClock>) -> Self {
         Self {
-            joycon: JoyCon::new(side, controls),
+            joycon: JoyCon::new(side, controls, clock),
         }
     }
 }
@@ -738,6 +783,17 @@ impl Peer for Rail {
     fn clear_to_send(&self) -> bool {
         self.joycon.controls.seated()
     }
+
+    /// The Joy-Con's session; whether it is on the rail is the
+    /// [`Controls`]', which the SoC saves.
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&self.joycon.session)
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError> {
+        self.joycon.session = decode("Joy-Con", state)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -745,9 +801,13 @@ mod tests {
     use super::*;
 
     fn seated(side: Side) -> (Rail, Arc<Controls>) {
+        seated_on(side, Arc::default())
+    }
+
+    fn seated_on(side: Side, clock: Arc<GuestClock>) -> (Rail, Arc<Controls>) {
         let controls = Arc::new(Controls::default());
         controls.set_seated(true);
-        (Rail::new(side, Arc::clone(&controls)), controls)
+        (Rail::new(side, Arc::clone(&controls), clock), controls)
     }
 
     fn send(rail: &mut Rail, bytes: &[u8]) -> Vec<u8> {
@@ -846,13 +906,43 @@ mod tests {
 
     fn connected(side: Side) -> (Rail, Arc<Controls>) {
         let (mut rail, controls) = seated(side);
+        open_session(&mut rail);
+        (rail, controls)
+    }
+
+    fn open_session(rail: &mut Rail) {
         send(
-            &mut rail,
+            rail,
             &[
                 0x19, 0x01, 0x03, 0x07, 0x00, 0x91, 0x10, 0x00, 0x00, 0x00, 0x00, 0x3D,
             ],
         );
-        (rail, controls)
+    }
+
+    /// A restored Joy-Con is in the session the saved one was in, and its
+    /// report timer reads the same at the same guest time.
+    #[test]
+    fn a_restored_session_reports_with_the_timer_of_the_saved_one() {
+        let paused_clock = || {
+            let clock = Arc::new(GuestClock::new());
+            clock.pause();
+            clock.set(Duration::ZERO);
+            clock
+        };
+        let (saved_clock, restored_clock) = (paused_clock(), paused_clock());
+        let (mut saved, _) = seated_on(Side::Right, Arc::clone(&saved_clock));
+        open_session(&mut saved);
+        saved_clock.set(Duration::from_secs(1));
+        restored_clock.set(Duration::from_secs(1));
+        let (mut restored, _) = seated_on(Side::Right, Arc::clone(&restored_clock));
+        restored.restore(&saved.save().unwrap()).unwrap();
+        for at in [1_000, 1_500] {
+            saved_clock.set(Duration::from_millis(at));
+            restored_clock.set(Duration::from_millis(at));
+            let answer = send(&mut restored, &STATUS);
+            assert_eq!(answer[12 + 1], (at / 5) as u8, "the timer counts 5 ms");
+            assert_eq!(answer, send(&mut saved, &STATUS));
+        }
     }
 
     /// The published status request, and the report that answers it.

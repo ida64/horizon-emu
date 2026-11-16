@@ -35,7 +35,12 @@
 //! group and enable bits of bank 0, which the start-up loop above writes.
 use std::sync::{Arc, Mutex};
 
-use crate::bus::MmioDevice;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    bus::{MmioDevice, NoState},
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 pub const DISTRIBUTOR_BASE: u64 = 0x702F_9000;
 pub const DISTRIBUTOR_SIZE: u64 = 0x1000;
@@ -58,13 +63,16 @@ const SPURIOUS: u32 = 1023;
 /// Interface 0's bit in a target byte.
 const INTERFACE_0: u8 = 1;
 
+#[derive(Serialize, Deserialize)]
 struct State {
     distributor_control: u32,
     group: [u32; BANKS],
     enabled: [u32; BANKS],
     pending: [u32; BANKS],
     active: [u32; BANKS],
+    #[serde(with = "crate::snapshot::array")]
     priority: [u8; LINES],
+    #[serde(with = "crate::snapshot::array")]
     targets: [u8; LINES],
     config: [u32; BANKS * 2],
     cpu_control: u32,
@@ -160,6 +168,21 @@ impl Agic {
 
     fn update(&self, state: &State) {
         (self.output)(state.deliverable().is_some());
+    }
+}
+
+/// Saves the distributor and interface 0: every line's group, enable,
+/// pending, active, priority, targets and configuration, and the
+/// interface's control, mask and binary point. The output line is a level
+/// the main interrupt controller saves.
+impl Snapshot for Agic {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&*self.state.lock().unwrap())
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        *self.state.lock().unwrap() = decode("AGIC", state)?;
+        Ok(())
     }
 }
 
@@ -260,6 +283,11 @@ impl MmioDevice for Distributor {
         self.0.update(&state);
         Some(())
     }
+
+    /// The controller is saved once, through its distributor.
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(&*self.0)
+    }
 }
 
 /// CPU interface 0's registers.
@@ -319,6 +347,11 @@ impl MmioDevice for CpuInterface {
         }
         self.0.update(&state);
         Some(())
+    }
+
+    /// The controller is saved through its distributor.
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(&NoState)
     }
 }
 

@@ -11,7 +11,8 @@
 //! kept), as the hardware's command processor does; it continues once the
 //! syncpoint gets there. Nothing announces syncpoint changes, so a stalled
 //! channel looks again every `WAIT_POLL` from a thread of its own, like
-//! the GPU's channel waits.
+//! the GPU's channel waits. The wait is channel state: a channel restored
+//! from a snapshot standing at one starts its thread again.
 //!
 //! Unimplemented methods/conditions fail the stream and never manufacture a
 //! fence completion; the DMAPUT write that ran into them is refused, or, for
@@ -30,14 +31,22 @@ use std::{
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
+
 use super::{Notes, host1x::Syncpoints, mc::DeviceMemory};
-use crate::bus::MmioDevice;
+use crate::{
+    bus::MmioDevice,
+    clock::GuestClock,
+    snapshot::{self, Snapshot, SnapshotError, encode},
+};
 
 type Engine = dyn Fn(u32, u32, u32) -> Option<()> + Send + Sync;
 
-/// How often a channel stalled on a syncpoint wait looks again (the GPU's
-/// channels poll at the same rate).
+/// How often, in guest time, a channel stalled on a syncpoint wait looks
+/// again (the GPU's channels poll at the same rate).
 const WAIT_POLL: Duration = Duration::from_micros(500);
+/// How often the waiting thread looks at the clock while it stands still.
+const PAUSED_POLL: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Opcode {
@@ -102,7 +111,7 @@ fn decode(word: u32) -> Option<Opcode> {
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 enum Pending {
     None,
     Sequence {
@@ -122,7 +131,7 @@ enum Pending {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 struct Frame {
     get: u64,
     end: u64,
@@ -132,7 +141,7 @@ struct Frame {
 
 /// A host syncpoint wait the stream stands at: syncpoint `index` must reach
 /// `threshold`, compared in the low `bits` bits (the legacy wait has 24).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Wait {
     index: usize,
     threshold: u32,
@@ -148,6 +157,9 @@ impl Wait {
 
 const FRAME_DEPTH: usize = 32;
 
+/// The channel's registers and where its stream stands; what its
+/// [`Snapshot`] saves.
+#[derive(Serialize, Deserialize)]
 struct State {
     start: u32,
     put: u32,
@@ -161,7 +173,9 @@ struct State {
     frames: [Frame; FRAME_DEPTH],
     depth: usize,
     wait: Option<Wait>,
-    /// Whether a thread is watching `wait`.
+    /// Whether a thread is watching `wait`. Not saved: it says whether
+    /// this machine has such a thread.
+    #[serde(skip)]
     polling: bool,
     fault: bool,
 }
@@ -183,6 +197,8 @@ pub struct Channel {
 struct Inner {
     memory: DeviceMemory,
     syncpoints: Arc<Syncpoints>,
+    /// Guest time, by which a stalled channel looks again.
+    clock: Arc<GuestClock>,
     engine: Arc<Engine>,
     notes: Arc<Notes>,
     state: Mutex<State>,
@@ -192,6 +208,7 @@ impl Channel {
     pub fn new(
         memory: DeviceMemory,
         syncpoints: Arc<Syncpoints>,
+        clock: Arc<GuestClock>,
         engine: Arc<Engine>,
         notes: Arc<Notes>,
     ) -> Self {
@@ -204,6 +221,7 @@ impl Channel {
             inner: Arc::new(Inner {
                 memory,
                 syncpoints,
+                clock,
                 engine,
                 notes,
                 state: Mutex::new(State {
@@ -458,15 +476,40 @@ impl Inner {
     }
 }
 
-/// Continues `inner`'s stream whenever its wait is met, until it no longer
-/// stands at one or the channel is gone.
-fn poll(inner: Weak<Inner>) {
+/// Watches the wait `state` stands at from a thread of its own, unless one
+/// already does.
+fn watch(inner: &Arc<Inner>, state: &mut State) {
+    if state.wait.is_some() && !state.polling {
+        state.polling = true;
+        let (weak, clock) = (Arc::downgrade(inner), Arc::clone(&inner.clock));
+        std::thread::Builder::new()
+            .name("host1x channel wait".into())
+            .spawn(move || poll(weak, clock))
+            .expect("host1x channel wait thread");
+    }
+}
+
+/// Continues `inner`'s stream whenever its wait is met, looking every
+/// `WAIT_POLL` of guest time, until it no longer stands at one or the
+/// channel is gone. Nothing continues while the clock stands still: the
+/// machine is paused, perhaps being saved.
+fn poll(inner: Weak<Inner>, clock: Arc<GuestClock>) {
+    let mut deadline = clock.now() + WAIT_POLL;
     loop {
-        std::thread::sleep(WAIT_POLL);
+        let wait = clock.until(deadline);
+        std::thread::sleep(if wait.is_zero() && clock.is_paused() {
+            PAUSED_POLL
+        } else {
+            wait
+        });
         let Some(inner) = inner.upgrade() else {
             return;
         };
         let mut state = inner.state.lock().unwrap();
+        if clock.is_paused() || clock.now() < deadline {
+            continue;
+        }
+        deadline = clock.now() + WAIT_POLL;
         if state.wait.is_some_and(|wait| wait.met(&inner.syncpoints)) {
             // A failure faults the channel; its note and the refusal of the
             // next DMAPUT write report it.
@@ -543,16 +586,41 @@ impl MmioDevice for Channel {
         }
         if matches!(offset, 0x18 | 0x24) && state.ctrl & 1 == 0 {
             inner.run(&mut state)?;
-            if state.wait.is_some() && !state.polling {
-                state.polling = true;
-                let weak = Arc::downgrade(inner);
-                std::thread::Builder::new()
-                    .name("host1x channel wait".into())
-                    .spawn(move || poll(weak))
-                    .expect("host1x channel wait thread");
-            }
+            watch(inner, &mut state);
         }
         Some(())
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+/// Saves the DMA registers, the class, the loaded payload, the command
+/// packet in progress, the gathers being executed, the syncpoint wait the
+/// stream stands at and whether it has faulted. A channel restored standing
+/// at a wait has a thread watching it again.
+impl Snapshot for Channel {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&*self.inner.state.lock().unwrap())
+    }
+
+    fn restore(&self, saved: &[u8]) -> Result<(), SnapshotError> {
+        let restored: State = snapshot::decode("host1x channel", saved)?;
+        if restored.depth > FRAME_DEPTH {
+            return Err(SnapshotError::Corrupt(format!(
+                "host1x channel: {} gathers deep",
+                restored.depth
+            )));
+        }
+        let mut state = self.inner.state.lock().unwrap();
+        // A thread already watching goes on watching the restored wait,
+        // or ends when there is none.
+        let polling = state.polling;
+        *state = restored;
+        state.polling = polling;
+        watch(&self.inner, &mut state);
+        Ok(())
     }
 }
 
@@ -595,6 +663,7 @@ mod tests {
             let channel = Channel::new(
                 DeviceMemory::new(&mc, &ram, SMMU_HOST1X_ASID),
                 Arc::clone(&syncpoints),
+                Arc::new(GuestClock::new()),
                 Arc::new(move |class, offset, value| {
                     record.lock().unwrap().push((class, offset, value));
                     Some(())
@@ -670,6 +739,29 @@ mod tests {
         );
         assert!(bench.idle());
         assert!(bench.notes.take().is_empty());
+    }
+
+    #[test]
+    fn a_restored_channel_standing_at_a_wait_continues_once_it_is_met() {
+        let saved = Bench::new();
+        saved.syncpoints.add(7, 4);
+        let mut words = wait32(7, 5).to_vec();
+        words.extend([setclass(0x5d, 0, 0), 0x1010_0002, 0xc0, 0x100]);
+        saved.submit(&words).unwrap();
+        let state = saved.channel.save().unwrap();
+
+        let restored = Bench::new();
+        // Memory and syncpoints are their owners' to restore.
+        restored.poke(RING, &words);
+        restored.syncpoints.add(7, 4);
+        restored.channel.restore(&state).unwrap();
+        assert!(!restored.idle());
+        restored.syncpoints.add(7, 1);
+        assert_eq!(
+            restored.engine_calls(2),
+            [(0x5d, 0x10, 0xc0), (0x5d, 0x11, 0x100)]
+        );
+        assert!(restored.idle());
     }
 
     #[test]

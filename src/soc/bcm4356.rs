@@ -39,14 +39,20 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     time::Duration,
 };
+
+use serde::{Deserialize, Serialize};
 
 use super::{
     Notes,
     pcie_endpoint::{PcieFunction, Upstream},
     wifi_ap::{self, AccessPoint},
+};
+use crate::{
+    clock::GuestClock,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
 };
 
 // ---------------------------------------------------------------------------
@@ -407,7 +413,9 @@ const DEFAULT_PASSIVE_DWELL_MS: u64 = 110;
 
 /// Work the firmware finishes later, on the air: tagged with what it
 /// belongs to so that work overtaken by events (an aborted scan, a new
-/// join) does nothing.
+/// join) does nothing. Kept in the function's state with the guest time
+/// it is due at, so a snapshot carries it.
+#[derive(Serialize, Deserialize)]
 enum Deferred {
     /// The scan reached the access point's channel and heard it.
     ScanFound {
@@ -442,6 +450,7 @@ enum Deferred {
 }
 
 /// The station's association with the access point.
+#[derive(Serialize, Deserialize)]
 struct Association {
     if_id: u8,
     epoch: u32,
@@ -488,19 +497,31 @@ impl<'a> Event<'a> {
 }
 
 /// The function.
+///
+/// Its state, saved whole by its [`Snapshot`]: configuration space, core
+/// wrappers, the PCIe core's mailbox and interrupt registers, the chip's
+/// RAM, the started firmware's rings, posted buffers, settings, scan and
+/// association (with the access point's authenticator), the work it has
+/// scheduled on the air, and the access point's own state. The access
+/// point's uplink to the router is wiring and stays as built; frames from
+/// the network are dropped while guest time stands still.
 pub struct Bcm4356Wifi {
-    /// Shared with the timer threads that finish scans.
+    /// Shared with the thread that runs scheduled work.
     state: Arc<Mutex<State>>,
+    /// Signalled when work is scheduled or the function goes away.
+    due: Arc<Condvar>,
     upstream: Arc<dyn Upstream>,
     notes: Arc<Notes>,
+    clock: Arc<GuestClock>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 struct Wrapper {
     ioctrl: u32,
     resetctrl: u32,
 }
 
+#[derive(Serialize, Deserialize)]
 struct Config {
     command: u16,
     bars: [u32; 4],
@@ -520,14 +541,14 @@ struct Config {
     bar2_config: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 struct Ring {
     base: u64,
     max_items: u16,
     item_len: u16,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 struct HostBuffer {
     request_id: u32,
     address: u64,
@@ -535,6 +556,7 @@ struct HostBuffer {
 }
 
 /// The started firmware.
+#[derive(Serialize, Deserialize)]
 struct Dongle {
     /// Addresses of the index arrays in RAM.
     h2d_write: u32,
@@ -564,7 +586,8 @@ struct Dongle {
     up: bool,
     /// What the host set and the firmware keeps.
     settings: HashMap<String, Vec<u8>>,
-    /// Work to finish later, for the outer layer to time.
+    /// Work to finish later, after these delays; moved to
+    /// [`State::scheduled`] once the request that made it is done.
     timers: Vec<(Duration, Deferred)>,
     /// The sync ID of the scan in flight (cleared by an abort).
     scan_in_flight: Option<u16>,
@@ -574,6 +597,7 @@ struct Dongle {
     epoch: u32,
 }
 
+#[derive(Serialize, Deserialize)]
 struct State {
     config: Config,
     wrappers: [Wrapper; 4],
@@ -593,15 +617,40 @@ struct State {
     image_end: u32,
     halted: bool,
     dongle: Option<Dongle>,
+    /// The level of the interrupt the function last signalled.
     interrupt: bool,
+    /// Work due on the air, by the guest time it is due at; in that order,
+    /// and in the order it was scheduled among work due at the same time.
+    scheduled: Vec<(Duration, Deferred)>,
+    /// The access point and the router behind it: wiring, set up by the
+    /// machine's builder; the access point's state is saved on its own.
+    #[serde(skip)]
     network: Option<Network>,
+    /// The function is gone: the thread running scheduled work ends.
+    #[serde(skip)]
+    stopped: bool,
+}
+
+/// What the function's snapshot holds: its state and the access point's.
+#[derive(Serialize)]
+struct Saving<'a> {
+    state: &'a State,
+    access_point: Option<&'a AccessPoint>,
+}
+
+#[derive(Deserialize)]
+struct Saved {
+    state: State,
+    access_point: Option<AccessPoint>,
 }
 
 /// Why an access was not served.
 type Refusal = String;
 
 impl Bcm4356Wifi {
-    pub fn new(upstream: Box<dyn Upstream>, notes: Arc<Notes>) -> Self {
+    /// The function, as at power-on, with the thread that runs the work it
+    /// schedules when guest time (`clock`) reaches it.
+    pub fn new(upstream: Box<dyn Upstream>, notes: Arc<Notes>, clock: Arc<GuestClock>) -> Self {
         // At power-on the ROM boot loader runs: ChipCommon, the PCIe core
         // and the ARM are out of reset and clocked, the 802.11 core is held
         // in reset (assumed; the host resets the ARM before downloading and
@@ -614,43 +663,63 @@ impl Bcm4356Wifi {
             ioctrl: 0,
             resetctrl: AIRC_RESET,
         };
+        let state = Arc::new(Mutex::new(State {
+            config: Config {
+                command: 0,
+                bars: [0x4, 0, 0x4, 0],
+                cache_line: 0,
+                interrupt_line: 0,
+                pmcsr: 0,
+                msi_control: 0,
+                msi_address: 0,
+                msi_data: 0,
+                device_control: 0,
+                link_control: 0,
+                device_control_2: 0,
+                link_control_2: 0,
+                bar0_window: CC_BASE,
+                bar0_wrapper: CC_BASE + WRAPPER_OFFSET,
+                bar1_window: 0,
+                bar2_config: BAR2_CONFIG_RESET,
+            },
+            wrappers: [up, held, up, up],
+            armcr4_bank: 0,
+            cc_gpio_pull: [0; 2],
+            pcie2_intmask: 0,
+            mailbox_int: 0,
+            mailbox_mask: 0,
+            config_address: 0,
+            reset_vector: 0,
+            ram: vec![0; RAM_SIZE as usize],
+            image_end: 0,
+            halted: false,
+            dongle: None,
+            interrupt: false,
+            scheduled: Vec::new(),
+            network: None,
+            stopped: false,
+        }));
+        let due = Arc::new(Condvar::new());
+        let upstream: Arc<dyn Upstream> = Arc::from(upstream);
+        {
+            let (state, due, upstream, notes, clock) = (
+                Arc::clone(&state),
+                Arc::clone(&due),
+                Arc::clone(&upstream),
+                Arc::clone(&notes),
+                Arc::clone(&clock),
+            );
+            std::thread::Builder::new()
+                .name("bcm4356 air".into())
+                .spawn(move || run_scheduled(&state, &due, upstream.as_ref(), &notes, &clock))
+                .expect("BCM4356 WiFi: spawn the thread of scheduled work");
+        }
         Self {
-            state: Arc::new(Mutex::new(State {
-                config: Config {
-                    command: 0,
-                    bars: [0x4, 0, 0x4, 0],
-                    cache_line: 0,
-                    interrupt_line: 0,
-                    pmcsr: 0,
-                    msi_control: 0,
-                    msi_address: 0,
-                    msi_data: 0,
-                    device_control: 0,
-                    link_control: 0,
-                    device_control_2: 0,
-                    link_control_2: 0,
-                    bar0_window: CC_BASE,
-                    bar0_wrapper: CC_BASE + WRAPPER_OFFSET,
-                    bar1_window: 0,
-                    bar2_config: BAR2_CONFIG_RESET,
-                },
-                wrappers: [up, held, up, up],
-                armcr4_bank: 0,
-                cc_gpio_pull: [0; 2],
-                pcie2_intmask: 0,
-                mailbox_int: 0,
-                mailbox_mask: 0,
-                config_address: 0,
-                reset_vector: 0,
-                ram: vec![0; RAM_SIZE as usize],
-                image_end: 0,
-                halted: false,
-                dongle: None,
-                interrupt: false,
-                network: None,
-            })),
-            upstream: Arc::from(upstream),
+            state,
+            due,
+            upstream,
             notes,
+            clock,
         }
     }
 
@@ -673,43 +742,120 @@ impl Bcm4356Wifi {
 
     /// An Ethernet frame from the network behind the access point for the
     /// station: delivered if the station is associated (and, on a WPA2
-    /// network, authorized), else lost on the air.
+    /// network, authorized), else lost on the air. While guest time stands
+    /// still (the machine is paused, as for a snapshot) it is lost too: the
+    /// function's state and guest memory must not change then, and the
+    /// sender sends again, as after any loss on the air.
     pub fn from_network(&self, frame: &[u8]) {
         let mut state = self.state.lock().unwrap();
+        if self.clock.is_paused() {
+            return;
+        }
         let result = state.network_sent(frame, self.upstream.as_ref());
+        if state.arm(self.clock.now()) {
+            self.due.notify_one();
+        }
         drop(state);
         if let Err(note) = result {
             self.notes.add(format!("BCM4356 WiFi: {note}"));
         }
     }
+}
 
-    fn schedule(&self) {
-        let timers = self.state.lock().unwrap().take_timers();
-        schedule(&self.state, &self.upstream, &self.notes, timers);
+impl Drop for Bcm4356Wifi {
+    fn drop(&mut self) {
+        self.state.lock().unwrap().stopped = true;
+        self.due.notify_all();
     }
 }
 
-/// Runs `timers` on threads of their own after their delays (timers keep
-/// real time, like the guest's), then whatever work they leave.
-fn schedule(
-    state: &Arc<Mutex<State>>,
-    upstream: &Arc<dyn Upstream>,
-    notes: &Arc<Notes>,
-    timers: Vec<(Duration, Deferred)>,
+/// How long the thread of scheduled work waits at most before it looks
+/// again while guest time stands still.
+const PAUSED_POLL: Duration = Duration::from_millis(20);
+
+/// The thread of scheduled work: runs each piece when guest time reaches
+/// the moment it is due at, in order, and schedules what it leaves from
+/// that moment. Nothing runs while guest time stands still: the check and
+/// the work happen under the state's lock, which
+/// [`Snapshot::quiesce`] takes after the clock stopped.
+fn run_scheduled(
+    state: &Mutex<State>,
+    due: &Condvar,
+    upstream: &dyn Upstream,
+    notes: &Notes,
+    clock: &GuestClock,
 ) {
-    for (delay, work) in timers {
-        let (state, upstream, notes) = (Arc::clone(state), Arc::clone(upstream), Arc::clone(notes));
-        std::thread::spawn(move || {
-            std::thread::sleep(delay);
-            let mut locked = state.lock().unwrap();
-            let result = locked.deferred(work, upstream.as_ref());
-            let more = locked.take_timers();
-            drop(locked);
-            if let Err(note) = result {
-                notes.add(format!("BCM4356 WiFi: {note}"));
+    let mut locked = state.lock().unwrap();
+    while !locked.stopped {
+        let wait = match locked.scheduled.first() {
+            None => None,
+            Some(_) if clock.is_paused() => Some(PAUSED_POLL),
+            Some(&(deadline, _)) => Some(clock.until(deadline)),
+        };
+        locked = match wait {
+            None => due.wait(locked).unwrap(),
+            Some(wait) if !wait.is_zero() => due.wait_timeout(locked, wait).unwrap().0,
+            Some(_) => {
+                let (deadline, work) = locked.scheduled.remove(0);
+                let result = locked.deferred(work, upstream);
+                locked.arm(deadline);
+                if let Err(note) = result {
+                    notes.add(format!("BCM4356 WiFi: {note}"));
+                }
+                locked
             }
-            schedule(&state, &upstream, &notes, more);
-        });
+        };
+    }
+}
+
+impl Snapshot for Bcm4356Wifi {
+    /// Waits for a frame from the network or scheduled work under way when
+    /// guest time stopped; neither starts again until it runs on.
+    fn quiesce(&self) -> Result<(), SnapshotError> {
+        drop(self.state.lock().unwrap());
+        Ok(())
+    }
+
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        let state = self.state.lock().unwrap();
+        encode(&Saving {
+            state: &state,
+            access_point: state.network.as_ref().map(|network| &network.ap),
+        })
+    }
+
+    /// Takes the saved state back, with the work it had scheduled, which
+    /// runs when guest time reaches it. The access point takes back its
+    /// group key; its uplink stays as built.
+    fn restore(&self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let Saved {
+            state: mut restored,
+            access_point,
+        } = decode("BCM4356 WiFi", bytes)?;
+        if restored.ram.len() != RAM_SIZE as usize {
+            return Err(SnapshotError::Corrupt(format!(
+                "BCM4356 WiFi: {} bytes of RAM where the chip has {RAM_SIZE}",
+                restored.ram.len()
+            )));
+        }
+        let mut state = self.state.lock().unwrap();
+        match (state.network.as_mut(), access_point) {
+            (Some(network), Some(saved)) => network
+                .ap
+                .restore(saved)
+                .map_err(|error| SnapshotError::Corrupt(format!("BCM4356 WiFi: {error}")))?,
+            (None, None) => {}
+            _ => {
+                return Err(SnapshotError::Corrupt(
+                    "BCM4356 WiFi: an access point in one machine and not in the other".into(),
+                ));
+            }
+        }
+        restored.network = state.network.take();
+        restored.stopped = state.stopped;
+        *state = restored;
+        self.due.notify_all();
+        Ok(())
     }
 }
 
@@ -1352,11 +1498,21 @@ impl State {
         Ok(())
     }
 
-    fn take_timers(&mut self) -> Vec<(Duration, Deferred)> {
-        self.dongle
-            .as_mut()
-            .map(|dongle| std::mem::take(&mut dongle.timers))
-            .unwrap_or_default()
+    /// Schedules the work the firmware left, after its delays from guest
+    /// time `base`: now for a host request, the moment it was due at for
+    /// scheduled work. Whether there was any.
+    fn arm(&mut self, base: Duration) -> bool {
+        let Some(dongle) = self.dongle.as_mut() else {
+            return false;
+        };
+        let timers = std::mem::take(&mut dongle.timers);
+        let any = !timers.is_empty();
+        for (delay, work) in timers {
+            let at = base + delay;
+            let index = self.scheduled.partition_point(|&(due, _)| due <= at);
+            self.scheduled.insert(index, (at, work));
+        }
+        any
     }
 
     /// Finishes work the firmware began earlier.
@@ -2466,8 +2622,10 @@ impl PcieFunction for Bcm4356Wifi {
         } else {
             Err(format!("memory write at {address:#x} outside the BARs"))
         };
+        if state.arm(self.clock.now()) {
+            self.due.notify_one();
+        }
         drop(state);
-        self.schedule();
         self.served(result)
     }
 }
@@ -2517,9 +2675,15 @@ mod tests {
     const BAR2: u64 = 0x2000_0000;
 
     fn setup() -> (Bcm4356Wifi, Arc<Host>) {
+        setup_on(Arc::new(GuestClock::new()))
+    }
+
+    /// The function with its BARs placed and memory decoding on, keeping
+    /// guest time with `clock`.
+    fn setup_on(clock: Arc<GuestClock>) -> (Bcm4356Wifi, Arc<Host>) {
         let host = Arc::new(Host::default());
         host.memory.lock().unwrap().resize(0x1_0000, 0);
-        let wifi = Bcm4356Wifi::new(Box::new(HostPort(Arc::clone(&host))), Arc::default());
+        let wifi = Bcm4356Wifi::new(Box::new(HostPort(Arc::clone(&host))), Arc::default(), clock);
         wifi.config_write(0x10, 4, BAR0 as u32).unwrap();
         wifi.config_write(0x18, 4, BAR2 as u32).unwrap();
         wifi.config_write(0x04, 2, 0x6).unwrap();
@@ -2871,11 +3035,24 @@ mod tests {
         assert_eq!(get(&host, HOST + 0xc000, frame.len()), frame);
     }
 
-    #[test]
-    fn escan_ends_after_its_dwell_time_or_when_aborted() {
-        let (wifi, host) = setup();
-        let shared = u64::from(boot(&wifi));
-        enable_all_events(&wifi);
+    /// A message posting a host buffer of 2016 bytes.
+    fn post(kind: u8, id: u32, address: u64) -> Vec<u8> {
+        let mut item = vec![0; 40];
+        item[0] = kind;
+        item[4..8].copy_from_slice(&id.to_le_bytes());
+        item[8..10].copy_from_slice(&2016u16.to_le_bytes());
+        item[16..24].copy_from_slice(&address.to_le_bytes());
+        item
+    }
+
+    /// Boots the firmware with every event enabled, sets up the common
+    /// rings, posts an ioctl response buffer and an event buffer, then
+    /// starts "escan" (sync ID 0x1234) over channels 1 and 6 with
+    /// `dwell_ms` of active dwell. Returns the addresses of the H2D and D2H
+    /// write indices, the request and its control message.
+    fn start_escan(wifi: &Bcm4356Wifi, host: &Host, dwell_ms: i32) -> (u64, u64, Vec<u8>, Vec<u8>) {
+        let shared = u64::from(boot(wifi));
+        enable_all_events(wifi);
         let ring_info = wifi.memory_read(BAR2 + shared + 48, 4).unwrap();
         let ring_mem = wifi.memory_read(BAR2 + ring_info, 4).unwrap();
         let h2d_w = wifi.memory_read(BAR2 + ring_info + 4, 4).unwrap();
@@ -2893,40 +3070,26 @@ mod tests {
             wifi.memory_write(at + 6, 2, *len).unwrap();
             wifi.memory_write(at + 8, 8, *base).unwrap();
         }
-        // An ioctl response buffer, an event buffer, then "escan" over two
-        // channels with 5 ms active dwell.
-        let post = |kind: u8, id: u32, address: u64| {
-            let mut item = vec![0; 40];
-            item[0] = kind;
-            item[4..8].copy_from_slice(&id.to_le_bytes());
-            item[8..10].copy_from_slice(&2016u16.to_le_bytes());
-            item[16..24].copy_from_slice(&address.to_le_bytes());
-            item
-        };
-        put(&host, HOST, &post(MSG_IOCTLRESP_BUF_POST, 7, HOST + 0x8000));
-        put(
-            &host,
-            HOST + 40,
-            &post(MSG_EVENT_BUF_POST, 9, HOST + 0xa000),
-        );
+        put(host, HOST, &post(MSG_IOCTLRESP_BUF_POST, 7, HOST + 0x8000));
+        put(host, HOST + 40, &post(MSG_EVENT_BUF_POST, 9, HOST + 0xa000));
         let mut request = b"escan\0".to_vec();
         let mut params = vec![0u8; 76];
         params[0..4].copy_from_slice(&1u32.to_le_bytes());
         params[4..6].copy_from_slice(&WL_SCAN_ACTION_START.to_le_bytes());
         params[6..8].copy_from_slice(&0x1234u16.to_le_bytes());
-        params[56..60].copy_from_slice(&5i32.to_le_bytes());
+        params[56..60].copy_from_slice(&dwell_ms.to_le_bytes());
         params[60..64].copy_from_slice(&(-1i32).to_le_bytes());
         params[68..72].copy_from_slice(&2u32.to_le_bytes());
         params[72..76].copy_from_slice(&[1, 0x10, 6, 0x10]);
         request.extend(params);
-        put(&host, HOST + 0x9000, &request);
+        put(host, HOST + 0x9000, &request);
         let mut ioctl = vec![0; 40];
         ioctl[0] = MSG_IOCTLPTR_REQ;
         ioctl[8..12].copy_from_slice(&WLC_SET_VAR.to_le_bytes());
         ioctl[12..14].copy_from_slice(&1u16.to_le_bytes());
         ioctl[14..16].copy_from_slice(&(request.len() as u16).to_le_bytes());
         ioctl[24..32].copy_from_slice(&(HOST + 0x9000).to_le_bytes());
-        put(&host, HOST + 80, &ioctl);
+        put(host, HOST + 80, &ioctl);
         wifi.memory_write(BAR2 + h2d_w, 2, 3).unwrap();
         wifi.memory_write(
             BAR0 + 0x2000 + u64::from(PCIE2_H2D_MAILBOX_0),
@@ -2934,6 +3097,31 @@ mod tests {
             0x1234_5678,
         )
         .unwrap();
+        (h2d_w, d2h_w, request, ioctl)
+    }
+
+    /// The escan result in the first posted event buffer: its status and
+    /// sync ID.
+    fn escan_result_event(host: &Host) -> (u32, u16) {
+        let message = get(host, HOST + 0x2000 + 48, 24);
+        assert_eq!(message[0], MSG_WL_EVENT);
+        assert_eq!(le32(&message, 4), 9, "in the posted event buffer");
+        let frame = get(host, HOST + 0xa000, usize::from(le16(&message, 12)));
+        assert_eq!(
+            u32::from_be_bytes(frame[28..32].try_into().unwrap()),
+            WLC_E_ESCAN_RESULT
+        );
+        (
+            u32::from_be_bytes(frame[32..36].try_into().unwrap()),
+            le16(&frame, 72 + 8),
+        )
+    }
+
+    #[test]
+    fn escan_ends_after_its_dwell_time_or_when_aborted() {
+        let (wifi, host) = setup();
+        // "escan" over two channels with 5 ms active dwell.
+        let (h2d_w, d2h_w, request, ioctl) = start_escan(&wifi, &host, 5);
         // Acknowledged and completed at once; the result follows the dwell.
         assert_eq!(wifi.memory_read(BAR2 + d2h_w, 2), Some(2));
         assert_eq!(
@@ -3009,6 +3197,56 @@ mod tests {
             WLC_E_STATUS_ABORT
         );
         assert_eq!(le16(&frame, 72 + 8), 0x4321, "sync ID");
+    }
+
+    /// A scan's end, due when the machine is saved, is reported by a
+    /// function built afresh and restored from the snapshot when guest time
+    /// reaches the moment it was due at: not while guest time stands still,
+    /// not before, and once.
+    #[test]
+    fn scheduled_work_survives_a_snapshot() {
+        let saved_at = Duration::from_secs(10);
+        let clock = Arc::new(GuestClock::new());
+        clock.pause();
+        clock.set(saved_at);
+        let (wifi, host) = setup_on(Arc::clone(&clock));
+        // Two channels of 300 ms each: the scan ends 600 ms on.
+        let (_, d2h_w, _, _) = start_escan(&wifi, &host, 300);
+        let due = saved_at + Duration::from_millis(600);
+        assert_eq!(wifi.memory_read(BAR2 + d2h_w, 2), Some(2));
+        wifi.quiesce().unwrap();
+        let saved = wifi.save().unwrap();
+        drop(wifi);
+
+        // The host memory is the machine's, restored with it.
+        let clock = Arc::new(GuestClock::new());
+        clock.pause();
+        clock.set(saved_at);
+        let restored = Bcm4356Wifi::new(
+            Box::new(HostPort(Arc::clone(&host))),
+            Arc::default(),
+            Arc::clone(&clock),
+        );
+        restored.restore(&saved).unwrap();
+        clock.set(due + Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            restored.memory_read(BAR2 + d2h_w, 2),
+            Some(2),
+            "nothing runs while guest time stands still"
+        );
+        clock.set(due - Duration::from_millis(200));
+        clock.resume();
+        let host_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while restored.memory_read(BAR2 + d2h_w, 2) == Some(2) {
+            assert!(std::time::Instant::now() < host_deadline, "never reported");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let seen_at = clock.now();
+        assert!(seen_at >= due, "reported at {seen_at:?}, due at {due:?}");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(restored.memory_read(BAR2 + d2h_w, 2), Some(3), "once");
+        assert_eq!(escan_result_event(&host), (WLC_E_STATUS_SUCCESS, 0x1234));
     }
 
     /// After "up" the firmware announces wl0 (WLC_E_IF, ADD) when the

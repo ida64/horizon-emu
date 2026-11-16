@@ -246,6 +246,22 @@ impl Renderer {
         })
     }
 
+    /// Drops everything held on the host GPU (render targets, uploaded
+    /// textures, programs, pipelines, the frame being recorded), as a
+    /// restored machine starts with: it is rebuilt from guest memory as
+    /// draws need it. Only the fallback counts stay.
+    pub fn drop_caches(&self) {
+        let mut state = self.state.lock().unwrap();
+        let State {
+            fallbacks, draws, ..
+        } = std::mem::take(&mut *state);
+        *state = State {
+            fallbacks,
+            draws,
+            ..State::default()
+        };
+    }
+
     fn gpu() -> &'static Gpu {
         GPU.as_ref().expect("a renderer exists only with a device")
     }

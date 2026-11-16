@@ -37,6 +37,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use super::identity;
 use crate::maxwell::Unmodeled;
 
@@ -76,7 +78,7 @@ const PORT_AUTO_INCREMENT_WRITE: u32 = 1 << 24;
 const PORT_AUTO_INCREMENT_READ: u32 = 1 << 25;
 
 /// What one falcon's processor is doing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Cpu {
     /// Out of reset, never started.
     Stopped,
@@ -85,7 +87,7 @@ enum Cpu {
 }
 
 /// One of a falcon's memories as its programmed-I/O port sees it.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Port {
     control: u32,
     words: HashMap<u32, u32>,
@@ -115,6 +117,7 @@ impl Port {
 }
 
 /// State every falcon has: interrupts, processor, memory ports.
+#[derive(Serialize, Deserialize)]
 struct Core {
     cpu: Cpu,
     irq_status: u32,
@@ -194,7 +197,9 @@ impl Core {
     }
 }
 
-/// The power management unit, at BAR0 `0x10A000`.
+/// The power management unit, at BAR0 `0x10A000`. Saved whole in machine
+/// snapshots: processor state, memory words, mailboxes.
+#[derive(Serialize, Deserialize)]
 pub struct Pmu {
     core: Core,
     mailbox: [u32; 2],
@@ -288,7 +293,9 @@ const FECS_MAILBOXES: u32 = 16;
 /// The arbiter command field, which reads 0 once the command is done.
 const ARB_CTX_CMD: u32 = 0x1F;
 
-/// The FECS controller, at BAR0 `0x409000`.
+/// The FECS controller, at BAR0 `0x409000`. Saved whole in machine
+/// snapshots.
+#[derive(Serialize, Deserialize)]
 pub struct Fecs {
     core: Core,
     mailbox: [u32; FECS_MAILBOXES as usize],
@@ -415,7 +422,9 @@ impl Fecs {
     }
 }
 
-/// The GPCCS controller, at BAR0 `0x41A000`.
+/// The GPCCS controller, at BAR0 `0x41A000`. Saved whole in machine
+/// snapshots.
+#[derive(Serialize, Deserialize)]
 pub struct Gpccs {
     core: Core,
     dma_command: u32,

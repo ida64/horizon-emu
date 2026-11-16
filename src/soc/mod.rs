@@ -362,7 +362,7 @@ impl Soc {
                 line(gic, gm20b::STALL_INTID),
                 line(gic, gm20b::NONSTALL_INTID),
             ],
-            elapsed(clock),
+            Arc::clone(clock),
             gm20b::maxwell_engines(Arc::clone(&syncpoints)),
             Arc::clone(&notes),
         );
@@ -392,6 +392,7 @@ impl Soc {
                 Box::new(host1x_channel::Channel::new(
                     DeviceMemory::new(&mc, ram, mc::SMMU_HOST1X_ASID),
                     Arc::clone(&syncpoints),
+                    Arc::clone(clock),
                     Arc::new(move |class, offset, value| vic.method(class, offset, value)),
                     Arc::clone(&notes),
                 )),
@@ -422,7 +423,7 @@ impl Soc {
             gpio,
             touch_input,
             joycons: Arc::default(),
-            pmic: max77620::Max77620::new(line(gic, PMU_INTID)),
+            pmic: max77620::Max77620::new(Arc::clone(clock), line(gic, PMU_INTID)),
             pmc: Arc::new(Pmc::new()),
             wifi: std::sync::OnceLock::new(),
             clock: Arc::clone(clock),
@@ -487,7 +488,13 @@ impl Soc {
                 Arc::clone(&soc.notes),
             ))
         };
-        let rail = |side| Box::new(joycon::Rail::new(side, Arc::clone(&soc.joycons)));
+        let rail = |side| {
+            Box::new(joycon::Rail::new(
+                side,
+                Arc::clone(&soc.joycons),
+                Arc::clone(&soc.clock),
+            ))
+        };
         let uarts = vec![
             (
                 joycon::RIGHT_UART_BASE,
@@ -552,6 +559,7 @@ impl Soc {
         let wifi = Arc::new(bcm4356::Bcm4356Wifi::new(
             pcie.upstream(),
             Arc::clone(&soc.notes),
+            Arc::clone(clock),
         ));
         pcie.attach(Arc::clone(&wifi) as Arc<dyn pcie_endpoint::PcieFunction>);
         let _ = soc.wifi.set(wifi);
@@ -601,6 +609,7 @@ impl Soc {
             DeviceMemory::new(&soc.mc, ram, adsp::SMMU_ASID),
             agic,
             Arc::clone(&soc.notes),
+            clock,
         ));
         bus.map(
             "AMISC",
@@ -726,7 +735,10 @@ impl Soc {
             Box::new(soc.i2c("I2C1", I2C1_INTID, i2c1)),
         );
         // Tegra210 DTS: I2C2 SPI 84, I2C3 SPI 92, SPI4 SPI 93.
-        let light: Box<dyn I2cDevice> = Box::new(bh1730::Bh1730::new(Arc::clone(&soc.notes)));
+        let light: Box<dyn I2cDevice> = Box::new(bh1730::Bh1730::new(
+            Arc::clone(&soc.clock),
+            Arc::clone(&soc.notes),
+        ));
         bus.map(
             "I2C2",
             0x7000_C400,
@@ -771,6 +783,7 @@ impl Soc {
             emmc,
             sdmmc::Timing::EMMC,
             Arc::clone(&soc.notes),
+            Arc::clone(&soc.clock),
         );
         bus.map("SDMMC4", SDMMC4_BASE, sdmmc::SIZE, Box::new(sdmmc4));
         let sdmmc2 = Sdmmc::new(
@@ -779,6 +792,7 @@ impl Soc {
             None,
             sdmmc::Timing::INSTANT,
             Arc::clone(&soc.notes),
+            Arc::clone(&soc.clock),
         );
         bus.map("SDMMC2", SDMMC2_BASE, sdmmc::SIZE, Box::new(sdmmc2));
         let sd_card = sd_card
@@ -789,6 +803,7 @@ impl Soc {
             sd_card,
             sdmmc::Timing::SD_CARD,
             Arc::clone(&soc.notes),
+            Arc::clone(&soc.clock),
         );
         let supply = sdmmc1.card_supply();
         soc.gpio.observe_output(Box::new(move |port, pin, high| {
@@ -830,7 +845,22 @@ impl Soc {
     /// state a bus device's [`MmioDevice::snapshot`](crate::bus::MmioDevice::snapshot)
     /// leaves to another part.
     pub fn snapshot_parts(&self) -> Vec<(&'static str, &dyn crate::snapshot::Snapshot)> {
-        Vec::new()
+        let mut parts: Vec<(&'static str, &dyn crate::snapshot::Snapshot)> = Vec::new();
+        // The WiFi function: the PCIe root complex reaches it only as a
+        // `PcieFunction`.
+        if let Some(wifi) = self.wifi.get() {
+            parts.push(("BCM4356 WiFi", wifi.as_ref()));
+        }
+        // The GPU: its BAR windows on the bus answer `NoState`.
+        parts.push(("GM20B", &self.gpu));
+        // The PMIC and its clock: both its I2C addresses answer `NoState`.
+        parts.push(("MAX77620", &self.pmic));
+        // The touch controller's events and modes, and the finger held on
+        // the glass: shared by the I2C3 device and the host's input.
+        parts.push(("touch input", self.touch_input.as_ref()));
+        // Whether the Joy-Con are on their rails and what is held on them.
+        parts.push(("Joy-Con controls", self.joycons.as_ref()));
+        parts
     }
 
     /// Where each GPU channel stands, a line each.
@@ -852,7 +882,7 @@ impl Soc {
     /// Keeps the display controllers' frames going until `stop` is set; see
     /// [`dc::keep_time`].
     pub fn keep_time(&self, stop: &AtomicBool) {
-        dc::keep_time(&[&self.dc, &self.dcb], stop);
+        dc::keep_time(&[&self.dc, &self.dcb], &self.clock, stop);
     }
 
     /// The input line of shared interrupt `intid` at the interrupt controller.

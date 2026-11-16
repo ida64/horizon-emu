@@ -18,7 +18,7 @@
 //! firmware does not look at again.
 
 use super::regs::{RegisterFile, word};
-use crate::bus::MmioDevice;
+use crate::{bus::MmioDevice, snapshot::Snapshot};
 
 pub const BASE: u64 = 0x700E_3000;
 /// nvservices maps 0x100 bytes (text `0x22fe8`).
@@ -78,6 +78,11 @@ impl MmioDevice for MipiCal {
             _ => self.registers.set(register, value),
         }
         Some(())
+    }
+
+    /// All there is: the registers, the last calibration's result included.
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(&self.registers)
     }
 }
 

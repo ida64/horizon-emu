@@ -10,7 +10,11 @@
 //! The observed firmware path uses TMP451 temperatures instead of raw die
 //! sensors and does not read SOCTHERM calibration fuses. Unknown sensor
 //! registers refuse rather than inventing conversion/calibration data.
-use crate::bus::MmioDevice;
+use super::regs::{restore_words, save_words};
+use crate::{
+    bus::MmioDevice,
+    snapshot::{Snapshot, SnapshotError},
+};
 use std::sync::Mutex;
 pub const BASE: u64 = 0x700e_2000;
 pub const SIZE: u64 = 0x1000;
@@ -59,5 +63,20 @@ impl MmioDevice for Soctherm {
             _ => return None,
         }
         Some(())
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+/// Saves the configuration and the overcurrent interrupt enables.
+impl Snapshot for Soctherm {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        save_words(&self.registers)
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        restore_words("SOCTHERM", &self.registers, state)
     }
 }

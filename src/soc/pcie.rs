@@ -31,8 +31,12 @@
 use super::{
     mc::DeviceMemory,
     pcie_endpoint::{PcieFunction, Upstream},
+    regs::{restore_words, save_words},
 };
-use crate::bus::MmioDevice;
+use crate::{
+    bus::{MmioDevice, NoState},
+    snapshot::{Snapshot, SnapshotError},
+};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub const BASE: u64 = 0x0100_0000;
@@ -115,6 +119,19 @@ impl Inner {
                     .then(|| ((fpci >> 4) << 12) + (cpu - start))
             })
             .filter(|&bus| bus < FPCI_SPECIAL)
+    }
+}
+
+/// Saves the root ports' and the AFI's registers, pending MSI vectors
+/// included. The attached function saves its own state; the interrupt
+/// lines are levels the interrupt controller saves.
+impl Snapshot for Inner {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        save_words(&self.registers)
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        restore_words("PCIe", &self.registers, state)
     }
 }
 
@@ -262,6 +279,10 @@ impl MmioDevice for Pcie {
         self.0.update_msi(&regs);
         Some(())
     }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(&*self.0)
+    }
 }
 
 /// Downstream configuration aperture: `pcie` text 0x1b000 encodes bus
@@ -310,6 +331,12 @@ impl MmioDevice for DownstreamConfig {
             None => Some(()),
         }
     }
+
+    /// A window onto the function's configuration space: the root complex
+    /// and the function save what it reaches.
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(&NoState)
+    }
 }
 
 /// The memory windows: CPU address -> AFI AXI BAR -> bus address -> the
@@ -326,6 +353,12 @@ impl MmioDevice for MemoryWindow {
     fn write(&self, _core: usize, offset: u64, size: u8, value: u64) -> Option<()> {
         let bus = self.0.outbound(MEMORY_BASE + offset)?;
         self.0.function.get()?.memory_write(bus, size, value)
+    }
+
+    /// A window onto the function's BARs: the root complex and the function
+    /// save what it reaches.
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(&NoState)
     }
 }
 

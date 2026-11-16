@@ -249,6 +249,7 @@ fn a_channel_submission_composes_and_signals_its_syncpoint() {
     let channel = Channel::new(
         DeviceMemory::new(&bench.mc, &bench.ram, SMMU_HOST1X_ASID),
         Arc::clone(&bench.syncpoints),
+        Arc::default(),
         Arc::new(move |class, offset, value| {
             (class == CLASS).then_some(())?;
             vic.thi_write(offset, value)
@@ -376,6 +377,7 @@ fn the_netconnect_launch_capture_copies_the_frame_and_signals() {
     let channel = Channel::new(
         DeviceMemory::new(&mc, &ram, SMMU_HOST1X_ASID),
         Arc::clone(&syncpoints),
+        Arc::default(),
         Arc::new(move |class, offset, value| {
             (class == CLASS).then_some(())?;
             vic.thi_write(offset, value)

@@ -38,8 +38,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use serde::{Deserialize, Serialize};
+
 use super::{Notes, regs::word};
-use crate::bus::MmioDevice;
+use crate::{
+    bus::MmioDevice,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 pub const BASE: u64 = 0x5430_0000;
 pub const SIZE: u64 = 0x1000;
@@ -104,6 +109,7 @@ mod dcs {
 const DISPLAY_ID: [u8; 3] = [0x10, 0x81, 0x26];
 
 /// The LCD module.
+#[derive(Serialize, Deserialize)]
 pub struct Panel {
     max_return_size: usize,
     /// Answer to the last read request, sent at the next turnaround.
@@ -210,6 +216,7 @@ pub struct Dsi {
     notes: Arc<Notes>,
 }
 
+#[derive(Serialize, Deserialize)]
 struct State {
     /// Registers without behavior of their own, as last written.
     registers: HashMap<u64, u32>,
@@ -346,6 +353,24 @@ impl MmioDevice for Dsi {
             }
         }
         Some(())
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+/// Saves the registers, both FIFOs and the panel: its return size, the
+/// answer it holds for the next turnaround, and whether it sleeps and
+/// shows.
+impl Snapshot for Dsi {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&*self.state.lock().unwrap())
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        *self.state.lock().unwrap() = decode("DSI", state)?;
+        Ok(())
     }
 }
 

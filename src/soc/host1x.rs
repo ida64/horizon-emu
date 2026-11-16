@@ -26,11 +26,16 @@
 
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use super::{
     dc::Dc,
     regs::{RegisterFile, word},
 };
-use crate::bus::MmioDevice;
+use crate::{
+    bus::MmioDevice,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 pub const SYNC_BASE: u64 = 0x5000_2100;
 /// Up to the last register nvservices uses, `SYNCPT_PROT_EN` at
@@ -84,8 +89,11 @@ fn syncpoint_at(offset: u64, array: u64) -> Option<usize> {
     (index < SYNCPOINT_COUNT).then_some(index)
 }
 
+#[derive(Serialize, Deserialize)]
 struct State {
+    #[serde(with = "crate::snapshot::array")]
     values: [u32; SYNCPOINT_COUNT],
+    #[serde(with = "crate::snapshot::array")]
     thresholds: [u32; SYNCPOINT_COUNT],
     /// Threshold interrupts enabled towards CPU0.
     enabled: [u32; BITMAP_WORDS],
@@ -113,7 +121,9 @@ impl State {
 }
 
 /// The syncpoint counters, shared with the devices that increment them,
-/// and the threshold interrupt they raise.
+/// and the threshold interrupt they raise. Shared by the display
+/// controllers, the GPU, the VIC and the host1x channels; [`Host1xSync`]'s
+/// [`Snapshot`] saves them, once.
 pub struct Syncpoints {
     state: Mutex<State>,
     /// INTID 97, nvservices' syncpoint interrupt (text `0x5a454`); none in
@@ -293,6 +303,30 @@ impl MmioDevice for Host1xSync {
             });
         }
         Some(())
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+/// Saves the syncpoints for every device that counts on them (values,
+/// thresholds, enabled threshold interrupts, their status and the level
+/// last driven onto the interrupt line), and the configuration registers.
+/// The line is not driven again: the interrupt controller saves its own
+/// level.
+impl Snapshot for Host1xSync {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        let syncpoints = encode(&*self.syncpoints.state.lock().unwrap())?;
+        encode(&(syncpoints, self.configuration.save()?))
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        let (syncpoints, configuration): (Vec<u8>, Vec<u8>) = decode("host1x", state)?;
+        let syncpoints = decode("host1x syncpoints", &syncpoints)?;
+        self.configuration.restore(&configuration)?;
+        *self.syncpoints.state.lock().unwrap() = syncpoints;
+        Ok(())
     }
 }
 

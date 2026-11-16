@@ -24,7 +24,10 @@
 use std::sync::Mutex;
 
 use super::regs::{RegisterFile, word};
-use crate::bus::MmioDevice;
+use crate::{
+    bus::MmioDevice,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 pub const BASE: u64 = 0x7000_E400;
 pub const SIZE: u64 = 0xC00;
@@ -134,6 +137,25 @@ impl MmioDevice for Pmc {
         };
         self.registers.set(register, value);
         Some(())
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+/// Saves the registers, wake status included, and which partitions are
+/// powered.
+impl Snapshot for Pmc {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&(self.registers.save()?, *self.powered.lock().unwrap()))
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        let (registers, powered): (Vec<u8>, u32) = decode("PMC", state)?;
+        self.registers.restore(&registers)?;
+        *self.powered.lock().unwrap() = powered;
+        Ok(())
     }
 }
 

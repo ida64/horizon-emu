@@ -6,6 +6,8 @@
 //! `classes/3d/clb197.h`]. Methods without an action are state: they are
 //! stored and read back by draws, clears and macros.
 
+use serde::{Deserialize, Serialize};
+
 use super::inline::{self, Completion, InlineToMemory};
 use super::mme::{MacroTarget, Mme};
 use super::pipeline::{
@@ -118,7 +120,9 @@ const STOP_SHADER_PERFORMANCE_COUNTER: u32 = m(0x33e4);
 /// methods; see `ThreeD::shadow`.
 const SHADOW_FIRST_METHOD: u32 = 0x80;
 
-/// The 3D engine of a channel.
+/// The 3D engine of a channel. Machine snapshots save everything but its
+/// caches, which a restored engine rebuilds from guest memory.
+#[derive(Serialize, Deserialize)]
 pub struct ThreeD {
     registers: Vec<u32>,
     shadow: Vec<u32>,
@@ -129,6 +133,7 @@ pub struct ThreeD {
     batch: Option<Batch>,
     /// Instance of the current/last `BEGIN`.
     instance: u32,
+    #[serde(skip)]
     caches: Caches,
     /// Graphics-engine priv registers written through `SET_FALCON04`:
     /// (value, mask of the bits written so far).
@@ -198,6 +203,12 @@ pub fn release_semaphore(
 }
 
 impl ThreeD {
+    /// Whether a restored register file and shadow RAM have the size
+    /// methods index.
+    pub(super) fn fits(&self) -> bool {
+        self.registers.len() == METHODS && self.shadow.len() == METHODS
+    }
+
     pub fn registers(&self) -> Registers<'_> {
         Registers(&self.registers)
     }

@@ -8,7 +8,11 @@
 //! completion follows actual data movement. Other peripheral addresses or
 //! modes refuse, never complete.
 use super::{Notes, mc::DeviceMemory, regs::word, serial::Serial};
-use crate::bus::MmioDevice;
+use crate::{
+    bus::MmioDevice,
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 pub const BASE: u64 = 0x6002_0000;
 pub const SIZE: u64 = 0x2000;
@@ -22,6 +26,7 @@ pub fn intid(channel: usize) -> u32 {
         112 + channel as u32
     }
 }
+#[derive(Serialize, Deserialize)]
 struct State {
     general: u32,
     mask: u32,
@@ -162,6 +167,26 @@ impl MmioDevice for ApbDma {
             _ => return None,
         }
         Some(())
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+/// Saves the global enable, the interrupt mask and every channel's
+/// registers, including how far a transfer has come: a transfer waiting
+/// for received bytes continues from there. The UARTs save their own
+/// FIFOs; the channel interrupt lines are levels the interrupt controller
+/// saves.
+impl Snapshot for ApbDma {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&*self.state.lock().unwrap())
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        *self.state.lock().unwrap() = decode("APB DMA", state)?;
+        Ok(())
     }
 }
 

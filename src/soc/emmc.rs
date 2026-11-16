@@ -19,11 +19,14 @@
 
 use std::{collections::HashMap, fs::File, io, sync::Arc};
 
+use serde::{Deserialize, Serialize};
+
 use super::{
     Notes,
-    medium::{Medium, SECTOR_SIZE},
+    medium::{Medium, MediumState, SECTOR_SIZE},
     sdmmc::{Card, Response},
 };
+use crate::snapshot::{SnapshotError, decode, encode};
 
 const EXT_CSD_SIZE: usize = 512;
 
@@ -155,7 +158,7 @@ impl std::fmt::Display for ImageError {
 }
 
 /// Device states of the standard, with their `CURRENT_STATE` encoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum State {
     Idle = 0,
     Ready = 1,
@@ -167,9 +170,10 @@ enum State {
 }
 
 /// What moves over the data lines after a command.
+#[derive(Clone, Serialize, Deserialize)]
 enum Data {
     /// A fixed block the card sends: the extended CSD.
-    Block(Box<[u8; EXT_CSD_SIZE]>),
+    Block(Vec<u8>),
     /// The tuning pattern; only the host's sampling logic looks at it.
     Tuning,
     /// Sectors from or to the selected partition. `left` is `None` for an
@@ -189,6 +193,20 @@ pub struct Emmc {
     block_count: Option<u32>,
     data: Option<Data>,
     notes: Arc<Notes>,
+}
+
+/// The module's state in a machine snapshot: its registers, the transfer
+/// in progress, and what the run changed of each partition.
+#[derive(Serialize, Deserialize)]
+struct Saved<'a> {
+    partitions: [MediumState<'a>; 3],
+    state: State,
+    rca: u16,
+    #[serde(with = "crate::snapshot::array")]
+    ext_csd: [u8; EXT_CSD_SIZE],
+    errors: u32,
+    block_count: Option<u32>,
+    data: Option<Data>,
 }
 
 impl Emmc {
@@ -406,7 +424,7 @@ impl Card for Emmc {
             // SEND_EXT_CSD.
             (8, Transfer) => {
                 let response = self.r1();
-                self.data = Some(Data::Block(Box::new(self.ext_csd)));
+                self.data = Some(Data::Block(self.ext_csd.to_vec()));
                 self.state = SendingData;
                 response
             }
@@ -514,6 +532,32 @@ impl Card for Emmc {
             self.end_of_block(Some(0));
         }
         tuning
+    }
+
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&Saved {
+            partitions: self.partitions.each_ref().map(Medium::save),
+            state: self.state,
+            rca: self.rca,
+            ext_csd: self.ext_csd,
+            errors: self.errors,
+            block_count: self.block_count,
+            data: self.data.clone(),
+        })
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError> {
+        let saved: Saved = decode(DEVICE, state)?;
+        for (partition, state) in self.partitions.iter_mut().zip(saved.partitions) {
+            partition.restore(state)?;
+        }
+        self.state = saved.state;
+        self.rca = saved.rca;
+        self.ext_csd = saved.ext_csd;
+        self.errors = saved.errors;
+        self.block_count = saved.block_count;
+        self.data = saved.data;
+        Ok(())
     }
 }
 

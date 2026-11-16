@@ -48,6 +48,10 @@ pub mod two_d;
 #[cfg(test)]
 mod tests;
 
+use serde::{Deserialize, Serialize};
+
+use crate::snapshot::{SnapshotError, decode, encode};
+
 /// Memory as a GPU channel addresses it: its page tables applied.
 pub trait GpuMemory: Sync {
     fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()>;
@@ -80,6 +84,19 @@ pub trait Engines: Send {
     fn flush(&mut self, _memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
         Ok(())
     }
+
+    /// The engines' state for a machine snapshot: everything that decides
+    /// what later methods do (register files, shadow RAM, bindings, macro
+    /// code, transfers and macro calls in flight), never a cache of guest
+    /// memory or anything held on the host GPU. Taken after
+    /// [`flush`](Self::flush), so nothing rendered is left only on the
+    /// host.
+    fn save(&self) -> Result<Vec<u8>, SnapshotError>;
+
+    /// Takes back what [`save`](Self::save) returned, into engines made for
+    /// the channel as for a new one (with the same hooks); caches start
+    /// empty.
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError>;
 }
 
 /// Connections to the rest of the GPU a channel's engines need for some
@@ -142,7 +159,10 @@ pub const COPY: u16 = 0xB0B5;
 pub const COPY_A: u16 = 0xA0B5;
 pub const INLINE_TO_MEMORY: u16 = 0xA140;
 
-/// The engine state of one channel.
+/// The engine state of one channel. Saved in machine snapshots without
+/// its hooks, which the channel restored into has already (see
+/// [`Engines::restore`]).
+#[derive(Serialize, Deserialize)]
 pub struct Channel {
     subchannels: [Option<u16>; 8],
     three_d: three_d::ThreeD,
@@ -151,6 +171,7 @@ pub struct Channel {
     compute: Compute,
     inline: inline::InlineToMemory,
     mme: mme::Mme,
+    #[serde(skip)]
     hooks: Hooks,
 }
 
@@ -372,17 +393,50 @@ impl Engines for Channel {
         };
         self.hooks.signal(&tracked)
     }
+
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(self)
+    }
+
+    /// Every engine's state is replaced; the hooks (timer, syncpoints,
+    /// renderer) stay. Every cache starts empty: the 3D engine's programs
+    /// and textures are not saved, the Metal renderer drops what it holds
+    /// on the host GPU, and a new epoch of [`resources::Writes`] begins.
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError> {
+        let restored: Channel = decode("GPU channel engines", state)?;
+        if !(restored.three_d.fits()
+            && restored.two_d.fits()
+            && restored.copy.fits()
+            && restored.compute.fits())
+        {
+            return Err(SnapshotError::Corrupt(
+                "GPU channel engines: register files of another size".into(),
+            ));
+        }
+        let hooks = std::mem::take(&mut self.hooks);
+        *self = Channel { hooks, ..restored };
+        if let Some(renderer) = &self.hooks.metal {
+            renderer.drop_caches();
+        }
+        self.hooks.writes.signal();
+        Ok(())
+    }
 }
 
 /// The compute class (0xB1C0), as far as modeled: its inline-to-memory
 /// block and semaphore releases. Kernel launches are refused.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Compute {
     registers: Vec<u32>,
     inline: inline::InlineToMemory,
 }
 
 impl Compute {
+    /// Whether a restored register file has the size methods index.
+    fn fits(&self) -> bool {
+        self.registers.is_empty() || self.registers.len() == 0xE00
+    }
+
     fn method(
         &mut self,
         method: u32,

@@ -11,6 +11,7 @@
 //! bootloaders hand the console over.
 
 use super::i2c::RegisterMap;
+use crate::snapshot::{SnapshotError, decode, encode};
 
 pub const CPU_ADDRESS: u8 = 0x1B;
 pub const GPU_ADDRESS: u8 = 0x1C;
@@ -59,5 +60,15 @@ impl RegisterMap for Max77621 {
         debug_assert!([VOUT, VOUT_DVS, CONTROL1, CONTROL2].len() == self.registers.len());
         *self.registers.get_mut(usize::from(register))? = value;
         Some(())
+    }
+
+    /// The output and control registers.
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&self.registers)
+    }
+
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError> {
+        self.registers = decode("MAX77621", state)?;
+        Ok(())
     }
 }

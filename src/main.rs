@@ -29,7 +29,7 @@ use horizon_emu::{
     keys::KeySet,
     machine::{
         Caller, CodeAddress, ExceptionState, Machine, Module, Place, Poke, Process, RunEnd,
-        RunOptions, TraceEvent,
+        RunOptions, SaveReport, TraceEvent,
     },
     maxwell, nand, net, sdcard,
     secmon::{self, SmcEffect},
@@ -47,6 +47,7 @@ use crate::{
 const USAGE: &str = "\
 usage: horizon-emu info <kernel.elf>
        horizon-emu boot <kernel.elf> [options]
+       horizon-emu restore <snapshot dir> [options]
        horizon-emu format-emmc <new image file> [--keys FILE [--firmware DIR]]
        horizon-emu patch-prodinfo <image file> --keys FILE
        horizon-emu format-sd <new image file> --size SIZE [--add HOST=CARD ...]
@@ -69,6 +70,20 @@ G for binary multiples; a multiple of 512K above 2088M and up to 32G),
 formatted as the console formats a card, with each --add's host file HOST
 at the absolute path CARD (/hbmenu.nro, /switch/foo.nro), directories
 created as needed.
+
+restore builds the machine a snapshot was taken of (see the control
+socket's save_state) and goes on from where it was: the same kernel, keys,
+DRAM, seed, storage images as they were then, WiFi network and homebrew
+options, which the snapshot recorded and which cannot be given again; the
+other options (window, control, scripts, tracing, --dns, --forward...)
+apply as for boot. The snapshot itself is never changed, so it can be
+restored any number of times: images the saved machine wrote to are
+cloned for the restored one into
+  --workdir DIR       (default: a new directory under the system's
+                      temporary directory, printed at start)
+Host connections of the saved machine are gone, as after a dropped link;
+the console makes new ones. The processors run at full speed unless
+--cpu-slowdown says otherwise.
 
 options:
   --dram 4|6|8        installed DRAM in GiB (default 4)
@@ -212,8 +227,10 @@ taken as it is, such as one inside a process):
                       call, like --verbose
   --control SOCKET    serve requests on a Unix socket at SOCKET while the
                       machine runs: script steps, screenshots, pixels,
-                      status, stop (one JSON object per line; what
-                      `horizon-emu mcp` drives runs with)
+                      status, stop, save_state (a snapshot of the running
+                      machine into a directory, for restore). One JSON
+                      object per line; what `horizon-emu mcp` drives runs
+                      with
   --survey            do not stop at device accesses nothing models: answer
                       reads with zero, drop writes, and print each. Not a
                       faithful run; it lists what the guest wants
@@ -263,15 +280,163 @@ fn run(arguments: &[String]) -> Result<(), String> {
     if command == "patch-prodinfo" {
         return patch_prodinfo(path, flags).map_err(|error| format!("{path}: {error}"));
     }
+    if command == "restore" {
+        return restore(Path::new(path), flags);
+    }
     let image = KernelImage::load(Path::new(path)).map_err(|error| error.to_string())?;
     match command.as_str() {
         "info" if flags.is_empty() => {
             info(&image);
             Ok(())
         }
-        "boot" => boot(image, flags),
+        "boot" => boot(image, Path::new(path), flags, None),
         _ => Err(usage()),
     }
+}
+
+/// Flags that make the machine what it is, and whether each takes a
+/// value. A snapshot records them; a restored machine is built with them
+/// again, and they cannot be given to `restore`.
+const MACHINE_FLAGS: &[(&str, bool)] = &[
+    ("--dram", true),
+    ("--seed", true),
+    ("--keys", true),
+    ("--emmc", true),
+    ("--emmc-boot0", true),
+    ("--emmc-boot1", true),
+    ("--emmc-writable", false),
+    ("--sd", true),
+    ("--sd-writable", false),
+    ("--wifi-ssid", true),
+    ("--wifi-passphrase", true),
+    ("--debug-mode", false),
+    ("--disable-program-verification", false),
+    ("--homebrew-keys", false),
+    ("--replace-program", true),
+    ("--homebrew", true),
+    ("--homebrew-in", true),
+    ("--hbl", true),
+    ("--homebrew-app", true),
+];
+
+/// Machine flags naming host files that are read when the machine is
+/// built, recorded as absolute paths.
+const FILE_FLAGS: &[&str] = &["--keys", "--homebrew", "--hbl", "--homebrew-app"];
+
+/// Storage image flags: a snapshot holds a copy of each image, under the
+/// name given, and the flag that makes the image written to.
+const IMAGE_FLAGS: &[(&str, &str, &str)] = &[
+    ("--emmc", "emmc.img", "--emmc-writable"),
+    ("--emmc-boot0", "emmc-boot0.img", "--emmc-writable"),
+    ("--emmc-boot1", "emmc-boot1.img", "--emmc-writable"),
+    ("--sd", "sd.img", "--sd-writable"),
+];
+
+/// `boot.json` of a snapshot: how to build the machine again.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedBoot {
+    /// Machine flags with their values; images by their names in the
+    /// snapshot.
+    flags: Vec<String>,
+}
+
+/// Takes snapshots of a running machine: its state, a copy of the kernel
+/// and of each storage image, and how it was built.
+struct Snapshotter {
+    kernel: PathBuf,
+    /// Machine flags as given, with host files as absolute paths.
+    flags: Vec<String>,
+}
+
+impl Snapshotter {
+    fn save(&self, machine: &Machine, dir: &Path) -> Result<SaveReport, String> {
+        let mut beside = |dir: &Path| -> io::Result<()> {
+            let mut saved = SavedBoot { flags: Vec::new() };
+            let mut flags = self.flags.iter();
+            while let Some(flag) = flags.next() {
+                saved.flags.push(flag.clone());
+                let Some(&(_, name, _)) = IMAGE_FLAGS.iter().find(|(image, ..)| image == flag)
+                else {
+                    continue;
+                };
+                let source = flags
+                    .next()
+                    .expect("an image flag was recorded with its value");
+                clone_file(Path::new(source), &dir.join(name))?;
+                saved.flags.push(name.into());
+            }
+            clone_file(&self.kernel, &dir.join("kernel.elf"))?;
+            let json = serde_json::to_vec_pretty(&saved).map_err(io::Error::other)?;
+            std::fs::write(dir.join("boot.json"), json)
+        };
+        machine
+            .save_state(dir, &mut beside)
+            .map_err(|error| format!("{}: {error}", dir.display()))
+    }
+}
+
+/// Copies `source` to `target`, replacing it: a clone on APFS, made at once
+/// whatever the size, sharing blocks until either is written.
+fn clone_file(source: &Path, target: &Path) -> io::Result<()> {
+    match std::fs::remove_file(target) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    std::fs::copy(source, target)
+        .map(drop)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", source.display())))
+}
+
+/// `restore DIR [options]`: the snapshot's machine flags, its images as
+/// the restored machine is to use them, then the options given.
+fn restore(dir: &Path, flags: &[String]) -> Result<(), String> {
+    let file = dir.join("boot.json");
+    let saved: SavedBoot = std::fs::read(&file)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
+        .map_err(|error| format!("{}: {error}", file.display()))?;
+    let mut workdir = None;
+    let mut given = Vec::new();
+    let mut rest = flags.iter();
+    while let Some(flag) = rest.next() {
+        if flag == "--workdir" {
+            workdir = Some(PathBuf::from(rest.next().ok_or("--workdir needs a value")?));
+        } else if MACHINE_FLAGS.iter().any(|(machine, _)| machine == flag) {
+            return Err(format!("{flag}: the snapshot says what the machine is"));
+        } else {
+            given.push(flag.clone());
+        }
+    }
+    let workdir = workdir.unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("horizon-emu-restore-{}", std::process::id()))
+    });
+    let mut all = Vec::new();
+    let mut saved_flags = saved.flags.iter();
+    while let Some(flag) = saved_flags.next() {
+        all.push(flag.clone());
+        let Some(&(_, _, writable)) = IMAGE_FLAGS.iter().find(|(image, ..)| image == flag) else {
+            continue;
+        };
+        let name = saved_flags
+            .next()
+            .ok_or_else(|| format!("{}: {flag} without an image", file.display()))?;
+        let image = dir.join(name);
+        if saved.flags.iter().any(|flag| flag == writable) {
+            // Written to: a clone, so that the snapshot stays as it is.
+            std::fs::create_dir_all(&workdir)
+                .map_err(|error| format!("--workdir {}: {error}", workdir.display()))?;
+            let copy = workdir.join(name);
+            clone_file(&image, &copy).map_err(|error| error.to_string())?;
+            println!("restore: {flag} {}", copy.display());
+            all.push(copy.display().to_string());
+        } else {
+            all.push(image.display().to_string());
+        }
+    }
+    all.extend(given);
+    let kernel = dir.join("kernel.elf");
+    let image = KernelImage::load(&kernel).map_err(|error| error.to_string())?;
+    boot(image, &kernel, &all, Some(dir))
 }
 
 fn format_sd(path: &str, flags: &[String]) -> Result<(), String> {
@@ -410,7 +575,34 @@ fn info(image: &KernelImage) {
     println!("loader entry   {:#x}", image.loader_entry);
 }
 
-fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
+/// How a snapshot records the value of machine flag `flag`: files the
+/// machine is built from as absolute paths, so that a restore from
+/// elsewhere finds them.
+fn recorded_value(flag: &str, value: &str) -> String {
+    let absolute = |path: &str| {
+        std::path::absolute(path)
+            .map_or_else(|_| path.to_string(), |path| path.display().to_string())
+    };
+    if FILE_FLAGS.contains(&flag) || IMAGE_FLAGS.iter().any(|(image, ..)| *image == flag) {
+        absolute(value)
+    } else if flag == "--replace-program"
+        && let Some((program, nsp)) = value.split_once('=')
+    {
+        format!("{program}={}", absolute(nsp))
+    } else {
+        value.to_string()
+    }
+}
+
+/// Boots `image` (read from `kernel`) as `flags` say, or with `restore`,
+/// goes on from the snapshot in that directory instead.
+fn boot(
+    mut image: KernelImage,
+    kernel: &Path,
+    flags: &[String],
+    restore: Option<&Path>,
+) -> Result<(), String> {
+    let mut machine_flags = Vec::new();
     let mut params = BootParams::default();
     let mut timeout = None;
     let mut show_window = false;
@@ -442,6 +634,12 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
 
     let mut flags = flags.iter();
     while let Some(flag) = flags.next() {
+        if let Some(&(_, takes_value)) = MACHINE_FLAGS.iter().find(|(name, _)| name == flag) {
+            machine_flags.push(flag.clone());
+            if takes_value && let Some(value) = flags.clone().next() {
+                machine_flags.push(recorded_value(flag, value));
+            }
+        }
         let mut value = || flags.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
             "--dram" => {
@@ -659,6 +857,10 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
         .transpose()?;
     let machine = Machine::new(image, &params, keys, emmc, sd_card, Box::new(io::stderr()))
         .map_err(|error| error.to_string())?;
+    let snapshotter = Snapshotter {
+        kernel: std::path::absolute(kernel).map_err(|error| error.to_string())?,
+        flags: machine_flags,
+    };
     if let Some(ssid) = &wifi_ssid {
         let ap = AccessPoint::new(ssid, wifi_passphrase.as_deref())
             .map_err(|error| format!("--wifi-ssid: {error}"))?;
@@ -681,6 +883,19 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
         return Err("--forward needs --wifi-ssid".into());
     } else if dns.is_some() {
         return Err("--dns needs --wifi-ssid".into());
+    }
+    // The WiFi radio's access point is part of what is restored, so it is
+    // in place first.
+    if let Some(dir) = restore {
+        let started = Instant::now();
+        machine
+            .restore_state(dir)
+            .map_err(|error| format!("{}: {error}", dir.display()))?;
+        println!(
+            "restored {} in {:.2} s",
+            dir.display(),
+            started.elapsed().as_secs_f64()
+        );
     }
     let mut window = show_window.then(ScreenWindow::open).transpose()?;
     let stop = AtomicBool::new(false);
@@ -711,7 +926,11 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
             })
             .transpose()?,
     };
-    let cpu_slowdown = cpu_slowdown.unwrap_or((10, Some(Duration::from_secs(12))));
+    // A restored machine is past the boot that the default slows.
+    let cpu_slowdown = cpu_slowdown.unwrap_or(match restore {
+        Some(_) => (1, None),
+        None => (10, Some(Duration::from_secs(12))),
+    });
     let options = RunOptions {
         timeout,
         stop: &stop,
@@ -769,6 +988,7 @@ fn boot(mut image: KernelImage, flags: &[String]) -> Result<(), String> {
                 stop: &stop,
                 started,
                 ended: &ended,
+                snapshot: &snapshotter,
             };
             scope.spawn(move || control::serve(listener, &controlled));
         }

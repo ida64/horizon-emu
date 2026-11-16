@@ -161,6 +161,17 @@ impl Timers {
 }
 
 impl Snapshot for Timers {
+    /// Raises what is due by the paused guest time, which the timer thread
+    /// might otherwise do in the middle of the save.
+    fn quiesce(&self) -> Result<(), SnapshotError> {
+        let count = self.count();
+        let mut timers = self.timers.lock().unwrap();
+        for (core, timer) in timers.iter_mut().enumerate() {
+            self.drive(timer, core, count);
+        }
+        Ok(())
+    }
+
     fn save(&self) -> Result<Vec<u8>, SnapshotError> {
         encode(&*self.timers.lock().unwrap())
     }

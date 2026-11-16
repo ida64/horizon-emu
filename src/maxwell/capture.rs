@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::{Engines, GpuMemory, Unmodeled};
+use crate::snapshot::SnapshotError;
 
 const MAGIC: &[u8; 8] = b"MXCAP001";
 const PAGE: u64 = 0x1000;
@@ -252,6 +253,23 @@ impl Engines for Recorder {
             shadow: &self.shadow,
         };
         self.inner.flush(&observed)
+    }
+
+    /// The recorded engines' state; the capture's own bookkeeping (its
+    /// shadow of memory) is not machine state.
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        self.inner.save()
+    }
+
+    /// Refused: a capture replays a channel from its method-init list
+    /// (its `I` record), which a restored channel's engines are no longer
+    /// at, so the replay of what it records would diverge.
+    fn restore(&mut self, _state: &[u8]) -> Result<(), SnapshotError> {
+        Err(SnapshotError::Unsupported(
+            "a GPU channel while a capture runs: its replay would start from the method-init \
+             state, not the restored one"
+                .into(),
+        ))
     }
 }
 

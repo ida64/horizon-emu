@@ -14,6 +14,9 @@
 /// by hid 0xe7ae0 for the calibration module type LSM6DS3H.
 const ID: u8 = 0x69;
 
+/// The registers and the SPI command in progress: what the SPI controller
+/// saves of the sensor in a snapshot.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Lsm6ds3 {
     registers: [u8; 0x20],
     command: Option<u8>,

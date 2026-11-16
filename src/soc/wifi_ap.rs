@@ -26,6 +26,7 @@ use aes::{
     cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray},
 };
 use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use std::io::Read;
 
@@ -86,7 +87,10 @@ const MIC_AT: usize = 81;
 const KEY_DATA_LEN_AT: usize = 97;
 const KEY_DATA_AT: usize = 99;
 
-/// The configured network.
+/// The configured network. Saved with the radio's snapshot: its SSID and
+/// key follow from the command line, but the group key is drawn at random
+/// when it is built and stations hold it once they joined.
+#[derive(Serialize, Deserialize)]
 pub struct AccessPoint {
     ssid: Vec<u8>,
     /// The pairwise master key of a WPA2-Personal network.
@@ -213,9 +217,23 @@ impl AccessPoint {
             done: false,
         })
     }
+
+    /// Takes the state of `saved`, the same network in the machine a
+    /// snapshot was taken of: its group key. Refused for a network
+    /// configured differently (another SSID or passphrase), which the
+    /// saved stations could not be associated with.
+    pub fn restore(&mut self, saved: AccessPoint) -> Result<(), String> {
+        if saved.ssid != self.ssid || saved.pmk != self.pmk {
+            return Err("the access point was configured with another SSID or passphrase".into());
+        }
+        self.gtk = saved.gtk;
+        Ok(())
+    }
 }
 
-/// The access point's half of the 4-way handshake with one station.
+/// The access point's half of the 4-way handshake with one station: all
+/// of it is saved with the association it belongs to.
+#[derive(Serialize, Deserialize)]
 pub struct Authenticator {
     pmk: [u8; 32],
     gtk: [u8; 16],
@@ -223,9 +241,13 @@ pub struct Authenticator {
     anonce: [u8; 32],
     replay: u64,
     /// KCK, KEK and TK once message 2 arrived.
-    ptk: Option<[u8; 48]>,
+    ptk: Option<Ptk>,
     done: bool,
 }
+
+/// A pairwise transient key: KCK, KEK and TK.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct Ptk(#[serde(with = "crate::snapshot::array")] [u8; 48]);
 
 impl Authenticator {
     /// Whether the handshake completed: data frames may flow.
@@ -271,11 +293,11 @@ impl Authenticator {
             if !mic_valid(&ptk[..16], eapol) {
                 return None;
             }
-            self.ptk = Some(ptk);
+            self.ptk = Some(Ptk(ptk));
             Some(self.message_3())
         } else {
             // Message 4.
-            let ptk = self.ptk?;
+            let ptk = self.ptk?.0;
             if !mic_valid(&ptk[..16], eapol) {
                 return None;
             }
@@ -287,7 +309,7 @@ impl Authenticator {
     /// Message 3: install, secure, with the RSN element and the GTK in a
     /// GTK KDE (key ID 1), key-wrapped with the KEK.
     fn message_3(&mut self) -> Vec<u8> {
-        let ptk = self.ptk.unwrap();
+        let ptk = self.ptk.unwrap().0;
         self.replay += 1;
         let mut data = RSN_IE.to_vec();
         data.extend([0xdd, 22, 0x00, 0x0f, 0xac, 1, 1, 0]);

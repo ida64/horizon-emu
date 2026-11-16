@@ -62,7 +62,8 @@ use crate::{
     soc::mc::DeviceMemory,
 };
 
-use self::crypto::{CipherMode, Crypto, CryptoError, RSA_SIZE};
+use self::crypto::{CipherMode, Crypto, CryptoError, RSA_SIZE, SavedCrypto};
+use crate::snapshot::{Snapshot, SnapshotError, decode, encode};
 
 /// Immediate of the SMC instruction for kernel-originated calls.
 pub const KERNEL_SMC: u16 = 1;
@@ -602,7 +603,7 @@ pub enum Unimplemented {
     Crypto(&'static str),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Carveout {
     pub address: u64,
     pub size: u64,
@@ -635,17 +636,62 @@ struct State {
 }
 
 /// An asynchronous operation's outcome, waiting for its key.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Pending {
     key: u64,
     result: AsyncResult,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum AsyncResult {
     /// `ComputeAes`: the engine wrote its output already.
     Aes,
     /// An RSA operation: the bytes `GetResultData` must ask for exactly,
     /// or the status the operation failed with.
     Data(Result<Vec<u8>, u64>),
+}
+
+/// [`State`] as a snapshot holds it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedState {
+    rng: SplitMix64,
+    key_rng: SplitMix64,
+    cores_on: [bool; CORE_COUNT],
+    carveouts: [Carveout; CARVEOUT_COUNT],
+    crypto: SavedCrypto,
+    pending: Option<Pending>,
+    charger_hi_z_mode: bool,
+}
+
+/// Everything the monitor learned since boot. What it was built with
+/// (the boot parameters, the key file) a restored machine is built with
+/// again.
+impl Snapshot for SecureMonitor {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        let state = self.state.lock().unwrap();
+        encode(&SavedState {
+            rng: SplitMix64(state.rng.0),
+            key_rng: SplitMix64(state.key_rng.0),
+            cores_on: state.cores_on,
+            carveouts: state.carveouts,
+            crypto: state.crypto.save_state(),
+            pending: state.pending.clone(),
+            charger_hi_z_mode: state.charger_hi_z_mode,
+        })
+    }
+
+    fn restore(&self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let saved: SavedState = decode("secure monitor", bytes)?;
+        let mut state = self.state.lock().unwrap();
+        state.rng = saved.rng;
+        state.key_rng = saved.key_rng;
+        state.cores_on = saved.cores_on;
+        state.carveouts = saved.carveouts;
+        state.crypto.restore_state(saved.crypto);
+        state.pending = saved.pending;
+        state.charger_hi_z_mode = saved.charger_hi_z_mode;
+        Ok(())
+    }
 }
 
 impl SecureMonitor {
@@ -1383,6 +1429,7 @@ fn engine_buffer(memory: &DeviceMemory, list: u64, size: u64) -> Option<u64> {
 
 /// SplitMix64. Hardware uses a true random source; a seeded generator keeps
 /// the kernel's randomized layout reproducible from run to run.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct SplitMix64(u64);
 
 impl SplitMix64 {

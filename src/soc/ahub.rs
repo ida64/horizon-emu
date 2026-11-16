@@ -37,7 +37,7 @@
 //! `+0x04` and global one at `0xC04`, Linux `ADMA_GLOBAL_SOFT_RESET`) read
 //! 0 at once: nothing is in flight, so a reset completes immediately. No
 //! transfer is ever started here; registers not listed here refuse.
-use crate::bus::MmioDevice;
+use crate::{bus::MmioDevice, snapshot::Snapshot};
 
 use super::regs::{RegisterFile, word};
 
@@ -103,6 +103,11 @@ impl MmioDevice for Block {
             value
         };
         self.registers.write(core, offset, size, value)
+    }
+
+    /// All there is: the configuration registers.
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(&self.registers)
     }
 }
 

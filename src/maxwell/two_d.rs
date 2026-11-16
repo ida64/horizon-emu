@@ -11,6 +11,8 @@
 //! origin modes: with CORNER the API adds half a step itself); `src_x0`,
 //! `du_dx` and their y counterparts are 32.32 fixed point.
 
+use serde::{Deserialize, Serialize};
+
 use super::surface::{Layout, Rect, Surface, Window};
 use super::texture::format::ColorFormat;
 use super::texture::layout::BlockLinear;
@@ -46,7 +48,8 @@ const SET_PIXELS_FROM_MEMORY_SRC_X0_FRAC: usize = m(0x8d0);
 const SET_PIXELS_FROM_MEMORY_SRC_Y0_FRAC: usize = m(0x8d8);
 const PIXELS_FROM_MEMORY_SRC_Y0_INT: usize = m(0x8dc);
 
-/// The 2D engine of a channel.
+/// The 2D engine of a channel; saved whole in machine snapshots.
+#[derive(Serialize, Deserialize)]
 pub struct TwoD {
     registers: Vec<u32>,
     /// Render enable latched by `SET_RENDER_ENABLE_C`, as in the 3D class.
@@ -70,6 +73,11 @@ fn refuse(method: usize, argument: u32, what: &str) -> Unmodeled {
 }
 
 impl TwoD {
+    /// Whether a restored register file has the size methods index.
+    pub(super) fn fits(&self) -> bool {
+        self.registers.len() == METHODS
+    }
+
     /// Sets a register's initial value (netlist SW_METHOD_INIT).
     pub fn set_initial(&mut self, method: u32, value: u32) -> Result<(), Unmodeled> {
         let slot = self.registers.get_mut(method as usize).ok_or_else(|| {

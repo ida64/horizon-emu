@@ -58,8 +58,13 @@
 
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use super::{Notes, host1x::Syncpoints, mc::DeviceMemory};
-use crate::maxwell::texture::layout::{BlockLinear, BlockLinearSurface, GOB_HEIGHT};
+use crate::{
+    maxwell::texture::layout::{BlockLinear, BlockLinearSurface, GOB_HEIGHT},
+    snapshot::{Snapshot, SnapshotError, decode, encode},
+};
 
 /// Host1x class of the VIC (nvnflinger `0x84F60(…, 106, 93)`).
 pub const CLASS: u32 = 0x5D;
@@ -115,8 +120,10 @@ pub struct Vic {
     state: Mutex<State>,
 }
 
+#[derive(Serialize, Deserialize)]
 struct State {
     offset: u32,
+    #[serde(with = "crate::snapshot::array")]
     methods: [u32; method::COUNT],
 }
 
@@ -202,6 +209,21 @@ impl Vic {
     fn refuse(&self, reason: String) -> Option<()> {
         self.notes.add(format!("VIC: {reason}"));
         None
+    }
+}
+
+/// Saves the THI method offset and the method state the next EXECUTE
+/// composes with. An EXECUTE completes within the method that starts it,
+/// so nothing is ever in flight. Saved by its host, the
+/// [`HostFalcon`](super::falcon_host::HostFalcon).
+impl Snapshot for Vic {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&*self.state.lock().unwrap())
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        *self.state.lock().unwrap() = decode("VIC", state)?;
+        Ok(())
     }
 }
 

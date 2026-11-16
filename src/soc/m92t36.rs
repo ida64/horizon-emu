@@ -10,9 +10,13 @@
 //! interrupt status 2 acknowledges it (`0x51250`). No PD negotiation is
 //! possible without a cable; unknown commands/registers refuse.
 use super::{gpio::Gpio, i2c::I2cDevice};
+use crate::snapshot::{SnapshotError, decode, encode};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 pub const ADDRESS: u8 = 0x18;
-#[derive(Default)]
+/// Everything a snapshot saves. The IRQ pin's level is the GPIO's input,
+/// which the GPIO saves.
+#[derive(Default, Serialize, Deserialize)]
 struct State {
     pointer: u8,
     interrupt: u16,
@@ -112,6 +116,13 @@ impl I2cDevice for Arc<M92t36> {
         }
         data.copy_from_slice(&value.to_le_bytes());
         Some(true)
+    }
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&*self.state.lock().unwrap())
+    }
+    fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError> {
+        *self.state.lock().unwrap() = decode("M92T36", state)?;
+        Ok(())
     }
 }
 

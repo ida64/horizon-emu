@@ -28,12 +28,17 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+use serde::{Deserialize, Serialize};
+
 use super::{
     super::host1x::Syncpoints,
     mmu::{self, AddressSpace, BusMemory, ChannelMemory},
     pushbuffer::{GpEntry, Header, MethodRun},
 };
-use crate::maxwell::{Engines, Unmodeled};
+use crate::{
+    maxwell::{Engines, Unmodeled},
+    snapshot::SnapshotError,
+};
 
 /// Channels the CCSR table has (`ccsr_channel__size_1` = 512).
 pub const CHANNELS: usize = 512;
@@ -106,7 +111,7 @@ const SYNCPOINT_FIELDS: u32 = 0xFF13;
 const FETCH_WORDS: u32 = 1024;
 
 /// What a stopped channel waits for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Wait {
     /// Host1x syncpoint `index` reaching `threshold`, compared as host1x
     /// does, modulo 2^32 (nvservices' own test at text `0x5E2D4`).
@@ -135,7 +140,7 @@ impl Wait {
 }
 
 /// How far a channel got.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
     /// GP_GET reached GP_PUT.
     Idle,
@@ -161,20 +166,25 @@ pub struct Env<'a> {
     pub note: &'a (dyn Fn(String) + Sync),
 }
 
-/// A pushbuffer segment being executed.
+/// A pushbuffer segment being executed. Machine snapshots save where
+/// execution stands in it, not the words fetched ahead: a restored channel
+/// fetches them from memory again.
+#[derive(Serialize, Deserialize)]
 struct Segment {
     address: u64,
     length: u32,
     /// Next word.
     position: u32,
     /// Words from `cached_from` on, as fetched.
+    #[serde(skip)]
     cached_from: u32,
+    #[serde(skip)]
     cache: Vec<u32>,
 }
 
 /// Host method state of a channel (the PBDMA's registers, saved in RAMFC
 /// on hardware).
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Host {
     semaphore_address: u64,
     semaphore_payload: u32,
@@ -197,6 +207,24 @@ pub struct Context {
     classes: [Option<u16>; 8],
     /// How the last turn on the host ended, for reports.
     pub last: Option<Outcome>,
+}
+
+/// A [`Context`] as a machine snapshot holds it: everything but the words
+/// fetched ahead, with its engines' state ([`Engines::save`]).
+#[derive(Serialize, Deserialize)]
+pub struct SavedContext {
+    instance: u64,
+    space: AddressSpace,
+    userd: u64,
+    gp_base: u64,
+    gp_entries: u32,
+    gp_get: u32,
+    segment: Option<Segment>,
+    run: Option<MethodRun>,
+    host: Host,
+    engines: Vec<u8>,
+    classes: [Option<u16>; 8],
+    last: Option<Outcome>,
 }
 
 /// What a channel's RAMFC says about its rings.
@@ -317,6 +345,80 @@ impl Context {
         self.engines
             .flush(memory)
             .map_err(|unmodeled| with_fault(memory, unmodeled))
+    }
+
+    /// Writes everything the engines hold back to memory
+    /// ([`Engines::flush`]), between methods, before a machine snapshot:
+    /// what memory holds is then all of the channel's work.
+    pub fn write_back(&mut self, bus: &dyn BusMemory) -> Result<(), Unmodeled> {
+        let memory = ChannelMemory::new(self.space, bus);
+        self.flush(&memory)
+    }
+
+    /// The channel's state for a machine snapshot, taken between methods
+    /// after [`write_back`](Self::write_back).
+    pub fn save(&self) -> Result<SavedContext, SnapshotError> {
+        Ok(SavedContext {
+            instance: self.instance,
+            space: self.space,
+            userd: self.userd,
+            gp_base: self.gp_base,
+            gp_entries: self.gp_entries,
+            gp_get: self.gp_get,
+            segment: self.segment.as_ref().map(|segment| Segment {
+                address: segment.address,
+                length: segment.length,
+                position: segment.position,
+                cached_from: 0,
+                cache: Vec::new(),
+            }),
+            run: self.run,
+            host: Host {
+                semaphore_address: self.host.semaphore_address,
+                semaphore_payload: self.host.semaphore_payload,
+                syncpoint_payload: self.host.syncpoint_payload,
+            },
+            engines: self.engines.save()?,
+            classes: self.classes,
+            last: self.last,
+        })
+    }
+
+    /// The channel `saved` describes, with `engines` made for it as for a
+    /// new channel and then given their saved state. It goes on from the
+    /// saved GP_GET and segment position; words it had fetched ahead are
+    /// fetched again.
+    pub fn restore(
+        saved: SavedContext,
+        mut engines: Box<dyn Engines>,
+    ) -> Result<Self, SnapshotError> {
+        let instance = saved.instance;
+        if !saved.gp_entries.is_power_of_two()
+            || saved.gp_get >= saved.gp_entries
+            || saved
+                .segment
+                .as_ref()
+                .is_some_and(|segment| segment.position > segment.length)
+        {
+            return Err(SnapshotError::Corrupt(format!(
+                "GPU channel instance {instance:#x}: position outside its ring or segment"
+            )));
+        }
+        engines.restore(&saved.engines)?;
+        Ok(Self {
+            instance,
+            space: saved.space,
+            userd: saved.userd,
+            gp_base: saved.gp_base,
+            gp_entries: saved.gp_entries,
+            gp_get: saved.gp_get,
+            segment: saved.segment,
+            run: saved.run,
+            host: saved.host,
+            engines,
+            classes: saved.classes,
+            last: saved.last,
+        })
     }
 
     fn gp_put(&self, bus: &dyn BusMemory) -> Result<u32, Unmodeled> {
@@ -619,7 +721,7 @@ fn fetch(
 }
 
 /// One CCSR entry.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Ccsr {
     /// `ccsr_channel_inst`: instance pointer bits 27:0 (address >> 12),
     /// target bits 29:28, bound bit 31.
@@ -675,7 +777,10 @@ const CONTEXT_VALID: u32 = 1 << 13;
 const RUNLIST_CHID: u32 = 0xFFF;
 const RUNLIST_TSG: u32 = 1 << 13;
 
-/// The host's registers and channels.
+/// The host's registers and channels. Machine snapshots save the
+/// registers, CCSR table and runlist here; the channel states separately
+/// ([`Context::save`]), and only while no channel is executing.
+#[derive(Serialize, Deserialize)]
 pub struct Fifo {
     pub channels: Vec<Ccsr>,
     /// Channel IDs of the last runlist submitted, in its order.
@@ -693,8 +798,10 @@ pub struct Fifo {
     preempt_pending: bool,
     runlist_preempt_pending: u32,
     /// The channel the worker is executing.
+    #[serde(skip)]
     pub executing: Option<usize>,
     /// Channel states by instance block address.
+    #[serde(skip)]
     pub contexts: HashMap<u64, Context>,
 }
 
@@ -731,6 +838,12 @@ impl Fifo {
             executing,
             ..Self::default()
         };
+    }
+
+    /// Whether restored registers describe this host: a full CCSR table
+    /// and a runlist of its channels.
+    pub fn fits(&self) -> bool {
+        self.channels.len() == CHANNELS && self.runlist.iter().all(|&chid| chid < CHANNELS)
     }
 
     /// `fifo_intr_0` as read: the runlist interrupt shows while any
@@ -1018,6 +1131,15 @@ mod tests {
 
         fn flush(&mut self, _memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
             self.0.lock().unwrap().push(FLUSH);
+            Ok(())
+        }
+
+        fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+            crate::snapshot::encode(&*self.0.lock().unwrap())
+        }
+
+        fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError> {
+            *self.0.lock().unwrap() = crate::snapshot::decode("recorder", state)?;
             Ok(())
         }
     }

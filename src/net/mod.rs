@@ -50,6 +50,23 @@
 //! All of this runs on one dedicated thread ("nat-router") that multiplexes
 //! the host sockets with `poll(2)`; [`Router::send`] only enqueues the frame
 //! and never blocks. Large UDP replies are fragmented to the 1500-byte MTU.
+//!
+//! **Machine snapshots.** The router is not part of the machine: it holds
+//! host sockets, which cannot be saved, and the machine's builder attaches
+//! a new one to the WiFi model's access point (the `uplink`) whenever it
+//! builds a machine, restored or not. Saving and restoring therefore leave
+//! it alone, and:
+//! * while the machine is paused (guest time standing still, as while a
+//!   snapshot is taken) the radio model drops what the router delivers;
+//!   the console sees a frame lost on the air and its peers retransmit;
+//! * a restored machine meets a router with no flows: every TCP connection
+//!   and UDP flow of the saved machine is gone, as after the link dropped
+//!   (the console's next segment on an old connection is answered with a
+//!   RST), and the console's MAC is learned again from its next frame;
+//! * the console keeps its address: the DHCP server keeps no lease state
+//!   (there is one lease, [`CONSOLE_IP`], for any client), so the lease the
+//!   console holds in its saved memory stays valid and its renewals are
+//!   acknowledged as before.
 
 mod dhcp;
 mod dns;

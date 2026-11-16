@@ -33,6 +33,8 @@
 //! FIFO the same way; this makes the result independent of how the
 //! pushbuffer splits a call's parameters.
 
+use serde::{Deserialize, Serialize};
+
 use super::Unmodeled;
 
 /// Entries of the start address RAM: macro `j` of `CALL_MME_MACRO(j)` is
@@ -63,7 +65,7 @@ pub trait MacroTarget {
 }
 
 /// One in-flight macro call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Call {
     macro_index: usize,
     pc: usize,
@@ -79,10 +81,13 @@ struct Call {
 }
 
 /// The channel's macro unit: instruction RAM, start addresses, and the call
-/// in progress.
+/// in progress. Saved whole in machine snapshots, a call waiting for its
+/// parameters included.
+#[derive(Serialize, Deserialize)]
 pub struct Mme {
     code: Vec<u32>,
     code_pointer: u32,
+    #[serde(with = "crate::snapshot::array")]
     start_addresses: [u32; MACRO_COUNT],
     start_pointer: u32,
     call: Option<Call>,
