@@ -47,6 +47,7 @@ pub mod medium;
 pub mod mipi_cal;
 pub mod mselect;
 pub mod ntag;
+pub mod nvdec;
 pub mod pcie;
 pub mod pcie_endpoint;
 pub mod pg_up;
@@ -519,14 +520,33 @@ impl Soc {
             falcon_host::SIZE,
             Box::new(Arc::clone(&vic)),
         );
+        let nvdec = Arc::new(falcon_host::HostFalcon::new(
+            DeviceMemory::new(&mc, ram, mc::SMMU_NVDEC_ASID),
+            nvdec::Nvdec::new(
+                DeviceMemory::new(&mc, ram, mc::SMMU_NVDEC_ASID),
+                Arc::clone(&syncpoints),
+                Arc::clone(&notes),
+            ),
+            Arc::clone(&notes),
+        ));
+        bus.map(
+            "NVDEC",
+            falcon_host::NVDEC_BASE,
+            falcon_host::SIZE,
+            Box::new(Arc::clone(&nvdec)),
+        );
         let channels: Vec<Arc<host1x_channel::Channel>> = (0..7)
             .map(|index| {
-                let vic = Arc::clone(&vic);
+                let (vic, nvdec) = (Arc::clone(&vic), Arc::clone(&nvdec));
                 let channel = Arc::new(host1x_channel::Channel::new(
                     DeviceMemory::new(&mc, ram, mc::SMMU_HOST1X_ASID),
                     Arc::clone(&syncpoints),
                     Arc::clone(clock),
-                    Arc::new(move |class, offset, value| vic.method(class, offset, value)),
+                    // The VIC refuses any class but its own.
+                    Arc::new(move |class, offset, value| match class {
+                        nvdec::CLASS => nvdec.method(class, offset, value),
+                        _ => vic.method(class, offset, value),
+                    }),
                     Arc::clone(&notes),
                 ));
                 bus.map(
