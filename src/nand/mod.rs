@@ -68,10 +68,19 @@ const SECTOR_SIZE: u64 = 512;
 pub const USER_AREA_SIZE: u64 = 0x7_47C0_0000;
 const SECTORS: u64 = USER_AREA_SIZE / SECTOR_SIZE;
 
-const ENTRY_COUNT: u32 = 128;
+/// Entries the table declares: exactly the partitions. \[inference\] A
+/// console's table counts no unused entries: the NX bootloader's check of
+/// the table (`0x40000ABC`, text offset 0x8BC of firmware 23.5.0's)
+/// walks every one of `NumberOfPartitionEntries`, wants each to start
+/// after the previous one's end (the first after `FirstUsableLBA - 1`) and
+/// to end after it starts, and `LastUsableLBA` at or past the last one's
+/// end, so an all-zero entry fails it (panic `0xF0A00034`).
+const ENTRY_COUNT: u32 = PARTITIONS.len() as u32;
 const ENTRY_SIZE: u32 = 128;
-/// Sectors of the partition entry array.
-const ENTRY_SECTORS: u64 = (ENTRY_COUNT * ENTRY_SIZE) as u64 / SECTOR_SIZE;
+/// Sectors kept for each copy of the entry array: the 16 KiB the UEFI
+/// specification reserves at least, which puts the first partition at
+/// sector 34 as on a console.
+const ENTRY_SECTORS: u64 = 0x4000 / SECTOR_SIZE;
 const HEADER_SIZE: u32 = 92;
 /// First sector after the protective MBR, the header and the entries.
 const FIRST_USABLE: u64 = 2 + ENTRY_SECTORS;
@@ -284,10 +293,12 @@ fn protective_mbr() -> Vec<u8> {
 }
 
 /// Everything the table consists of: first sector and contents of each
-/// piece.
+/// piece. Each entry array fills its reserved sectors, zero past the
+/// entries the headers count and check.
 fn layout() -> [(u64, Vec<u8>); 5] {
-    let entries = entries();
+    let mut entries = entries();
     let crc = crc32(&entries);
+    entries.resize((ENTRY_SECTORS * SECTOR_SIZE) as usize, 0);
     let (last, backup_entries) = (SECTORS - 1, SECTORS - 1 - ENTRY_SECTORS);
     [
         (0, protective_mbr()),
@@ -306,6 +317,33 @@ pub fn format_user_area(image: &File) -> io::Result<()> {
         image.write_all_at(&data, sector * SECTOR_SIZE)?;
     }
     Ok(())
+}
+
+/// Writes the partition table of [`format_user_area`] over that of the
+/// partitioned `image` (the MBR, both headers and both entry arrays) and
+/// nothing else, so the partitions keep their contents. Images formatted
+/// before the table counted eleven entries had 128, the unused ones zero,
+/// which the NX bootloader refuses; their entries were the same. Whether
+/// anything changed.
+pub fn rewrite_partition_table(image: &File) -> Result<bool, NandError> {
+    check_partitioned(image)?;
+    if image.metadata().map_err(NandError::Image)?.len() != USER_AREA_SIZE {
+        return Err(NandError::NotPartitioned);
+    }
+    let mut changed = false;
+    for (sector, data) in layout() {
+        let mut found = vec![0; data.len()];
+        image
+            .read_exact_at(&mut found, sector * SECTOR_SIZE)
+            .map_err(NandError::Image)?;
+        if found != data {
+            image
+                .write_all_at(&data, sector * SECTOR_SIZE)
+                .map_err(NandError::Image)?;
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 /// Bytes of the partition `name` within the user area.
@@ -514,7 +552,9 @@ impl Sectors for EncryptedPartition<'_> {
     }
 }
 
-/// That `image` has the partitions this module assumes.
+/// That `image` has the partitions this module assumes: the entries
+/// [`format_user_area`] writes at sector 2, whichever entry count its
+/// headers give.
 fn check_partitioned(image: &File) -> Result<(), NandError> {
     let expected = entries();
     let mut found = vec![0; expected.len()];
@@ -763,6 +803,51 @@ mod tests {
         u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
     }
 
+    fn u32_at(data: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+    }
+
+    /// The NX bootloader's check of a table (see [`ENTRY_COUNT`]), given
+    /// the header sector and the entry array it points at.
+    fn bootloader_accepts(header: &[u8], array: &[u8]) -> bool {
+        let (first_usable, last_usable) = (u64_at(header, 40), u64_at(header, 48));
+        let (count, size) = (u32_at(header, 80) as usize, u32_at(header, 84) as usize);
+        let mut previous_last = first_usable - 1;
+        for index in 0..count {
+            let Some(entry) = array.get(index * size..(index + 1) * size) else {
+                return false;
+            };
+            let (first, last) = (u64_at(entry, 32), u64_at(entry, 40));
+            if first >= last || first <= previous_last {
+                return false;
+            }
+            previous_last = last;
+        }
+        last_usable >= previous_last
+    }
+
+    /// The header of images formatted before: 128 entries counted, the
+    /// entry CRC over all of them.
+    fn old_header(header: &[u8], array: &[u8]) -> Vec<u8> {
+        let mut old = header.to_vec();
+        old[80..84].copy_from_slice(&128u32.to_le_bytes());
+        old[88..92].copy_from_slice(&crc32(&array[..128 * 128]).to_le_bytes());
+        old[16..20].fill(0);
+        let crc = crc32(&old[..HEADER_SIZE as usize]);
+        old[16..20].copy_from_slice(&crc.to_le_bytes());
+        old
+    }
+
+    #[test]
+    fn the_bootloader_accepts_the_table_and_refuses_the_old_one() {
+        let [_, (_, primary), (_, array), (_, backup_array), (_, backup)] = layout();
+        assert_eq!(u32_at(&primary, 80), 11);
+        assert!(bootloader_accepts(&primary, &array));
+        assert!(bootloader_accepts(&backup, &backup_array));
+        assert!(!bootloader_accepts(&old_header(&primary, &array), &array));
+        assert!(!bootloader_accepts(&old_header(&backup, &array), &array));
+    }
+
     #[test]
     fn checksums_and_cross_references_of_both_tables_hold() {
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
@@ -774,6 +859,9 @@ mod tests {
             (last, backup),
         ] = layout();
         assert_eq!(entries, backup_entries);
+        assert_eq!(entries.len() as u64, ENTRY_SECTORS * SECTOR_SIZE);
+        let counted = &entries[..(ENTRY_COUNT * ENTRY_SIZE) as usize];
+        assert_eq!(counted.len(), 11 * 128);
         for (header, own, other, entries_at) in [
             (&primary, 1, last, 2),
             (&backup, last, 1, backup_entries_at),
@@ -781,11 +869,12 @@ mod tests {
             let mut unsigned = header[..HEADER_SIZE as usize].to_vec();
             unsigned[16..20].fill(0);
             assert_eq!(header[16..20], crc32(&unsigned).to_le_bytes());
-            assert_eq!(header[88..92], crc32(&entries).to_le_bytes());
+            assert_eq!(header[88..92], crc32(counted).to_le_bytes());
             assert_eq!(
                 (u64_at(header, 24), u64_at(header, 32), u64_at(header, 72)),
                 (own, other, entries_at)
             );
+            assert_eq!((u64_at(header, 40), u64_at(header, 48)), (34, SECTORS - 34));
         }
         assert!(backup_entries_at > LAST_USABLE);
     }
@@ -808,7 +897,10 @@ mod tests {
             entries[10 * 128 + 56..10 * 128 + 66],
             [b'U', 0, b'S', 0, b'E', 0, b'R', 0, 0, 0]
         );
-        assert_eq!(entries[11 * 128..12 * 128], [0; 128], "eleven entries");
+        assert!(
+            entries[11 * 128..].iter().all(|&byte| byte == 0),
+            "eleven entries"
+        );
         assert_eq!(partition_range("SYSTEM"), Some(0x780_0000..0xA780_0000));
         assert_eq!(partition_range("system"), None);
     }
@@ -821,6 +913,55 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn an_old_table_is_rewritten_in_place_and_the_partitions_keep_their_contents() {
+        let scratch = Scratch(
+            std::env::temp_dir().join(format!("horizon-emu-gpt-test-{}", std::process::id())),
+        );
+        std::fs::create_dir_all(&scratch.0).unwrap();
+        let image = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(scratch.0.join("emmc.img"))
+            .unwrap();
+        assert!(matches!(
+            rewrite_partition_table(&image),
+            Err(NandError::NotPartitioned)
+        ));
+        format_user_area(&image).unwrap();
+        let [_, (_, primary), (_, array), (backup_at, _), (last, backup)] = layout();
+        // As images were formatted before.
+        image
+            .write_all_at(&old_header(&primary, &array), SECTOR_SIZE)
+            .unwrap();
+        image
+            .write_all_at(&old_header(&backup, &array), last * SECTOR_SIZE)
+            .unwrap();
+        let package2_at = partition_range("BCPKG2-1-Normal-Main").unwrap().start;
+        image.write_all_at(b"package2", package2_at).unwrap();
+        let prodinfo_at = partition_range("PRODINFO").unwrap().start;
+        image.write_all_at(b"CAL0", prodinfo_at).unwrap();
+
+        assert!(rewrite_partition_table(&image).unwrap());
+        let read = |offset: u64, size: usize| {
+            let mut bytes = vec![0; size];
+            image.read_exact_at(&mut bytes, offset).unwrap();
+            bytes
+        };
+        assert_eq!(read(SECTOR_SIZE, 512), primary);
+        assert_eq!(read(last * SECTOR_SIZE, 512), backup);
+        assert_eq!(read(backup_at * SECTOR_SIZE, array.len()), array);
+        assert_eq!(read(package2_at, 8), b"package2");
+        assert_eq!(read(prodinfo_at, 4), b"CAL0");
+        assert!(bootloader_accepts(
+            &read(SECTOR_SIZE, 512),
+            &read(2 * SECTOR_SIZE, array.len())
+        ));
+        assert!(!rewrite_partition_table(&image).unwrap());
+        check_partitioned(&image).unwrap();
     }
 
     #[test]
