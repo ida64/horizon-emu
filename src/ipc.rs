@@ -552,6 +552,8 @@ pub struct Tracker {
     sessions: HashMap<usize, Session>,
     next_session: usize,
     pending: HashMap<Client, Pending>,
+    /// The process that registered each service with sm.
+    servers: HashMap<String, u64>,
 }
 
 impl Tracker {
@@ -622,6 +624,29 @@ impl Tracker {
                 Some(self.reply(client.process, sent, result, data, contents))
             }
             _ => None,
+        }
+    }
+
+    /// What the request `client` waits for an answer to goes to and asks,
+    /// as its trace line named them (`sm: tipc request 1 "clkrst"`), and
+    /// the process that registered the service it is a session of, if the
+    /// tracker saw that. `None` when the thread has no request outstanding.
+    pub fn outstanding(&self, client: Client) -> Option<(String, Option<u64>)> {
+        match self.pending.get(&client)? {
+            Pending::Connect(name) => Some((format!("port {name:?}"), None)),
+            Pending::Request(sent) => {
+                let mut words = sent.target.clone();
+                if let Some((protocol, action)) = sent.request {
+                    let _ = write!(words, " {protocol} {action}");
+                }
+                if let Some(service) = &sent.service {
+                    let _ = write!(words, " {service:?}");
+                }
+                // Names derived from a command's answer start with the
+                // service's: `fsp-srv#52#8`, `lm@3`.
+                let service = sent.target.split(['#', '@']).next().unwrap_or_default();
+                Some((words, self.servers.get(service).copied()))
+            }
         }
     }
 
@@ -826,6 +851,12 @@ impl Tracker {
                     self.name(process, handle, service.clone());
                     moved[0] = Some(service.clone());
                     return;
+                }
+                if command == SM_REGISTER_SERVICE
+                    && self.is_sm(sent.session)
+                    && let Some(service) = &sent.service
+                {
+                    self.servers.insert(service.clone(), process);
                 }
                 // What sm returns for its other commands is not a session.
                 if self.is_sm(sent.session) {
@@ -1336,6 +1367,45 @@ mod tests {
             reply.unwrap(),
             "<- fsp-srv cmif request 1 not answered, the call failed with 2001-0114"
         );
+    }
+
+    #[test]
+    fn outstanding_request_names_its_service_and_the_process_that_registered_it() {
+        let mut tracker = Tracker::default();
+        // The server registers fsp-srv with sm.
+        let server = Client {
+            process: 9,
+            thread: 0x2000,
+        };
+        let port = [0, 0x2000, 0, 0, 0, 0, 0, 0];
+        tracker.call(server, svc::CONNECT_TO_NAMED_PORT, &port, b"sm:\0", &[]);
+        let connected = [0, 0x9001, 0, 0, 0, 0, 0, 0];
+        tracker.returned(server, svc::CONNECT_TO_NAMED_PORT, &connected, &[], &[]);
+        let register = bytes(&[0x12, 4, FSP_SRV[0], FSP_SRV[1], 0x3B, 0]);
+        let arguments = [0x9001, 0, 0, 0, 0, 0, 0, 0];
+        tracker.call(server, svc::SEND_SYNC_REQUEST, &arguments, &register, &[]);
+        let registered = bytes(&[0x12, 0x8000_0001, 1 << 5, 0x9002, 0]);
+        tracker.returned(server, svc::SEND_SYNC_REQUEST, &[0; 8], &registered, &[]);
+
+        // A client waits for sm to name a service sm does not have yet.
+        look_up(&mut tracker, 0x8001, FSP_SRV, 0x8002);
+        let lookup = bytes(&[0x11, 2, 0x726B_6C63, 0x7473]);
+        let arguments = [0x8001, 0, 0, 0, 0, 0, 0, 0];
+        tracker.call(CLIENT, svc::SEND_SYNC_REQUEST, &arguments, &lookup, &[]);
+        assert_eq!(
+            tracker.outstanding(CLIENT),
+            Some(("sm: tipc request 1 \"clkrst\"".into(), None))
+        );
+
+        // Then for an answer from the server.
+        let request = bytes(&[4, 6, 0, 0, SFCI, 1, 18, 0]);
+        let arguments = [0x8002, 0, 0, 0, 0, 0, 0, 0];
+        tracker.call(CLIENT, svc::SEND_SYNC_REQUEST, &arguments, &request, &[]);
+        assert_eq!(
+            tracker.outstanding(CLIENT),
+            Some(("fsp-srv cmif request 18".into(), Some(server.process)))
+        );
+        assert_eq!(tracker.outstanding(server), None);
     }
 
     #[test]
