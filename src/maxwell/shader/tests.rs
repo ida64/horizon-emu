@@ -329,7 +329,7 @@ fn real_ui2d_vertex_and_fragment() {
     input.0[0x80 / 4] = 0.25f32.to_bits();
     input.0[0x84 / 4] = 0.5f32.to_bits();
     let mut output = Attributes::default();
-    vs.run_vertex(&env, &input, &mut output).unwrap();
+    vs.run_vertex(&env, &input, 0, &mut output).unwrap();
     assert_eq!(f32::from_bits(output.0[0x7c / 4]), 1.0);
     let color = [1f32.to_le_bytes(); 4].concat();
     env.const_buffers[3] = ConstantBuffer::whole(&color);
@@ -611,4 +611,41 @@ fn geometry_handles_emit_and_cut() {
     );
     let err = p.run_geometry(&env, &refs, &mut Vec::new()).unwrap_err();
     assert!(err.0.contains("ISBE entry 3"), "{}", err.0);
+}
+
+/// An executed `ALD` of an inactive vertex attribute refuses; one the
+/// program does not execute (here predicated on `!PT`), or of another
+/// attribute, reads the inputs.
+#[test]
+fn vertex_reads_of_inactive_attributes_refuse_when_executed() {
+    let mut header = [0; 0x50];
+    header[..4].copy_from_slice(&0x0401u32.to_le_bytes());
+    const EXIT: u64 = 0xe30000000007000f;
+    const NEVER: u64 = 8 << 16;
+    let mut input = Attributes::default();
+    input.0[0xa0 / 4] = 42;
+    input.0[0x9c / 4] = 7;
+    let t = Textures::default();
+    let env = environment(&t);
+    let run = |words: &[u64], inactive: u32| {
+        let mut output = Attributes::default();
+        with_header(&header, words)
+            .run_vertex(&env, &input, inactive, &mut output)
+            .map(|()| output)
+    };
+    let store = ast(0, 0x80, 0xff);
+    let err = run(&[ald(0, 0xa0, 0xff), store, EXIT], 1 << 2).unwrap_err();
+    assert!(
+        err.0.contains("vertex attribute 2, which is inactive"),
+        "{}",
+        err.0
+    );
+    // Two words from 0x9c: the second is attribute 2's first.
+    let pair = ald(0, 0x9c, 0xff) | (1 << 47);
+    assert!(run(&[pair, store, EXIT], 1 << 2).is_err());
+    let output = run(&[ald(0, 0xa0, 0xff), store, EXIT], 1 << 3).unwrap();
+    assert_eq!(output.0[0x80 / 4], 42);
+    let output = run(&[ald(0, 0x9c, 0xff), store, EXIT], 1 << 2).unwrap();
+    assert_eq!(output.0[0x80 / 4], 7);
+    run(&[ald(0, 0xa0, 0xff) | NEVER, EXIT], 1 << 2).unwrap();
 }

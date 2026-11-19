@@ -11,6 +11,10 @@
 //! `INVALIDATE_TEXTURE_HEADER_CACHE`, ...) therefore have no counterpart
 //! here, and their invalidation methods have no effect.
 //!
+//! Both caches are bounded ([`PROGRAM_BUDGET`], [`TEXTURE_BUDGET`]):
+//! beyond its budget a cache drops the entries used least recently
+//! (`maxwell::lru`), which are decoded again when next used.
+//!
 //! # The staleness an epoch allows
 //!
 //! Within an epoch, a write to a validated texture by anything but the
@@ -28,6 +32,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use super::lru::Lru;
 use super::sampling::{FetchRequest, GatherRequest, Query, SampleRequest, Target, TextureUnit};
 use super::shader::Program;
 use super::texture::{Texture, Tic, Tsc};
@@ -141,13 +146,39 @@ fn read(memory: &dyn GpuMemory, address: u64, length: usize) -> Result<Vec<u8>, 
     Ok(bytes)
 }
 
-/// Decoded shader programs by address.
-#[derive(Default)]
+/// Host memory the decoded programs of one channel may take, with the
+/// bytes they were decoded from \[assumption: sized so that every
+/// program a session uses at once stays (a program is at most 64 KiB of
+/// code, `shader::MAX_PROGRAM`, decoded to a few times that); a dropped
+/// program is decoded again when drawn with\].
+pub const PROGRAM_BUDGET: usize = 64 << 20;
+
+/// Host memory the decoded textures of one channel may take, with the
+/// bytes they were decoded from \[assumption: decoded texels are four
+/// `f32` each, so a 1280x720 texture takes 14 MiB; this holds a few
+/// dozen screen-sized images, more than a frame of the HOME menu or the
+/// browser samples; a dropped texture is decoded again when sampled\].
+pub const TEXTURE_BUDGET: usize = 512 << 20;
+
+/// Decoded shader programs by address, the least recently used dropped
+/// beyond [`PROGRAM_BUDGET`].
 pub struct ProgramCache {
-    entries: HashMap<u64, (Vec<u8>, Arc<Program>)>,
+    entries: Lru<u64, (Vec<u8>, Arc<Program>)>,
+}
+
+impl Default for ProgramCache {
+    fn default() -> Self {
+        Self::with_budget(PROGRAM_BUDGET)
+    }
 }
 
 impl ProgramCache {
+    pub fn with_budget(budget: usize) -> Self {
+        ProgramCache {
+            entries: Lru::new(budget),
+        }
+    }
+
     /// The program whose header is at `address`, as memory holds it now.
     pub fn get(&mut self, memory: &dyn GpuMemory, address: u64) -> Result<Arc<Program>, Unmodeled> {
         if let Some((raw, program)) = self.entries.get(&address)
@@ -158,8 +189,14 @@ impl ProgramCache {
         let program = Program::decode(memory, address)?;
         let raw = read(memory, address, program.len())?;
         let program = Arc::new(program);
-        self.entries.insert(address, (raw, program.clone()));
+        let cost = raw.len() + program.bytes();
+        self.entries.insert(address, (raw, program.clone()), cost);
         Ok(program)
+    }
+
+    /// Programs held, and the host memory they take.
+    pub fn usage(&self) -> (usize, usize) {
+        (self.entries.len(), self.entries.cost())
     }
 }
 
@@ -167,10 +204,32 @@ impl ProgramCache {
 /// last compared equal to memory.
 type CachedTexture = (Vec<u8>, Arc<Texture>, Stamp);
 
-/// Decoded textures by TIC contents, kept across draws.
-#[derive(Default)]
+/// Decoded textures by TIC contents, kept across draws; the least
+/// recently used are dropped beyond [`TEXTURE_BUDGET`]. A draw keeps the
+/// textures it resolved ([`DrawTextures`]), so none is dropped while in
+/// use.
 pub struct TextureCache {
-    entries: Mutex<HashMap<[u32; 8], CachedTexture>>,
+    entries: Mutex<Lru<[u32; 8], CachedTexture>>,
+}
+
+impl Default for TextureCache {
+    fn default() -> Self {
+        Self::with_budget(TEXTURE_BUDGET)
+    }
+}
+
+impl TextureCache {
+    pub fn with_budget(budget: usize) -> Self {
+        TextureCache {
+            entries: Mutex::new(Lru::new(budget)),
+        }
+    }
+
+    /// Textures held, and the host memory they take.
+    pub fn usage(&self) -> (usize, usize) {
+        let entries = self.entries.lock().unwrap();
+        (entries.len(), entries.cost())
+    }
 }
 
 /// Where a draw's texture handles point.
@@ -255,11 +314,13 @@ impl<'a> DrawTextures<'a> {
                     _ => {
                         drop(entries);
                         let texture = Arc::new(Texture::decode(self.memory, &tic)?);
-                        self.cache
-                            .entries
-                            .lock()
-                            .unwrap()
-                            .insert(words, (raw, texture.clone(), self.writes.stamp()));
+                        let cost = raw.len() + texture.bytes();
+                        // Dropped textures are freed outside the lock.
+                        let _dropped = self.cache.entries.lock().unwrap().insert(
+                            words,
+                            (raw, texture.clone(), self.writes.stamp()),
+                            cost,
+                        );
                         texture
                     }
                 }
@@ -364,5 +425,128 @@ impl TextureUnit for ThreadTextures<'_> {
         self.with(handle, |texture, sampler| {
             texture.lod(sampler, target, ddx, ddy)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{DrawTextures, Pools, ProgramCache, TextureCache, Writes};
+    use crate::maxwell::tests::Ram;
+
+    /// A pixel program at `address` whose one instruction moves `value`
+    /// into R0 (layout as in `shader::tests`), then the end group.
+    fn put_program(ram: &Ram, address: u64, value: u32) {
+        let mut bytes = vec![0; 0x50];
+        bytes[..4].copy_from_slice(&0x1402u32.to_le_bytes());
+        bytes[0x48] = 15;
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let mov = 0x010000000007f000u64 | (u64::from(value) << 20);
+        for word in [mov, 0x50b0000000070f00, 0x50b0000000070f00] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0; 32]);
+        ram.put(address, &bytes);
+    }
+
+    #[test]
+    fn program_cache_drops_least_recently_used_and_decodes_again() {
+        let ram = Ram::new(0x10000);
+        for i in 0..8u32 {
+            put_program(&ram, u64::from(i) * 0x1000, i + 1);
+        }
+        let mut sizing = ProgramCache::default();
+        sizing.get(&ram, 0).unwrap();
+        let one = sizing.usage().1;
+        // Room for four programs.
+        let mut cache = ProgramCache::with_budget(4 * one);
+        let mut held = Vec::new();
+        for i in 0..8u64 {
+            held.push(cache.get(&ram, i * 0x1000).unwrap());
+            let (count, cost) = cache.usage();
+            assert!(
+                cost <= 4 * one && count <= 4,
+                "{count} programs, {cost} bytes"
+            );
+        }
+        // The most recent stays and is the same program.
+        assert!(Arc::ptr_eq(&cache.get(&ram, 7 * 0x1000).unwrap(), &held[7]));
+        // The first was dropped: decoded again, equal in content.
+        let again = cache.get(&ram, 0).unwrap();
+        assert!(!Arc::ptr_eq(&again, &held[0]));
+        assert_eq!(
+            again.mnemonics().collect::<Vec<_>>(),
+            held[0].mnemonics().collect::<Vec<_>>()
+        );
+    }
+
+    /// A 2x2 A8B8G8R8 block-linear TIC (as in `texture::tests`) at
+    /// `address`.
+    fn tic(address: u32) -> [u32; 8] {
+        [
+            8 | (2 << 7)
+                | (2 << 10)
+                | (2 << 13)
+                | (2 << 16)
+                | (2 << 19)
+                | (3 << 22)
+                | (4 << 25)
+                | (5 << 28),
+            address,
+            3 << 21,
+            0,
+            1 | (1 << 23) | (7 << 29),
+            1 | (1 << 31),
+            0,
+            0,
+        ]
+    }
+
+    #[test]
+    fn texture_cache_stays_within_budget_and_redecodes() {
+        const HEADERS: u64 = 0;
+        const SAMPLERS: u64 = 0x800;
+        let ram = Ram::new(0x20000);
+        let sampler: [u32; 3] = [2 | (2 << 3) | (2 << 6), 2 | (2 << 4) | (1 << 6), 15 << 20];
+        for (i, word) in sampler.iter().enumerate() {
+            ram.put(SAMPLERS + i as u64 * 4, &word.to_le_bytes());
+        }
+        for i in 0..8u32 {
+            let address = 0x10000 + i * 0x1000;
+            for (k, word) in tic(address).iter().enumerate() {
+                ram.put(
+                    HEADERS + u64::from(i) * 32 + k as u64 * 4,
+                    &word.to_le_bytes(),
+                );
+            }
+            ram.put(u64::from(address), &[i as u8 * 30; 512]);
+        }
+        let pools = Pools {
+            header_pool: HEADERS,
+            header_maximum: 7,
+            sampler_pool: SAMPLERS,
+            sampler_maximum: 0,
+            sampler_from_header: false,
+        };
+        let writes = Writes::default();
+        let sizing = TextureCache::default();
+        DrawTextures::new(&ram, pools, &sizing, &writes)
+            .resolve(0)
+            .unwrap();
+        let one = sizing.usage().1;
+        let cache = TextureCache::with_budget(3 * one);
+        // One draw per texture, then the first again.
+        for i in (0..8u32).chain([0]) {
+            let draw = DrawTextures::new(&ram, pools, &cache, &writes);
+            let (texture, _) = draw.resolve(i).unwrap();
+            let value = f32::from(i as u8 * 30) / 255.;
+            assert_eq!(texture.level(0).unwrap().3[0], [value; 4], "texture {i}");
+            let (count, cost) = cache.usage();
+            assert!(
+                cost <= 3 * one && count <= 3,
+                "{count} textures, {cost} bytes"
+            );
+        }
     }
 }

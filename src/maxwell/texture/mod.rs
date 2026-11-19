@@ -326,6 +326,14 @@ impl Texture {
             .map(|m| (m.width, m.height, m.depth, m.texels.as_slice()))
     }
 
+    /// Host memory the decoded texels take.
+    pub fn bytes(&self) -> usize {
+        self.levels
+            .iter()
+            .map(|m| std::mem::size_of_val(m.texels.as_slice()))
+            .sum()
+    }
+
     /// The level-of-detail range sampling may select, as the interpreter
     /// clamps it (`clamp_lod`): (minimum, maximum) relative to the base
     /// level.

@@ -211,6 +211,9 @@ impl Lane {
 enum Io<'a> {
     Vertex {
         input: &'a Attributes,
+        /// Bit `a`: generic attribute `a` (words at 0x80 + 0x10 * a) has
+        /// no value this model establishes; `ALD` of it refuses.
+        inactive: u32,
         output: &'a mut Attributes,
     },
     Geometry(Geometry<'a>),
@@ -250,6 +253,7 @@ pub(super) fn run_vertex(
     program: &Program,
     env: &Env<'_>,
     input: &Attributes,
+    inactive: u32,
     output: &mut Attributes,
 ) -> Result<(), Unmodeled> {
     if program.header.shader_type() != ShaderType::Vertex {
@@ -262,7 +266,11 @@ pub(super) fn run_vertex(
         program,
         env,
         lanes: [Lane::new()],
-        io: Io::Vertex { input, output },
+        io: Io::Vertex {
+            input,
+            inactive,
+            output,
+        },
         op: Op::Invalid,
         word: 0,
         pc: 0,
@@ -976,7 +984,10 @@ impl<'a, const L: usize> Machine<'a, L> {
     /// bit 31, `O` (read outputs) bit 32, vertex register 39-46, size
     /// 47-48 (1-4 words) [public: eden
     /// `translate/impl/load_store_attribute.cpp` `ALD`]. In a geometry
-    /// program the vertex register holds an input vertex handle.
+    /// program the vertex register holds an input vertex handle. An
+    /// executed read of an inactive vertex attribute refuses (see
+    /// `pipeline::VertexFetch`); a program that only names one in its
+    /// header, on a path the draw does not take, runs.
     fn ald(&mut self, active: u8) -> Result<(), Unmodeled> {
         let w = self.word;
         self.require(!bit(w, 31), "P (patch)")?;
@@ -991,9 +1002,28 @@ impl<'a, const L: usize> Machine<'a, L> {
         let outputs = bit(w, 32);
         self.each(active, |m, lane| {
             let source = match &m.io {
-                Io::Vertex { input, output } => {
+                Io::Vertex {
+                    input,
+                    inactive,
+                    output,
+                } => {
                     m.require(vertex == RZ, "vertex register outside a geometry program")?;
-                    if outputs { &output.0 } else { &input.0 }
+                    if outputs {
+                        &output.0
+                    } else {
+                        // Generic attribute a: words 0x20 + 4a .. 0x24 + 4a.
+                        let (first, last) = (offset / 4, offset / 4 + count - 1);
+                        if let Some(a) = (0..32u32).find(|a| {
+                            inactive & (1 << a) != 0 && first < 0x24 + 4 * a && 0x20 + 4 * a <= last
+                        }) {
+                            return m.fail(&format!(
+                                "of vertex attribute {a}, which is inactive \
+                                 (SET_VERTEX_ATTRIBUTE_A SOURCE INACTIVE): the value the \
+                                 hardware supplies for it is not established"
+                            ));
+                        }
+                        &input.0
+                    }
                 }
                 Io::Geometry(geometry) => {
                     m.require(!outputs, "O (disallowed in a geometry program)")?;

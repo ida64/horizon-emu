@@ -511,7 +511,8 @@ fn env<'a>(
 }
 
 /// Vertex attribute formats (`SET_VERTEX_ATTRIBUTE_A` `COMPONENT_BIT_WIDTHS`):
-/// component sizes in bits, in memory order.
+/// component sizes in bits, in memory order: component 0 in the lowest
+/// bits of the little-endian attribute.
 fn component_widths(code: u32) -> Option<&'static [u32]> {
     Some(match code {
         0x01 => &[32, 32, 32, 32],
@@ -528,6 +529,12 @@ fn component_widths(code: u32) -> Option<&'static [u32]> {
         0x18 | 0x32 => &[8, 8],
         0x1B => &[16],
         0x1D => &[8],
+        // A2B10G10R10: one little-endian word, R in bits 9:0, G 19:10, B
+        // 29:20, A 31:30, named most significant first as A8B8G8R8 is
+        // [public: open-gpu-doc `clb197.h`; the OpenGL
+        // `GL_INT_2_10_10_10_REV` / Direct3D `DXGI_FORMAT_R10G10B10A2`
+        // packing it serves]. The Settings Mii editor fetches SNORM ones.
+        0x30 => &[10, 10, 10, 2],
         _ => return None,
     })
 }
@@ -543,13 +550,14 @@ fn fetch_attribute(raw: u32, bytes: &[u8]) -> Result<[u32; 4], Unmodeled> {
     // Missing components read as (0, 0, 0, 1).
     let one = if integer { 1 } else { 1.0f32.to_bits() };
     let mut out = [0, 0, 0, one];
-    let mut offset = 0;
+    let mut packed = [0u8; 16];
+    let length = bytes.len().min(16);
+    packed[..length].copy_from_slice(&bytes[..length]);
+    let packed = u128::from_le_bytes(packed);
+    let mut shift = 0;
     for (component, &width) in widths.iter().enumerate() {
-        let size = (width / 8) as usize;
-        let mut word = [0u8; 4];
-        word[..size].copy_from_slice(&bytes[offset..offset + size]);
-        offset += size;
-        let value = u32::from_le_bytes(word);
+        let value = ((packed >> shift) as u32) & (u32::MAX >> (32 - width));
+        shift += width;
         let signed = |value: u32| ((value << (32 - width)) as i32) >> (32 - width);
         let max_signed = ((1u64 << (width - 1)) - 1) as f32;
         let max_unsigned = ((1u64 << width) - 1) as f64;
@@ -601,10 +609,28 @@ pub fn f16_to_f32(half: u16) -> f32 {
 }
 
 /// Vertex fetch: what the vertex shader's inputs are made of.
+///
+/// An attribute whose `SET_VERTEX_ATTRIBUTE_A` SOURCE is INACTIVE is not
+/// fetched: the hardware supplies a constant for it, the per-attribute
+/// value of the immediate-mode methods (envytools `gf100_3d.xml`:
+/// `VERTEX_ATTRIB_FORMAT` bit 6 `CONST`, values from `VTX_ATTR_DEFINE`
+/// 0x114c / `VTX_ATTR_DATA` 0x1150). NVN writes neither \[inference: the
+/// Settings Mii editor's channel never calls them, nor does its
+/// method-init list set them, in a capture of the session\], and what
+/// they hold then is not established. So such an attribute is marked
+/// ([`VertexFetch::inactive`]) and only a read the vertex program
+/// executes refuses. NVN marks every attribute its vertex state leaves
+/// unused inactive (`0x3a400040`, R32 float), and uber-shaders name
+/// attributes in their header (`vtg_input_used`) that branches on
+/// constant buffer values skip: the Mii editor's vertex program reads
+/// attribute 2 (a skinning index) only when its constant buffer asks for
+/// skinning.
 struct VertexFetch {
-    /// (attribute, raw `SET_VERTEX_ATTRIBUTE_A`, stream) for each input the
-    /// shader reads.
+    /// (attribute, raw `SET_VERTEX_ATTRIBUTE_A`, stream) for each active
+    /// input the shader names.
     attributes: Vec<(usize, u32, usize)>,
+    /// Bit `a`: the shader names attribute `a`, which is inactive.
+    inactive: u32,
     streams: Vec<Stream>,
 }
 
@@ -620,6 +646,7 @@ struct Stream {
 impl VertexFetch {
     fn new(r: Registers<'_>, vertex: &Program) -> Result<VertexFetch, Unmodeled> {
         let mut attributes = Vec::new();
+        let mut inactive = 0;
         for attribute in 0..32 {
             let word = 0x80 / 4 + attribute * 4;
             if !(0..4).any(|c| vertex.header().vtg_input_used(word + c)) {
@@ -627,13 +654,8 @@ impl VertexFetch {
             }
             let raw = r.get(SET_VERTEX_ATTRIBUTE_A + attribute as u32 * 4);
             if raw & (1 << 6) != 0 {
-                // SOURCE INACTIVE: the default value applies, which this
-                // model does not establish.
-                return Err(refuse(
-                    "inactive vertex attribute read by the shader",
-                    SET_VERTEX_ATTRIBUTE_A + attribute as u32 * 4,
-                    raw,
-                ));
+                inactive |= 1 << attribute;
+                continue;
             }
             attributes.push((attribute, raw, (raw & 0x1F) as usize));
         }
@@ -659,6 +681,7 @@ impl VertexFetch {
         }
         Ok(VertexFetch {
             attributes,
+            inactive,
             streams,
         })
     }
@@ -876,7 +899,7 @@ pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result
         inputs.0[0x2F8 / 4] = batch.instance;
         inputs.0[0x2FC / 4] = id;
         let mut outputs = Attributes([0; 256]);
-        vertex.run_vertex(&vertex_env, &inputs, &mut outputs)?;
+        vertex.run_vertex(&vertex_env, &inputs, fetch.inactive, &mut outputs)?;
         let clip = std::array::from_fn(|i| f32::from_bits(outputs.0[0x70 / 4 + i]));
         let done = Shaded {
             clip,
@@ -1564,5 +1587,33 @@ mod tests {
         assert_eq!(bytes.len(), 0x1900);
         assert!(super::read_mapped(&ram, 0x3000, 0x100).is_empty());
         assert_eq!(super::read_mapped(&ram, 0x1700, 0x80).len(), 0x80);
+    }
+
+    /// A2B10G10R10 unpacks bit fields, R lowest; SNORM clamps the most
+    /// negative code to -1 (the 2-bit alpha too); byte-sized formats read
+    /// as before.
+    #[test]
+    fn packed_and_byte_vertex_attributes() {
+        let attribute = |widths: u32, kind: u32| (kind << 27) | (widths << 21);
+        let float = |words: [u32; 4]| words.map(f32::from_bits);
+        // R = 511, G = -511, B = -512, A = -2 (binary 10).
+        let packed: u32 = 511 | ((1024 - 511) << 10) | (512 << 20) | (2 << 30);
+        let words = super::fetch_attribute(attribute(0x30, 1), &packed.to_le_bytes()).unwrap();
+        assert_eq!(float(words), [1.0, -1.0, -1.0, -1.0]);
+        // UNORM: 0, 1023, 512, 3.
+        let packed: u32 = (1023 << 10) | (512 << 20) | (3 << 30);
+        let words = super::fetch_attribute(attribute(0x30, 2), &packed.to_le_bytes()).unwrap();
+        assert_eq!(float(words), [0.0, 1.0, (512.0f64 / 1023.0) as f32, 1.0]);
+        // UINT, with R and B swapped.
+        let words = super::fetch_attribute(
+            attribute(0x30, 4) | (1 << 31),
+            &(5u32 | (6 << 10) | (7 << 20) | (1 << 30)).to_le_bytes(),
+        )
+        .unwrap();
+        assert_eq!(words, [7, 6, 5, 1]);
+        // R16_G16_B16 SINT reads three halves, alpha 1.
+        let bytes = [0xff, 0xff, 2, 0, 0, 0x80];
+        let words = super::fetch_attribute(attribute(0x05, 3), &bytes).unwrap();
+        assert_eq!(words, [-1i32 as u32, 2, -32768i32 as u32, 1]);
     }
 }
