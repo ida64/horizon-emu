@@ -77,13 +77,15 @@
 //!   writes the AArch64 reset vector again), the CPU cluster's resets in
 //!   the clock and reset controller (`RST_CPUG_CMPLX` asserted again, so
 //!   the warmboot's release is a release), MSELECT (back in reset: it
-//!   loses its settings), and `MC_SECURITY_CFG3` (0 after reset: how the
-//!   monitor learns the SoC lost power);
+//!   loses its settings), `MC_SECURITY_CFG3` (0 after reset: how the
+//!   monitor learns the SoC lost power), and the CPU cluster's interrupt
+//!   controller ([`PowerDomain::power_lost`]; the monitor's resume sets
+//!   its Secure side up again and the kernel restores its own,
+//!   [`crate::secmon::setup`]);
 //! * kept, though lost on the console \[assumption\]: every other block,
 //!   among them the rest of the clock and reset controller, the memory and
 //!   EMC controllers (the boot ROM's restore from PMC scratch would write
-//!   back what they hold, `bootrom::warm_boot`), the GIC (the kernel
-//!   saves and restores what it uses around sleep) and the security engine
+//!   back what they hold, `bootrom::warm_boot`) and the security engine
 //!   (its context comes back from the monitor's save on the warm path);
 //! * kept, as on the console: DRAM, the PMC (bar what the wake changes),
 //!   the PMIC and its clock.
@@ -174,6 +176,9 @@ impl PowerDomain for NeverWakes {
     fn wake_pending(&self) -> bool {
         false
     }
+
+    /// No block outside the BPMP's is here.
+    fn power_lost(&self) {}
 
     fn warm_boot(&self) -> Result<WarmStart, String> {
         Err("no wake source".into())
@@ -400,6 +405,10 @@ impl Bpmp {
 pub trait PowerDomain: Sync {
     /// Whether a wake event is pending at the PMC.
     fn wake_pending(&self) -> bool;
+    /// Resets what the SoC's power-down resets outside the BPMP's own
+    /// blocks and the registers of `SC7_RESETS`: the CPU cluster's
+    /// interrupt controller ([`crate::gic::Gic::reset`]).
+    fn power_lost(&self);
     /// Runs the boot ROM's warm path on the SoC as SC7 left it and applies
     /// what it does outside the BPMP and IRAM; gives what it leaves those.
     fn warm_boot(&self) -> Result<WarmStart, String>;
@@ -471,6 +480,7 @@ fn power_down(running: &mut Running, env: &Env<'_>) -> Result<(), String> {
     for (address, value) in SC7_RESETS {
         write_register(env.bus, address, value)?;
     }
+    env.power.power_lost();
     Ok(())
 }
 
@@ -940,6 +950,10 @@ impl PowerDomain for Machine {
         self.soc.wake_pending()
     }
 
+    fn power_lost(&self) {
+        self.gic.reset();
+    }
+
     fn warm_boot(&self) -> Result<WarmStart, String> {
         let fuses = self
             .bpmp
@@ -1256,6 +1270,9 @@ mod tests {
         fn wake_pending(&self) -> bool {
             self.wake.load(Ordering::SeqCst)
         }
+
+        /// No interrupt controller in these tests.
+        fn power_lost(&self) {}
 
         fn warm_boot(&self) -> Result<WarmStart, String> {
             self.start

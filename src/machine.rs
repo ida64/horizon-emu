@@ -837,13 +837,21 @@ impl Machine {
             .map(|power_on| bpmp::Bpmp::power_on(&power_on, &soc, &bus, &keys))
             .transpose()
             .map_err(MachineError::PowerOn)?;
+        // Powered on, the interrupt controller comes out of reset and the
+        // secure monitor sets it up; started at the kernel, it is as the
+        // monitor leaves it.
+        if bpmp.is_some() {
+            gic.reset();
+        }
+        let secmon = SecureMonitor::new(params, keys);
+        secmon.attach_gic(Arc::clone(&gic));
 
         Ok(Self {
             vm,
             engine_memory: DeviceMemory::new(&soc.mc, &ram, mc::SMMU_SE_ASID),
             ram,
             image,
-            secmon: SecureMonitor::new(params, keys),
+            secmon,
             bus,
             gic,
             clock,
