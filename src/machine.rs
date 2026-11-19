@@ -3,12 +3,14 @@
 
 mod bpmp;
 mod snapshot;
+mod threads;
 
 pub use self::bpmp::{
     BPMP_CORE, Bpmp, BpmpExit, Env, NeverWakes, Power, PowerDomain, PowerOn, Slice, TsecPort,
     WarmStart, apply_rom_bits, run, warm_start,
 };
 pub use self::snapshot::SaveReport;
+pub use self::threads::{GuestThread, KernelObject, ThreadCall, ThreadState};
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -262,6 +264,50 @@ pub struct Poke {
     pub value: u64,
 }
 
+/// How many times slower than the host the console's processor runs, which
+/// a fresh boot is held to until its program launcher is done
+/// ([`PacingEnd::LauncherDone`]).
+///
+/// The firmware's boot leaves an ordering to the processor's speed. The
+/// filesystem process (FS) hands the eMMC's clock over to the clock driver
+/// (pcv) while the launcher (boot2) is still starting programs, and asks
+/// pcv's `clkrst` for the eMMC's module (OpenSession 0x40000018) holding the
+/// eMMC: FS's request threads wait for it. pcv's thread for `clkrst` asks
+/// settings (`set:sys` 62) as it starts serving, and settings serves one
+/// request at a time. If a program launched by then has settings open a
+/// system save in that moment (bsdsocket's `set:sys` 183 opens save
+/// 0x8000000000000052), settings waits for FS, FS for pcv and pcv for
+/// settings, for good. The kernel's thread objects of a stopped boot show
+/// exactly that (`--list-threads`, 4 of 65 boots at host speed). In a boot
+/// that got through, pcv answered FS's eMMC request at 4.675 s and bsdsocket
+/// sent request 183 at 4.706 s: pcv's part is paced by its regulators and
+/// clocks in real time, the launcher's by the processor, and at host speed
+/// the launcher is only just behind. On the console it is far behind
+/// \[inference\]: the firmware is built against its processor.
+///
+/// The factor is \[assumption\]: the T210's Cortex-A57 cores at 1020 MHz
+/// against a current host core, the figure the boot was slowed by until
+/// commit 689076f, not measured against a console.
+pub const CONSOLE_SLOWDOWN: u32 = 10;
+
+/// Until when [`RunOptions::cpu_slowdown`] slows the processors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacingEnd {
+    /// Throughout the run.
+    Never,
+    /// For this long from the start of the run.
+    After(Duration),
+    /// Until the boot's program launcher (`boot2`, program
+    /// 0x0100000000000008) has ended, as the kernel's process objects tell,
+    /// and at most for [`LAUNCHER_PACING_LIMIT`].
+    LauncherDone,
+}
+
+/// The longest [`PacingEnd::LauncherDone`] slows a run, for one whose
+/// launcher never ends or whose kernel's objects cannot be read
+/// \[assumption\]: a paced boot's launcher is done well within it.
+pub const LAUNCHER_PACING_LIMIT: Duration = Duration::from_secs(120);
+
 #[derive(Clone, Copy)]
 pub struct RunOptions<'a> {
     /// Wall-clock bound; the machine is stopped when it expires. Without
@@ -286,18 +332,12 @@ pub struct RunOptions<'a> {
     pub survey: bool,
     /// How many times slower than the host the guest's processors run; 1 is
     /// as fast as the host goes. Everything else keeps real time: timers,
-    /// the clock, and the waits drivers make for their hardware, as a
-    /// console's processor, about a tenth of the host's speed, sees them.
-    /// Boots once stopped at host speed: the program launcher had nearly
-    /// all of its forty programs up while the clock driver (pcv) waited on
-    /// its regulators, settings was kept busy in the filesystem process as
-    /// that handed its card clock over to pcv, which waited for settings,
-    /// and the three waited for each other for good. That no longer
-    /// happens, so this is for looking at timing, not needed to boot.
+    /// the clock, and the waits drivers make for their hardware, as the
+    /// console's processor sees them. See [`CONSOLE_SLOWDOWN`] for why a
+    /// boot needs this.
     pub cpu_slowdown: u32,
-    /// For how long from the start of the run the processors are slowed;
-    /// `None` is throughout.
-    pub cpu_slowdown_for: Option<Duration>,
+    /// Until when the processors are slowed.
+    pub cpu_slowdown_until: PacingEnd,
     /// Places that stop the machine when a core is about to execute them.
     pub breakpoints: &'a [Place],
     /// Places whose execution is reported without stopping.
@@ -308,6 +348,10 @@ pub struct RunOptions<'a> {
     /// Instructions to single-step, reporting each, between a breakpoint
     /// being reached and the machine stopping for it.
     pub steps_after_breakpoint: u32,
+    /// When the machine stops, list the threads of the guest's processes
+    /// from the kernel's own objects ([`RunReport::threads`]). Nothing is
+    /// watched while the guest runs, so this does not change its timing.
+    pub list_threads: bool,
     /// Receives the reports, on the thread of the core they concern.
     pub trace: &'a (dyn Fn(TraceEvent<'_>) + Sync),
 }
@@ -395,6 +439,9 @@ pub enum TraceEvent<'a> {
     },
     /// The console woke from sleep; `core` runs again.
     Woke { core: usize },
+    /// The processors stopped being slowed: the boot's program launcher
+    /// ended (`launcher_ended`), or the slowing's time is up.
+    FullSpeed { launcher_ended: bool },
     /// A survey answered a device access that nothing models.
     Unmodeled {
         core: usize,
@@ -645,6 +692,10 @@ pub struct RunReport {
     /// been reused since. The threads of a process that ended itself
     /// (`ExitProcess`) are not listed.
     pub calls_in_progress: Vec<CallInProgress>,
+    /// The threads of the guest's processes when the machine stopped, with
+    /// [`RunOptions::list_threads`]; empty without it, or where the kernel's
+    /// objects are not where kernel 23.5.0 keeps them.
+    pub threads: Vec<GuestThread>,
 }
 
 /// A supervisor call that had not returned when the machine stopped.
@@ -972,12 +1023,12 @@ impl Machine {
 
         self.soc.notes.set_survey(options.survey);
         let (reports, finished) = mpsc::channel();
-        let paced_until = options.cpu_slowdown_for.map(|span| Instant::now() + span);
         let session = Session {
             machine: self,
             options,
-            paced_until,
+            pacing: AtomicBool::new(options.cpu_slowdown > 1),
             slide: OnceLock::new(),
+            kernel_view: OnceLock::new(),
             calls: Mutex::new(HashMap::new()),
             processes: Mutex::new(HashMap::new()),
             stop: AtomicBool::new(false),
@@ -993,12 +1044,7 @@ impl Machine {
             scope.spawn(|| self.timers.run(&session.stop));
             scope.spawn(|| self.soc.keep_time(&session.stop));
             if options.cpu_slowdown > 1 {
-                scope.spawn(|| {
-                    while !session.stop.load(Ordering::SeqCst) && session.paced() {
-                        thread::sleep(PACING_SLICE);
-                        (0..CORE_COUNT).for_each(|core| self.signals.interrupt_run(core));
-                    }
-                });
+                scope.spawn(|| session.pace());
             }
             match self.restored.lock().unwrap().take() {
                 // A restored machine's guest time stood still since the
@@ -1078,11 +1124,16 @@ impl Machine {
             })
             .collect();
         calls_in_progress.sort_by_key(|call| (call.caller.context, call.caller.thread));
+        let threads = match session.kernel_view.get() {
+            Some((regime, slide)) if options.list_threads => self.guest_threads(regime, *slide),
+            _ => Vec::new(),
+        };
         RunReport {
             ended,
             cores,
             smc_counts: session.smc_counts.into_inner().unwrap(),
             calls_in_progress,
+            threads,
         }
     }
 
@@ -1341,18 +1392,8 @@ impl Machine {
                 .flatten()
         };
         let process = kernel_u64(thread.checked_add(THREAD_PROCESS)?)?;
-        let id = kernel_u64(process.checked_add(PROCESS_ID)?)?;
-        if id as u32 != context as u32 {
-            return None;
-        }
-        let mut name = [0; PROCESS_NAME_SIZE];
-        (self.read_virtual(regime, process + PROCESS_NAME, &mut name) == name.len())
-            .then_some(())?;
-        Some(Process {
-            id,
-            program_id: kernel_u64(process + PROCESS_PROGRAM_ID)?,
-            name,
-        })
+        self.process_object(regime, process)
+            .filter(|process| process.id as u32 == context as u32)
     }
 
     /// The thread object of the thread the core runs, read where the kernel
@@ -1637,8 +1678,10 @@ impl Pause {
 struct Session<'a> {
     machine: &'a Machine,
     options: RunOptions<'a>,
-    /// When the processors stop being slowed, if they are and it ends.
-    paced_until: Option<Instant>,
+    /// Whether the processors are being slowed: from the start of the run
+    /// while [`RunOptions::cpu_slowdown`] is above 1, until
+    /// [`RunOptions::cpu_slowdown_until`] is reached.
+    pacing: AtomicBool,
     stop: AtomicBool,
     started: AtomicUsize,
     /// Per core: whether it has a thread, and what a thread whose core was
@@ -1649,6 +1692,11 @@ struct Session<'a> {
     /// Relocated minus image address of the kernel, once a core has been
     /// seen executing relocated kernel code.
     slide: OnceLock<u64>,
+    /// A core's translation regime, whose kernel half every core shares,
+    /// and the kernel's slide: taken at the first secure monitor call from
+    /// the relocated kernel, or when a core stops, where
+    /// [`RunOptions::list_threads`] or [`PacingEnd::LauncherDone`] needs it.
+    kernel_view: OnceLock<(TranslationRegime, u64)>,
     /// Supervisor calls that have not returned, by who made them. A thread
     /// is in one call at a time, so its next call replaces one that never
     /// returned.
@@ -1721,7 +1769,67 @@ const CLREX_IMMEDIATE: u32 = 0xF << 8;
 impl<'env> Session<'env> {
     /// Whether the processors are being slowed at this moment.
     fn paced(&self) -> bool {
-        self.options.cpu_slowdown > 1 && self.paced_until.is_none_or(|end| Instant::now() < end)
+        self.pacing.load(Ordering::Relaxed)
+    }
+
+    /// While the processors are slowed, takes every core out of the guest
+    /// each [`PACING_SLICE`] to pay what it owes, and ends the slowing
+    /// where [`RunOptions::cpu_slowdown_until`] says.
+    fn pace(&self) {
+        // How often the kernel's processes are looked through for the
+        // launcher.
+        const LAUNCHER_POLL: Duration = Duration::from_millis(100);
+
+        let started = Instant::now();
+        let until = self.options.cpu_slowdown_until;
+        let limit = match until {
+            PacingEnd::Never => None,
+            PacingEnd::After(span) => Some(span),
+            PacingEnd::LauncherDone => Some(LAUNCHER_PACING_LIMIT),
+        };
+        let (mut launcher_seen, mut looked) = (false, started);
+        while !self.stop.load(Ordering::SeqCst) {
+            thread::sleep(PACING_SLICE);
+            (0..CORE_COUNT).for_each(|core| self.machine.signals.interrupt_run(core));
+            let now = Instant::now();
+            let mut launcher_ended = false;
+            if until == PacingEnd::LauncherDone && now - looked >= LAUNCHER_POLL {
+                looked = now;
+                if let Some((regime, slide)) = self.kernel_view.get() {
+                    // Seen first, so that a kernel that has not started it
+                    // yet does not count.
+                    match self.machine.launcher_running(regime, *slide) {
+                        Some(true) => launcher_seen = true,
+                        Some(false) => launcher_ended = launcher_seen,
+                        None => {}
+                    }
+                }
+            }
+            if launcher_ended || limit.is_some_and(|limit| now - started >= limit) {
+                self.pacing.store(false, Ordering::Relaxed);
+                (self.options.trace)(TraceEvent::FullSpeed { launcher_ended });
+                return;
+            }
+        }
+    }
+
+    /// Takes the kernel's half of the address space and its slide from a
+    /// core in the relocated kernel, once, where something needs them.
+    fn note_kernel_view(&self, vcpu: &Vcpu) -> Result<(), HvError> {
+        let wanted =
+            self.options.list_threads || self.options.cpu_slowdown_until == PacingEnd::LauncherDone;
+        if !wanted || self.kernel_view.get().is_some() {
+            return Ok(());
+        }
+        let pc = vcpu.pc()?;
+        if pc >> 63 == 0 {
+            return Ok(());
+        }
+        let regime = self.machine.translation_regime(vcpu)?;
+        if let Some(image) = self.machine.image_address(&regime, pc) {
+            let _ = self.kernel_view.set((regime, pc.wrapping_sub(image)));
+        }
+        Ok(())
     }
 
     fn start_core<'scope>(
@@ -1828,6 +1936,8 @@ impl<'env> Session<'env> {
         {
             state.process = self.known_process(state.context);
         }
+        // A run too short for a secure monitor call from the kernel.
+        let _ = self.note_kernel_view(&vcpu);
         CoreReport { core, stop, state }
     }
 
@@ -2265,6 +2375,7 @@ impl<'env> Session<'env> {
         vcpu: &Vcpu,
         immediate: u16,
     ) -> Result<Option<CoreStop>, HvError> {
+        self.note_kernel_view(vcpu)?;
         let mut registers = argument_registers(vcpu)?;
         let arguments = registers;
         let machine = self.machine;

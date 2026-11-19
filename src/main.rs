@@ -4,6 +4,7 @@ mod script;
 mod window;
 
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
     io::{self, Write},
     panic,
@@ -29,8 +30,9 @@ use horizon_emu::{
     keys::KeySet,
     log_manager::{self, Packet, Reassembler},
     machine::{
-        self, Caller, CodeAddress, ExceptionState, Firmware, Machine, Module, Place, Poke, PowerOn,
-        Process, RunEnd, RunOptions, RunReport, SaveReport, TraceEvent,
+        self, Caller, CodeAddress, ExceptionState, Firmware, GuestThread, KernelObject, Machine,
+        Module, PacingEnd, Place, Poke, PowerOn, Process, RunEnd, RunOptions, RunReport,
+        SaveReport, ThreadState, TraceEvent,
     },
     maxwell, nand, net, sdcard,
     secmon::{self, SmcEffect},
@@ -127,14 +129,17 @@ options:
   --cpu-slowdown N[:SECONDS]
                       run the guest's processors N times slower than the
                       host can, for the first SECONDS of the run or, without
-                      SECONDS, throughout. Timers and device waits keep real
-                      time either way, as the console's own processor,
-                      roughly a tenth of the host's speed, would see them.
-                      Default 1: full speed. Boots once stopped with nothing
-                      on screen at full speed (1 of 6), three processes
-                      waiting for each other while the system's programs
-                      were launched; none of 24 full-speed boots to HOME did
-                      since
+                      SECONDS, throughout; 1 is full speed. Timers and device
+                      waits keep real time either way. Default: a fresh boot
+                      runs at the console's own speed, 10 times slower, until
+                      its program launcher (boot2) has ended, then at full
+                      speed; a restored machine at full speed. At full speed
+                      the launcher can start a program that keeps settings
+                      busy in the filesystem process at the moment that
+                      hands the eMMC's clock to the clock driver (pcv),
+                      which waits for settings: the three then wait for
+                      each other for good, with nothing on screen
+                      (--list-threads shows it)
   --symbols FILE      function names for kernel addresses (JSON export)
   --keys FILE         console keys (name = hex lines); without them the
                       secure monitor cannot derive keys for the guest
@@ -280,6 +285,14 @@ taken as it is, such as one inside a process):
                       themselves, fatal errors reported, kernel debug text.
                       Like --trace-svc it watches every supervisor call,
                       which slows the guest
+  --list-threads      when the machine stops, list every thread of the
+                      guest's processes as the kernel's own objects describe
+                      it: its state, the supervisor call it is in, and for a
+                      request the port its session came from, the processes
+                      serving it and the message; for a lock its owner; for
+                      the objects waited for who holds or signals them.
+                      Read from memory after the stop, so it does not slow
+                      the guest (kernel 23.5.0 only)
   --crash-dump DIR    each time a process takes an exception the firmware
                       treats as a crash (abort, alignment fault, undefined
                       instruction, BRK), write DIR/crash-NNN-NAME.txt: the
@@ -855,7 +868,7 @@ fn boot(
     let mut keys = KeySet::default();
     let (mut trace_smc, mut trace_svc, mut trace_devices) = (false, false, false);
     let (mut trace_ipc, mut trace_times, mut verbose) = (false, false, false);
-    let mut survey = false;
+    let (mut survey, mut list_threads) = (false, false);
     let mut bpmp_trace = 0;
     let mut crash_dump = None::<PathBuf>;
     let (mut log_lines, mut log_file) = (false, None::<PathBuf>);
@@ -924,8 +937,8 @@ fn boot(
                         .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
                 });
                 cpu_slowdown = match (factor, seconds) {
-                    (Some(factor), None) => Some((factor, None)),
-                    (Some(factor), Some(Some(span))) => Some((factor, Some(span))),
+                    (Some(factor), None) => Some((factor, PacingEnd::Never)),
+                    (Some(factor), Some(Some(span))) => Some((factor, PacingEnd::After(span))),
                     _ => return Err("--cpu-slowdown: expected N or N:SECONDS, N from 1 up".into()),
                 }
             }
@@ -1035,6 +1048,7 @@ fn boot(
             "--trace-ipc" => trace_ipc = true,
             "--trace-times" => trace_times = true,
             "--verbose" => verbose = true,
+            "--list-threads" => list_threads = true,
             "--crash-dump" => crash_dump = Some(PathBuf::from(value()?)),
             "--log" => log_lines = true,
             "--log-file" => log_file = Some(PathBuf::from(value()?)),
@@ -1360,7 +1374,11 @@ fn boot(
             (None, false) => None,
         },
     };
-    let cpu_slowdown = cpu_slowdown.unwrap_or((1, None));
+    // A restored machine is past the launcher that a boot is paced for.
+    let cpu_slowdown = cpu_slowdown.unwrap_or(match restore {
+        Some(_) => (1, PacingEnd::Never),
+        None => (machine::CONSOLE_SLOWDOWN, PacingEnd::LauncherDone),
+    });
     let options = RunOptions {
         timeout,
         stop: &stop,
@@ -1380,11 +1398,12 @@ fn boot(
         trace_devices,
         survey,
         cpu_slowdown: cpu_slowdown.0,
-        cpu_slowdown_for: cpu_slowdown.1,
+        cpu_slowdown_until: cpu_slowdown.1,
         breakpoints: &breakpoints,
         tracepoints: &tracepoints,
         pokes: &pokes,
         steps_after_breakpoint,
+        list_threads,
         trace: &|event| print_event(event, &tracing),
     };
     // What the screen was last said to show: panel awake, backlight lit.
@@ -1520,7 +1539,16 @@ fn boot(
             // where they are, on the rails or not.
             let (kept, seated) = console
                 .with(|machine| {
-                    report_run(machine, &report, &ended, &symbols, verbose, &log);
+                    let tracker = tracing.ipc.as_ref().map(|tracker| tracker.lock().unwrap());
+                    report_run(
+                        machine,
+                        &report,
+                        &ended,
+                        &symbols,
+                        verbose,
+                        &log,
+                        tracker.as_deref(),
+                    );
                     (machine.battery_backed(), machine.joycons_seated())
                 })
                 .expect("the machine that ran is in place");
@@ -1609,8 +1637,9 @@ fn apply_input(machine: &Machine, at: Duration, input: Input, tracing: &Tracing)
 }
 
 /// Prints how a run of `machine` ended (`ended`) and where it stood: each
-/// core, the calls not returned from, the secure monitor calls, the notes
-/// devices left, the GPU channels with `verbose`, the carveouts.
+/// core, the calls not returned from (with what `ipc`, when it followed
+/// the requests, knows each waits for), the secure monitor calls, the
+/// notes devices left, the GPU channels with `verbose`, the carveouts.
 fn report_run(
     machine: &Machine,
     report: &RunReport,
@@ -1618,6 +1647,7 @@ fn report_run(
     symbols: &SymbolTable,
     verbose: bool,
     log: &LogOverlay,
+    ipc: Option<&Tracker>,
 ) {
     println!("{ended}");
     log.push(ended);
@@ -1651,11 +1681,25 @@ fn report_run(
     if !report.calls_in_progress.is_empty() {
         println!("supervisor calls not returned from:");
     }
+    // A server is named after its own waiting calls; one with none is
+    // given by its context.
+    let names: HashMap<u64, &str> = (report.calls_in_progress.iter())
+        .filter_map(|call| Some((call.caller.context, call.process.as_ref()?.name())))
+        .collect();
     for call in &report.calls_in_progress {
         let name = svc::name(call.id).unwrap_or("?");
         let process = call.process.as_ref().map_or("?", Process::name);
+        let waits = ipc
+            .and_then(|ipc| ipc.outstanding(client(call.caller)))
+            .map(|(request, server)| {
+                let server = server.map(|context| match names.get(&context) {
+                    Some(name) => format!(", served by {name}"),
+                    None => format!(", served by context {context:#x}"),
+                });
+                format!(" waits for {request}{}", server.unwrap_or_default())
+            });
         println!(
-            "  {process} (context {:#x}) thread {:#x}: {:#04x} {name} {:x?} from {:#x}, lr {:#x}, callers {:x?}, for {:.3} s",
+            "  {process} (context {:#x}) thread {:#x}: {:#04x} {name} {:x?} from {:#x}, lr {:#x}, callers {:x?}, for {:.3} s{}",
             call.caller.context,
             call.caller.thread,
             call.id,
@@ -1663,8 +1707,15 @@ fn report_run(
             call.pc,
             call.lr,
             call.callers,
-            call.waited.as_secs_f64()
+            call.waited.as_secs_f64(),
+            waits.unwrap_or_default()
         );
+    }
+    if !report.threads.is_empty() {
+        println!("threads when the machine stopped, from the kernel's thread objects:");
+    }
+    for thread in &report.threads {
+        println!("  {}", describe_thread(thread));
     }
     println!("secure monitor calls:");
     for (name, count) in &report.smc_counts {
@@ -2194,6 +2245,14 @@ fn write_event(out: &mut impl Write, event: TraceEvent, tracing: &Tracing) -> io
             width = usize::from(size) * 2 + 2
         ),
         TraceEvent::Woke { core } => writeln!(out, "console woke, core {core} runs"),
+        TraceEvent::FullSpeed { launcher_ended } => writeln!(
+            out,
+            "processors at full speed: {}",
+            match launcher_ended {
+                true => "the program launcher has ended",
+                false => "the slowdown's time is up",
+            }
+        ),
         TraceEvent::SecureAccess {
             core,
             block,
@@ -2403,6 +2462,126 @@ fn describe_caller(caller: Caller, process: Option<Process>) -> String {
         "{}context {context:#x}, thread {thread:#x}",
         name.unwrap_or_default()
     )
+}
+
+/// One line for a thread `--list-threads` lists: who it is, its state, the
+/// call it is in, what that call's handles stand for and the request it
+/// sends.
+fn describe_thread(thread: &GuestThread) -> String {
+    use std::fmt::Write as _;
+
+    let mut line = format!(
+        "{} (process {}) thread {:#x} (ID {}): {}",
+        thread.process.name(),
+        thread.process.id,
+        thread.tls,
+        thread.id,
+        match thread.state {
+            ThreadState::Initialized => "not started".to_string(),
+            ThreadState::Waiting => "waiting".to_string(),
+            ThreadState::Runnable => "runnable".to_string(),
+            ThreadState::Terminated => "ended".to_string(),
+            ThreadState::Unknown(state) => format!("state {state}"),
+        }
+    );
+    let Some(call) = &thread.call else {
+        return line;
+    };
+    let _ = write!(
+        line,
+        ", in {:#04x} {} {:x?} from {:#x}, lr {:#x}",
+        call.id,
+        svc::name(call.id).unwrap_or("?"),
+        call.arguments,
+        call.pc,
+        call.lr
+    );
+    let names = |processes: &[Process]| {
+        let names: Vec<&str> = processes.iter().map(Process::name).collect();
+        names.join(", ")
+    };
+    for (handle, object) in &call.objects {
+        let _ = write!(line, "; handle {handle:#x}: ");
+        let _ = match object {
+            KernelObject::NotOpen => write!(line, "not open"),
+            KernelObject::Session { port_name, servers } => {
+                let _ = write!(line, "session {}", session_origin(*port_name));
+                match servers.is_empty() {
+                    true => write!(line, ", no process holds its server end"),
+                    false => write!(line, ", served by {}", names(servers)),
+                }
+            }
+            KernelObject::ServerSession { port_name, clients } => write!(
+                line,
+                "server end of a session {} for {}",
+                session_origin(*port_name),
+                names(clients)
+            ),
+            KernelObject::ServerPort { port_name } => {
+                write!(line, "port {}", port_name_text(*port_name))
+            }
+            KernelObject::Thread { process, tls } => {
+                let owner = process.as_ref().map_or("?", Process::name);
+                write!(line, "thread {tls:#x} of {owner}")
+            }
+            KernelObject::ReadableEvent { signallers } => match signallers.is_empty() {
+                true => write!(line, "event no process can signal"),
+                false => write!(line, "event signalled by {}", names(signallers)),
+            },
+            KernelObject::Other { token, holders } => {
+                write!(
+                    line,
+                    "object of class {token:#06x} held by {}",
+                    names(holders)
+                )
+            }
+        };
+    }
+    // Requests to sm name a service in their first eight bytes.
+    let to_sm = call.objects.iter().any(|(_, object)| {
+        matches!(object, KernelObject::Session { servers, .. }
+            if servers.iter().any(|server| server.name() == "sm"))
+    });
+    if let Some(message) = ipc::Message::parse(&call.message) {
+        let _ = match ipc::Request::parse(&message) {
+            Some(request) => {
+                let _ = write!(line, "; {} {}", request.protocol, request.action);
+                if let Some(object) = request.object {
+                    let _ = write!(line, " object {object}");
+                }
+                if to_sm && let Some(name) = request.data.get(..8) {
+                    let _ = write!(line, " name {:?}", svc::text(name));
+                }
+                let words: Vec<String> = (request.data.as_chunks::<4>().0.iter().take(12))
+                    .map(|&word| format!("{:x}", u32::from_le_bytes(word)))
+                    .collect();
+                write!(line, " data [{}]", words.join(", "))
+            }
+            None => write!(line, "; message type {}", message.kind),
+        };
+    }
+    line
+}
+
+/// Where a session came from: its port, by the name the port was created
+/// with, or none.
+fn session_origin(port_name: Option<u64>) -> String {
+    match port_name {
+        Some(name) => format!("of port {}", port_name_text(name)),
+        None => "made without a port".into(),
+    }
+}
+
+/// The name a port was created with: text if it is text, else the number.
+fn port_name_text(name: u64) -> String {
+    let text = svc::text(&name.to_le_bytes());
+    match name {
+        0 => "without a name".into(),
+        _ if text.bytes().all(|byte| byte.is_ascii_graphic()) && !text.is_empty() => {
+            format!("{text:?}")
+        }
+        _ => format!("named {name:#x}"),
+    }
 }
 
 /// `0xffff… (image 0x8006… Function+0x10)`, with as much of that as is known.
