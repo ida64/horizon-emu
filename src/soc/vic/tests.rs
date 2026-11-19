@@ -996,3 +996,53 @@ fn the_capture_thumbnail_reduces_the_planar_picture_to_rgb() {
     capture.memory().read(0xe246_0000, &mut chroma).unwrap();
     assert!(chroma.iter().all(|&value| value == 128));
 }
+
+/// The gamma memo returns the curve's own value for every argument, also
+/// for far more distinct arguments than it holds and for arguments that
+/// share a set, in any order.
+#[test]
+fn the_gamma_memo_returns_the_curves_own_values() {
+    let mut degamma = Memo::new(srgb_to_linear);
+    let mut regamma = Memo::new(clamped_linear_to_srgb);
+    let arguments: Vec<f32> = (0..20_000u32)
+        .map(|n| (n.wrapping_mul(7919) % 65_536) as f32 / 65_535.0)
+        .chain((0..=255).map(|byte| f32::from(byte as u8) / 255.0))
+        .chain([-0.5, 1.5, -0.0])
+        .collect();
+    for _ in 0..2 {
+        for &argument in &arguments {
+            let expected = srgb_to_linear(argument);
+            assert_eq!(
+                degamma.get(argument).to_bits(),
+                expected.to_bits(),
+                "{argument}"
+            );
+            let expected = clamped_linear_to_srgb(argument);
+            assert_eq!(
+                regamma.get(argument).to_bits(),
+                expected.to_bits(),
+                "{argument}"
+            );
+        }
+    }
+}
+
+/// Banding hands every row, the shorter last one included, to exactly one
+/// band, with the right first row, whether or not it splits the work.
+#[test]
+fn bands_cover_every_row_once() {
+    for (len, width, work) in [(10, 3, 0), (10, 3, BANDED_WORK), (1000, 7, BANDED_WORK)] {
+        let mut items = vec![(0usize, 0usize); len];
+        in_bands(&mut items, width, work, |first, band| {
+            for (row, items) in (first..).zip(band.chunks_mut(width)) {
+                for item in items {
+                    item.0 += 1;
+                    item.1 = row;
+                }
+            }
+        });
+        for (at, &(count, row)) in items.iter().enumerate() {
+            assert_eq!((count, row), (1, at / width), "item {at} of {len}");
+        }
+    }
+}
