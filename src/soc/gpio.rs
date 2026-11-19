@@ -339,4 +339,29 @@ mod tests {
         assert!(!asserted.load(Ordering::SeqCst));
         assert_eq!(gpio.set_input(1, 0, true), None);
     }
+
+    #[test]
+    fn at_power_on_inputs_read_low_until_the_pin_is_a_gpio() {
+        // Port X (controller 5, port 3: index 23; the bootloader reads its
+        // `IN` at 0x6000_D53C) with the volume buttons (pins 6 and 7) held
+        // high by the board, as the bootloader's check finds it, then makes
+        // them inputs (`0x40017480`).
+        const X: u64 = 0x50C;
+        let gpio = Gpio::new([(23, 0b1100_0000)]).power_on();
+        assert_eq!(gpio.read(0, X + IN, 4), Some(0));
+        assert_eq!(
+            gpio.read(0, X + IN + MASKED, 4),
+            Some(0),
+            "debounce enables"
+        );
+        // A port whose levels are not known reads zero too while no pin is
+        // a GPIO.
+        assert_eq!(gpio.read(0, IN, 4), Some(0));
+        gpio.write(0, X + CNF + MASKED, 4, 0xC0C0).unwrap();
+        gpio.write(0, X + OE + MASKED, 4, 0xC000).unwrap();
+        assert_eq!(gpio.read(0, X + IN, 4), Some(0b1100_0000));
+        // Started at kernel entry, the levels show regardless of CNF.
+        let gpio = Gpio::new([(23, 0b1100_0000)]);
+        assert_eq!(gpio.read(0, X + IN, 4), Some(0b1100_0000));
+    }
 }
