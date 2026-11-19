@@ -40,7 +40,9 @@
 //! * sm's commands: 0xf80. Command 1 takes eight bytes of name and answers
 //!   with a moved handle, the session to that service; command 2 takes a
 //!   name, a session limit and a flag and answers with a moved handle;
-//!   command 3 takes a name.
+//!   command 3 takes a name. The same commands come in CMIF from homebrew
+//!   (libnx on hbloader: command 0 with the process ID, then command 1 with
+//!   a name, answered with a moved handle), and sm answers them.
 //!
 //! From public documentation of the formats rather than from these binaries:
 //! the CMIF envelope types other than 6 (1 and 4 request, 3, 5 and 7
@@ -623,6 +625,26 @@ impl Tracker {
         }
     }
 
+    /// What a request that supervisor call `id`, with `X0`-`X7` in
+    /// `arguments` and `data` as for [`Tracker::call`], sends goes to, named
+    /// as its trace line names it; `None` for a call that sends none. Asked
+    /// before the call is passed to [`Tracker::call`].
+    pub fn addressee(
+        &self,
+        process: u64,
+        id: u16,
+        arguments: &[u64; 8],
+        data: &[u8],
+    ) -> Option<String> {
+        let handle = svc::session_handle(id, arguments)?;
+        let session = self.handles.get(&(process, handle)).copied();
+        let object = Message::parse(data)
+            .as_ref()
+            .and_then(Request::parse)
+            .and_then(|request| request.object);
+        Some(self.target(session, handle, object))
+    }
+
     fn request(
         &mut self,
         process: u64,
@@ -657,7 +679,7 @@ impl Tracker {
                 if let Some(object) = request.object {
                     let _ = write!(line, " object {object}");
                 }
-                if self.is_sm(session, request.protocol)
+                if self.is_sm(session)
                     && let Action::Request(
                         SM_GET_SERVICE | SM_REGISTER_SERVICE | SM_UNREGISTER_SERVICE,
                     ) = request.action
@@ -791,14 +813,14 @@ impl Tracker {
         moved: &mut [Option<String>],
         objects: &mut [Option<String>],
     ) {
-        let Some((protocol, action)) = sent.request else {
+        let Some((_, action)) = sent.request else {
             return;
         };
         let first_handle = message.move_handles.first().copied();
         match action {
             Action::Request(command) => {
                 if command == SM_GET_SERVICE
-                    && self.is_sm(sent.session, protocol)
+                    && self.is_sm(sent.session)
                     && let (Some(service), Some(handle)) = (&sent.service, first_handle)
                 {
                     self.name(process, handle, service.clone());
@@ -806,7 +828,7 @@ impl Tracker {
                     return;
                 }
                 // What sm returns for its other commands is not a session.
-                if self.is_sm(sent.session, protocol) {
+                if self.is_sm(sent.session) {
                     return;
                 }
                 let derived = format!("{}#{command}", sent.target);
@@ -855,11 +877,10 @@ impl Tracker {
         }
     }
 
-    fn is_sm(&self, session: Option<usize>, protocol: Protocol) -> bool {
-        protocol == Protocol::Tipc
-            && session
-                .and_then(|index| self.sessions.get(&index))
-                .is_some_and(|session| session.name == SM_PORT)
+    fn is_sm(&self, session: Option<usize>) -> bool {
+        session
+            .and_then(|index| self.sessions.get(&index))
+            .is_some_and(|session| session.name == SM_PORT)
     }
 
     fn objects(&mut self, session: Option<usize>) -> Option<&mut HashMap<u32, String>> {
@@ -918,6 +939,7 @@ fn shown<'c>(target: &str, contents: &'c [Contents]) -> &'c [Contents] {
 /// Appends ` = ` and the start of a buffer: as text if that is what it is,
 /// as little-endian words otherwise.
 fn write_contents(line: &mut String, bytes: &[u8]) {
+    let bytes = &bytes[..bytes.len().min(SHOWN_BUFFER_BYTES as usize)];
     let text = bytes.split(|&byte| byte == 0).next().unwrap_or_default();
     let is_text = text.len() >= 4
         && text
@@ -1252,6 +1274,38 @@ mod tests {
         );
         let (request, _) = exchange(&mut tracker, 0x8002, &[4, 6, 0, 0, SFCI, 1, 1, 0], &[0, 0]);
         assert_eq!(request, "-> handle 0x8002 cmif request 1");
+    }
+
+    #[test]
+    fn cmif_lookup_names_the_service_and_what_it_returns() {
+        // libnx on hbloader asks sm in CMIF, and lm returns its logger as a
+        // moved handle when the session is no domain.
+        let mut tracker = Tracker::default();
+        let port = [0, 0x2000, 0, 0, 0, 0, 0, 0];
+        tracker.call(CLIENT, svc::CONNECT_TO_NAMED_PORT, &port, b"sm:\0", &[]);
+        let connected = [0, 0x8001, 0, 0, 0, 0, 0, 0];
+        tracker.returned(CLIENT, svc::CONNECT_TO_NAMED_PORT, &connected, &[], &[]);
+        let (request, reply) = exchange(
+            &mut tracker,
+            0x8001,
+            &[4, 10, 0, 0, SFCI, 1, 1, 0, 0x6D6C, 0, 0, 0],
+            &[0, 0x8000_0004, 1 << 5, 0x8002, SFCO, 1, 0, 0],
+        );
+        assert_eq!(request, "-> sm: cmif request 1 name \"lm\" data [6d6c, 0]");
+        assert_eq!(reply, "<- sm: cmif request 1 result ok move [0x8002 = lm]");
+        exchange(
+            &mut tracker,
+            0x8002,
+            &[4, 10, 0, 0, SFCI, 1, 0, 0, 0, 0, 0, 0],
+            &[0, 0x8000_0004, 1 << 5, 0x8003, SFCO, 1, 0, 0],
+        );
+        let log = bytes(&[4, 8, 0, 0, SFCI, 1, 0, 0]);
+        let arguments = [0x8003, 0, 0, 0, 0, 0, 0, 0];
+        let addressee = tracker.addressee(CLIENT.process, svc::SEND_SYNC_REQUEST, &arguments, &log);
+        assert_eq!(addressee.as_deref(), Some("lm#0"));
+        // Not a request-sending call.
+        let closing = tracker.addressee(CLIENT.process, svc::CLOSE_HANDLE, &arguments, &[]);
+        assert_eq!(closing, None);
     }
 
     #[test]

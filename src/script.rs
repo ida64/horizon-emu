@@ -14,7 +14,10 @@
 
 use std::time::{Duration, Instant};
 
-use horizon_emu::{machine::Machine, soc::joycon::Button};
+use horizon_emu::{
+    machine::Machine,
+    soc::{joycon::Button, ntag::Ntag215},
+};
 
 /// How long a button or a finger is held when a line does not say.
 const HOLD: Duration = Duration::from_millis(300);
@@ -25,19 +28,34 @@ const TOLERANCE: u8 = 16;
 /// Size of the console's screen.
 const SCREEN: (u32, u32) = (1280, 720);
 
-/// Something that is pressed: a button of the Joy-Con, or the console's
-/// power button (`power`).
+/// Something that is pressed: a button of the Joy-Con, the console's
+/// power button (`power`), or a button of the Pro Controller in range of
+/// its radio (`pro:BUTTON`), SYNC (`pro:sync`) among them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Key {
     Joycon(Button),
     Power,
+    Pro(Button),
+    ProSync,
 }
 
 impl Key {
+    /// `power`, `pro:sync`, or buttons joined by `+` (held together),
+    /// prefixed `pro:` for the Pro Controller's.
     fn named(name: &str) -> Option<Self> {
+        let chord = |names: &str| {
+            names
+                .split('+')
+                .map(Button::named)
+                .reduce(|chord, button| Some(chord?.and(button?)))?
+        };
         match name {
             "power" => Some(Self::Power),
-            _ => Button::named(name).map(Self::Joycon),
+            "pro:sync" => Some(Self::ProSync),
+            _ => match name.strip_prefix("pro:") {
+                Some(buttons) => chord(buttons).map(Self::Pro),
+                None => chord(name).map(Self::Joycon),
+            },
         }
     }
 
@@ -45,6 +63,10 @@ impl Key {
         match self {
             Self::Joycon(button) => machine.press(button, held),
             Self::Power => machine.press_power(held),
+            Self::Pro(button) => machine.bluetooth().press(button, held),
+            // The controller acts on SYNC as it goes down.
+            Self::ProSync if held => machine.bluetooth().sync(),
+            Self::ProSync => {}
         }
     }
 }
@@ -70,6 +92,8 @@ enum Step {
         every: Duration,
     },
     Joycons(bool),
+    /// An NFC tag held over the right Joy-Con's reader, or taken away.
+    Amiibo(Option<Box<Ntag215>>),
     Screenshot(String),
 }
 
@@ -106,13 +130,20 @@ impl Script {
     /// wait X,Y RRGGBB       until that pixel of the 1280x720 screen is that colour
     /// sleep SECONDS
     /// press BUTTON [HOLD_MS] [until X,Y RRGGBB [SECONDS]]
-    ///                       BUTTON: one of the Joy-Con's, or `power`
+    ///                       BUTTON: one of the Joy-Con's (several joined
+    ///                       by `+` are held together, `l+r`), `power`, or
+    ///                       `pro:` and the Pro Controller's or `sync`
+    ///                       (with --pro-controller)
     /// touch X,Y [HOLD_MS] [until X,Y RRGGBB [SECONDS]]
     ///                       with `until`: again every SECONDS (3) until
     ///                       that pixel is that colour; not at all if it is
     /// type TEXT             the rest of the line, on the open on-screen
     ///                       keyboard, key by key
     /// joycons on|off
+    /// amiibo FILE [writable]  hold the NTAG215 dumped in FILE (540 bytes)
+    ///                       over the right Joy-Con's NFC reader, with
+    ///                       `writable` saving what is written to it there
+    /// amiibo off            take it away
     /// screenshot FILE
     /// ```
     pub fn parse(text: &str) -> Result<Self, String> {
@@ -218,6 +249,10 @@ impl Script {
                 }
                 Step::Joycons(seated) => {
                     machine.seat_joycons(*seated);
+                    self.finish(&mut report);
+                }
+                Step::Amiibo(tag) => {
+                    machine.place_tag(tag.as_deref().cloned());
                     self.finish(&mut report);
                 }
                 Step::Screenshot(path) => {
@@ -373,6 +408,12 @@ fn parse_step(line: &str) -> Option<Step> {
             "off" => false,
             _ => return None,
         }),
+        "amiibo" => match (words.next()?, words.next_if_eq(&"writable")) {
+            ("off", None) => Step::Amiibo(None),
+            (file, writable) => Step::Amiibo(Some(Box::new(
+                Ntag215::load(std::path::Path::new(file), writable.is_some()).ok()?,
+            ))),
+        },
         "screenshot" => Step::Screenshot(words.next()?.to_string()),
         _ => return None,
     };

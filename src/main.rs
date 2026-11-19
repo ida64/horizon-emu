@@ -1,6 +1,5 @@
 mod control;
 mod homebrew_options;
-mod mcp;
 mod script;
 mod window;
 
@@ -25,10 +24,11 @@ use horizon_emu::{
     },
     boot::{BootParams, DramSize},
     image::KernelImage,
-    ipc::{Client, ResultCode, Tracker},
+    ipc::{self, Client, ResultCode, Tracker},
     keys::KeySet,
+    log_manager::{self, Packet, Reassembler},
     machine::{
-        Caller, CodeAddress, ExceptionState, Machine, Module, Place, Poke, Process, RunEnd,
+        self, Caller, CodeAddress, ExceptionState, Machine, Module, Place, Poke, Process, RunEnd,
         RunOptions, SaveReport, TraceEvent,
     },
     maxwell, nand, net, sdcard,
@@ -49,7 +49,7 @@ usage: horizon-emu info <kernel.elf>
        horizon-emu boot <kernel.elf> [options]
        horizon-emu restore <snapshot dir> [options]
        horizon-emu format-emmc <new image file> [--keys FILE [--firmware DIR]]
-       horizon-emu patch-prodinfo <image file> --keys FILE
+       horizon-emu patch-prodinfo <image file> --keys FILE [--wlan-mac MAC]
        horizon-emu format-sd <new image file> --size SIZE [--add HOST=CARD ...]
 
 <kernel.elf> is the package2 kernel wrapped as an ELF (see pkg2elf.py).
@@ -64,7 +64,9 @@ TLS client key and self-signed certificate, which Nintendo's servers
 reject); with --firmware also the contents (*.nca) of that directory,
 installed as the system's programs and data. patch-prodinfo gives the
 calibration data of an image formatted before it had one that made-up
-TLS client identity, and changes nothing else. format-sd creates a
+TLS client identity, and changes nothing else; with --wlan-mac it gives
+the console that WLAN MAC address instead (another console, for a second
+emulator on the same --air), and changes nothing else. format-sd creates a
 microSD card image for --sd (a sparse file) of SIZE bytes (suffix K, M or
 G for binary multiples; a multiple of 512K above 2088M and up to 32G),
 formatted as the console formats a card, with each --add's host file HOST
@@ -123,6 +125,13 @@ options:
                       open network unless
   --wifi-passphrase P makes it WPA2-Personal (CCMP) with passphrase P
                       (8 to 63 printable ASCII characters)
+  --air ADDRESS:PORT  the radio shares the air with every other emulator
+                      given the same address (UDP; the first to bind it
+                      relays for all): they see each other's networks
+                      (local wireless, ldn) and exchange frames on the
+                      channels they use. Give each console its own WLAN
+                      address (patch-prodinfo --wlan-mac). The link is not
+                      part of a snapshot; give it again to restore
   --forward HOST_PORT[:CONSOLE_PORT]
                       with --wifi-ssid: TCP connections to HOST_PORT of this
                       machine's 127.0.0.1 reach CONSOLE_PORT (the same number
@@ -137,6 +146,15 @@ options:
                       connection test host (ctest.cdn.nintendo.net) with
                       the address of a web server puts that server in front
                       of the console as a captive portal
+  --pro-controller FILE
+                      a Pro Controller in range of the console's Bluetooth
+                      radio from power on, asleep; FILE holds what it
+                      remembers of the console it pairs with (written when
+                      it pairs), so that it reconnects on a later run. Press
+                      pro:sync in a script to pair it (System Settings or
+                      Controllers > Change Grip/Order), pro:BUTTON to press
+                      its buttons; a button wakes a paired one, which then
+                      reconnects
   --window            show the console's screen in a window. Closing it
                       stops the machine and ends the program; when the
                       machine stops by itself, the window stays, showing
@@ -165,6 +183,12 @@ options:
                       after the machine starts (0: they are on from power
                       on), or with :off, slide them off; may be given more
                       than once. Without this the rails are empty
+  --amiibo FILE       hold the NFC tag dumped in FILE (the 540 bytes of an
+                      NTAG215, such as an amiibo) over the right Joy-Con's
+                      reader from the start; what is written to it stays on
+                      the virtual tag
+  --amiibo-writable   with --amiibo: write what is written to the tag back
+                      to FILE
   --press SECONDS:BUTTON[:HOLD_MS]
                       hold a button of the Joy-Con SECONDS after the machine
                       starts and let go HOLD_MS milliseconds later (default
@@ -182,6 +206,9 @@ options:
                         type TEXT            the rest of the line, key by key
                                              on the open on-screen keyboard
                         joycons on|off
+                        amiibo FILE [writable]    the tag dumped in FILE over
+                                             the right Joy-Con's reader
+                        amiibo off           take it away
                         screenshot FILE
                       A press or touch line may end in
                         until X,Y RRGGBB [SECONDS]
@@ -225,12 +252,20 @@ taken as it is, such as one inside a process):
                       modules (base, size, path, build ID), with each code
                       address as module+offset. Watches every supervisor
                       call, like --verbose
+  --log               print what processes log, one line each, as the log
+                      manager lm receives it (lm still gets every request):
+                        log: PROCESS SEVERITY [MODULE] FILE:LINE FUNCTION: TEXT
+                      from the packets of ILogger::Log requests, put back
+                      together where a message took several, and
+                        log: PROCESS OutputDebugString: TEXT
+                      for that supervisor call. Never anything of spl.
+                      Watches every supervisor call, like --verbose
+  --log-file FILE     the same, into FILE instead of stderr
   --control SOCKET    serve requests on a Unix socket at SOCKET while the
                       machine runs: script steps, screenshots, pixels,
                       status, stop, save_state (a snapshot of the running
                       machine into a directory, for restore). One JSON
-                      object per line; what `horizon-emu mcp` drives runs
-                      with
+                      object per line
   --survey            do not stop at device accesses nothing models: answer
                       reads with zero, drop writes, and print each. Not a
                       faithful run; it lists what the guest wants
@@ -259,15 +294,10 @@ fn main() -> ExitCode {
 
 /// The whole usage message: the general options and those of homebrew.
 fn usage() -> String {
-    format!("{USAGE}\n\n{}\n\n{}", homebrew_options::USAGE, mcp::USAGE)
+    format!("{USAGE}\n\n{}", homebrew_options::USAGE)
 }
 
 fn run(arguments: &[String]) -> Result<(), String> {
-    if let [command, flags @ ..] = arguments
-        && command == "mcp"
-    {
-        return mcp::serve(flags);
-    }
     let [command, path, flags @ ..] = arguments else {
         return Err(usage());
     };
@@ -317,11 +347,18 @@ const MACHINE_FLAGS: &[(&str, bool)] = &[
     ("--homebrew-in", true),
     ("--hbl", true),
     ("--homebrew-app", true),
+    ("--pro-controller", true),
 ];
 
 /// Machine flags naming host files that are read when the machine is
 /// built, recorded as absolute paths.
-const FILE_FLAGS: &[&str] = &["--keys", "--homebrew", "--hbl", "--homebrew-app"];
+const FILE_FLAGS: &[&str] = &[
+    "--keys",
+    "--homebrew",
+    "--hbl",
+    "--homebrew-app",
+    "--pro-controller",
+];
 
 /// Storage image flags: a snapshot holds a copy of each image, under the
 /// name given, and the flag that makes the image written to.
@@ -515,18 +552,32 @@ fn format_emmc(path: &str, flags: &[String]) -> Result<(), String> {
 }
 
 fn patch_prodinfo(path: &str, flags: &[String]) -> Result<(), String> {
-    let [flag, keys] = flags else {
-        return Err(usage());
+    let (keys, wlan_mac) = match flags {
+        [flag, keys] if flag == "--keys" => (keys, None),
+        [flag, keys, mac_flag, mac] if flag == "--keys" && mac_flag == "--wlan-mac" => {
+            let bytes: Vec<u8> = mac
+                .split(':')
+                .filter_map(|b| (b.len() == 2).then(|| u8::from_str_radix(b, 16).ok())?)
+                .collect();
+            let mac: [u8; 6] = bytes
+                .try_into()
+                .map_err(|_| format!("--wlan-mac {mac}: not XX:XX:XX:XX:XX:XX"))?;
+            (keys, Some(mac))
+        }
+        _ => return Err(usage()),
     };
-    if flag != "--keys" {
-        return Err(usage());
-    }
     let keys = KeySet::load(Path::new(keys)).map_err(|error| error.to_string())?;
     let image = OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
         .map_err(|error| error.to_string())?;
+    if let Some(mac) = wlan_mac {
+        nand::calibration::set_wlan_mac_address(&image, &keys, mac)
+            .map_err(|error| error.to_string())?;
+        println!("WLAN MAC address {}", flags[3]);
+        return Ok(());
+    }
     let device_id = nand::calibration::install_ssl_identity(&image, &keys)
         .map_err(|error| error.to_string())?;
     println!("console {device_id:016X}: made-up TLS client identity installed");
@@ -612,6 +663,7 @@ fn boot(
     let (mut trace_ipc, mut trace_times, mut verbose) = (false, false, false);
     let mut survey = false;
     let mut crash_dump = None::<PathBuf>;
+    let (mut log_lines, mut log_file) = (false, None::<PathBuf>);
     let mut control = None::<String>;
     let mut cpu_slowdown = None;
     let (mut breakpoints, mut tracepoints) = (Vec::new(), Vec::new());
@@ -628,6 +680,9 @@ fn boot(
     let (mut wifi_ssid, mut wifi_passphrase) = (None::<String>, None::<String>);
     let mut forwards = Vec::new();
     let mut dns = None;
+    let mut air = None::<std::net::SocketAddr>;
+    let (mut amiibo, mut amiibo_writable) = (None::<&String>, false);
+    let mut pro_controller = None::<&String>;
     if maxwell::metal::available() {
         maxwell::select_renderer(maxwell::RendererKind::Metal);
     }
@@ -728,6 +783,8 @@ fn boot(
                     .ok_or("--joycons: expected SECONDS or SECONDS:off")?;
                 inputs.push((at, Input::Seat(seated)));
             }
+            "--amiibo" => amiibo = Some(value()?),
+            "--amiibo-writable" => amiibo_writable = true,
             "--press" => inputs.extend(parse_press(value()?)?),
             "--script" => {
                 let path = value()?;
@@ -743,6 +800,15 @@ fn boot(
             "--sd-writable" => sd_writable = true,
             "--wifi-ssid" => wifi_ssid = Some(value()?.clone()),
             "--wifi-passphrase" => wifi_passphrase = Some(value()?.clone()),
+            "--pro-controller" => pro_controller = Some(value()?),
+            "--air" => {
+                let value = value()?.as_str();
+                air = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("--air {value}: not ADDRESS:PORT"))?,
+                );
+            }
             "--dns" => {
                 let value = value()?.as_str();
                 let address = value
@@ -770,6 +836,8 @@ fn boot(
             "--trace-times" => trace_times = true,
             "--verbose" => verbose = true,
             "--crash-dump" => crash_dump = Some(PathBuf::from(value()?)),
+            "--log" => log_lines = true,
+            "--log-file" => log_file = Some(PathBuf::from(value()?)),
             "--control" => control = Some(value()?.clone()),
             "--trace-devices" => trace_devices = true,
             "--survey" => survey = true,
@@ -884,6 +952,23 @@ fn boot(
     } else if dns.is_some() {
         return Err("--dns needs --wifi-ssid".into());
     }
+    if let Some(address) = air {
+        let wifi = std::sync::Arc::clone(machine.wifi());
+        let link = horizon_emu::air::Air::join(
+            address,
+            Box::new(move |channel, frame| wifi.from_air(channel, frame)),
+        )
+        .map_err(|error| format!("--air {address}: {error}"))?;
+        machine.wifi().set_air(Box::new(move |channel, frame| {
+            link.transmit(channel, frame)
+        }));
+    }
+    if let Some(memory) = pro_controller {
+        machine
+            .bluetooth()
+            .place_pro_controller(Path::new(memory))
+            .map_err(|error| format!("--pro-controller: {error}"))?;
+    }
     // The WiFi radio's access point is part of what is restored, so it is
     // in place first.
     if let Some(dir) = restore {
@@ -897,13 +982,20 @@ fn boot(
             started.elapsed().as_secs_f64()
         );
     }
+    if let Some(path) = amiibo {
+        let tag = horizon_emu::soc::ntag::Ntag215::load(Path::new(path), amiibo_writable)
+            .map_err(|error| format!("--amiibo {error}"))?;
+        machine.place_tag(Some(tag));
+    } else if amiibo_writable {
+        return Err("--amiibo-writable needs --amiibo".into());
+    }
     let mut window = show_window.then(ScreenWindow::open).transpose()?;
     let stop = AtomicBool::new(false);
     let log = LogOverlay::default();
     let tracing = Tracing {
         symbols: &symbols,
         svc: trace_svc,
-        ipc: (trace_ipc || verbose).then(Mutex::default),
+        ipc: (trace_ipc || verbose || log_lines || log_file.is_some()).then(Mutex::default),
         ipc_lines: trace_ipc,
         smc: trace_smc,
         verbose,
@@ -925,6 +1017,19 @@ fn boot(
                 })
             })
             .transpose()?,
+        log: match (&log_file, log_lines) {
+            (Some(path), _) => Some(LogOutput {
+                packets: Mutex::default(),
+                file: Some(Mutex::new(File::create(path).map_err(|error| {
+                    format!("--log-file {}: {error}", path.display())
+                })?)),
+            }),
+            (None, true) => Some(LogOutput {
+                packets: Mutex::default(),
+                file: None,
+            }),
+            (None, false) => None,
+        },
     };
     // A restored machine is past the boot that the default slows.
     let cpu_slowdown = cpu_slowdown.unwrap_or(match restore {
@@ -937,7 +1042,16 @@ fn boot(
         trace_smc: trace_smc || verbose,
         // Requests and answers are read off the supervisor calls that carry
         // them.
-        trace_svc: trace_svc || trace_ipc || verbose || tracing.crash_dumps.is_some(),
+        trace_svc: trace_svc
+            || trace_ipc
+            || verbose
+            || tracing.crash_dumps.is_some()
+            || tracing.log.is_some(),
+        // A log packet is read whole; a trace line shows the start.
+        buffer_bytes: match tracing.log {
+            Some(_) => machine::CALL_DATA_LIMIT,
+            None => ipc::SHOWN_BUFFER_BYTES,
+        },
         trace_devices,
         survey,
         cpu_slowdown: cpu_slowdown.0,
@@ -1296,6 +1410,15 @@ struct Tracing<'a> {
     overlay: Option<&'a LogOverlay>,
     /// Where crash dumps go, with `--crash-dump`.
     crash_dumps: Option<CrashDumps>,
+    /// What processes log, with `--log` or `--log-file`.
+    log: Option<LogOutput>,
+}
+
+/// Where `--log` and `--log-file` put what processes log.
+struct LogOutput {
+    packets: Mutex<Reassembler>,
+    /// `None` is stderr, with the trace lines.
+    file: Option<Mutex<File>>,
 }
 
 /// The directory `--crash-dump` names, and how many dumps went there.
@@ -1559,6 +1682,11 @@ fn write_event(out: &mut impl Write, event: TraceEvent, tracing: &Tracing) -> io
             if tracing.verbose {
                 write_milestone(out, id, process, data)?;
             }
+            if let Some(log) = &tracing.log {
+                write_logged(
+                    out, tracing, log, id, &arguments, caller, process, data, buffers,
+                )?;
+            }
             let line = tracing.ipc.as_ref().and_then(|tracker| {
                 tracker
                     .lock()
@@ -1757,6 +1885,59 @@ fn write_ipc(
         None => write!(out, "core {core}: ipc context {:#x}", caller.context)?,
     }
     writeln!(out, " {line} (thread {thread:#x})")
+}
+
+/// Writes the lines of what call `id` logs, where `--log` or `--log-file`
+/// asks: an `OutputDebugString`'s text, or the message a `Log` request to
+/// lm completes. Nothing of spl's. Asked before the tracker hears of the
+/// call.
+#[allow(clippy::too_many_arguments)]
+fn write_logged(
+    out: &mut impl Write,
+    tracing: &Tracing,
+    log: &LogOutput,
+    id: u16,
+    arguments: &[u64; 8],
+    caller: Caller,
+    process: Option<Process>,
+    data: &[u8],
+    buffers: &[ipc::Contents],
+) -> io::Result<()> {
+    let name = process.as_ref().map_or("?", Process::name);
+    if name == "spl" {
+        return Ok(());
+    }
+    let lines: Vec<String> = if id == svc::OUTPUT_DEBUG_STRING {
+        let text = String::from_utf8_lossy(data);
+        let text = text.trim_end_matches(['\0', '\n', '\r']);
+        (text.lines())
+            .map(|line| format!("log: {name} OutputDebugString: {line}"))
+            .collect()
+    } else {
+        let Some(tracker) = &tracing.ipc else {
+            return Ok(());
+        };
+        let target = (tracker.lock().unwrap()).addressee(caller.context, id, arguments, data);
+        if target.as_deref() != Some(log_manager::LOGGER) {
+            return Ok(());
+        }
+        let Some(packet) = log_manager::logged_packet(data, buffers) else {
+            return Ok(());
+        };
+        match Packet::parse(packet) {
+            Ok(packet) => (log.packets.lock().unwrap().push(&packet).iter())
+                .flat_map(|message| message.lines(name))
+                .collect(),
+            Err(error) => vec![format!("log: {name} packet not read: {error}")],
+        }
+    };
+    match &log.file {
+        Some(file) => {
+            let mut file = file.lock().unwrap();
+            lines.iter().try_for_each(|line| writeln!(file, "{line}"))
+        }
+        None => lines.iter().try_for_each(|line| writeln!(out, "{line}")),
+    }
 }
 
 fn client(caller: Caller) -> Client {

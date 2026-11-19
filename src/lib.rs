@@ -17,12 +17,14 @@
 //!   a microSD card with files on it; [`homebrew`] runs programs Nintendo
 //!   did not sign on it.
 //! * [`machine`] ties these into a console and executes it.
-//! * [`symbols`] and [`svc`] name things for traces, and [`ipc`] decodes the
-//!   messages processes send each other.
+//! * [`symbols`] and [`svc`] name things for traces, [`ipc`] decodes the
+//!   messages processes send each other, and [`log_manager`] the log
+//!   packets they send the log manager.
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 compile_error!("the only CPU backend is Hypervisor.framework on Apple silicon");
 
+pub mod air;
 pub mod arm64;
 pub mod boot;
 pub mod bus;
@@ -33,6 +35,7 @@ pub mod hvf;
 pub mod image;
 pub mod ipc;
 pub mod keys;
+pub mod log_manager;
 pub mod machine;
 pub mod maxwell;
 pub mod memory;
