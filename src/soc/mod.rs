@@ -135,6 +135,16 @@ const SDMMC4_INTID: u32 = 32 + 31;
 /// Nothing answers on it here: the slot is empty, and the controller chip
 /// behind the port is not modeled, so commands to it time out as on an
 /// empty port.
+///
+/// Without the chip the driver tries again about every 2 s. In the IPC
+/// trace, FS sets `gpio` pad output low then high, turns the regulator on
+/// and sets the `clkrst` rate to 200 MHz every 2.0 s \[inference: that this
+/// is a retry of the chip's start-up\]. Requests that need the driver wait
+/// for it. At boot, `ns`'s `IDeviceOperator` command 225 (after
+/// `IsGameCardInserted` says no) took from 0.3 ms to 5.9 s across runs
+/// before failing with 2002-2629, and `am` waits for `ns` before it starts
+/// `qlaunch`. So the lock screen comes up that much later, and with it the
+/// lock screen's auto-sleep (see `script.rs`).
 const SDMMC2_BASE: u64 = 0x700B_0200;
 const SDMMC2_INTID: u32 = 32 + 15;
 
