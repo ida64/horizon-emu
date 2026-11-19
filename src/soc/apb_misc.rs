@@ -46,7 +46,7 @@ pub const HIDREV_VALUE: u32 = 0x21 << 8 | 1 << 4;
 /// the part of the block `boot`'s pin driver reads into its tables (text
 /// `0x2eaac`) before it programs 47 of the groups. Configuration that
 /// starts at zero, like the pin multiplexer, but for the bits the
-/// bootloader's check finds set ([`PAD_POWER_ON_STATE`]).
+/// bootloader's check finds set (`PAD_POWER_ON_STATE`).
 pub const PAD_GROUPS: std::ops::Range<u64> = 0x8E4..0xB70;
 
 /// The registers outside the pad groups the check reads, with their
