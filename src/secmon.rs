@@ -34,15 +34,20 @@
 //! On the console the monitor then powers the whole SoC down but for the
 //! PMC and the memory, which keeps itself; a wake event starts the SoC
 //! from its boot ROM, whose warm boot path leads back into the monitor,
-//! and the monitor starts core 0 where the kernel asked. Here nothing
-//! loses power: core 0 stands still until a wake event and then starts at
-//! that address, and every device is as the firmware left it instead of
-//! out of reset. The firmware's drivers put back what a real sleep loses,
-//! which here writes what is already there. Before sleeping the monitor
-//! checks that the other cores are off and the SoC is in the state its
-//! sleep sequence expects (exosphere `secmon_smc_power_management.cpp`,
-//! `ValidateSocStateForSuspend`; `SLEEP_REQUIREMENTS` here), and aborts
-//! otherwise.
+//! and the monitor starts core 0 where the kernel asked. In a machine that
+//! ran the boot chain (the monitor did its [`cold_boot`]) that is what
+//! happens: the monitor prepares SC7 as the real one does and restarts the
+//! BPMP on its SC7 stub ([`sc7`], [`SmcEffect::SystemSuspend`]), and the
+//! warmboot firmware releases core 0 into its resume
+//! ([`SecureMonitor::core0_released`]). In one started from a kernel ELF
+//! nothing loses power: core 0 stands still until a wake event and then
+//! starts at that address, and every device is as the firmware left it
+//! instead of out of reset; the firmware's drivers put back what a real
+//! sleep loses, which there writes what is already there. Before sleeping
+//! the monitor checks that the other cores are off and the SoC is in the
+//! state its sleep sequence expects (exosphere
+//! `secmon_smc_power_management.cpp`, `ValidateSocStateForSuspend`;
+//! `SLEEP_REQUIREMENTS` here), and aborts otherwise.
 //!
 //! Config items read while booting: 1, 10 (memory mode), 11 and 12 (kernel
 //! configuration). Every wrapper in the kernel treats a non-zero status as
@@ -403,10 +408,10 @@ const CORE_PARTITIONS: [u32; CORE_COUNT] = [14, 9, 10, 11];
 /// `(register, mask, required value, what it means)`; anything else
 /// aborts (exosphere `ValidateSocStateForSuspend`, bit positions from the
 /// TRM's clock and reset device numbering). Two of its checks are not
-/// here, as nothing in this machine can fail them: the BPMP halted by the
-/// flow controller (no BPMP runs) and USB, USB2, AHB DMA and the BPMP kept
-/// off the AHB arbiter (the boot chain's setting, in a block no guest
-/// software reaches here).
+/// here: the BPMP parked by the flow controller, which only a machine
+/// that runs the boot chain has and checks ([`sc7`]), and USB, USB2, AHB
+/// DMA and the BPMP kept off the AHB arbiter (the boot chain's setting, in
+/// a block not modelled here).
 const SLEEP_REQUIREMENTS: [(u64, u32, u32, &str); 8] = [
     (PMC_PWRGATE_STATUS, 7 << 9, 0, "cores 1 to 3 power-gated"),
     (
