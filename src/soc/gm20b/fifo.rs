@@ -94,8 +94,9 @@ const SEMAPHORE_RELEASE_WFI_DISABLE: u32 = 1 << 20;
 const SEMAPHORE_RELEASE_4_BYTES: u32 = 1 << 24;
 
 /// `MEM_OP_B`/`MEM_OP_D` operations (bits 31:27) with nothing to do in a
-/// model without caches or TLBs: membar, TLB invalidate, L2 invalidates,
-/// clean comptags, L2 flush; and `MEM_OP_B`'s soft flush.
+/// model without caches, beyond dropping the TLB ([`mmu::Tlb`]), which
+/// every one of them does: membar, TLB invalidate, L2 invalidates, clean
+/// comptags, L2 flush; and `MEM_OP_B`'s soft flush.
 const MEM_OPS_WITHOUT_EFFECT: [u32; 6] = [0x05, 0x09, 0x0D, 0x0E, 0x0F, 0x10];
 const MEM_OP_B_SOFT_FLUSH: u32 = 0x06;
 
@@ -421,6 +422,11 @@ impl Context {
         })
     }
 
+    /// The bus address of the channel's GP_PUT, in USERD.
+    pub fn gp_put_at(&self) -> u64 {
+        self.userd + USERD_GP_PUT
+    }
+
     fn gp_put(&self, bus: &dyn BusMemory) -> Result<u32, Unmodeled> {
         let put = mmu::read_u32(bus, self.userd + USERD_GP_PUT)?;
         if put >= self.gp_entries {
@@ -572,8 +578,11 @@ impl Context {
             method::SEMAPHORE_C => host.semaphore_payload = argument,
             method::SEMAPHORE_D => return self.semaphore(env, argument),
             method::MEM_OP_B | method::MEM_OP_D
-                if MEM_OPS_WITHOUT_EFFECT.contains(&(argument >> 27)) => {}
-            method::MEM_OP_B if argument >> 27 == MEM_OP_B_SOFT_FLUSH => {}
+                if MEM_OPS_WITHOUT_EFFECT.contains(&(argument >> 27)) =>
+            {
+                env.bus.invalidate()
+            }
+            method::MEM_OP_B if argument >> 27 == MEM_OP_B_SOFT_FLUSH => env.bus.invalidate(),
             method::SET_REFERENCE => mmu::write_u32(env.bus, self.userd + USERD_REF, argument)?,
             method::SYNCPOINT_A => host.syncpoint_payload = argument,
             method::SYNCPOINT_B if argument & !SYNCPOINT_FIELDS == 0 => {

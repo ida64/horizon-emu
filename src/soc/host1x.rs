@@ -29,7 +29,10 @@
 //! syncpoints, which it lets run on, from one that is stuck; the channels
 //! answer them ([`Channel::command_status`]).
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Condvar, Mutex},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -134,12 +137,24 @@ impl State {
 /// and the threshold interrupt they raise. Shared by the display
 /// controllers, the GPU, the VIC and the host1x channels; [`Host1xSync`]'s
 /// [`Snapshot`] saves them, once.
+///
+/// Whoever waits for a syncpoint is told of every change as it happens
+/// ([`Syncpoints::wait_change`], [`Syncpoints::on_change`]), so a wait is
+/// over at the guest time its syncpoint got there.
 pub struct Syncpoints {
     state: Mutex<State>,
     /// INTID 97, nvservices' syncpoint interrupt (text `0x5a454`); none in
     /// tests that do not look at it.
     line: Option<InterruptLine>,
+    /// How many changes there were, for [`Syncpoints::wait_change`].
+    changes: Mutex<u64>,
+    changed: Condvar,
+    /// Called after every change.
+    watchers: Mutex<Vec<Watcher>>,
 }
+
+/// Told that the syncpoints changed; must not change them itself.
+pub type Watcher = Box<dyn Fn() + Send + Sync>;
 
 impl Default for Syncpoints {
     fn default() -> Self {
@@ -163,6 +178,9 @@ impl Syncpoints {
                 asserted: false,
             }),
             line,
+            changes: Mutex::new(0),
+            changed: Condvar::new(),
+            watchers: Mutex::new(Vec::new()),
         }
     }
 
@@ -183,20 +201,55 @@ impl Syncpoints {
         self.state.lock().unwrap().values.get(index).copied()
     }
 
+    /// How many times the syncpoints changed so far: what
+    /// [`Syncpoints::wait_change`] waits to move.
+    pub fn changes(&self) -> u64 {
+        *self.changes.lock().unwrap()
+    }
+
+    /// Waits until the count of changes is no longer `seen`, or `timeout`
+    /// passed.
+    pub fn wait_change(&self, seen: u64, timeout: Duration) {
+        let changes = self.changes.lock().unwrap();
+        let _ = self
+            .changed
+            .wait_timeout_while(changes, timeout, |changes| *changes == seen)
+            .unwrap();
+    }
+
+    /// Has `watcher` called after every change from now on.
+    pub fn on_change(&self, watcher: Watcher) {
+        self.watchers.lock().unwrap().push(watcher);
+    }
+
     /// Applies `change` and brings the interrupt line to the resulting
     /// level. The lock is held across the line update so that levels reach
-    /// the interrupt controller in the order they were computed.
+    /// the interrupt controller in the order they were computed. Waiters
+    /// are told afterwards, outside the lock.
     fn change<R>(&self, change: impl FnOnce(&mut State) -> R) -> R {
-        let mut state = self.state.lock().unwrap();
-        let result = change(&mut state);
-        let level = state.status.iter().any(|&word| word != 0);
-        if level != state.asserted {
-            state.asserted = level;
-            if let Some(line) = &self.line {
-                line(level);
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            let result = change(&mut state);
+            let level = state.status.iter().any(|&word| word != 0);
+            if level != state.asserted {
+                state.asserted = level;
+                if let Some(line) = &self.line {
+                    line(level);
+                }
             }
-        }
+            result
+        };
+        self.tell();
         result
+    }
+
+    /// Tells the waiters that the syncpoints changed.
+    fn tell(&self) {
+        *self.changes.lock().unwrap() += 1;
+        self.changed.notify_all();
+        for watcher in self.watchers.lock().unwrap().iter() {
+            watcher();
+        }
     }
 
     /// Applies `update` to every syncpoint whose bit is set in `bits`, word
@@ -364,6 +417,7 @@ impl Snapshot for Host1xSync {
         let syncpoints = decode("host1x syncpoints", &syncpoints)?;
         self.configuration.restore(&configuration)?;
         *self.syncpoints.state.lock().unwrap() = syncpoints;
+        self.syncpoints.tell();
         Ok(())
     }
 }
