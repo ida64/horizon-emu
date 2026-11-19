@@ -64,7 +64,40 @@ const INFO_ADDRESS: u16 = 0x100;
 ///   clears it was not tried\]
 ///
 /// Events are queued immediately, so a press and release between two of
-/// hid's polls are both reported.
+/// hid's polls are both reported. hid does not wait for the interrupt: in
+/// a trace of a 23.5.0 boot it never wrote the interrupt enable (`B6 00
+/// 2C`), the GPIO never had X1's interrupt enabled, and hid read the
+/// event count about every 4 ms whether or not the panel was touched. It
+/// read every contact's start and end, in order, a few milliseconds after
+/// they happened.
+///
+/// A touch that hid reports can still go unseen by HOME. The firmware
+/// causes this, not the controller:
+/// - HOME follows fingers once per pass of its `TouchManager::update`
+///   (qlaunch text `0xb84e90`, which `0xc07eec` registers as an update
+///   callback). Each pass reads the last 16 touch states (`0x23ee60`
+///   with 16), but takes up fingers only from the newest one. It looks at
+///   older states only to see whether a finger it already follows has
+///   ended. A touch that starts and ends between two passes is never
+///   taken up. \[inference: read from the decompiled pass; that it runs
+///   once per frame is inferred from its name and the measurements\]
+///   HOME's frames are far apart here. While idle on a busy host, the
+///   display controller took a new HOME frame every 32 ms (median),
+///   86 ms at the 99th percentile and at most 132 ms, over 1500 frames.
+///   Taps held 50 ms were lost 7 times in 74. In each of the 3 losses
+///   traced, no frame was taken between hid reading the touch's start
+///   and its end; 36 of the 37 taps that worked had one. Taps held
+///   100–500 ms all selected their icon (108 of 108). \[inference: how
+///   often hardware HOME draws was not measured\]
+/// - HOME takes no input at all for about a second after it comes up from
+///   the lock screen, and the same goes for a dialog that has just
+///   opened. Buttons are ignored as well as touches. Taps at most 0.5 s
+///   after HOME's icons showed selected nothing (0 of 7), and from 1 s on
+///   all of them did. Repeated taps first worked 0.9 to 1.5 s in. On the
+///   sleep dialog, both taps on Back and presses of B did nothing in the
+///   first 0.5 s, with one exception (a B at 0.5 s), and always worked
+///   from 1 s on. \[inference: why HOME waits is not known; its opening
+///   animations would explain it\]
 pub struct TouchInput {
     state: Mutex<State>,
     interrupt: Box<dyn Fn(bool) + Send + Sync>,

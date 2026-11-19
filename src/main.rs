@@ -258,6 +258,11 @@ options:
                       auto-sleep), and after a boot it can come up with that
                       time nearly gone: to hold POWER there, wait for it with
                         press zl 300 until 820,330 2d2d2d 4
+                      HOME ignores buttons and touches for about a second
+                      after it comes up from the lock screen or opens a
+                      dialog, and misses a touch that ends before its next
+                      frame: wait for that second, keep the default hold
+                      (horizon_emu::soc::touch::TouchInput)
   --debug-mode        report development functions as enabled to the kernel,
                       which turns on its debug log (UART-A, shown on stderr)
 
