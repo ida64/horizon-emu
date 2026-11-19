@@ -274,31 +274,42 @@ impl Channel {
     pub fn render_target(&self, index: u32, memory: &dyn GpuMemory) -> Option<Image> {
         let registers = self.three_d.registers();
         let (surface, format) = pipeline::color_target(registers, index).ok()??;
-        let rect = surface::Rect {
-            x0: 0,
-            y0: 0,
-            x1: surface.width,
-            y1: surface.height,
-        };
-        let mut window = surface::Window::load(memory, surface, rect).ok()?;
-        let mut rgba = vec![0; (surface.width * surface.height * 4) as usize];
-        for band in window.bands_mut() {
-            for y in band.y0..(band.y0 + surface::BAND_ROWS).min(surface.height) {
-                for x in 0..surface.width {
-                    let value = format.read(band.pixel(x, y));
-                    let at = ((y * surface.width + x) * 4) as usize;
-                    for (k, v) in value.iter().enumerate() {
-                        rgba[at + k] = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-                    }
+        surface_image(surface, format, memory)
+    }
+}
+
+/// `surface`, holding `format` pixels, as it is in memory now, converted to
+/// RGBA8 (debug aid; `None` if unreadable).
+pub fn surface_image(
+    surface: surface::Surface,
+    format: texture::format::ColorFormat,
+    memory: &dyn GpuMemory,
+) -> Option<Image> {
+    let rect = surface::Rect {
+        x0: 0,
+        y0: 0,
+        x1: surface.width,
+        y1: surface.height,
+    };
+    let (width, height) = (surface.width, surface.height);
+    let mut window = surface::Window::load(memory, surface, rect).ok()?;
+    let mut rgba = vec![0; (width * height * 4) as usize];
+    for band in window.bands_mut() {
+        for y in band.y0..(band.y0 + surface::BAND_ROWS).min(height) {
+            for x in 0..width {
+                let value = format.read(band.pixel(x, y));
+                let at = ((y * width + x) * 4) as usize;
+                for (k, v) in value.iter().enumerate() {
+                    rgba[at + k] = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
                 }
             }
         }
-        Some(Image {
-            width: surface.width,
-            height: surface.height,
-            rgba,
-        })
     }
+    Some(Image {
+        width,
+        height,
+        rgba,
+    })
 }
 
 impl Engines for Channel {

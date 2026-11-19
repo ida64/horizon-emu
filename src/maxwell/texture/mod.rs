@@ -82,11 +82,17 @@ impl Tic {
                 return Err(unsupported("TIC BC5 mixed DATA_TYPE", words[0]));
             }
         }
+        // Word 6 bit 0 is COLOR_KEY_OP, read only by the colour-key header
+        // versions (1, 4) refused above; the block-linear and pitch headers
+        // name it RESERVED6Y [public: envytools rnndb/graph/gm200_texture.xml
+        // TIC word 6 `COLOR_KEY_OP`, "Used if (HEADER_VERSION ==
+        // PITCH_COLORKEY || HEADER_VERSION == BLOCKLINEAR_COLORKEY)"; NVIDIA
+        // clb197tex.h `TEXHEAD_BL_RESERVED6Y` MW(192:192)]. The Mii editor's
+        // textures arrive with it set.
         for (index, mask) in [
             (2, 0xe11f0000u32),
             (4, 0x00070000),
             (5, 0x40000000),
-            (6, 1),
             (7, 0xff000000),
         ] {
             if words[index] & mask != 0 {

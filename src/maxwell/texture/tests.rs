@@ -183,6 +183,19 @@ fn pitch_srgb_and_swizzle() {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<Texture>();
 }
+/// Word 6 bit 0 (COLOR_KEY_OP) only means something to the colour-key
+/// header versions, which stay refused; a block-linear header with it set
+/// (as the Mii editor's arrive) parses as without it.
+#[test]
+fn color_key_op_outside_color_key_headers() {
+    let plain = descriptor(8, 2, 2);
+    let mut keyed = plain;
+    keyed[6] = 1;
+    let tic = Tic::parse(keyed).unwrap();
+    assert_eq!(tic.shape, Tic::parse(plain).unwrap().shape);
+    keyed[2] = 4 << 21; // BLOCKLINEAR_COLORKEY
+    assert!(Tic::parse(keyed).is_err());
+}
 #[test]
 fn bc_known_vectors() {
     // D3D11.3 §19.5: BC1 c0=black <= c1=white, index 3 is transparent.
