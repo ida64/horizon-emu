@@ -196,17 +196,16 @@ fn answer(request: Request, controlled: &Controlled) -> Result<Value, String> {
             }))
         }
         Request::Pixel { x, y } => {
-            let screen = machine
-                .screen()
+            let pixel = machine
+                .screen_pixel(x, y)
                 .map_err(|reason| format!("no picture: {reason}"))?;
-            let frame = &screen.frame;
-            if x >= frame.width || y >= frame.height {
+            let Some(value) = pixel.value else {
                 return Err(format!(
                     "{x},{y} is outside the {}x{} screen",
-                    frame.width, frame.height
+                    pixel.width, pixel.height
                 ));
-            }
-            let [_, red, green, blue] = frame.pixels[(y * frame.width + x) as usize].to_be_bytes();
+            };
+            let [_, red, green, blue] = value.to_be_bytes();
             Ok(json!({"rgb": format!("{red:02x}{green:02x}{blue:02x}")}))
         }
         Request::Status => {

@@ -81,7 +81,7 @@ use self::{
     bq24193::Bq24193,
     car::Car,
     cldvfs::ClDvfs,
-    dc::{Dc, Frame, NoFrame},
+    dc::{Dc, Frame, NoFrame, Pixel},
     dpaux::Dpaux,
     dsi::Dsi,
     emc::{EmcPort, View},
@@ -1243,6 +1243,12 @@ impl Soc {
             panel_on,
             backlight_on,
         })
+    }
+
+    /// Point `(x, y)` of the screen's picture right now, worked out alone;
+    /// see [`Dc::pixel_turned_clockwise`].
+    pub fn screen_pixel(&self, x: u32, y: u32) -> Result<Pixel, NoFrame> {
+        self.dc.pixel_turned_clockwise(&self.display_memory, x, y)
     }
 
     /// How the panel and its backlight stand right now.
