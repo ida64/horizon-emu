@@ -16,6 +16,7 @@ pub mod bq24193;
 pub mod car;
 pub mod cldvfs;
 pub mod dc;
+pub mod dot11;
 pub mod dpaux;
 pub mod dsi;
 pub mod emc;
@@ -42,9 +43,10 @@ pub mod max77620;
 pub mod max77621;
 pub mod mc;
 pub mod mc_channel;
-mod medium;
+pub mod medium;
 pub mod mipi_cal;
 pub mod mselect;
+pub mod ntag;
 pub mod pcie;
 pub mod pcie_endpoint;
 pub mod pinmux;
@@ -396,6 +398,16 @@ pub struct BootSignals {
 /// `RST_DEVICES_L` bit 1: the BPMP ("COP").
 const COP_RESET: (u64, u32) = (0x004, 1);
 
+/// How the panel and its backlight stand, whether or not the display
+/// controller's picture can be composed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Panel {
+    /// Whether the panel is awake and unblanked.
+    pub panel_on: bool,
+    /// Whether the backlight driver is powered and given a nonzero duty
+    /// cycle.
+    pub backlight_on: bool,
+}
 pub struct Soc {
     pub mc: Arc<Mc>,
     pub gpio: Arc<Gpio>,
@@ -419,6 +431,8 @@ pub struct Soc {
     /// The WiFi function of the radio, for placing an access point around
     /// it (`--wifi-ssid`); set once the PCIe root complex is built.
     pub wifi: std::sync::OnceLock<Arc<bcm4356::Bcm4356Wifi>>,
+    /// What is in range of the Bluetooth radio (`--pro-controller`).
+    pub bluetooth: Arc<bluetooth_uart::Air>,
     /// Guest time, which the SoC's clocks count.
     pub clock: Arc<GuestClock>,
     gic: Arc<Gic>,
@@ -585,6 +599,7 @@ impl Soc {
             se,
             tsec,
             wifi: std::sync::OnceLock::new(),
+            bluetooth: Arc::new(bluetooth_uart::Air::new(Arc::clone(clock))),
             clock: Arc::clone(clock),
             gic: Arc::clone(gic),
             dc: controller(DC_INTID),
@@ -676,11 +691,15 @@ impl Soc {
                 bluetooth_uart::BASE,
                 "Bluetooth UART",
                 serial(
-                    Box::<bluetooth_uart::Line>::default(),
+                    Box::new(bluetooth_uart::Line::new(
+                        Arc::clone(&soc.clock),
+                        Arc::clone(&soc.bluetooth),
+                    )),
                     bluetooth_uart::INTID,
                 ),
             ),
         ];
+        bluetooth_uart::keep_radio(&uarts[2].2, Arc::clone(&soc.clock));
         for (base, name, uart) in &uarts {
             bus.map(name, *base, serial::SIZE, Box::new(Arc::clone(uart)));
         }
@@ -1186,13 +1205,26 @@ impl Soc {
 
     /// The screen as it is right now.
     pub fn screen(&self) -> Result<Screen, NoFrame> {
+        let frame = self.dc.frame_turned_clockwise(&self.display_memory)?;
+        let Panel {
+            panel_on,
+            backlight_on,
+        } = self.panel();
+        Ok(Screen {
+            frame,
+            panel_on,
+            backlight_on,
+        })
+    }
+
+    /// How the panel and its backlight stand right now.
+    pub fn panel(&self) -> Panel {
         let powered = self.gpio.output(BACKLIGHT_PORT, BACKLIGHT_ENABLE_PIN) == Some(true);
         let dimmer = self.pwm.get(0).unwrap_or(0);
-        Ok(Screen {
-            frame: self.dc.frame_turned_clockwise(&self.display_memory)?,
+        Panel {
             panel_on: self.dsi.panel_is_showing(),
             backlight_on: powered && dimmer & PWM_ENABLE != 0 && dimmer & PWM_WIDTH != 0,
-        })
+        }
     }
 
     /// Keeps the display controllers' frames going until `stop` is set; see
@@ -1233,4 +1265,65 @@ impl Soc {
 fn line(gic: &Arc<Gic>, intid: u32) -> Box<dyn Fn(bool) + Send + Sync> {
     let gic = Arc::clone(gic);
     Box::new(move |level| gic.set_line(0, intid, level))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        boot::{CORE_COUNT, DRAM_BASE},
+        bus::MmioDevice,
+    };
+
+    #[test]
+    fn the_panel_reads_lit_while_the_display_controller_composes_no_picture() {
+        let params = BootParams::default();
+        let gic = Arc::new(Gic::new(CORE_COUNT, Box::new(|_| {})));
+        let ram = Arc::new(GuestRam::new(DRAM_BASE, params.dram.bytes() as usize).unwrap());
+        let clock = Arc::new(GuestClock::new());
+        let soc = Soc::new(
+            &params,
+            &gic,
+            &ram,
+            &clock,
+            None,
+            None,
+            false,
+            &mut Bus::default(),
+        )
+        .unwrap();
+        let dark = Panel {
+            panel_on: false,
+            backlight_on: false,
+        };
+        assert_eq!(soc.panel(), dark);
+
+        // DSI: controller on, then exit sleep and display on, as short
+        // packets through the write FIFO (`WR_DATA`, `TRIGGER`).
+        let dsi = |offset: u64, value: u32| soc.dsi.write(0, offset, 4, value.into()).unwrap();
+        dsi(0x2C, 1);
+        for packet in [0x1105, 0x2905] {
+            dsi(0x28, packet);
+            dsi(0x4C, 1 << 1);
+        }
+        // The backlight driver's enable, GPIO port V pin 1 (controller 5,
+        // port 1), driven high, and the dimmer at full duty.
+        let pin = 1 << BACKLIGHT_ENABLE_PIN;
+        for row in [0x00, 0x10, 0x20] {
+            soc.gpio.write(0, 0x504 + row, 4, pin).unwrap();
+        }
+        soc.pwm.set(0, PWM_ENABLE | PWM_WIDTH);
+
+        assert!(
+            soc.screen().is_err(),
+            "the display controller was never set up"
+        );
+        assert_eq!(
+            soc.panel(),
+            Panel {
+                panel_on: true,
+                backlight_on: true,
+            }
+        );
+    }
 }
