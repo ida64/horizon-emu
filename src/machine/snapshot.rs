@@ -19,6 +19,7 @@ use std::{
     io,
     os::{fd::AsRawFd, unix::fs::FileExt},
     path::Path,
+    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
@@ -183,7 +184,7 @@ impl Machine {
     /// Asks every core with a thread to park and waits until they have.
     fn park_cores(&self) -> Result<[Option<ParkedCore>; CORE_COUNT], SnapshotError> {
         let mut state = self.pause.state.lock().unwrap();
-        if state.requested {
+        if self.pause.requested() {
             return Err(SnapshotError::Unsupported(
                 "a snapshot is being taken already".into(),
             ));
@@ -195,7 +196,7 @@ impl Machine {
                 "a machine that is not running".into(),
             ));
         }
-        state.requested = true;
+        self.pause.requested.store(true, Ordering::SeqCst);
         let deadline = Instant::now() + PARK_TIMEOUT;
         loop {
             let threads = state.threads;
@@ -239,7 +240,8 @@ impl Machine {
     }
 
     fn release_cores(&self) {
-        self.pause.state.lock().unwrap().requested = false;
+        let _state = self.pause.state.lock().unwrap();
+        self.pause.requested.store(false, Ordering::SeqCst);
         self.pause.changed.notify_all();
     }
 

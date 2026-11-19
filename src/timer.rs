@@ -4,7 +4,13 @@
 //! `CNTP_CTL_EL0`/`CNTP_CVAL_EL0` (`0x800ceea0`), and assumes the console's
 //! 19.2 MHz counter without ever reading `CNTFRQ_EL0`. The host counter runs
 //! at another rate, so the counter is synthesized from guest time
-//! ([`GuestClock`]) instead of exposing the host's.
+//! ([`GuestClock`]) instead of exposing the host's, and every read of it
+//! traps. Hypervisor.framework offers no way around that: the guest may
+//! read only the virtual counter untrapped, as the host's 24 MHz count
+//! (Apple silicon) minus an offset, and no counter can be scaled. With EL2
+//! enabled a guest hypervisor could program `CNTHCTL_EL2` and `CNTVOFF_EL2`,
+//! still at the host's rate, and the framework shows its guests no FEAT_ECV
+//! (`ID_AA64MMFR0_EL1.ECV` is 0), so not even a physical counter offset.
 
 use std::{
     sync::{
@@ -203,8 +209,16 @@ impl Snapshot for Timers {
     }
 }
 
+/// Counter ticks in `elapsed`, rounded down, modulo 2^64: whole seconds
+/// and the rest apart, which needs no 128-bit division (it runs for every
+/// trapped counter read) and gives what dividing the whole by a second does,
+/// since the seconds' ticks are whole.
 fn ticks(elapsed: Duration) -> u64 {
-    (elapsed.as_nanos() * u128::from(COUNTER_HZ) / 1_000_000_000) as u64
+    let subsecond = u64::from(elapsed.subsec_nanos()) * COUNTER_HZ / 1_000_000_000;
+    elapsed
+        .as_secs()
+        .wrapping_mul(COUNTER_HZ)
+        .wrapping_add(subsecond)
 }
 
 /// Shortest duration that spans at least `ticks` counter ticks.
@@ -240,6 +254,43 @@ mod tests {
         }
         // The kernel parks idle timers at the maximum compare value.
         assert!(duration(u64::MAX) > Duration::from_secs(1 << 30));
+    }
+
+    /// The counter reads what the 128-bit conversion of guest time gave,
+    /// in every second and at its edges, up to the largest guest time.
+    #[test]
+    fn ticks_are_those_of_the_whole_nanosecond_count() {
+        let reference = |elapsed: Duration| {
+            (elapsed.as_nanos() * u128::from(COUNTER_HZ) / 1_000_000_000) as u64
+        };
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let subseconds = [0, 1, 51, 52, 53, 999_999_947, 999_999_999];
+        let seconds = [
+            0,
+            1,
+            7,
+            3_600,
+            1 << 32,
+            1 << 40,
+            u64::MAX / COUNTER_HZ,
+            u64::MAX,
+        ];
+        for secs in seconds {
+            for nanos in subseconds {
+                let elapsed = Duration::new(secs, nanos);
+                assert_eq!(ticks(elapsed), reference(elapsed), "{elapsed:?}");
+            }
+        }
+        for _ in 0..1_000_000 {
+            let elapsed = Duration::from_nanos(random() >> 1);
+            assert_eq!(ticks(elapsed), reference(elapsed), "{elapsed:?}");
+        }
     }
 
     /// The timer thread is woken only for a deadline before the one it
