@@ -174,6 +174,43 @@ fn equals(memory: &dyn GpuMemory, address: u64, expected: &[u8]) -> Result<bool,
     Ok(true)
 }
 
+/// `None` if memory at `address` holds `expected`, else the `length` bytes
+/// it holds, read once: compared a piece at a time while equal, the rest
+/// read after the first difference. Refuses as [`read`] would.
+fn read_unless_equal(
+    memory: &dyn GpuMemory,
+    address: u64,
+    length: usize,
+    expected: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>, Unmodeled> {
+    let Some(expected) = expected.filter(|expected| expected.len() == length) else {
+        return read(memory, address, length).map(Some);
+    };
+    let mut buffer = [0u8; 4096];
+    let mut at = 0;
+    for chunk in expected.chunks(buffer.len()) {
+        let piece = &mut buffer[..chunk.len()];
+        memory
+            .read(address + at as u64, piece)
+            .ok_or_else(|| unmapped(address, length))?;
+        if piece != chunk {
+            let mut bytes = Vec::with_capacity(length);
+            bytes.extend_from_slice(&expected[..at]);
+            bytes.extend_from_slice(piece);
+            let done = bytes.len();
+            bytes.resize(length, 0);
+            if done < length {
+                memory
+                    .read(address + done as u64, &mut bytes[done..])
+                    .ok_or_else(|| unmapped(address, length))?;
+            }
+            return Ok(Some(bytes));
+        }
+        at += chunk.len();
+    }
+    Ok(None)
+}
+
 /// Host memory the decoded programs of one channel may take, with the
 /// bytes they were decoded from \[assumption: sized so that every
 /// program a session uses at once stays (a program is at most 64 KiB of
@@ -228,16 +265,49 @@ impl ProgramCache {
     }
 }
 
-/// A decoded texture, the raw bytes it was decoded from, and when they
-/// last compared equal to memory.
-type CachedTexture = (Arc<[u8]>, Arc<Texture>, Stamp);
+/// A texture decoded from `raw`, the bytes of its footprint.
+struct Decoded {
+    raw: Box<[u8]>,
+    texture: Arc<Texture>,
+    /// Tells this decode from any other kept under the same key before or
+    /// after it.
+    serial: u64,
+}
 
-/// Decoded textures by TIC contents, kept across draws; the least
-/// recently used are dropped beyond [`TEXTURE_BUDGET`]. A draw keeps the
-/// textures it resolved ([`DrawTextures`]), so none is dropped while in
-/// use.
+/// The decoded texture a TIC's memory last compared equal to: the one
+/// under `(words, hash)` with serial `serial`, compared at `stamp`.
+#[derive(Clone, Copy)]
+struct Binding {
+    hash: u64,
+    serial: u64,
+    stamp: Stamp,
+}
+
+/// TICs whose binding is kept \[assumption: far more than a frame binds;
+/// a dropped binding costs a hash of the memory at the next use\].
+const BINDING_LIMIT: usize = 1 << 16;
+
+struct Entries {
+    bindings: Lru<[u32; 8], Binding>,
+    /// Decoded textures by TIC contents and [`content_hash`] of their
+    /// bytes.
+    decoded: Lru<([u32; 8], u64), Arc<Decoded>>,
+    serials: u64,
+}
+
+/// Decoded textures by TIC contents and memory contents, kept across
+/// draws; the least recently used are dropped beyond [`TEXTURE_BUDGET`].
+/// A draw keeps the textures it resolved ([`DrawTextures`]), so none is
+/// dropped while in use.
+///
+/// Each TIC is bound to the decode its memory last compared equal to.
+/// When the memory changed, the decode of the new contents is looked up
+/// by their hash and taken only if its bytes are equal (a texture that a
+/// guest alternates between a few contents, as the Mii editor's render
+/// targets do, is decoded once per contents); otherwise the new contents
+/// are decoded.
 pub struct TextureCache {
-    entries: Mutex<Lru<[u32; 8], CachedTexture>>,
+    entries: Mutex<Entries>,
 }
 
 impl Default for TextureCache {
@@ -249,15 +319,93 @@ impl Default for TextureCache {
 impl TextureCache {
     pub fn with_budget(budget: usize) -> Self {
         TextureCache {
-            entries: Mutex::new(Lru::new(budget)),
+            entries: Mutex::new(Entries {
+                bindings: Lru::new(BINDING_LIMIT),
+                decoded: Lru::new(budget),
+                serials: 0,
+            }),
         }
     }
 
     /// Textures held, and the host memory they take.
     pub fn usage(&self) -> (usize, usize) {
         let entries = self.entries.lock().unwrap();
-        (entries.len(), entries.cost())
+        (entries.decoded.len(), entries.decoded.cost())
     }
+
+    /// The texture `words` describe whose memory holds `raw`, now bound to
+    /// it: kept if decoded before, decoded otherwise.
+    fn contents(
+        &self,
+        words: [u32; 8],
+        tic: &Tic,
+        raw: Vec<u8>,
+        writes: &Writes,
+    ) -> Result<Arc<Texture>, Unmodeled> {
+        let hash = content_hash(&raw);
+        let kept = self
+            .entries
+            .lock()
+            .unwrap()
+            .decoded
+            .get(&(words, hash))
+            .cloned();
+        let decoded = match kept {
+            Some(decoded) if *decoded.raw == *raw => decoded,
+            _ => {
+                let texture = Arc::new(Texture::decode(&raw, tic)?);
+                let cost = raw.len() + texture.bytes();
+                let mut entries = self.entries.lock().unwrap();
+                entries.serials += 1;
+                let decoded = Arc::new(Decoded {
+                    raw: raw.into(),
+                    texture,
+                    serial: entries.serials,
+                });
+                let dropped = entries.decoded.insert((words, hash), decoded.clone(), cost);
+                drop(entries);
+                // Dropped textures are freed outside the lock.
+                drop(dropped);
+                decoded
+            }
+        };
+        let binding = Binding {
+            hash,
+            serial: decoded.serial,
+            stamp: writes.stamp(),
+        };
+        self.entries
+            .lock()
+            .unwrap()
+            .bindings
+            .insert(words, binding, 1);
+        Ok(decoded.texture.clone())
+    }
+}
+
+/// A hash of `bytes` for [`TextureCache`]'s lookup by contents, which
+/// compares the bytes too: fast rather than strong (four independent
+/// multiply-rotate lanes, eight bytes each).
+fn content_hash(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut lanes = [1u64, 2, 3, 4];
+    let (chunks, remainder) = bytes.as_chunks::<32>();
+    for chunk in chunks {
+        let (words, _) = chunk.as_chunks::<8>();
+        for (lane, word) in lanes.iter_mut().zip(words) {
+            *lane = (*lane ^ u64::from_le_bytes(*word))
+                .wrapping_mul(K)
+                .rotate_left(29);
+        }
+    }
+    let mut hash = bytes.len() as u64;
+    for lane in lanes {
+        hash = (hash ^ lane).wrapping_mul(K).rotate_left(31);
+    }
+    for &byte in remainder {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(K).rotate_left(23);
+    }
+    hash ^ (hash >> 32)
 }
 
 /// Where a draw's texture handles point.
@@ -321,36 +469,39 @@ impl<'a> DrawTextures<'a> {
         let tic = Tic::parse(words)?;
         let (address, length) = Texture::footprint(&tic)?;
         let end = address.saturating_add(length);
-        // A kept texture: current, or to be compared with memory.
-        let (fresh, kept) = match self.cache.entries.lock().unwrap().get(&words) {
-            Some((_, texture, stamp)) if self.writes.unchanged(*stamp, address, end) => {
-                (Some(texture.clone()), None)
-            }
-            Some((raw, texture, _)) => (None, Some((raw.clone(), texture.clone()))),
-            None => (None, None),
+        // The decode this TIC's memory last compared equal to, if kept.
+        let bound = {
+            let mut entries = self.cache.entries.lock().unwrap();
+            let Entries {
+                bindings, decoded, ..
+            } = &mut *entries;
+            bindings.get(&words).copied().and_then(|binding| {
+                decoded
+                    .get(&(words, binding.hash))
+                    .filter(|decoded| decoded.serial == binding.serial)
+                    .map(|decoded| (binding, decoded.clone()))
+            })
         };
-        let texture = match (fresh, kept) {
-            (Some(texture), _) => texture,
-            (None, Some((raw, texture))) if equals(self.memory, address, &raw)? => {
-                let stamp = self.writes.stamp();
-                if let Some((kept, _, at)) = self.cache.entries.lock().unwrap().get_mut(&words)
-                    && Arc::ptr_eq(kept, &raw)
-                {
-                    *at = stamp;
-                }
-                texture
+        let texture = match bound {
+            Some((binding, decoded)) if self.writes.unchanged(binding.stamp, address, end) => {
+                decoded.texture.clone()
             }
-            (None, _) => {
-                let raw: Arc<[u8]> = read(self.memory, address, length as usize)?.into();
-                let texture = Arc::new(Texture::decode(self.memory, &tic)?);
-                let cost = raw.len() + texture.bytes();
-                // Dropped textures are freed outside the lock.
-                let _dropped = self.cache.entries.lock().unwrap().insert(
-                    words,
-                    (raw, texture.clone(), self.writes.stamp()),
-                    cost,
-                );
-                texture
+            bound => {
+                let expected = bound.as_ref().map(|(_, decoded)| &*decoded.raw);
+                match read_unless_equal(self.memory, address, length as usize, expected)? {
+                    None => {
+                        let (binding, decoded) = bound.expect("compared with a kept decode");
+                        let stamp = self.writes.stamp();
+                        if let Some(kept) =
+                            self.cache.entries.lock().unwrap().bindings.get_mut(&words)
+                            && kept.serial == binding.serial
+                        {
+                            kept.stamp = stamp;
+                        }
+                        decoded.texture.clone()
+                    }
+                    Some(raw) => self.cache.contents(words, &tic, raw, self.writes)?,
+                }
             }
         };
         self.resolved.lock().unwrap().insert(index, texture.clone());
@@ -459,7 +610,11 @@ impl TextureUnit for ThreadTextures<'_> {
 mod tests {
     use std::sync::Arc;
 
-    use super::{DrawTextures, Pools, ProgramCache, TextureCache, Writes};
+    use super::{
+        Decoded, DrawTextures, Pools, ProgramCache, Texture, TextureCache, Tracked, Writes,
+        content_hash, read,
+    };
+    use crate::maxwell::GpuMemory;
     use crate::maxwell::tests::Ram;
 
     /// A pixel program at `address` whose one instruction moves `value`
@@ -575,5 +730,99 @@ mod tests {
                 "{count} textures, {cost} bytes"
             );
         }
+    }
+
+    /// Every texture the cache hands out equals a decode of memory as it
+    /// stands: a texture whose memory changed is decoded again, contents
+    /// seen before are taken from the cache, and a kept decode whose hash
+    /// matches but whose bytes differ is not taken.
+    #[test]
+    fn texture_cache_follows_memory_contents() {
+        const SAMPLERS: u64 = 0x800;
+        const TEXELS: u64 = 0x10000;
+        let ram = Ram::new(0x20000);
+        let sampler: [u32; 3] = [2 | (2 << 3) | (2 << 6), 2 | (2 << 4) | (1 << 6), 15 << 20];
+        for (i, word) in sampler.iter().enumerate() {
+            ram.put(SAMPLERS + i as u64 * 4, &word.to_le_bytes());
+        }
+        let words = tic(TEXELS as u32);
+        for (k, word) in words.iter().enumerate() {
+            ram.put(k as u64 * 4, &word.to_le_bytes());
+        }
+        let pools = Pools {
+            header_pool: 0,
+            header_maximum: 0,
+            sampler_pool: SAMPLERS,
+            sampler_maximum: 0,
+            sampler_from_header: false,
+        };
+        let writes = Writes::default();
+        let cache = TextureCache::default();
+        let resolve = || {
+            let texture = DrawTextures::new(&ram, pools, &cache, &writes)
+                .resolve(0)
+                .unwrap()
+                .0;
+            // Equal, bit for bit, to a decode of memory now.
+            let raw = read(&ram, TEXELS, 512).unwrap();
+            let fresh = Texture::decode(&raw, texture.tic()).unwrap();
+            let (ours, theirs) = (texture.level(0).unwrap().3, fresh.level(0).unwrap().3);
+            assert_eq!(
+                ours.iter()
+                    .flatten()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                theirs
+                    .iter()
+                    .flatten()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            texture
+        };
+        let a: Vec<u8> = (0..512).map(|i| (i * 7) as u8).collect();
+        let mut b = a.clone();
+        b[0] ^= 0xff;
+        ram.put(TEXELS, &a);
+        let first = resolve();
+        // Unchanged within the epoch, and compared equal in the next.
+        assert!(Arc::ptr_eq(&resolve(), &first));
+        writes.signal();
+        assert!(Arc::ptr_eq(&resolve(), &first));
+        // Changed: decoded again.
+        ram.put(TEXELS, &b);
+        writes.signal();
+        let second = resolve();
+        assert!(!Arc::ptr_eq(&second, &first));
+        assert_ne!(second.level(0).unwrap().3[0], first.level(0).unwrap().3[0]);
+        // The first contents again (an engine's write this time): the
+        // first decode, not a new one.
+        Tracked {
+            memory: &ram,
+            writes: &writes,
+        }
+        .write(TEXELS, &a[..4])
+        .unwrap();
+        assert!(Arc::ptr_eq(&resolve(), &first));
+        assert_eq!(cache.usage().0, 2);
+        // A kept decode under the hash of new contents, of other bytes (as
+        // a hash collision would leave): decoded again all the same.
+        let mut c = a.clone();
+        c[1] ^= 0xff;
+        {
+            let mut entries = cache.entries.lock().unwrap();
+            let impostor = Arc::new(Decoded {
+                raw: a.clone().into(),
+                texture: first.clone(),
+                serial: u64::MAX,
+            });
+            entries
+                .decoded
+                .insert((words, content_hash(&c)), impostor, 1);
+        }
+        ram.put(TEXELS, &c);
+        writes.signal();
+        let third = resolve();
+        assert!(!Arc::ptr_eq(&third, &first) && !Arc::ptr_eq(&third, &second));
     }
 }

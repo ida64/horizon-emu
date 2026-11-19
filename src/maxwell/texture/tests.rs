@@ -1,19 +1,6 @@
 use super::*;
 use crate::maxwell::sampling::{FetchRequest, GatherRequest, Lod, Query, SampleRequest};
 
-struct Memory(Vec<u8>);
-impl GpuMemory for Memory {
-    fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
-        buffer.copy_from_slice(
-            self.0
-                .get(address as usize..address as usize + buffer.len())?,
-        );
-        Some(())
-    }
-    fn write(&self, _: u64, _: &[u8]) -> Option<()> {
-        None
-    }
-}
 fn descriptor(format: u32, width: u32, height: u32) -> [u32; 8] {
     [
         format
@@ -174,7 +161,7 @@ fn pitch_srgb_and_swizzle() {
     let tic = Tic::parse(words).unwrap();
     let mut data = vec![0; 32];
     data[..4].copy_from_slice(&[128, 64, 255, 128]);
-    let texture = Texture::decode(&Memory(data), &tic).unwrap();
+    let texture = Texture::decode(&data, &tic).unwrap();
     let c = texture.levels[0].texels[0];
     assert!((c[0] - 0.2158605).abs() < 1e-6);
     assert!((c[1] - 0.05126946).abs() < 1e-6);
@@ -335,7 +322,7 @@ fn starter_bntx_decode() {
     words[3] = (u32le(bntx, o + 0x34) as u32 & 7) << 3;
     let tic = Tic::parse(words).unwrap();
     assert_eq!(Texture::footprint(&tic).unwrap(), (0, size as u64));
-    let texture = Texture::decode(&Memory(bntx[offset..offset + size].to_vec()), &tic).unwrap();
+    let texture = Texture::decode(&bntx[offset..offset + size], &tic).unwrap();
     let pixels = &texture.levels[0].texels;
     assert_eq!(pixels.len(), 1024);
     assert!(pixels.iter().all(|p| p[0] >= 0.
@@ -345,4 +332,248 @@ fn starter_bntx_decode() {
         && p[3] == 1.));
     assert!(pixels.iter().any(|p| p[0] > 0.9));
     assert!(pixels.iter().any(|p| p[0] < 0.1));
+}
+
+/// `Texture::decode` as it was before its per-component tables and
+/// column offsets: every block addressed in full, every component
+/// converted at every texel. The reference of
+/// `decode_matches_reference`.
+fn reference_decode(raw: &[u8], tic: &Tic) -> Result<Vec<Vec<[f32; 4]>>, Unmodeled> {
+    let (_, size) = Texture::footprint(tic)?;
+    let raw = &raw[..size as usize];
+    let tiled = if tic.pitch.is_none() {
+        Some(layout::block_linear_image(&tic.shape, tic.block)?)
+    } else {
+        None
+    };
+    let mut levels = Vec::new();
+    let f = tic.format;
+    let srgb8 = matches!(
+        f.encoding,
+        Encoding::Bc1 | Encoding::Bc2 | Encoding::Bc3 | Encoding::Bc7
+    ) || matches!(f.encoding, Encoding::Packed(fields) if fields[..3].iter().all(|(_,bits)| matches!(bits,0|8)));
+    for level in 0..tic.shape.levels {
+        let width = (tic.shape.width >> level).max(1);
+        let height = (tic.shape.height >> level).max(1);
+        let depth = (tic.shape.depth >> level).max(1);
+        let mut texels = vec![[0.; 4]; (width * height * depth * tic.shape.layers) as usize];
+        let mut block = [[0.; 4]; 144];
+        for layer in 0..tic.shape.layers {
+            for z in 0..depth {
+                for by in 0..height.div_ceil(f.block_height) {
+                    for bx in 0..width.div_ceil(f.block_width) {
+                        let offset = if let Some(image) = &tiled {
+                            let m = &image.levels[level as usize];
+                            u64::from(layer) * image.layer_stride
+                                + m.offset
+                                + m.surface.offset(bx * f.bytes_per_block, by, z)
+                        } else {
+                            u64::from(tic.pitch.unwrap())
+                                * (u64::from(layer * depth + z)
+                                    * u64::from(height.div_ceil(f.block_height))
+                                    + u64::from(by))
+                                + u64::from(bx * f.bytes_per_block)
+                        } as usize;
+                        let mut split = [0u8; 16];
+                        let bytes = if let Some(image) = &tiled
+                            && !f.bytes_per_block.is_power_of_two()
+                        {
+                            let m = &image.levels[level as usize];
+                            for byte in 0..f.bytes_per_block {
+                                let address = u64::from(layer) * image.layer_stride
+                                    + m.offset
+                                    + m.surface.offset(bx * f.bytes_per_block + byte, by, z);
+                                split[byte as usize] = *raw
+                                    .get(address as usize)
+                                    .ok_or_else(|| unsupported("texture byte offset", address))?;
+                            }
+                            &split[..f.bytes_per_block as usize]
+                        } else {
+                            raw.get(offset..offset + f.bytes_per_block as usize)
+                                .ok_or_else(|| unsupported("texture block offset", offset))?
+                        };
+                        if let Encoding::Packed(fields) = f.encoding {
+                            let mut word = 0u128;
+                            for (i, &b) in bytes.iter().enumerate() {
+                                word |= u128::from(b) << (i * 8);
+                            }
+                            let mut c = [0., 0., 0., 1.];
+                            for (i, (shift, bits)) in fields.into_iter().enumerate() {
+                                if bits == 0 {
+                                    continue;
+                                }
+                                let v = ((word >> shift) & ((1u128 << bits) - 1)) as u32;
+                                c[i] = match tic.types[i] {
+                                    ComponentType::Unorm | ComponentType::UnormForceFp16 => {
+                                        format::unorm_to_f32(v, bits.into())
+                                    }
+                                    ComponentType::Snorm | ComponentType::SnormForceFp16 => {
+                                        format::snorm_to_f32(v, bits.into())
+                                    }
+                                    ComponentType::Float => match bits {
+                                        10 => format::uf10_to_f32(v),
+                                        11 => format::uf11_to_f32(v),
+                                        16 => format::f16_to_f32(v as u16),
+                                        32 => f32::from_bits(v),
+                                        _ => {
+                                            return Err(unsupported(
+                                                "TIC FLOAT component bits",
+                                                bits,
+                                            ));
+                                        }
+                                    },
+                                    ComponentType::Uint | ComponentType::Sint => 0.,
+                                };
+                                if matches!(
+                                    tic.types[i],
+                                    ComponentType::UnormForceFp16 | ComponentType::SnormForceFp16
+                                ) {
+                                    c[i] = format::f16_to_f32(format::f32_to_f16(c[i]));
+                                }
+                            }
+                            block[0] = c;
+                        } else {
+                            decode_block(tic, bytes, &mut block)?;
+                        }
+                        for y in 0..f.block_height.min(height - by * f.block_height) {
+                            for x in 0..f.block_width.min(width - bx * f.block_width) {
+                                let mut c = block[(y * f.block_width + x) as usize];
+                                if tic.srgb {
+                                    for v in &mut c[..3] {
+                                        *v = if srgb8 {
+                                            format::SRGB8_TO_LINEAR
+                                                [(*v * 255.).round().clamp(0., 255.) as usize]
+                                        } else {
+                                            format::srgb_to_linear(*v)
+                                        };
+                                    }
+                                }
+                                let c = tic.swizzle.map(|s| match s {
+                                    0 => 0.,
+                                    2..=5 => c[(s - 2) as usize],
+                                    6 | 7 => 1.,
+                                    _ => unreachable!(),
+                                });
+                                let index = (((layer as usize * depth as usize + z as usize)
+                                    * height as usize
+                                    + (by * f.block_height + y) as usize)
+                                    * width as usize)
+                                    + (bx * f.block_width + x) as usize;
+                                texels[index] = c;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        levels.push(texels);
+    }
+    Ok(levels)
+}
+
+/// The decoder equals [`reference_decode`] bit for bit (NaN for NaN) on
+/// random bytes, for every TIC format, random data types, swizzles, sRGB
+/// views, pitch and block-linear layouts (block heights and depths,
+/// levels, array layers, 3D slices), refusals included; now and then a
+/// texture large enough for 16-bit fields to be converted by table.
+#[test]
+fn decode_matches_reference() {
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move |n: u32| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % u64::from(n)) as u32
+    };
+    let formats: Vec<ImageFormat> = (0..0x80)
+        .filter_map(|raw| ImageFormat::from_tic(raw).ok())
+        .collect();
+    let (mut decoded, mut refused) = (0, 0);
+    for case in 0..20000 {
+        let format = formats[case % formats.len()];
+        let packed = matches!(format.encoding, Encoding::Packed(_));
+        let pitch = packed && next(3) == 0;
+        // Large: over 2^18 texels.
+        let large = case % 151 == 0;
+        let kind = if large {
+            1
+        } else {
+            [1, 5, 2][next(3) as usize]
+        };
+        let (width, height) = if large {
+            (512 + next(64), 512 + next(16))
+        } else {
+            (1 + next(40), 1 + next(24))
+        };
+        let d = 1 + next(4);
+        let levels = if pitch { 1 } else { 1 + next(3) };
+        let types: u32 = (0..4)
+            .map(|i| {
+                let t = if packed {
+                    1 + next(7)
+                } else if next(4) == 0 {
+                    1
+                } else {
+                    2
+                };
+                t << (7 + 3 * i)
+            })
+            .sum();
+        let swizzle: u32 = (0..4)
+            .map(|i| [0, 2, 3, 4, 5, 6, 7][next(7) as usize] << (19 + 3 * i))
+            .sum();
+        let blocks_wide = width.div_ceil(format.block_width);
+        let row = (blocks_wide * format.bytes_per_block).div_ceil(32) + next(2);
+        let words = [
+            format.raw | types | swizzle,
+            0,
+            if pitch { 2 << 21 } else { 3 << 21 },
+            if pitch {
+                row
+            } else {
+                (next(4) << 3) | (next(3) << 6) | ((levels - 1) << 28)
+            },
+            (width - 1) | (next(2) << 22) | (kind << 23),
+            (height - 1) | ((d - 1) << 16) | (1 << 31),
+            0,
+            (levels - 1) << 4,
+        ];
+        let Ok(tic) = Tic::parse(words) else {
+            continue;
+        };
+        let Ok((_, size)) = Texture::footprint(&tic) else {
+            continue;
+        };
+        let raw: Vec<u8> = (0..size).map(|_| next(256) as u8).collect();
+        match (Texture::decode(&raw, &tic), reference_decode(&raw, &tic)) {
+            (Ok(texture), Ok(reference)) => {
+                decoded += 1;
+                assert_eq!(texture.levels.len(), reference.len());
+                for (level, (ours, theirs)) in texture.levels.iter().zip(&reference).enumerate() {
+                    assert_eq!(ours.texels.len(), theirs.len());
+                    for (i, (a, b)) in ours.texels.iter().zip(theirs).enumerate() {
+                        for (a, b) in a.iter().zip(b) {
+                            assert!(
+                                a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
+                                "{words:x?} level {level} texel {i}: {a} != {b}"
+                            );
+                        }
+                    }
+                }
+            }
+            (Err(ours), Err(theirs)) => {
+                refused += 1;
+                assert_eq!(ours, theirs, "{words:x?}");
+            }
+            (ours, theirs) => panic!(
+                "{words:x?}: {:?} against {:?}",
+                ours.map(|_| ()),
+                theirs.map(|_| ())
+            ),
+        }
+    }
+    assert!(
+        decoded > 2000 && refused > 0,
+        "{decoded} decoded, {refused} refused"
+    );
 }
