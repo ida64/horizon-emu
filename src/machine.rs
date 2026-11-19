@@ -11,6 +11,7 @@ pub use self::bpmp::{
 pub use self::snapshot::SaveReport;
 
 use std::{
+    cell::Cell,
     collections::{BTreeMap, HashMap},
     fmt, io,
     panic::{self, AssertUnwindSafe},
@@ -1527,9 +1528,18 @@ struct SignalState {
     waiting: bool,
 }
 
+thread_local! {
+    /// The core whose run loop this thread is in, between
+    /// [`CoreSignals::attach`] and the detach after it.
+    static OWN_CORE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
 impl CoreSignals {
+    /// Called by `core`'s thread when its run loop takes up the vCPU
+    /// (`Some`) and before it destroys it (`None`).
     fn attach(&self, core: usize, vcpu: Option<VcpuHandle>) {
         *self.0[core].vcpu.lock().unwrap() = vcpu;
+        OWN_CORE.set(vcpu.map(|_| core));
     }
 
     fn notify(&self, core: usize) {
@@ -1542,9 +1552,14 @@ impl CoreSignals {
         signal.wake.notify_one();
         // A core in `wait` looks again at whatever it waits for, its
         // interrupt input included, before it enters the guest again; a
-        // kick would only make that entry return at once. A core not in
-        // `wait` may be in the guest or on its way there.
-        if !waiting && let Some(vcpu) = *signal.vcpu.lock().unwrap() {
+        // kick would only make that entry return at once. So does a core
+        // whose own thread raised its input while serving an exit (a
+        // write that unmasks a pending interrupt, a timer set in the
+        // past). Any other core may be in the guest or on its way there.
+        if !waiting
+            && OWN_CORE.get() != Some(core)
+            && let Some(vcpu) = *signal.vcpu.lock().unwrap()
+        {
             vcpu.kick().expect("an attached vCPU is live");
         }
     }
@@ -1592,13 +1607,15 @@ pub enum ParkedCore {
 /// or where a core waits (switched off, asleep), and lets them go again.
 #[derive(Default)]
 struct Pause {
+    /// Whether the cores are to park; changed with `state` held, read
+    /// without it before every entry into the guest.
+    requested: AtomicBool,
     state: Mutex<PauseState>,
     changed: Condvar,
 }
 
 #[derive(Default)]
 struct PauseState {
-    requested: bool,
     /// Cores with a thread in the current run.
     threads: [bool; CORE_COUNT],
     parked: [Option<ParkedCore>; CORE_COUNT],
@@ -1617,7 +1634,7 @@ enum Start {
 
 impl Pause {
     fn requested(&self) -> bool {
-        self.state.lock().unwrap().requested
+        self.requested.load(Ordering::SeqCst)
     }
 
     /// Called by `core`'s thread when it sees a pause requested: records
@@ -1626,7 +1643,7 @@ impl Pause {
         let mut state = self.state.lock().unwrap();
         state.parked[core] = Some(parked);
         self.changed.notify_all();
-        while state.requested {
+        while self.requested() {
             state = self.changed.wait(state).unwrap();
         }
         state.parked[core] = None;
