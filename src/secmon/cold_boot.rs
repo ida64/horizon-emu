@@ -34,9 +34,14 @@
 //!
 //! # The monitor's steps, in order
 //!
-//! 1. Set-up the guest cannot see here ([`NOT_MODELLED`]), then it zeroes
-//!    its own IRAM image (`0x40030000`, `0xE000` bytes; the bootloader reads
-//!    package2's partition there next) and sets its state to 1.
+//! 1. Its resident part LZ4-decompressed to TZRAM [`RESIDENT`] (the boot
+//!    stage, `0x400307FC`); set-up the guest cannot see here
+//!    ([`NOT_MODELLED`]) and what the warm path reads later
+//!    ([`sc7`]: `PMC_SCRATCH1` = `0x8000D000`, `SECURE_SCRATCH21` bit 4,
+//!    `SECURE_SCRATCH32` = `0x339`, `SECURE_SCRATCH34` = `0x7C012800`,
+//!    `MC_SECURITY_CFG3` = 3); then it zeroes its own IRAM image
+//!    (`0x40030000`, `0xE000` bytes; the bootloader reads package2's
+//!    partition there next) and sets its state to 1.
 //! 2. Bootloader state 1: it copies the boot config (`0x400` bytes at IRAM
 //!    `0x4003F800`) unless the console is not a development unit, in which
 //!    case the copy is zeroes (`0x1F01E0A04`; the hardware state from fuse
@@ -52,8 +57,20 @@
 //!    in a recovery boot (for config item 17), and sets core 0 to start at
 //!    DRAM base + the header's entry point with `X0` = 0 (`0x1F0143C20`).
 //! 5. Bootloader state 4: final memory controller set-up ([`NOT_MODELLED`]),
-//!    a wait for the BPMP to halt ([`HALT_COP_EVENTS`]), then the drop to
-//!    EL1 (`SPSR_EL3` `0x3C5`, `0x1F0140CC0`).
+//!    a wait for the BPMP to halt itself ([`HALT_COP_EVENTS`] mode 2), which
+//!    it then parks for good (`0x40000000`), then the drop to EL1
+//!    (`SPSR_EL3` `0x3C5`, `0x1F0140CC0`).
+//!
+//! # What TZRAM holds here
+//!
+//! The monitor's resident image exactly as its boot stage decompresses it
+//! (code, rodata and initialised data, `0xAC18` bytes at [`RESIDENT`]),
+//! nothing else: its code never runs, and its data does not track this
+//! monitor's state. The SC7 preparation reads two things out of it (the
+//! BPMP's SC7 stub and the block its engine context ends with) and saves
+//! `0x7C012000..0x7C020000` of it for the warmboot firmware to verify.
+//! The SC7 routine's stack (linked lists, bounce buffers) is at
+//! [`sc7::STACK`].
 //!
 //! # Boot parameters
 //!
@@ -801,7 +818,12 @@ mod tests {
             Box::new(crate::soc::pmc::Pmc::new()),
         );
         bus.map("MC", mc::BASE, mc::SIZE, Box::new(Arc::clone(controller)));
-        bus.map("TZRAM", tzram::BASE, tzram::SIZE, Box::new(Arc::clone(tzram)));
+        bus.map(
+            "TZRAM",
+            tzram::BASE,
+            tzram::SIZE,
+            Box::new(Arc::clone(tzram)),
+        );
     }
 
     fn register(bus: &Bus, address: u64) -> u32 {
@@ -1015,7 +1037,10 @@ mod tests {
             "FLOW",
             HALT_COP_EVENTS & !0xFFF,
             0x1000,
-            Box::new(RegisterFile::zeroed([(HALT_COP_EVENTS & 0xFFF, 0x5000_0000)])),
+            Box::new(RegisterFile::zeroed([(
+                HALT_COP_EVENTS & 0xFFF,
+                0x5000_0000,
+            )])),
         );
         let controller = Arc::new(Mc::new(crate::boot::DramSize::Gb4));
         map_secure_blocks(&mut bus, &controller, &Arc::default());
