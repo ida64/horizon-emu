@@ -269,12 +269,14 @@ pub struct ChipFuses {
 /// bit 0).
 pub fn fuses_after_boot() -> impl Iterator<Item = (u64, u32)> {
     let key_hash = ERISTA_PUBLIC_KEY_HASH
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .enumerate()
         .map(|(index, word)| {
             (
                 FUSE_PUBLIC_KEY0 + 4 * index as u64,
-                u32::from_le_bytes(word.try_into().unwrap()),
+                u32::from_le_bytes(*word),
             )
         });
     let private_key = (0..5).map(|index| (FUSE_PRIVATE_KEY0 + 4 * index, u32::MAX));
@@ -745,12 +747,12 @@ fn secure_storage_key(fuses: &Fuses) -> Key {
     ];
     let cipher = Aes128::new((&fuses.secure_boot_key).into());
     let mut block = [0; 16];
-    for word in block.chunks_exact_mut(4) {
-        word.copy_from_slice(&fuses.device_key.to_le_bytes());
+    for word in block.as_chunks_mut::<4>().0 {
+        *word = fuses.device_key.to_le_bytes();
     }
     let mut block: aes::Block = block.into();
     cipher.encrypt_block(&mut block);
-    for (bytes, word) in block.chunks_exact_mut(4).zip(identity) {
+    for (bytes, word) in block.as_chunks_mut::<4>().0.iter_mut().zip(identity) {
         for (byte, mask) in bytes.iter_mut().zip(word.to_le_bytes()) {
             *byte ^= mask;
         }
@@ -897,7 +899,7 @@ pub struct WarmBootHandoff {
     /// As for the cold boot ([`BootRomHandoff::cpsr`]).
     pub cpsr: u32,
     /// What the ROM wrote into IRAM: the warmboot's code.
-    pub iram_written: Vec<Range<u32>>,
+    pub iram_written: Range<u32>,
     /// The rest of IRAM; reads of it should be refused with the note until
     /// the guest has written the bytes itself.
     pub iram_undefined: Vec<(Range<u32>, &'static str)>,
@@ -1097,8 +1099,8 @@ pub fn warm_boot(
     let code = &image[WB0_HEADER_SIZE..WB0_HEADER_SIZE + code_length as usize];
     let start = (destination - IRAM_BASE) as usize;
     iram[start..start + code.len()].copy_from_slice(code);
-    let written = vec![destination..destination + code_length];
-    let iram_undefined = undefined(&written, &WARM_REGIONS);
+    let written = destination..destination + code_length;
+    let iram_undefined = undefined(std::slice::from_ref(&written), &WARM_REGIONS);
     Ok(WarmBootHandoff {
         entry,
         cpsr: ENTRY_CPSR,
@@ -1167,7 +1169,7 @@ mod tests {
             })
             .expect("the key file has the key");
         let mut key = [0; 16];
-        for (byte, pair) in key.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        for (byte, pair) in key.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
             *byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
         }
         key
@@ -1433,14 +1435,14 @@ mod tests {
         let cipher = Aes128::new((&key("package1_key_08")).into());
         let mut chain: [u8; 16] = blob[0x10..0x20].try_into().unwrap();
         let mut plain = Vec::with_capacity(size);
-        for block in blob[0x20..0x20 + size].chunks_exact(16) {
-            let mut decrypted: aes::Block = <[u8; 16]>::try_from(block).unwrap().into();
+        for block in blob[0x20..0x20 + size].as_chunks::<16>().0 {
+            let mut decrypted: aes::Block = (*block).into();
             cipher.decrypt_block(&mut decrypted);
             for (byte, chained) in decrypted.iter_mut().zip(chain) {
                 *byte ^= chained;
             }
             plain.extend_from_slice(&decrypted);
-            chain = block.try_into().unwrap();
+            chain = *block;
         }
         assert_eq!(&plain[..4], b"PK11");
         let (warmboot, bootloader, monitor) = (
@@ -1510,11 +1512,11 @@ mod tests {
         }
         let cipher = Aes128::new(srk.into());
         let mut chain = [0; 16];
-        for block in plain.chunks_exact_mut(16) {
+        for block in plain.as_chunks_mut::<16>().0 {
             for (byte, chained) in block.iter_mut().zip(chain) {
                 *byte ^= chained;
             }
-            let mut encrypted: aes::Block = <[u8; 16]>::try_from(&*block).unwrap().into();
+            let mut encrypted: aes::Block = (*block).into();
             cipher.encrypt_block(&mut encrypted);
             block.copy_from_slice(&encrypted);
             chain = encrypted.into();
@@ -1544,7 +1546,7 @@ mod tests {
         assert_eq!(handoff.entry, 0x4001_0240);
         assert_eq!(handoff.cpsr, 0xD3);
         assert_eq!(iram[0x1_0240..0x1_1430], warmboot[0x240..0x1430]);
-        assert_eq!(handoff.iram_written, [0x4001_0240..0x4001_1430]);
+        assert_eq!(handoff.iram_written, 0x4001_0240..0x4001_1430);
         let ranges: Vec<_> = handoff
             .iram_undefined
             .iter()

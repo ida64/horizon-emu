@@ -683,11 +683,17 @@ impl TsecSoc for TsecPort {
         Some(())
     }
 
-    /// \[assumption\] The slot keeps every permission: what the TSEC
-    /// firmware leaves in its access register is not established, and is
-    /// refused when read ([`crate::soc::se`] stores what was loaded).
-    fn load_se_keyslot(&self, slot: usize, key: &Key) -> Option<()> {
-        self.se.load_key(slot, key, 0).ok()
+    /// A secure-only slot is loaded with [`crate::soc::se::LOCK_PER_KEY`],
+    /// which clears its bit of `SE_CRYPTO_SECURITY_PERKEY`; the slot keeps
+    /// every access permission either way (what the TSEC model leaves, see
+    /// [`crate::soc::tsec`]).
+    fn load_se_keyslot(&self, slot: usize, key: &Key, secure_only: bool) -> Option<()> {
+        let flags = if secure_only {
+            crate::soc::se::LOCK_PER_KEY
+        } else {
+            0
+        };
+        self.se.load_key(slot, key, flags).ok()
     }
 
     fn restart_bpmp(&self, entry: u32) -> Option<()> {
@@ -1307,5 +1313,35 @@ mod tests {
         other.restore(&saved).unwrap();
         assert_eq!(other.core(), bpmp.core());
         assert!(other.unestablished.check(0, 4).is_some());
+    }
+
+    /// What the NX bootloader's hardware check reads of keyslots 0x0C and
+    /// 0x0D after the TSEC has loaded them (its CSV rows for SE+0x280 and
+    /// SE+0x2B4/0x2B8).
+    #[test]
+    fn the_tsec_s_secure_only_keyslot_loses_only_its_per_key_bit() {
+        use crate::{
+            bus::MmioDevice,
+            soc::mc::{DeviceMemory, Mc, SMMU_SE_ASID},
+        };
+        let mc = Arc::new(Mc::new(crate::boot::DramSize::Gb4));
+        let ram = Arc::new(GuestRam::new(0x8000_0000, 0x1000).unwrap());
+        let se = Arc::new(Se::new(
+            Box::new(DeviceMemory::new(&mc, &ram, SMMU_SE_ASID)),
+            Arc::default(),
+            0,
+        ));
+        let port = TsecPort {
+            iram: Arc::new(Iram::new()),
+            bus: Weak::new(),
+            se: Arc::clone(&se),
+            signals: Arc::default(),
+        };
+        port.load_se_keyslot(0x0D, &[1; 16], true).unwrap();
+        port.load_se_keyslot(0x0C, &[2; 16], false).unwrap();
+        let read = |offset| se.read(BPMP_CORE, offset, 4).unwrap() as u32;
+        assert_eq!(read(0x280) & 0xFFFF, 0xDFFF);
+        assert_eq!(read(0x284 + 0x0C * 4) & 0x7F, 0x7F);
+        assert_eq!(read(0x284 + 0x0D * 4) & 0x7F, 0x7F);
     }
 }

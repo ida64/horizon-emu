@@ -15,7 +15,7 @@
 //! so its key slots and the context it saves are the device's own.
 //!
 //! 1. Wake detection on, wake status cleared (`0x1F014371C`).
-//! 2. The preconditions ([`super::SLEEP_REQUIREMENTS`]) and the BPMP parked
+//! 2. The preconditions (`SLEEP_REQUIREMENTS` of [`super`]) and the BPMP parked
 //!    (`HALT_COP_EVENTS` = `0x40000000`, as the cold boot leaves it).
 //! 3. `PMC_SCRATCH0` = 1 (warm boot), `DPD_ENABLE` bit 1 (`0x1F0143548`).
 //! 4. 16 random bytes R from the engine into `SECURE_SCRATCH24..27`,
@@ -52,7 +52,8 @@
 //!
 //! The monitor redoes its SoC security set-up only if `MC_SECURITY_CFG3`
 //! reads 0, which is how it learns the SoC lost power; the part of it
-//! modelled is the cold boot's ([`cold_boot_setup`], the BPMP parked again).
+//! modelled is `SECURE_SCRATCH34` and `MC_SECURITY_CFG3` written again and
+//! the BPMP parked again once it halted itself.
 //! Then core 0 enters the kernel at the entry `CPU_SUSPEND` was given,
 //! with its context in `X0`.
 
@@ -141,7 +142,7 @@ const CORE0_PARTITIONS: [u32; 3] = [14, 15, 0];
 const TOGGLE_START: u32 = 1 << 8;
 
 const SE: u64 = se::BASE;
-const SE_SECURITY: u64 = SE + 0x000;
+const SE_SECURITY: u64 = SE;
 const SE_OPERATION: u64 = SE + 0x008;
 const SE_INT_STATUS: u64 = SE + 0x010;
 const SE_CONFIG: u64 = SE + 0x014;
@@ -640,3 +641,277 @@ pub(super) fn resume(port: &Port<'_>, stop: &AtomicBool) -> Result<()> {
 
 const _: () = assert!(STUB_IRAM + STUB_SIZE as u64 <= iram::BASE + iram::SIZE);
 const _: () = assert!(SAVED + SAVED_SIZE as u64 == tzram::BASE + tzram::SIZE);
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use aes::{
+        Aes256,
+        cipher::{BlockDecrypt, BlockEncrypt, KeyInit},
+    };
+
+    use super::*;
+    use crate::{
+        boot::{BootParams, DramSize},
+        keys::KeySet,
+        secmon::{KERNEL_SMC, SLEEP_REQUIREMENTS, SecureMonitor, SmcEffect, function},
+        soc::{
+            Notes, car::Car, evp::Evp, iram::Iram, pmc::Pmc, regs::RegisterFile, se::Se,
+            tzram::Tzram,
+        },
+    };
+
+    /// A console after the monitor's cold boot, as far as its SC7
+    /// preparation reaches: PMC, CAR, flow, EVP, IRAM, TZRAM, the security
+    /// engine over them, and DRAM.
+    struct Console {
+        monitor: SecureMonitor,
+        bus: Bus,
+        tzram: Arc<Tzram>,
+        iram: Arc<Iram>,
+        ram: Arc<GuestRam>,
+        engine: mc::DeviceMemory,
+        notes: Arc<Notes>,
+    }
+
+    fn console() -> Console {
+        let ram = Arc::new(GuestRam::new(0x8000_0000, 0x2_0000).unwrap());
+        let iram = Arc::new(Iram::new());
+        let tzram = Arc::new(Tzram::new());
+        // TZRAM's saved part: something that is not all one byte.
+        let contents: Vec<u8> = (0..SAVED_SIZE)
+            .map(|index| (index * 7 + index / 251) as u8)
+            .collect();
+        tzram.load((SAVED - tzram::BASE) as u32, &contents).unwrap();
+        let mut bus = Bus::default();
+        let pmc_device = Arc::new(Pmc::new());
+        bus.map(
+            "PMC",
+            pmc::BASE,
+            pmc::SIZE,
+            Box::new(Arc::clone(&pmc_device)),
+        );
+        bus.map("CAR", car::BASE, car::SIZE, Box::new(Car::new()));
+        bus.map(
+            "FLOW",
+            flow::BASE,
+            flow::SIZE,
+            Box::new(RegisterFile::zeroed([(0x004, COP_PARKED)])),
+        );
+        bus.map("EVP", evp::BASE, evp::SIZE, Box::new(Evp::new()));
+        bus.map("IRAM", iram::BASE, iram::SIZE, Box::new(Arc::clone(&iram)));
+        bus.map(
+            "TZRAM",
+            tzram::BASE,
+            tzram::SIZE,
+            Box::new(Arc::clone(&tzram)),
+        );
+        let memory = se::BootMemory::new(Arc::clone(&iram), Arc::clone(&tzram), Arc::clone(&ram));
+        let notes = Arc::new(Notes::default());
+        let se = Arc::new(Se::new(Box::new(memory), Arc::clone(&notes), 5));
+        // As `Soc::new` wires it: the SRK goes to PMC secure scratch.
+        se.on_srk_saved(Box::new(move |words| {
+            for (offset, word) in se::SRK_SCRATCH.into_iter().zip(words) {
+                crate::bus::MmioDevice::write(pmc_device.as_ref(), 0, offset, 4, word.into())
+                    .expect("the PMC takes its secure scratch registers");
+            }
+        }));
+        bus.map("SE", se::BASE, se::SIZE, Box::new(se));
+        // The SoC as the firmware leaves it for sleep.
+        for (register, mask, required, _) in SLEEP_REQUIREMENTS.into_iter().skip(1) {
+            let value = read(&bus, register);
+            assert!(matches!(
+                bus.write(0, register, 4, (value | mask & required).into()),
+                Access::Done(())
+            ));
+        }
+        let controller = Arc::new(mc::Mc::new(DramSize::Gb4));
+        let engine = mc::DeviceMemory::new(&controller, &ram, mc::SMMU_SE_ASID);
+        let monitor = SecureMonitor::new(&BootParams::default(), KeySet::default());
+        monitor.state.lock().unwrap().boot_chain = true;
+        Console {
+            monitor,
+            bus,
+            tzram,
+            iram,
+            ram,
+            engine,
+            notes,
+        }
+    }
+
+    fn read(bus: &Bus, address: u64) -> u32 {
+        match bus.read(0, address, 4) {
+            Access::Done(value) => value as u32,
+            _ => panic!("register {address:#x}"),
+        }
+    }
+
+    fn scratch(bus: &Bus, first: u64) -> [u8; 16] {
+        let mut bytes = [0; 16];
+        for (index, word) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *word = read(bus, first + index as u64 * 4).to_le_bytes();
+        }
+        bytes
+    }
+
+    /// The 32 key bytes of `slot`, read through the key table registers.
+    fn key(bus: &Bus, slot: u32) -> [u8; 32] {
+        let mut bytes = [0; 32];
+        for (word, chunk) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            bus.write(
+                0,
+                SE_CRYPTO_KEYTABLE_ADDR,
+                4,
+                u64::from(slot << 4 | word as u32),
+            );
+            *chunk = read(bus, SE_CRYPTO_KEYTABLE_DATA).to_le_bytes();
+        }
+        bytes
+    }
+
+    fn cmac(key: &[u8; 32], data: &[u8]) -> [u8; 16] {
+        let cipher = Aes256::new(key.into());
+        let mut subkey = aes::Block::default();
+        cipher.encrypt_block(&mut subkey);
+        let subkey = double(u128::from_be_bytes(subkey.into()));
+        let mut state = 0u128;
+        let blocks = data.as_chunks::<16>().0;
+        for (index, block) in blocks.iter().enumerate() {
+            let mut value = u128::from_be_bytes(*block) ^ state;
+            if index + 1 == blocks.len() {
+                value ^= subkey;
+            }
+            let mut block = aes::Block::from(value.to_be_bytes());
+            cipher.encrypt_block(&mut block);
+            state = u128::from_be_bytes(block.into());
+        }
+        state.to_be_bytes()
+    }
+
+    #[test]
+    fn suspend_saves_tzram_encrypted_and_maced_under_a_key_the_warmboot_can_derive() {
+        let console = console();
+        let mut x = [0; 8];
+        x[..4].copy_from_slice(&[function::CPU_SUSPEND.into(), 0x0201_001B, 0x8000_1000, 7]);
+        let effect = console
+            .monitor
+            .call(0, KERNEL_SMC, &mut x, &console.bus, &console.engine);
+        assert_eq!(
+            effect,
+            SmcEffect::SystemSuspend,
+            "{:?}",
+            console.notes.take()
+        );
+        assert_eq!(
+            console.monitor.state.lock().unwrap().suspended,
+            Some((0x8000_1000, 7))
+        );
+        let bus = &console.bus;
+
+        assert_eq!(read(bus, SCRATCH0), 1);
+        assert_eq!(read(bus, DPD_ENABLE) & 2, 2);
+        assert_eq!(read(bus, WAKE_STATUS), 0);
+        assert_eq!(read(bus, CNTRL2) & 0x200, 0x200);
+        assert_eq!(read(bus, SCRATCH43), CONTEXT as u32);
+        assert_eq!(read(bus, SEC_DISABLE3) & 0xFF, 0xFF);
+        assert_eq!(read(bus, SEC_DISABLE8) & 0xFF_0000, 0xFF_0000);
+
+        // Slot 3 is AES-256-ECB-decrypt(slot 2, R) in its first quad.
+        let seed = scratch(bus, SECURE_SCRATCH24);
+        assert_ne!(seed, [0; 16]);
+        let random = key(bus, SLOT_RANDOM);
+        let mut derived = aes::Block::from(seed);
+        Aes256::new(&random.into()).decrypt_block(&mut derived);
+        let mut tzram_key = [0; 32];
+        tzram_key[..16].copy_from_slice(&derived);
+        assert_eq!(key(bus, SLOT_TZRAM), tzram_key);
+
+        // DRAM holds TZRAM under AES-256-CBC with IV 0, and the MAC is its CMAC.
+        let mut plain = vec![0; SAVED_SIZE];
+        console
+            .tzram
+            .copy_out((SAVED - tzram::BASE) as u32, &mut plain)
+            .unwrap();
+        let mut saved = vec![0; SAVED_SIZE];
+        console.ram.read(SAVED_DRAM, &mut saved).unwrap();
+        assert_ne!(saved, plain);
+        let cipher = Aes256::new(&tzram_key.into());
+        let mut previous = [0u8; 16];
+        let mut decrypted = Vec::with_capacity(SAVED_SIZE);
+        for block in saved.as_chunks::<16>().0 {
+            let mut value = aes::Block::from(*block);
+            cipher.decrypt_block(&mut value);
+            decrypted.extend(value.iter().zip(previous).map(|(byte, iv)| byte ^ iv));
+            previous = *block;
+        }
+        assert_eq!(decrypted, plain);
+        assert_eq!(scratch(bus, SECURE_SCRATCH112), cmac(&tzram_key, &plain));
+
+        // The engine's context went to DRAM.
+        let mut context = vec![0; CONTEXT_SIZE];
+        console.ram.read(CONTEXT, &mut context).unwrap();
+        assert!(context.iter().any(|&byte| byte != 0));
+
+        // The BPMP restarted on the stub, core 0's partitions off.
+        let mut stub = vec![0; STUB_SIZE];
+        console
+            .tzram
+            .copy_out((STUB - tzram::BASE) as u32, &mut stub)
+            .unwrap();
+        let mut copied = vec![0; STUB_SIZE];
+        console
+            .iram
+            .copy_out((STUB_IRAM - iram::BASE) as u32, &mut copied)
+            .unwrap();
+        assert_eq!(copied, stub);
+        assert_eq!(read(bus, EVP_COP_VECTORS), 0x4000_3000);
+        assert_eq!(read(bus, EVP_COP_VECTORS + 4), 0x4000_3004);
+        assert_eq!(read(bus, HALT_COP_EVENTS), 0);
+        assert_eq!(read(bus, PWRGATE_STATUS) & (1 << 0 | 1 << 14 | 1 << 15), 0);
+
+        // Asleep, the monitor lets core 0 back in only at the resume vector.
+        assert!(!console.monitor.state.lock().unwrap().cores_on[0]);
+    }
+
+    #[test]
+    fn a_second_suspend_on_locked_scratch_panics_as_the_monitor_does() {
+        let console = console();
+        let bus = &console.bus;
+        assert!(matches!(
+            bus.write(0, SEC_DISABLE3, 4, 0x55),
+            Access::Done(())
+        ));
+        let mut x = [0; 8];
+        x[..4].copy_from_slice(&[function::CPU_SUSPEND.into(), 0x0201_001B, 0x8000_1000, 7]);
+        let effect = console
+            .monitor
+            .call(0, KERNEL_SMC, &mut x, bus, &console.engine);
+        assert!(matches!(
+            effect,
+            SmcEffect::Abort(crate::secmon::Abort::SuspendPanic(_))
+        ));
+    }
+
+    #[test]
+    fn suspend_needs_the_bpmp_parked() {
+        let console = console();
+        assert!(matches!(
+            console.bus.write(0, HALT_COP_EVENTS, 4, 0x5000_0000),
+            Access::Done(())
+        ));
+        let mut x = [0; 8];
+        x[..4].copy_from_slice(&[function::CPU_SUSPEND.into(), 0x0201_001B, 0x8000_1000, 7]);
+        let effect = console
+            .monitor
+            .call(0, KERNEL_SMC, &mut x, &console.bus, &console.engine);
+        assert!(matches!(
+            effect,
+            SmcEffect::Abort(crate::secmon::Abort::SocNotReadyForSleep {
+                value: 0x5000_0000,
+                ..
+            })
+        ));
+    }
+}
