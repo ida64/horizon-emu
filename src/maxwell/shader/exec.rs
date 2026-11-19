@@ -1267,11 +1267,18 @@ impl<'a, const L: usize> Machine<'a, L> {
         )
     }
 
+    /// `LDG`/`LD`. Size code 7 (`u b128` in envydis `gm107.c` `tabeed0sz`,
+    /// `UB128` in Ryujinx, `U128 // ???` in eden) loads 128 bits like B128
+    /// in both emulators
+    /// \[inference: what the `U` adds is not documented; at a 16-byte
+    /// aligned address, which is required here, a 128-bit load reads the
+    /// same bytes whatever it means\].
     fn load_global(&mut self, active: Mask) -> Result<(), Unmodeled> {
         self.check_global()?;
         let rd = bits(self.word, 0, 8);
         self.each(active, |m, lane| {
             let (address, size) = m.global_access(lane)?;
+            let size = if size == 7 { 6 } else { size };
             let width = global_width(size).ok_or_else(|| m.unmodeled(&format!("size {size}")))?;
             m.require(
                 address % width as u64 == 0,
