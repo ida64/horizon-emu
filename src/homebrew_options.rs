@@ -1,5 +1,6 @@
 //! The `boot` options that put programs Nintendo did not sign on the
-//! console: `--homebrew-keys`, `--replace-program` and `--homebrew`
+//! console: `--disable-program-verification`, `--homebrew-keys`,
+//! `--replace-program` and `--homebrew` with its companions
 //! (`horizon_emu::homebrew`).
 
 use std::{fs::File, path::Path};
@@ -61,6 +62,7 @@ const ALBUM: u64 = 0x0100_0000_0000_100D;
 
 #[derive(Default)]
 pub struct HomebrewOptions {
+    verification_disabled: bool,
     keys: bool,
     replacements: Vec<(u64, String)>,
     homebrew: Option<String>,
@@ -82,6 +84,7 @@ impl HomebrewOptions {
                 .map_err(|_| format!("{flag}: the program ID is in hex, not {id}"))
         };
         match flag {
+            "--disable-program-verification" => self.verification_disabled = true,
             "--homebrew-keys" => self.keys = true,
             "--replace-program" => {
                 let value = value()?;
@@ -103,7 +106,7 @@ impl HomebrewOptions {
     /// Whether the secure monitor is to report program verification as
     /// disabled.
     pub fn disables_verification(&self) -> bool {
-        self.homebrew.is_some()
+        self.verification_disabled || self.homebrew.is_some()
     }
 
     /// Whether the kernel image's INI1 is patched with the homebrew keys.

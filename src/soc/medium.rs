@@ -12,8 +12,12 @@
 //! in memory. A file the run writes to is not saved here; the snapshot
 //! keeps a copy of the file beside it, and the restored machine is built
 //! over that copy.
+//!
+//! A host read or write of an image file that fails is no answer a card
+//! gives: the medium hands back the error ([`MediumError::Host`]) for the
+//! machine to stop on, naming the file.
 
-use std::{borrow::Cow, collections::HashMap, fs::File, io, os::unix::fs::FileExt};
+use std::{borrow::Cow, collections::HashMap, fs::File, io, os::unix::fs::FileExt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,11 +25,39 @@ use crate::snapshot::SnapshotError;
 
 pub const SECTOR_SIZE: usize = 512;
 
+/// An image file and the path it was opened from, which names it when a
+/// host access to it fails.
+pub struct ImageFile {
+    pub file: File,
+    pub path: PathBuf,
+}
+
+impl ImageFile {
+    /// The error of a failed host access to `sector` of this file.
+    fn failed(&self, device: &str, doing: &str, sector: u64, error: io::Error) -> MediumError {
+        MediumError::Host(format!(
+            "{device}: cannot {doing} sector {sector} of the image {}: {error}",
+            self.path.display()
+        ))
+    }
+}
+
+/// Why a medium moved no sector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediumError {
+    /// A sector beyond the end, or a block that is not one sector: the
+    /// card reports that to the guest.
+    OutOfRange,
+    /// The host could not read or write the image file; the message says
+    /// which device, file and sector, and the host's error.
+    Host(String),
+}
+
 enum Backing {
     /// Nothing but erased sectors.
     Erased,
     File {
-        file: File,
+        image: ImageFile,
         /// Whether writes go to the file.
         write_through: bool,
     },
@@ -98,10 +130,15 @@ fn nonzero_runs(memory: &[u8]) -> Vec<(u64, Cow<'_, [u8]>)> {
 
 impl Medium {
     /// `sectors` sectors over `image`, written to only if `writable`.
-    pub fn new(device: &'static str, sectors: u64, image: Option<File>, writable: bool) -> Self {
+    pub fn new(
+        device: &'static str,
+        sectors: u64,
+        image: Option<ImageFile>,
+        writable: bool,
+    ) -> Self {
         let backing = match image {
-            Some(file) => Backing::File {
-                file,
+            Some(image) => Backing::File {
+                image,
                 write_through: writable,
             },
             None => Backing::Erased,
@@ -141,11 +178,11 @@ impl Medium {
         self.sectors
     }
 
-    /// `None` for a sector beyond the end or a block that is not one
-    /// sector.
-    pub fn read(&self, sector: u64, block: &mut [u8]) -> Option<()> {
+    /// Fills `block` with `sector`. [`MediumError::OutOfRange`] for a
+    /// sector beyond the end or a block that is not one sector.
+    pub fn read(&self, sector: u64, block: &mut [u8]) -> Result<(), MediumError> {
         if sector >= self.sectors || block.len() != SECTOR_SIZE {
-            return None;
+            return Err(MediumError::OutOfRange);
         }
         if let Some(sector) = self
             .written
@@ -153,7 +190,7 @@ impl Medium {
             .or_else(|| self.overlay.get(&sector))
         {
             block.copy_from_slice(&sector[..]);
-            return Some(());
+            return Ok(());
         }
         let offset = sector * SECTOR_SIZE as u64;
         block.fill(0);
@@ -162,42 +199,52 @@ impl Medium {
             Backing::Memory(memory) => {
                 block.copy_from_slice(&memory[offset as usize..][..SECTOR_SIZE]);
             }
-            Backing::File { file, .. } => {
+            Backing::File { image, .. } => {
                 // A short image leaves the rest erased.
                 let mut filled = 0;
                 while filled < SECTOR_SIZE {
-                    match file.read_at(&mut block[filled..], offset + filled as u64) {
+                    match image
+                        .file
+                        .read_at(&mut block[filled..], offset + filled as u64)
+                    {
                         Ok(0) => break,
                         Ok(count) => filled += count,
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                        Err(error) => panic!("cannot read the {} image: {error}", self.device),
+                        Err(error) => {
+                            return Err(image.failed(self.device, "read", sector, error));
+                        }
                     }
                 }
             }
         }
-        Some(())
+        Ok(())
     }
 
-    pub fn write(&mut self, sector: u64, block: &[u8]) -> Option<()> {
-        let block: &[u8; SECTOR_SIZE] = block.try_into().ok()?;
-        (sector < self.sectors).then_some(())?;
-        self.overlay.remove(&sector);
+    /// Stores `block` as `sector`, under the same errors as [`Self::read`].
+    pub fn write(&mut self, sector: u64, block: &[u8]) -> Result<(), MediumError> {
+        let block: &[u8; SECTOR_SIZE] = block.try_into().map_err(|_| MediumError::OutOfRange)?;
+        if sector >= self.sectors {
+            return Err(MediumError::OutOfRange);
+        }
         let offset = sector * SECTOR_SIZE as u64;
         match &mut self.backing {
             Backing::Memory(memory) => {
                 memory[offset as usize..][..SECTOR_SIZE].copy_from_slice(block);
             }
             Backing::File {
-                file,
+                image,
                 write_through: true,
-            } => file
-                .write_all_at(block, offset)
-                .unwrap_or_else(|error| panic!("cannot write the {} image: {error}", self.device)),
+            } => {
+                if let Err(error) = image.file.write_all_at(block, offset) {
+                    return Err(image.failed(self.device, "write", sector, error));
+                }
+            }
             _ => {
                 self.written.insert(sector, Box::new(*block));
             }
         }
-        Some(())
+        self.overlay.remove(&sector);
+        Ok(())
     }
 
     /// What the run has changed, borrowing the sectors.
@@ -301,7 +348,11 @@ mod tests {
         std::fs::write(&path, [1u8; 2 * SECTOR_SIZE]).unwrap();
         let file = File::options().read(true).write(true).open(&path).unwrap();
         let overlay = HashMap::from([(0, Box::new([7u8; SECTOR_SIZE]))]);
-        let mut medium = Medium::new("test", 2, Some(file), true).with_overlay(overlay);
+        let image = ImageFile {
+            file,
+            path: path.clone(),
+        };
+        let mut medium = Medium::new("test", 2, Some(image), true).with_overlay(overlay);
         let mut block = [0; SECTOR_SIZE];
 
         medium.read(0, &mut block).unwrap();
@@ -328,6 +379,46 @@ mod tests {
             std::fs::read(&path).unwrap()[..SECTOR_SIZE],
             [3; SECTOR_SIZE]
         );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_failing_host_file_is_an_error_naming_it_not_a_panic() {
+        let path =
+            std::env::temp_dir().join(format!("horizon-emu-medium-failing-{}", std::process::id()));
+        std::fs::write(&path, [1u8; 2 * SECTOR_SIZE]).unwrap();
+        let opened = |read: bool, write: bool| ImageFile {
+            file: File::options().read(read).write(write).open(&path).unwrap(),
+            path: path.clone(),
+        };
+        let mut block = [0; SECTOR_SIZE];
+
+        // Reading a file open only for writing fails on the host.
+        let medium = Medium::new("eMMC", 2, Some(opened(false, true)), false);
+        let Err(MediumError::Host(note)) = medium.read(1, &mut block) else {
+            panic!("the read did not fail");
+        };
+        let name = path.display().to_string();
+        assert!(note.starts_with("eMMC: cannot read sector 1 of the image "));
+        assert!(note.contains(&name), "{note}");
+        assert_eq!(
+            medium.read(2, &mut block),
+            Err(MediumError::OutOfRange),
+            "beyond the end is the card's to report"
+        );
+
+        // Writing through to a file open only for reading fails too, and
+        // leaves an overlaid sector as it was.
+        let mut medium = Medium::new("SD card", 2, Some(opened(true, false)), true)
+            .with_overlay(HashMap::from([(0, Box::new([7u8; SECTOR_SIZE]))]));
+        let Err(MediumError::Host(note)) = medium.write(0, &[2; SECTOR_SIZE]) else {
+            panic!("the write did not fail");
+        };
+        assert!(note.starts_with("SD card: cannot write sector 0 of the image "));
+        assert!(note.contains(&name), "{note}");
+        medium.read(0, &mut block).unwrap();
+        assert_eq!(block, [7; SECTOR_SIZE]);
+        assert_eq!(std::fs::read(&path).unwrap(), [1; 2 * SECTOR_SIZE]);
         std::fs::remove_file(&path).unwrap();
     }
 }

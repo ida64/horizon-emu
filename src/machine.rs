@@ -41,7 +41,7 @@ use crate::{
     secmon::{self, SecureMonitor, SmcEffect, Unimplemented},
     snapshot::Snapshot,
     soc::{
-        Screen, Soc,
+        Panel, Screen, Soc,
         dc::NoFrame,
         emmc::{EmmcImages, ImageError},
         mc::{self, DeviceMemory},
@@ -109,7 +109,7 @@ const SVC_RETURN: u64 = 0x800C_5488;
 const ERET: u32 = 0xD69F_03E0;
 
 /// At most this much of the memory a supervisor call names is captured.
-const CALL_DATA_LIMIT: u64 = 0x1000;
+pub const CALL_DATA_LIMIT: u64 = 0x1000;
 
 /// Address of the thread-local region of the thread a core runs, which the
 /// kernel sets when it switches threads (image 0x8009e590).
@@ -272,6 +272,10 @@ pub struct RunOptions<'a> {
     pub trace_smc: bool,
     /// Report every supervisor call and its return. Costs two breakpoints.
     pub trace_svc: bool,
+    /// How much of each buffer a request names, from its start, the
+    /// supervisor-call reports carry ([`ipc::SHOWN_BUFFER_BYTES`] is what a
+    /// trace line shows); at most [`CALL_DATA_LIMIT`] is read.
+    pub buffer_bytes: u64,
     /// Report every device register access.
     pub trace_devices: bool,
     /// Answer device accesses nothing models (reads with zero, writes by
@@ -871,6 +875,12 @@ impl Machine {
         self.soc.screen()
     }
 
+    /// How the panel and its backlight stand, whether or not a picture
+    /// can be composed.
+    pub fn panel(&self) -> Panel {
+        self.soc.panel()
+    }
+
     /// Puts a finger on the touchscreen at `(x, y)` or moves it there
     /// (screen coordinates, 1280x720, origin top left), or lifts it with
     /// `None`. `false` if the touch controller is not scanning yet, so the
@@ -894,6 +904,11 @@ impl Machine {
         self.soc.joycons.press(button, held);
     }
 
+    /// Holds an NFC tag over the right Joy-Con's reader, or takes it away.
+    pub fn place_tag(&self, tag: Option<crate::soc::ntag::Ntag215>) {
+        self.soc.joycons.place_tag(tag);
+    }
+
     /// Holds the console's power button, or lets go of it.
     pub fn press_power(&self, held: bool) {
         self.soc.pmic.power_key(held);
@@ -905,6 +920,12 @@ impl Machine {
             .wifi
             .get()
             .expect("the SoC attaches its WiFi function when built")
+    }
+
+    /// What is in range of the console's Bluetooth radio: a Pro Controller
+    /// once placed there, its buttons and its SYNC button.
+    pub fn bluetooth(&self) -> &crate::soc::bluetooth_uart::Air {
+        &self.soc.bluetooth
     }
 
     pub fn secure_monitor(&self) -> &SecureMonitor {
@@ -2059,7 +2080,7 @@ impl<'env> Session<'env> {
         buffers
             .iter()
             .map(|&buffer| {
-                let shown = buffer.size.min(ipc::SHOWN_BUFFER_BYTES);
+                let shown = buffer.size.min(self.options.buffer_bytes);
                 let bytes = self.machine.call_data(vcpu, buffer.address, shown)?;
                 Ok(ipc::Contents { buffer, bytes })
             })

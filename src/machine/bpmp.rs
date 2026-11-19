@@ -1600,7 +1600,10 @@ mod tests {
             bpmp.slice(&env, 100),
             Slice::Halted(CopStatus::HaltedUntil(_)) | Slice::Ran
         ));
-        bench.clock.sleep(Duration::from_micros(60));
+        let due = bench.clock.now() + Duration::from_micros(60);
+        while !bench.clock.until(due).is_zero() {
+            std::thread::sleep(bench.clock.until(due));
+        }
         assert_eq!(bpmp.slice(&env, 100), Slice::Ran);
         assert_eq!(bpmp.core().pc(), BASE + 3 * 4);
     }

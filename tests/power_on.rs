@@ -48,7 +48,7 @@ use horizon_emu::{
     memory::GuestRam,
     nand::{self, boot_images::BootImages},
     secmon::{ColdBootContext, SecureMonitor},
-    soc::{BootBlocks, Soc, emmc::EmmcImages, flow::CopStatus},
+    soc::{BootBlocks, Soc, emmc::EmmcImages, flow::CopStatus, medium::ImageFile},
 };
 
 const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../");
@@ -171,9 +171,16 @@ fn media(keys: &KeySet) -> (EmmcImages, [Vec<u8>; 2]) {
         bytes
     };
     let boot_bytes = [read(&boot0), read(&boot1)];
+    let image = |file: File, name: &str| ImageFile {
+        file,
+        path: directory.join(name),
+    };
     let images = EmmcImages {
-        user,
-        boot: [Some(boot0), Some(boot1)],
+        user: image(user, "user.img"),
+        boot: [
+            Some(image(boot0, "boot0.img")),
+            Some(image(boot1, "boot1.img")),
+        ],
         writable: false,
         overlay: Default::default(),
     };
