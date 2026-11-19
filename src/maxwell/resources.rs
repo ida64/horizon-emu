@@ -142,12 +142,36 @@ impl GpuMemory for Tracked<'_> {
 
 fn read(memory: &dyn GpuMemory, address: u64, length: usize) -> Result<Vec<u8>, Unmodeled> {
     let mut bytes = vec![0; length];
-    memory.read(address, &mut bytes).ok_or_else(|| {
-        Unmodeled(format!(
-            "read of {length:#x} bytes at unmapped GPU address {address:#x}"
-        ))
-    })?;
+    memory
+        .read(address, &mut bytes)
+        .ok_or_else(|| unmapped(address, length))?;
     Ok(bytes)
+}
+
+fn unmapped(address: u64, length: usize) -> Unmodeled {
+    Unmodeled(format!(
+        "read of {length:#x} bytes at unmapped GPU address {address:#x}"
+    ))
+}
+
+/// Whether memory at `address` holds `expected`, compared a piece at a
+/// time without a copy of the whole; refuses as [`read`] of the whole
+/// range would (pieces are read in order, so the first one that fails
+/// holds the first unmapped byte).
+fn equals(memory: &dyn GpuMemory, address: u64, expected: &[u8]) -> Result<bool, Unmodeled> {
+    let mut buffer = [0u8; 4096];
+    let mut at = address;
+    for chunk in expected.chunks(buffer.len()) {
+        let piece = &mut buffer[..chunk.len()];
+        memory
+            .read(at, piece)
+            .ok_or_else(|| unmapped(address, expected.len()))?;
+        if piece != chunk {
+            return Ok(false);
+        }
+        at += chunk.len() as u64;
+    }
+    Ok(true)
 }
 
 /// Host memory the decoded programs of one channel may take, with the
@@ -186,7 +210,7 @@ impl ProgramCache {
     /// The program whose header is at `address`, as memory holds it now.
     pub fn get(&mut self, memory: &dyn GpuMemory, address: u64) -> Result<Arc<Program>, Unmodeled> {
         if let Some((raw, program)) = self.entries.get(&address)
-            && read(memory, address, raw.len())? == *raw
+            && equals(memory, address, raw)?
         {
             return Ok(program.clone());
         }
@@ -206,7 +230,7 @@ impl ProgramCache {
 
 /// A decoded texture, the raw bytes it was decoded from, and when they
 /// last compared equal to memory.
-type CachedTexture = (Vec<u8>, Arc<Texture>, Stamp);
+type CachedTexture = (Arc<[u8]>, Arc<Texture>, Stamp);
 
 /// Decoded textures by TIC contents, kept across draws; the least
 /// recently used are dropped beyond [`TEXTURE_BUDGET`]. A draw keeps the
@@ -297,37 +321,36 @@ impl<'a> DrawTextures<'a> {
         let tic = Tic::parse(words)?;
         let (address, length) = Texture::footprint(&tic)?;
         let end = address.saturating_add(length);
-        let fresh = self
-            .cache
-            .entries
-            .lock()
-            .unwrap()
-            .get(&words)
-            .filter(|(_, _, stamp)| self.writes.unchanged(*stamp, address, end))
-            .map(|(_, texture, _)| texture.clone());
-        let texture = match fresh {
-            Some(texture) => texture,
-            None => {
-                let raw = read(self.memory, address, length as usize)?;
-                let mut entries = self.cache.entries.lock().unwrap();
-                match entries.get_mut(&words) {
-                    Some((cached_raw, texture, stamp)) if *cached_raw == raw => {
-                        *stamp = self.writes.stamp();
-                        texture.clone()
-                    }
-                    _ => {
-                        drop(entries);
-                        let texture = Arc::new(Texture::decode(self.memory, &tic)?);
-                        let cost = raw.len() + texture.bytes();
-                        // Dropped textures are freed outside the lock.
-                        let _dropped = self.cache.entries.lock().unwrap().insert(
-                            words,
-                            (raw, texture.clone(), self.writes.stamp()),
-                            cost,
-                        );
-                        texture
-                    }
+        // A kept texture: current, or to be compared with memory.
+        let (fresh, kept) = match self.cache.entries.lock().unwrap().get(&words) {
+            Some((_, texture, stamp)) if self.writes.unchanged(*stamp, address, end) => {
+                (Some(texture.clone()), None)
+            }
+            Some((raw, texture, _)) => (None, Some((raw.clone(), texture.clone()))),
+            None => (None, None),
+        };
+        let texture = match (fresh, kept) {
+            (Some(texture), _) => texture,
+            (None, Some((raw, texture))) if equals(self.memory, address, &raw)? => {
+                let stamp = self.writes.stamp();
+                if let Some((kept, _, at)) = self.cache.entries.lock().unwrap().get_mut(&words)
+                    && Arc::ptr_eq(kept, &raw)
+                {
+                    *at = stamp;
                 }
+                texture
+            }
+            (None, _) => {
+                let raw: Arc<[u8]> = read(self.memory, address, length as usize)?.into();
+                let texture = Arc::new(Texture::decode(self.memory, &tic)?);
+                let cost = raw.len() + texture.bytes();
+                // Dropped textures are freed outside the lock.
+                let _dropped = self.cache.entries.lock().unwrap().insert(
+                    words,
+                    (raw, texture.clone(), self.writes.stamp()),
+                    cost,
+                );
+                texture
             }
         };
         self.resolved.lock().unwrap().insert(index, texture.clone());

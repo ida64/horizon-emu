@@ -41,7 +41,10 @@
 //! machine starts at the kernel, leaves the aperture empty, as the secure
 //! monitor does before the kernel runs.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 use super::{
     iram::{self, Iram},
@@ -138,6 +141,9 @@ pub struct Mc {
     /// The per-channel apertures' copies, in a machine that runs the boot
     /// chain ([`mc_channel`]).
     channels: Option<mc_channel::Channels>,
+    /// Moves on every register write, carveout change and restore: what
+    /// each [`DeviceMemory`] has cached from the block is out of date then.
+    generation: AtomicU64,
 }
 
 /// What the memory controller tells about a request a carveout blocked.
@@ -175,6 +181,7 @@ impl Mc {
             on_violation: Mutex::new(None),
             iram: OnceLock::new(),
             channels: None,
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -197,6 +204,21 @@ impl Mc {
     /// the kernel).
     pub fn set_kernel_carveout(&self, index: usize, base: u64, size: u64) {
         self.kernel_carveouts.lock().unwrap()[index] = (base, size);
+        self.changed();
+    }
+
+    /// Something a client's view depends on changed: every cached view and
+    /// translation is dropped before the next access. Called after the
+    /// change, so that a client that sees the new generation also sees it.
+    fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// How many times something a translation depends on changed (a
+    /// register write, a carveout, a restore); what was cached at another
+    /// count may be out of date.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// Has `report` told about each request a carveout blocks.
@@ -208,28 +230,6 @@ impl Mc {
     /// machine that has IRAM; later calls change nothing.
     pub fn attach_iram(&self, iram: Arc<Iram>) {
         let _ = self.iram.set(iram);
-    }
-
-    /// Whether the ASID register at `client` sends the client's addresses
-    /// through the SMMU; if not, they are physical.
-    fn translates(&self, client: u64) -> bool {
-        self.registers
-            .get(client)
-            .is_some_and(|asids| asids & ASID_ENABLE != 0)
-    }
-
-    /// Where the `len` bytes at `physical` go. `None` if they start inside
-    /// the AHB redirect aperture but are not all IRAM there.
-    fn target(&self, physical: u64, len: usize) -> Option<Target<'_>> {
-        let bottom = u64::from(self.registers.get(IRAM_BOM).unwrap_or(0));
-        let top = u64::from(self.registers.get(IRAM_TOM).unwrap_or(0));
-        if !(bottom <= physical && physical < top) {
-            return Some(Target::Dram);
-        }
-        let end = physical.checked_add(len as u64)?;
-        let iram = self.iram.get()?;
-        let offset = physical.checked_sub(iram::BASE)?;
-        (end <= top && end <= iram::BASE + iram::SIZE).then_some(Target::Iram(iram, offset as u32))
     }
 
     /// Whether a carveout keeps `client` from the physical range starting
@@ -259,11 +259,39 @@ impl Mc {
         self.registers.get(SMMU_PTB_ASID).unwrap_or(0) as usize % ASID_COUNT
     }
 
+    /// What [`DeviceMemory`] caches for the client whose ASID register is at
+    /// `client`, as of `generation`.
+    fn view(&self, client: u64, generation: u64) -> View {
+        let exempt = KERNEL_CARVEOUT_CLIENTS.contains(&client);
+        View {
+            generation,
+            asids: self
+                .registers
+                .get(client)
+                .filter(|asids| asids & ASID_ENABLE != 0),
+            aperture: (
+                u64::from(self.registers.get(IRAM_BOM).unwrap_or(0)),
+                u64::from(self.registers.get(IRAM_TOM).unwrap_or(0)),
+            ),
+            carveouts: if exempt {
+                [(0, 0); KERNEL_CARVEOUT_COUNT]
+            } else {
+                *self.kernel_carveouts.lock().unwrap()
+            },
+            tlb: vec![(0, 0); TLB_ENTRIES]
+                .into_boxed_slice()
+                .try_into()
+                .expect("TLB_ENTRIES entries"),
+        }
+    }
+
     /// Translates `address` as the client whose ASID register is at
     /// `client` sees it, reading page tables through `read_u32` (physical
     /// address to little-endian word). `None` if the client's translation
-    /// is not enabled or the address is unmapped.
-    pub fn translate(
+    /// is not enabled or the address is unmapped. [`DeviceMemory`] caches
+    /// what this works out; the tests compare the two.
+    #[cfg(test)]
+    fn translate(
         &self,
         client: u64,
         address: u64,
@@ -273,6 +301,12 @@ impl Mc {
             .registers
             .get(client)
             .filter(|asids| asids & ASID_ENABLE != 0)?;
+        self.walk(asids, address, read_u32)
+    }
+
+    /// Translates `address` through the address spaces of ASID register
+    /// value `asids`, reading page tables through `read_u32`.
+    fn walk(&self, asids: u32, address: u64, read_u32: impl Fn(u64) -> Option<u32>) -> Option<u64> {
         (address < ADDRESS_LIMIT).then_some(())?;
         let asid = asids >> (8 * (address >> 32)) & ASID_FIELD;
         let address = address as u32;
@@ -292,11 +326,70 @@ impl Mc {
     }
 }
 
+/// Translations a client keeps, by device page (4 MiB of device address
+/// space, direct-mapped).
+const TLB_ENTRIES: usize = 1024;
+
+/// What a client's accesses depend on in the memory controller, read at
+/// [`Mc::generation`] `generation`, and the translations made since.
+///
+/// The SMMU's own TLB and page table cache are flushed by software after
+/// it changes page tables (`MC_SMMU_TLB_FLUSH`, `MC_SMMU_PTC_FLUSH`, Linux
+/// `tegra-smmu.c`), and changing a page directory or a client's ASID
+/// register is a register write too. Every register write drops all of
+/// this, so a translation is never kept past a flush. Failed translations
+/// are not kept: a page mapped later is found by the next access.
+struct View {
+    generation: u64,
+    /// The client's ASID register, if it enables translation.
+    asids: Option<u32>,
+    /// The AHB redirect aperture, bottom and top.
+    aperture: (u64, u64),
+    /// The kernel carveouts that can block this client (none set for a
+    /// client on the list).
+    carveouts: [(u64, u64); KERNEL_CARVEOUT_COUNT],
+    /// `(device page + 1, physical page address)`; 0 is an empty entry.
+    tlb: Box<[(u64, u64); TLB_ENTRIES]>,
+}
+
+impl View {
+    /// Where the `len` bytes at physical `physical` go, as [`Mc`]'s
+    /// aperture registers were read. `None` if they start inside the AHB
+    /// redirect aperture but are not all IRAM there.
+    fn target<'a>(&self, mc: &'a Mc, physical: u64, len: usize) -> Option<Target<'a>> {
+        let (bottom, top) = self.aperture;
+        if !(bottom <= physical && physical < top) {
+            return Some(Target::Dram);
+        }
+        let end = physical.checked_add(len as u64)?;
+        let iram = mc.iram.get()?;
+        let offset = physical.checked_sub(iram::BASE)?;
+        (end <= top && end <= iram::BASE + iram::SIZE).then_some(Target::Iram(iram, offset as u32))
+    }
+
+    /// Whether a carveout may keep the client from `len` bytes at
+    /// `physical` ([`Mc::blocked`] decides and reports).
+    fn may_block(&self, physical: u64, len: usize) -> bool {
+        let end = physical + len as u64;
+        self.carveouts
+            .iter()
+            .any(|&(base, size)| size != 0 && physical < base + size && base < end)
+    }
+}
+
 /// Where a physical address leads.
 enum Target<'a> {
     Dram,
     /// Through the AHB redirect aperture, at this offset into IRAM.
     Iram(&'a Iram, u32),
+}
+
+/// Where one piece of a client's access goes.
+enum Place<'a> {
+    Dram(u64),
+    Iram(&'a Iram, u32),
+    /// DRAM a kernel carveout keeps from the client.
+    Blocked,
 }
 
 fn frame_address(entry: u32) -> u64 {
@@ -310,15 +403,22 @@ pub struct DeviceMemory {
     mc: Arc<Mc>,
     ram: Arc<GuestRam>,
     client: u64,
+    view: Mutex<View>,
 }
 
 impl DeviceMemory {
     /// `client` is the offset of the device's ASID register.
     pub fn new(mc: &Arc<Mc>, ram: &Arc<GuestRam>, client: u64) -> Self {
+        let view = Mutex::new(View {
+            // Read before the first access.
+            generation: u64::MAX,
+            ..mc.view(client, 0)
+        });
         Self {
             mc: Arc::clone(mc),
             ram: Arc::clone(ram),
             client,
+            view,
         }
     }
 
@@ -332,29 +432,61 @@ impl DeviceMemory {
         &self.mc
     }
 
-    /// Splits `len` bytes at device address `address` into physically
-    /// contiguous pieces: `piece(physical, offset, len)`.
+    /// The physical address of device address `address`; `None` if the
+    /// client translates and `address` is unmapped. Through the
+    /// client's [`View`], read again first if the block changed since.
+    fn physical(&self, view: &mut View, address: u64) -> Option<u64> {
+        let generation = self.mc.generation.load(Ordering::Acquire);
+        if view.generation != generation {
+            *view = self.mc.view(self.client, generation);
+        }
+        let Some(asids) = view.asids else {
+            return Some(address);
+        };
+        let page = address / PAGE_SIZE;
+        let entry = &mut view.tlb[page as usize % TLB_ENTRIES];
+        if entry.0 == page + 1 {
+            return Some(entry.1 + address % PAGE_SIZE);
+        }
+        let physical = self.mc.walk(asids, address, |table| {
+            let mut word = [0; 4];
+            self.ram.read(table, &mut word)?;
+            Some(u32::from_le_bytes(word))
+        })?;
+        *entry = (page + 1, physical - address % PAGE_SIZE);
+        Some(physical)
+    }
+
+    /// Splits `len` bytes at device address `address` into pieces within
+    /// a page each: `piece(place, offset, len)`. `None` at the first piece
+    /// that is unmapped or outside DRAM and IRAM.
     fn pieces(
         &self,
         address: u64,
         len: usize,
-        mut piece: impl FnMut(u64, usize, usize) -> Option<()>,
+        is_write: bool,
+        mut piece: impl FnMut(Place<'_>, usize, usize) -> Option<()>,
     ) -> Option<()> {
         let mut done = 0;
         while done < len {
             let at = address.checked_add(done as u64)?;
-            let physical = if self.mc.translates(self.client) {
-                self.mc.translate(self.client, at, |table| {
-                    let mut word = [0; 4];
-                    self.ram.read(table, &mut word)?;
-                    Some(u32::from_le_bytes(word))
-                })?
-            } else {
-                at
-            };
             let in_page = (PAGE_SIZE - at % PAGE_SIZE) as usize;
             let count = in_page.min(len - done);
-            piece(physical, done, count)?;
+            let place = {
+                let mut view = self.view.lock().unwrap();
+                let physical = self.physical(&mut view, at)?;
+                match view.target(&self.mc, physical, count)? {
+                    Target::Iram(iram, offset) => Place::Iram(iram, offset),
+                    Target::Dram
+                        if view.may_block(physical, count)
+                            && self.mc.blocked(self.client, physical, count, is_write) =>
+                    {
+                        Place::Blocked
+                    }
+                    Target::Dram => Place::Dram(physical),
+                }
+            };
+            piece(place, done, count)?;
             done += count;
         }
         Some(())
@@ -363,15 +495,15 @@ impl DeviceMemory {
     /// `None` if any of the range is unmapped or outside DRAM and IRAM.
     /// What a kernel carveout keeps from this client reads as zeros.
     pub fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
-        self.pieces(address, buffer.len(), |physical, offset, len| {
+        self.pieces(address, buffer.len(), false, |place, offset, len| {
             let piece = &mut buffer[offset..offset + len];
-            match self.mc.target(physical, len)? {
-                Target::Iram(iram, at) => iram.copy_out(at, piece),
-                Target::Dram if self.mc.blocked(self.client, physical, len, false) => {
+            match place {
+                Place::Iram(iram, at) => iram.copy_out(at, piece),
+                Place::Blocked => {
                     piece.fill(0);
                     Some(())
                 }
-                Target::Dram => self.ram.read(physical, piece),
+                Place::Dram(physical) => self.ram.read(physical, piece),
             }
         })
     }
@@ -380,12 +512,12 @@ impl DeviceMemory {
     /// pieces before the failing one have been written. What a kernel
     /// carveout keeps from this client is dropped.
     pub fn write(&self, address: u64, data: &[u8]) -> Option<()> {
-        self.pieces(address, data.len(), |physical, offset, len| {
+        self.pieces(address, data.len(), true, |place, offset, len| {
             let piece = &data[offset..offset + len];
-            match self.mc.target(physical, len)? {
-                Target::Iram(iram, at) => iram.load(at, piece),
-                Target::Dram if self.mc.blocked(self.client, physical, len, true) => Some(()),
-                Target::Dram => self.ram.write(physical, piece),
+            match place {
+                Place::Iram(iram, at) => iram.load(at, piece),
+                Place::Blocked => Some(()),
+                Place::Dram(physical) => self.ram.write(physical, piece),
             }
         })
     }
@@ -415,6 +547,8 @@ impl MmioDevice for Mc {
                 }
             }
         }
+        // Among them the TLB and PTC flushes after a page table change.
+        self.changed();
         Some(())
     }
 
@@ -424,8 +558,7 @@ impl MmioDevice for Mc {
 }
 
 /// Saves the registers, every address space's page directory and the
-/// kernel carveouts. Translations are read from guest memory on each
-/// access, so nothing is cached to drop.
+/// kernel carveouts. What clients cached of them is dropped on restore.
 impl Snapshot for Mc {
     fn save(&self) -> Result<Vec<u8>, SnapshotError> {
         let page_directories = self.page_directories.lock().unwrap();
@@ -449,6 +582,7 @@ impl Snapshot for Mc {
         self.registers.restore(&registers)?;
         *self.page_directories.lock().unwrap() = page_directories;
         *self.kernel_carveouts.lock().unwrap() = kernel_carveouts;
+        self.changed();
         Ok(())
     }
 }
@@ -579,5 +713,158 @@ mod tests {
         // A client whose translation is enabled sees only its address space.
         write(&mc, SMMU_SDMMC4A_ASID, ASID_ENABLE | 5);
         assert_eq!(memory.read(0x8000_1FFE, &mut back), None);
+    }
+
+    /// A tiny deterministic generator for the randomized tests.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// The cached translations of [`DeviceMemory`] agree with walking the
+    /// tables afresh ([`Mc::translate`]) after every register write, over
+    /// random page tables, page table changes, page directory and ASID
+    /// register changes, with reads checked byte for byte.
+    #[test]
+    fn cached_translations_equal_fresh_walks_after_every_register_write() {
+        let mc = Arc::new(Mc::new(DramSize::Gb4));
+        let ram = Arc::new(GuestRam::new(0x8000_0000, 0x40_0000).unwrap());
+        // Distinct contents per word, to tell pages apart.
+        for word in 0..0x10_0000u64 {
+            ram.write(
+                0x8000_0000 + word * 4,
+                &(word as u32 ^ 0x5A5A_0000).to_le_bytes(),
+            )
+            .unwrap();
+        }
+        let memory = DeviceMemory::new(&mc, &ram, SMMU_GPU_ASID);
+        let mut rng = Xorshift(0x9E37_79B9_7F4A_7C15);
+        // Directories of ASIDs 5 and 6 at frames 0x80000/0x80001; page
+        // tables at frames 0x80002..0x80012.
+        let directory = |asid: u64| 0x8000_0000 + (asid - 5) * 0x1000;
+        let entry = |rng: &mut Xorshift| -> u32 {
+            match rng.below(8) {
+                0 => 0,
+                1 => 0x8000_0000 | 0x80000, // a section over all of RAM
+                _ => 0xC000_0000 | ENTRY_NEXT | (0x80002 + rng.below(16) as u32),
+            }
+        };
+        let page = |rng: &mut Xorshift| -> u32 {
+            match rng.below(6) {
+                0 => 0x80100 + rng.below(0x300) as u32, // no access bits
+                _ => 0xC000_0000 | (0x80100 + rng.below(0x300) as u32),
+            }
+        };
+        for asid in [5, 6] {
+            for index in 0..16 {
+                ram.write(directory(asid) + index * 4, &entry(&mut rng).to_le_bytes())
+                    .unwrap();
+            }
+        }
+        for word in 0..16 * 1024 {
+            ram.write(0x8000_2000 + word * 4, &page(&mut rng).to_le_bytes())
+                .unwrap();
+        }
+        let read_u32 = |table: u64| {
+            let mut word = [0; 4];
+            ram.read(table, &mut word)?;
+            Some(u32::from_le_bytes(word))
+        };
+        let device_address = |rng: &mut Xorshift| rng.below(1 << 26) | rng.below(2) << 32;
+        let mut checked = 0;
+        for _ in 0..4000 {
+            match rng.below(5) {
+                // Page tables change in memory, as the kernel changes them
+                // before it flushes.
+                0 | 1 => {
+                    let (at, value) = if rng.below(4) == 0 {
+                        (
+                            directory(5 + rng.below(2)) + rng.below(16) * 4,
+                            entry(&mut rng),
+                        )
+                    } else {
+                        (0x8000_2000 + rng.below(16 * 1024) * 4, page(&mut rng))
+                    };
+                    ram.write(at, &value.to_le_bytes()).unwrap();
+                    // Reads in between may see the old tables or the new.
+                    let mut scratch = [0; 8];
+                    let _ = memory.read(device_address(&mut rng), &mut scratch);
+                    continue;
+                }
+                2 => write(&mc, 0x34, rng.next() as u32), // PTC flush
+                3 => {
+                    let enable = if rng.below(8) == 0 { 0 } else { ASID_ENABLE };
+                    let asids = (5 + rng.below(2)) as u32 | (5 + rng.below(2) as u32) << 8;
+                    write(&mc, SMMU_GPU_ASID, enable | asids);
+                }
+                _ => {
+                    write(&mc, SMMU_PTB_ASID, 5 + rng.below(2) as u32);
+                    let frame = 0x80000 + rng.below(2) as u32;
+                    let access = if rng.below(10) == 0 { 0 } else { 0xE000_0000 };
+                    write(&mc, SMMU_PTB_DATA, access | frame);
+                }
+            }
+            for _ in 0..32 {
+                let at = device_address(&mut rng);
+                let fresh = if mc.registers.get(SMMU_GPU_ASID).unwrap() & ASID_ENABLE != 0 {
+                    mc.translate(SMMU_GPU_ASID, at, read_u32)
+                } else {
+                    Some(at)
+                };
+                let cached = memory.physical(&mut memory.view.lock().unwrap(), at);
+                assert_eq!(cached, fresh, "device address {at:#x}");
+                let mut through = [0; 8];
+                let outcome = memory.read(at, &mut through);
+                let in_page = (PAGE_SIZE - at % PAGE_SIZE).min(8) as usize;
+                if let Some(physical) = fresh
+                    && in_page == 8
+                {
+                    let mut direct = [0; 8];
+                    assert_eq!(outcome, ram.read(physical, &mut direct));
+                    assert_eq!(through, direct);
+                    checked += 1;
+                } else if fresh.is_none() {
+                    assert_eq!(outcome, None);
+                }
+            }
+        }
+        assert!(checked > 10_000, "{checked} reads compared");
+    }
+
+    /// A failed translation is not kept: a page mapped after it is found
+    /// at once, flushed or not.
+    #[test]
+    fn unmapped_pages_are_walked_again() {
+        let mc = Arc::new(Mc::new(DramSize::Gb4));
+        let ram = Arc::new(GuestRam::new(0x8000_0000, 0x1_0000).unwrap());
+        let memory = DeviceMemory::new(&mc, &ram, SMMU_DC_ASID);
+        ram.write(
+            0x8000_0000,
+            &(0xC000_0000 | ENTRY_NEXT | 0x80001).to_le_bytes(),
+        )
+        .unwrap();
+        write(&mc, SMMU_PTB_ASID, 5);
+        write(&mc, SMMU_PTB_DATA, 0xE000_0000 | 0x80000);
+        write(&mc, SMMU_DC_ASID, ASID_ENABLE | 5);
+        let mut back = [0; 4];
+        assert_eq!(memory.read(0x3000, &mut back), None);
+        ram.write(
+            0x8000_1000 + 3 * 4,
+            &(0xC000_0000u32 | 0x80002).to_le_bytes(),
+        )
+        .unwrap();
+        ram.write(0x8000_2000, &[1, 2, 3, 4]).unwrap();
+        memory.read(0x3000, &mut back).unwrap();
+        assert_eq!(back, [1, 2, 3, 4]);
     }
 }
