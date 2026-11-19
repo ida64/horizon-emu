@@ -226,7 +226,7 @@ impl Port<'_> {
         }
     }
 
-    fn modify(&self, address: u64, clear: u32, set: u32) -> Result<()> {
+    pub(super) fn modify(&self, address: u64, clear: u32, set: u32) -> Result<()> {
         let value = self.read(address)?;
         self.write(address, value & !clear | set)
     }
@@ -505,12 +505,23 @@ impl Port<'_> {
     /// Waits for the BPMP to halt itself, then parks it (end of
     /// `0x1F0147430`).
     pub(super) fn park_bpmp(&self, stop: &AtomicBool) -> Result<()> {
+        self.wait_for_bpmp_halt(stop)?;
+        self.write(HALT_COP_EVENTS, COP_PARKED)
+    }
+
+    /// Polls `HALT_COP_EVENTS` until the BPMP halted waiting for an event.
+    pub(super) fn wait_for_bpmp_halt(&self, stop: &AtomicBool) -> Result<()> {
         while self.read(HALT_COP_EVENTS)? >> 29 != HALT_MODE_WAIT_EVENT {
             if stop.load(Ordering::Relaxed) {
                 return Err(Sc7Fail::Stopped);
             }
             std::thread::sleep(std::time::Duration::from_micros(50));
         }
+        Ok(())
+    }
+
+    /// Parks the halted BPMP for good.
+    pub(super) fn park_halted_bpmp(&self) -> Result<()> {
         self.write(HALT_COP_EVENTS, COP_PARKED)
     }
 }

@@ -57,9 +57,10 @@
 //!    in a recovery boot (for config item 17), and sets core 0 to start at
 //!    DRAM base + the header's entry point with `X0` = 0 (`0x1F0143C20`).
 //! 5. Bootloader state 4: final memory controller set-up ([`NOT_MODELLED`]),
-//!    a wait for the BPMP to halt itself ([`HALT_COP_EVENTS`] mode 2), which
-//!    it then parks for good (`0x40000000`), then the drop to EL1
-//!    (`SPSR_EL3` `0x3C5`, `0x1F0140CC0`).
+//!    a wait for the BPMP to halt itself ([`HALT_COP_EVENTS`] mode 2), the
+//!    activity monitor's clock (`0x1F0142FD4`), the BPMP parked for good
+//!    (`0x40000000`), then the drop to EL1 (`SPSR_EL3` `0x3C5`,
+//!    `0x1F0140CC0`).
 //!
 //! # What TZRAM holds here
 //!
@@ -102,6 +103,7 @@ use crate::{
     memory::GuestRam,
     package2::{self, Package2Error},
     soc::{
+        car,
         iram::{self, Iram},
         tmr, tzram,
     },
@@ -205,9 +207,10 @@ const PACKAGE2_SIZE: RangeInclusive<u64> = 0x200..=0x7F_C000;
 /// carveouts and TrustZone ranges (the kernel cannot read them through
 /// its register call, and the kernel carveouts start empty in
 /// [`crate::soc::mc::Mc`]), walling the halted BPMP off (its exception
-/// vectors, SMMU address space and activity-monitor watchdog), `SCR_EL3`
-/// and the EL2/EL1 system registers (the kernel overwrites the EL1 ones
-/// it needs; `SCTLR_EL1` is entered as `0x00C50838`).
+/// vectors, SMMU address space and the activity monitor's watch on it,
+/// whose clock alone is set up: [`actmon_clock`]), `SCR_EL3` and the
+/// EL2/EL1 system registers (the kernel overwrites the EL1 ones it needs;
+/// `SCTLR_EL1` is entered as `0x00C50838`).
 pub const NOT_MODELLED: &str = "SoC security, counter and power set-up";
 
 /// Machine state the cold boot reads and writes.
@@ -512,6 +515,27 @@ fn wait_for_bootloader(iram: &Iram, state: u32, stop: &AtomicBool) -> Result<(),
     Ok(())
 }
 
+/// `CLK_RST_CONTROLLER` registers of the activity monitor (hekate
+/// `clock.h`): its reset and clock enable are bit 23 of the V group.
+const RST_DEVICES_V: u64 = car::BASE + 0x358;
+const CLK_OUT_ENB_V: u64 = car::BASE + 0x360;
+const CLK_SOURCE_ACTMON: u64 = car::BASE + 0x3E8;
+const ACTMON_BIT: u32 = 1 << 23;
+/// CLK_M, divider 0.
+const ACTMON_SOURCE: u32 = 0xC000_0000;
+
+/// The activity monitor's clock, once the BPMP has halted (`0x1F0142FD4`,
+/// called from `0x1F0147430`): held in reset and gated, its source set,
+/// clocked, let out of reset. The kernel's sleep needs it running
+/// ([`super::SLEEP_REQUIREMENTS`]).
+fn actmon_clock(port: &Port<'_>) -> Result<(), Sc7Fail> {
+    port.modify(RST_DEVICES_V, 0, ACTMON_BIT)?;
+    port.modify(CLK_OUT_ENB_V, ACTMON_BIT, 0)?;
+    port.write(CLK_SOURCE_ACTMON, ACTMON_SOURCE)?;
+    port.modify(CLK_OUT_ENB_V, 0, ACTMON_BIT)?;
+    port.modify(RST_DEVICES_V, ACTMON_BIT, 0)
+}
+
 impl SecureMonitor {
     /// The monitor's cold boot, from core 0's release at `entry` to the
     /// kernel's entry at EL1 (see the [module](self)). Runs on core 0's
@@ -604,7 +628,9 @@ impl SecureMonitor {
         }
 
         wait_for_bootloader(iram, BOOTLOADER_DONE, stop)?;
-        setup(port.park_bpmp(stop))?;
+        setup(port.wait_for_bpmp_halt(stop))?;
+        setup(actmon_clock(&port))?;
+        setup(port.park_halted_bpmp())?;
         let mut state = self.state.lock().unwrap();
         state.settings = settings.overridden_by(&self.params);
         state.boot_chain = true;
@@ -795,6 +821,12 @@ mod tests {
             0x1000,
             Box::new(RegisterFile::zeroed([(HALT_COP_EVENTS & 0xFFF, 0)])),
         );
+        bus.map(
+            "CAR",
+            car::BASE,
+            car::SIZE,
+            Box::new(crate::soc::car::Car::power_on()),
+        );
         let controller = Arc::new(Mc::new(params.dram));
         let tzram = Arc::new(tzram::Tzram::new());
         map_secure_blocks(&mut bus, &controller, &tzram);
@@ -916,6 +948,13 @@ mod tests {
         assert_eq!(register(&console.bus, pmc + 0x368), 0x7C01_2800);
         assert_eq!(register(&console.bus, sc7::MC_SECURITY_CFG3), 3);
         assert_eq!(register(&console.bus, HALT_COP_EVENTS), sc7::COP_PARKED);
+        // The activity monitor clocked and out of reset, for sleep.
+        assert_eq!(
+            register(&console.bus, CLK_OUT_ENB_V) & ACTMON_BIT,
+            ACTMON_BIT
+        );
+        assert_eq!(register(&console.bus, RST_DEVICES_V) & ACTMON_BIT, 0);
+        assert_eq!(register(&console.bus, CLK_SOURCE_ACTMON), ACTMON_SOURCE);
         // The resident image in TZRAM, and the SC7 stub in it.
         let mut resident = vec![0; RESIDENT_SIZE];
         console
