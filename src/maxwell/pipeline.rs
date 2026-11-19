@@ -64,7 +64,9 @@ fn require(
     }
 }
 
-/// Primitive topologies (`BEGIN_OP`).
+/// Primitive topologies (`BEGIN_OP`). The point and line variants come
+/// last so that snapshots taken before they existed name the same
+/// variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Topology {
     Triangles,
@@ -73,22 +75,36 @@ pub enum Topology {
     Quads,
     QuadStrip,
     Polygon,
+    Points,
+    Lines,
+    LineLoop,
+    LineStrip,
 }
 
 impl Topology {
     pub fn from_raw(raw: u32) -> Result<Self, Unmodeled> {
         Ok(match raw {
+            0 => Topology::Points,
+            1 => Topology::Lines,
+            2 => Topology::LineLoop,
+            3 => Topology::LineStrip,
             4 => Topology::Triangles,
             5 => Topology::TriangleStrip,
             6 => Topology::TriangleFan,
             7 => Topology::Quads,
             8 => Topology::QuadStrip,
             9 => Topology::Polygon,
-            _ => {
+            0xA..=0xD => {
                 return Err(Unmodeled(format!(
-                    "3D: primitive topology {raw:#x} (points, lines, adjacency and patches are not modeled)"
+                    "3D: primitive topology {raw:#x} (adjacency topologies are not modeled)"
                 )));
             }
+            0xE => {
+                return Err(Unmodeled(
+                    "3D: primitive topology 0xe (patches are not modeled)".into(),
+                ));
+            }
+            _ => return Err(Unmodeled(format!("3D: primitive topology {raw:#x}"))),
         })
     }
 }
@@ -223,6 +239,20 @@ const SET_PIPELINE_BINDING: u32 = 0x2010;
 const SET_BINDLESS_TEXTURE: u32 = 0x2608;
 const SET_RASTER_ENABLE: u32 = 0x037c;
 const SET_STREAM_OUTPUT: u32 = 0x0744;
+const SET_ALIASED_LINE_WIDTH_ENABLE: u32 = 0x020c;
+const SET_SNAP_GRID_LINE: u32 = 0x0318;
+const SET_LINE_WIDTH_FLOAT: u32 = 0x13b0;
+const SET_ALIASED_LINE_WIDTH_FLOAT: u32 = 0x13b4;
+const SET_LINE_MULTISAMPLE_OVERRIDE: u32 = 0x1418;
+const SET_POINT_SIZE: u32 = 0x1518;
+const SET_POINT_SPRITE: u32 = 0x1520;
+const SET_ANTI_ALIAS_ENABLE: u32 = 0x1534;
+const SET_ANTI_ALIASED_LINE: u32 = 0x1570;
+const SET_POINT_SPRITE_SELECT: u32 = 0x1604;
+const SET_ANTI_ALIASED_POINT: u32 = 0x1658;
+const SET_POINT_CENTER_MODE: u32 = 0x165c;
+const SET_LINE_STIPPLE: u32 = 0x166c;
+const SET_ATTRIBUTE_POINT_SIZE: u32 = 0x1910;
 
 /// Pipeline stages (`SET_PIPELINE_*(j)`): 0 vertex A (cull before fetch),
 /// 1 vertex B, 2 tessellation init, 3 tessellation, 4 geometry, 5 pixel.
@@ -758,8 +788,19 @@ impl ClipPlane {
     }
 }
 
-/// Triangles of a batch, by vertex positions in the batch.
-fn assemble(topology: Topology, elements: &[Element]) -> Vec<[usize; 3]> {
+/// The primitives of a batch, by vertex positions in the batch.
+#[derive(Debug, PartialEq, Eq)]
+enum Primitives {
+    Points(Vec<usize>),
+    /// Segments from their first to their second vertex.
+    Lines(Vec<[usize; 2]>),
+    Triangles(Vec<[usize; 3]>),
+}
+
+/// Primitive assembly [public: OpenGL 4.6 core, 10.1 "Primitive Types"].
+fn assemble(topology: Topology, elements: &[Element]) -> Primitives {
+    let mut points = Vec::new();
+    let mut lines = Vec::new();
     let mut triangles = Vec::new();
     // Primitive restart splits the batch into independent runs.
     let mut start = 0;
@@ -770,6 +811,17 @@ fn assemble(topology: Topology, elements: &[Element]) -> Vec<[usize; 3]> {
         start = end + 1;
         let n = run.len();
         match topology {
+            Topology::Points => points.extend_from_slice(&run),
+            Topology::Lines => lines.extend_from_slice(run.as_chunks::<2>().0),
+            Topology::LineStrip => lines.extend(run.windows(2).map(|s| [s[0], s[1]])),
+            // A loop closes with a segment from its last vertex to its
+            // first; a restart ends (and closes) the loop.
+            Topology::LineLoop => {
+                lines.extend(run.windows(2).map(|s| [s[0], s[1]]));
+                if n >= 2 {
+                    lines.push([run[n - 1], run[0]]);
+                }
+            }
             Topology::Triangles => {
                 for t in run.as_chunks::<3>().0 {
                     triangles.push(*t);
@@ -805,7 +857,33 @@ fn assemble(topology: Topology, elements: &[Element]) -> Vec<[usize; 3]> {
             }
         }
     }
-    triangles
+    match topology {
+        Topology::Points => Primitives::Points(points),
+        Topology::Lines | Topology::LineStrip | Topology::LineLoop => Primitives::Lines(lines),
+        _ => Primitives::Triangles(triangles),
+    }
+}
+
+impl ClipVertex {
+    /// The point a fraction `t` of the way from `a` to `b`.
+    fn lerp(a: &ClipVertex, b: &ClipVertex, t: f32) -> ClipVertex {
+        let lerp = |x: f32, y: f32| x + (y - x) * t;
+        ClipVertex {
+            clip: std::array::from_fn(|k| lerp(a.clip[k], b.clip[k])),
+            words: a
+                .words
+                .iter()
+                .zip(&b.words)
+                .map(|(&x, &y)| lerp(x, y))
+                .collect(),
+            distances: a
+                .distances
+                .iter()
+                .zip(&b.distances)
+                .map(|(&x, &y)| lerp(x, y))
+                .collect(),
+        }
+    }
 }
 
 /// Sutherland-Hodgman clipping of a polygon against `plane . clip >= 0`.
@@ -821,23 +899,7 @@ fn clip_polygon(polygon: Vec<ClipVertex>, plane: ClipPlane) -> Vec<ClipVertex> {
             out.push(a.clone());
         }
         if (da >= 0.0) != (db >= 0.0) {
-            let t = da / (da - db);
-            let lerp = |x: f32, y: f32| x + (y - x) * t;
-            out.push(ClipVertex {
-                clip: std::array::from_fn(|k| lerp(a.clip[k], b.clip[k])),
-                words: a
-                    .words
-                    .iter()
-                    .zip(&b.words)
-                    .map(|(&x, &y)| lerp(x, y))
-                    .collect(),
-                distances: a
-                    .distances
-                    .iter()
-                    .zip(&b.distances)
-                    .map(|(&x, &y)| lerp(x, y))
-                    .collect(),
-            });
+            out.push(ClipVertex::lerp(a, b, da / (da - db)));
         }
     }
     out
@@ -932,9 +994,10 @@ pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result
 }
 
 /// The geometry shader stage: one thread per input primitive of the
-/// shaded batch, the vertices of their output strips gathered into a new
-/// batch of triangle strips (a restart after each thread, and at each
-/// `OUT.CUT`), which clipping and rasterization take like a draw's own.
+/// shaded batch, the vertices of their output strips (or points) gathered
+/// into a new batch of the header's output topology (a restart after each
+/// thread, and at each `OUT.CUT`), which clipping and rasterization take
+/// like a draw's own.
 fn geometry_stage(
     context: &Context<'_>,
     geometry: &Program,
@@ -959,13 +1022,18 @@ fn geometry_stage(
             batch.topology
         )));
     }
-    // Point and line output would need point and line rasterization.
-    if header.output_topology() != 7 {
-        return Err(Unmodeled(format!(
-            "3D: geometry shader output topology {} (only TRIANGLESTRIP)",
-            header.output_topology()
-        )));
-    }
+    // CommonWord3.OutputTopology: POINTLIST (1), LINESTRIP (6),
+    // TRIANGLESTRIP (7) [public: NVIDIA open-gpu-doc Shader-Program-Header].
+    let output = match header.output_topology() {
+        1 => Topology::Points,
+        6 => Topology::LineStrip,
+        7 => Topology::TriangleStrip,
+        other => {
+            return Err(Unmodeled(format!(
+                "3D: geometry shader output topology {other}"
+            )));
+        }
+    };
     // Several threads per primitive tell themselves apart with
     // SR_INVOCATION_ID, which is not modeled.
     let threads = header.threads_per_input_primitive();
@@ -980,7 +1048,10 @@ fn geometry_stage(
     let unit = textures.unit();
     let env = env(&buffers, &unit, r, context.memory);
     let mut emitted = Vec::new();
-    for indices in assemble(batch.topology, &batch.elements) {
+    let Primitives::Triangles(primitives) = assemble(batch.topology, &batch.elements) else {
+        unreachable!("the input topology is checked to be triangles");
+    };
+    for indices in primitives {
         let inputs = indices.map(|i| {
             &*vertices[i]
                 .as_ref()
@@ -1012,7 +1083,7 @@ fn geometry_stage(
         }
     }
     let batch = Batch {
-        topology: Topology::TriangleStrip,
+        topology: output,
         instance: batch.instance,
         base_instance: batch.base_instance,
         elements,
@@ -1163,8 +1234,8 @@ fn rasterize(
     } else {
         None
     };
-    // Clipping, viewport transform and triangle setup.
-    let triangles = setup(r, batch, vertices, &varyings, vertex)?;
+    // Clipping, viewport transform and primitive setup.
+    let triangles = setup(r, batch, vertices, &varyings, vertex, pixel, clip)?;
     if triangles.is_empty() || (colors.is_empty() && depth.is_none()) {
         return Ok(());
     }
@@ -1372,83 +1443,212 @@ fn blend_state(r: Registers<'_>, target: u32, per_target: bool) -> Result<Blend,
     Ok(blend)
 }
 
-/// Clips, projects, culls and sets up the triangles of a batch.
+/// Clips, projects and sets up the primitives of a batch as the triangles
+/// the rasterizer covers: triangles as they are (after culling), line
+/// segments and points as the quads their rules cover (see `line_rule`
+/// and `point_rule`). `area` is the scissor and surface clip.
 fn setup(
     r: Registers<'_>,
     batch: &Batch,
     vertices: &[Option<Shaded>],
     varyings: &[(usize, Interpolation)],
-    vertex: &Program,
+    last: &Program,
+    pixel: &Program,
+    area: Rect,
 ) -> Result<Vec<Triangle>, Unmodeled> {
-    let control = r.get(SET_VIEWPORT_CLIP_CONTROL);
-    // GEOMETRY_CLIP: FRUSTUM_XY_CLIP (2), FRUSTUM_XYZ_CLIP (3) or
-    // FRUSTUM_Z_CLIP (5, the netlist's initial value). Without x/y
-    // clipping the rasterizer's guard band applies: primitives are cut only
-    // by the scissor and surface clip.
-    let mode = (control >> 11) & 7;
-    let (clip_xy, clip_z) = match mode {
-        2 => (true, false),
-        3 => (true, true),
-        5 => (false, true),
-        _ => {
-            return Err(refuse(
-                "geometry clip mode",
-                SET_VIEWPORT_CLIP_CONTROL,
-                control,
-            ));
-        }
-    };
-    // SET_VIEWPORT_Z_CLIP RANGE: -w..w (0) or 0..w (1).
-    let zero_to_w = r.get(SET_VIEWPORT_Z_CLIP) & 1 != 0;
-    let mut planes: Vec<ClipPlane> = Vec::new();
-    let homogeneous = |plane: [f32; 4]| ClipPlane::Homogeneous(plane, 0.0);
-    if clip_z {
-        planes.push(homogeneous(if zero_to_w {
-            [0.0, 0.0, 1.0, 0.0]
-        } else {
-            [0.0, 0.0, 1.0, 1.0]
-        }));
-        planes.push(homogeneous([0.0, 0.0, -1.0, 1.0]));
+    let clip = Clip::new(r, last)?;
+    match assemble(batch.topology, &batch.elements) {
+        Primitives::Triangles(list) => setup_triangles(r, &clip, &list, vertices, varyings),
+        Primitives::Lines(list) => setup_lines(r, &clip, &list, vertices, varyings, area),
+        Primitives::Points(list) => setup_points(r, &clip, &list, vertices, varyings, last, pixel),
     }
-    if clip_xy {
+}
+
+/// Clipping and the viewport transform of a draw.
+struct Clip {
+    planes: Vec<ClipPlane>,
+    /// The user clip distances in use (`ClipPlane::User(i)` is the `i`th).
+    user: Vec<usize>,
+    scale: [f32; 3],
+    offset: [f32; 3],
+}
+
+impl Clip {
+    fn new(r: Registers<'_>, last: &Program) -> Result<Clip, Unmodeled> {
+        let control = r.get(SET_VIEWPORT_CLIP_CONTROL);
+        // GEOMETRY_CLIP: FRUSTUM_XY_CLIP (2), FRUSTUM_XYZ_CLIP (3) or
+        // FRUSTUM_Z_CLIP (5, the netlist's initial value). Without x/y
+        // clipping the rasterizer's guard band applies: primitives are cut
+        // only by the scissor and surface clip.
+        let mode = (control >> 11) & 7;
+        let (clip_xy, clip_z) = match mode {
+            2 => (true, false),
+            3 => (true, true),
+            5 => (false, true),
+            _ => {
+                return Err(refuse(
+                    "geometry clip mode",
+                    SET_VIEWPORT_CLIP_CONTROL,
+                    control,
+                ));
+            }
+        };
+        // SET_VIEWPORT_Z_CLIP RANGE: -w..w (0) or 0..w (1).
+        let zero_to_w = r.get(SET_VIEWPORT_Z_CLIP) & 1 != 0;
+        let mut planes: Vec<ClipPlane> = Vec::new();
+        let homogeneous = |plane: [f32; 4]| ClipPlane::Homogeneous(plane, 0.0);
+        if clip_z {
+            planes.push(homogeneous(if zero_to_w {
+                [0.0, 0.0, 1.0, 0.0]
+            } else {
+                [0.0, 0.0, 1.0, 1.0]
+            }));
+            planes.push(homogeneous([0.0, 0.0, -1.0, 1.0]));
+        }
+        if clip_xy {
+            planes.extend(
+                [
+                    [1.0, 0.0, 0.0, 1.0],
+                    [-1.0, 0.0, 0.0, 1.0],
+                    [0.0, 1.0, 0.0, 1.0],
+                    [0.0, -1.0, 0.0, 1.0],
+                ]
+                .map(homogeneous),
+            );
+        }
+        // User clip planes (SET_USER_CLIP_ENABLE bit i) whose clip distance
+        // a[0x2c0 + 4i] the last vertex-pipeline shader writes [public:
+        // Ryujinx `AttributeConsts.ClipDistance0`]. A plane whose distance
+        // is not written has nothing to clip against; it is left out.
+        let user_enable = r.get(SET_USER_CLIP_ENABLE) & 0xFF;
+        let user: Vec<usize> = (0..8)
+            .filter(|&i| {
+                user_enable & (1 << i) != 0 && last.header().vtg_output_used(0x2C0 / 4 + i)
+            })
+            .collect();
+        planes.extend((0..user.len()).map(ClipPlane::User));
+        // Guard band: keeps snapped coordinates far inside i64 range; it
+        // cuts nothing that could reach a surface (at most 65536 pixels
+        // wide).
+        const GUARD: f32 = 1048576.0;
+        let scale = [0, 4, 8].map(|o| r.float(SET_VIEWPORT_SCALE_X + o));
+        let offset = [0xc, 0x10, 0x14].map(|o| r.float(SET_VIEWPORT_SCALE_X + o));
+        let guard_x = GUARD / scale[0].abs().max(1.0);
+        let guard_y = GUARD / scale[1].abs().max(1.0);
         planes.extend(
             [
-                [1.0, 0.0, 0.0, 1.0],
-                [-1.0, 0.0, 0.0, 1.0],
-                [0.0, 1.0, 0.0, 1.0],
-                [0.0, -1.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0, guard_x],
+                [-1.0, 0.0, 0.0, guard_x],
+                [0.0, 1.0, 0.0, guard_y],
+                [0.0, -1.0, 0.0, guard_y],
             ]
             .map(homogeneous),
         );
+        // w above a small positive bound, so the perspective divide is
+        // finite.
+        planes.push(ClipPlane::Homogeneous([0.0, 0.0, 0.0, 1.0], -1e-6));
+        Ok(Clip {
+            planes,
+            user,
+            scale,
+            offset,
+        })
     }
-    // User clip planes (SET_USER_CLIP_ENABLE bit i) whose clip distance
-    // a[0x2c0 + 4i] the vertex shader writes [public: Ryujinx
-    // `AttributeConsts.ClipDistance0`]. A plane whose distance is not
-    // written has nothing to clip against; it is left out.
-    let user_enable = r.get(SET_USER_CLIP_ENABLE) & 0xFF;
-    let user: Vec<usize> = (0..8)
-        .filter(|&i| user_enable & (1 << i) != 0 && vertex.header().vtg_output_used(0x2C0 / 4 + i))
-        .collect();
-    planes.extend((0..user.len()).map(ClipPlane::User));
-    // Guard band: keeps snapped coordinates far inside i64 range; it cuts
-    // nothing that could reach a surface (at most 65536 pixels wide).
-    const GUARD: f32 = 1048576.0;
-    let scale = [0, 4, 8].map(|o| r.float(SET_VIEWPORT_SCALE_X + o));
-    let offset = [0xc, 0x10, 0x14].map(|o| r.float(SET_VIEWPORT_SCALE_X + o));
-    let guard_x = GUARD / scale[0].abs().max(1.0);
-    let guard_y = GUARD / scale[1].abs().max(1.0);
-    planes.extend(
-        [
-            [1.0, 0.0, 0.0, guard_x],
-            [-1.0, 0.0, 0.0, guard_x],
-            [0.0, 1.0, 0.0, guard_y],
-            [0.0, -1.0, 0.0, guard_y],
-        ]
-        .map(homogeneous),
-    );
-    // w above a small positive bound, so the perspective divide is finite.
-    planes.push(ClipPlane::Homogeneous([0.0, 0.0, 0.0, 1.0], -1e-6));
 
+    /// A shaded vertex as clipping sees it.
+    fn vertex(&self, v: &Shaded, varyings: &[(usize, Interpolation)]) -> ClipVertex {
+        ClipVertex {
+            clip: v.clip,
+            words: varyings
+                .iter()
+                .map(|&(word, _)| f32::from_bits(v.attributes.0[word]))
+                .collect(),
+            distances: self
+                .user
+                .iter()
+                .map(|&i| f32::from_bits(v.attributes.0[0x2C0 / 4 + i]))
+                .collect(),
+        }
+    }
+
+    /// Window coordinates: physical x, y, depth and 1/w.
+    fn window(&self, v: &ClipVertex) -> [f32; 4] {
+        let inv_w = 1.0 / v.clip[3];
+        [
+            v.clip[0] * inv_w * self.scale[0] + self.offset[0],
+            v.clip[1] * inv_w * self.scale[1] + self.offset[1],
+            v.clip[2] * inv_w * self.scale[2] + self.offset[2],
+            inv_w,
+        ]
+    }
+
+    /// The part of segment `a`-`b` inside every plane, in the same
+    /// direction; `None` if no part is.
+    fn segment(&self, mut a: ClipVertex, mut b: ClipVertex) -> Option<(ClipVertex, ClipVertex)> {
+        for plane in &self.planes {
+            let da = plane.distance(&a);
+            let db = plane.distance(&b);
+            match (da >= 0.0, db >= 0.0) {
+                (true, true) => {}
+                (false, false) => return None,
+                (true, false) => b = ClipVertex::lerp(&a, &b, da / (da - db)),
+                (false, true) => a = ClipVertex::lerp(&a, &b, da / (da - db)),
+            }
+        }
+        Some((a, b))
+    }
+}
+
+/// The interpolation planes of a primitive through three window
+/// positions, each given with the clip vertex whose attribute words hold
+/// there and that vertex's window coordinates (for depth and 1/w). Flat
+/// inputs take the provoking vertex's words. Returns the planes and the
+/// depth plane.
+fn primitive_planes(
+    varyings: &[(usize, Interpolation)],
+    points: [[f32; 2]; 3],
+    corners: [(&ClipVertex, [f32; 4]); 3],
+    provoking: &Shaded,
+) -> (Box<[Plane; 256]>, Plane) {
+    let mut planes = Box::new([Plane::default(); 256]);
+    for (slot, &(word, mode)) in varyings.iter().enumerate() {
+        planes[word] = match mode {
+            Interpolation::Flat => Plane {
+                dx: 0.0,
+                dy: 0.0,
+                base: f32::from_bits(provoking.attributes.0[word]),
+            },
+            Interpolation::Perspective => {
+                raster::plane(points, corners.map(|(v, w)| v.words[slot] * w[3]))
+            }
+            _ => raster::plane(points, corners.map(|(v, _)| v.words[slot])),
+        };
+    }
+    // Fragment coordinates: x, y at the pixel center, z, 1/w.
+    planes[0x70 / 4] = Plane {
+        dx: 1.0,
+        dy: 0.0,
+        base: 0.0,
+    };
+    planes[0x74 / 4] = Plane {
+        dx: 0.0,
+        dy: 1.0,
+        base: 0.0,
+    };
+    let depth = raster::plane(points, corners.map(|(_, w)| w[2]));
+    planes[0x78 / 4] = depth;
+    planes[0x7C / 4] = raster::plane(points, corners.map(|(_, w)| w[3]));
+    (planes, depth)
+}
+
+/// Clips, projects, culls and sets up the triangles of a batch.
+fn setup_triangles(
+    r: Registers<'_>,
+    clip: &Clip,
+    list: &[[usize; 3]],
+    vertices: &[Option<Shaded>],
+    varyings: &[(usize, Interpolation)],
+) -> Result<Vec<Triangle>, Unmodeled> {
     let cull = r.enabled(OGL_SET_CULL);
     let cull_face = r.get(OGL_SET_CULL_FACE);
     let front_ccw = match r.get(OGL_SET_FRONT_FACE) {
@@ -1463,28 +1663,15 @@ fn setup(
     let provoking_last = r.get(SET_PROVOKING_VERTEX) & 1 != 0;
 
     let mut triangles = Vec::new();
-    for indices in assemble(batch.topology, &batch.elements) {
+    for indices in list {
         let shaded: Vec<&Shaded> = indices
             .iter()
             .map(|&i| vertices[i].as_ref().expect("assembly skips restarts"))
             .collect();
         let provoking = if provoking_last { shaded[2] } else { shaded[0] };
-        let polygon: Vec<ClipVertex> = shaded
-            .iter()
-            .map(|v| ClipVertex {
-                clip: v.clip,
-                words: varyings
-                    .iter()
-                    .map(|&(word, _)| f32::from_bits(v.attributes.0[word]))
-                    .collect(),
-                distances: user
-                    .iter()
-                    .map(|&i| f32::from_bits(v.attributes.0[0x2C0 / 4 + i]))
-                    .collect(),
-            })
-            .collect();
-        let mut polygon = polygon;
-        for &plane in &planes {
+        let mut polygon: Vec<ClipVertex> =
+            shaded.iter().map(|v| clip.vertex(v, varyings)).collect();
+        for &plane in &clip.planes {
             if polygon.len() < 3 {
                 break;
             }
@@ -1496,19 +1683,7 @@ fn setup(
         if polygon.len() < 3 {
             continue;
         }
-        // Window coordinates.
-        let window: Vec<[f32; 4]> = polygon
-            .iter()
-            .map(|v| {
-                let inv_w = 1.0 / v.clip[3];
-                [
-                    v.clip[0] * inv_w * scale[0] + offset[0],
-                    v.clip[1] * inv_w * scale[1] + offset[1],
-                    v.clip[2] * inv_w * scale[2] + offset[2],
-                    inv_w,
-                ]
-            })
-            .collect();
+        let window: Vec<[f32; 4]> = polygon.iter().map(|v| clip.window(v)).collect();
         // Facing from the signed area of the whole polygon, in window
         // coordinates with y down.
         let area: f32 = (0..window.len())
@@ -1537,36 +1712,323 @@ fn setup(
         for i in 1..window.len() - 1 {
             let corners = [0, i, i + 1];
             let points = corners.map(|k| [window[k][0], window[k][1]]);
-            let mut planes_out = Box::new([Plane::default(); 256]);
-            for (slot, &(word, mode)) in varyings.iter().enumerate() {
-                let values = corners.map(|k| match mode {
-                    Interpolation::Perspective => polygon[k].words[slot] * window[k][3],
-                    _ => polygon[k].words[slot],
-                });
-                planes_out[word] = match mode {
-                    Interpolation::Flat => Plane {
-                        dx: 0.0,
-                        dy: 0.0,
-                        base: f32::from_bits(provoking.attributes.0[word]),
-                    },
-                    _ => raster::plane(points, values),
-                };
+            let (planes, depth) = primitive_planes(
+                varyings,
+                points,
+                corners.map(|k| (&polygon[k], window[k])),
+                provoking,
+            );
+            if let Some(triangle) = Triangle::new(points, planes, depth, front_facing) {
+                triangles.push(triangle);
             }
-            // Fragment coordinates: x, y at the pixel center, z, 1/w.
-            planes_out[0x70 / 4] = Plane {
-                dx: 1.0,
-                dy: 0.0,
-                base: 0.0,
+        }
+    }
+    Ok(triangles)
+}
+
+/// How line segments rasterize.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LineRule {
+    /// A rectangle `width` wide centered on the segment, with its ends
+    /// through the endpoints perpendicular to it, covering the pixels
+    /// whose centers are inside.
+    Rectangle { width: f32 },
+    /// The non-antialiased line, `width` pixels wide
+    /// ([`raster::aliased_line`]).
+    Aliased { width: u32 },
+}
+
+/// The line rule the draw's state selects.
+///
+/// The rasterizer has three line modes. Mesa's NVK (nouveau's Vulkan
+/// driver) selects them as follows [public: Mesa
+/// `src/nouveau/vulkan/nvk_cmd_draw.c`]. It enables multisample
+/// rasterization (`SET_ANTI_ALIAS_ENABLE`) even for one sample ("this
+/// way we get strict lines and rectangular line support"). Rectangular
+/// lines are `SET_LINE_MULTISAMPLE_OVERRIDE` and `SET_ANTI_ALIASED_LINE`
+/// both off. Bresenham lines are the override on. Smooth rectangular
+/// lines are both on.
+///
+/// - Rectangular lines (multisample rasterization on, override and
+///   smooth off) cover the sample points inside a rectangle of the line
+///   width centered on the segment [public: Vulkan 1.3, "Basic Line
+///   Segment Rasterization"]. `SET_ANTI_ALIAS` 1X1 (checked at every
+///   draw) puts the one sample at the pixel center. Samples exactly on
+///   the rectangle's edges go by the top-left rule of the two triangles
+///   the rectangle is drawn as \[assumption: the hardware's tie rule is
+///   not public\]. The width is `SET_LINE_WIDTH_FLOAT`: nouveau's OpenGL
+///   driver writes that register for smooth or multisampled lines and
+///   `SET_ALIASED_LINE_WIDTH_FLOAT` for the others, with
+///   `SET_ALIASED_LINE_WIDTH_ENABLE` set at init [public: Mesa
+///   `nvc0_state.c` `nvc0_rasterizer_state_create`, `nvc0_screen.c`].
+/// - Non-antialiased lines (multisample rasterization off, or the
+///   override on; smooth off) follow OpenGL's diamond-exit rule, the
+///   width rounded to the nearest integer, 0 counting as 1 (see
+///   [`raster::aliased_line`]). The width is
+///   `SET_ALIASED_LINE_WIDTH_FLOAT` with `SET_ALIASED_LINE_WIDTH_ENABLE`,
+///   else `SET_LINE_WIDTH_FLOAT` \[inference: envytools `gf100_3d.xml`
+///   names 0x20c `LINE_WIDTH_SEPARATE`\]. The firmware's touch screen
+///   test (Settings, Test Input Devices) draws its strokes this way:
+///   multisample rasterization off, width 1.
+///
+/// Widths beyond 10, the widest line nouveau's OpenGL driver advertises
+/// (`max_line_width`), are refused: the hardware's limit and what it
+/// does past it are not established. Endpoints are snapped to
+/// `SET_SNAP_GRID_LINE`, here only the 1/256 pixel grid with RTNE
+/// rounding that triangles use.
+///
+/// Refused: stippled lines, and smooth lines (their coverage comes from
+/// `SET_LINE_SMOOTH_PARAMETERS` and `SET_LINE_SMOOTH_EDGE_TABLE`, whose
+/// meaning is not public).
+fn line_rule(r: Registers<'_>) -> Result<LineRule, Unmodeled> {
+    require(r, "line stipple", SET_LINE_STIPPLE, 1, 0)?;
+    require(r, "smooth lines", SET_ANTI_ALIASED_LINE, 1, 0)?;
+    require(
+        r,
+        "line snap grid other than 256x256 RTNE",
+        SET_SNAP_GRID_LINE,
+        0x10F,
+        8,
+    )?;
+    let rectangular = r.enabled(SET_ANTI_ALIAS_ENABLE) && !r.enabled(SET_LINE_MULTISAMPLE_OVERRIDE);
+    let register = if !rectangular && r.enabled(SET_ALIASED_LINE_WIDTH_ENABLE) {
+        SET_ALIASED_LINE_WIDTH_FLOAT
+    } else {
+        SET_LINE_WIDTH_FLOAT
+    };
+    let width = r.float(register);
+    if !(width > 0.0 && width <= 10.0) {
+        return Err(refuse("line width", register, r.get(register)));
+    }
+    Ok(if rectangular {
+        LineRule::Rectangle { width }
+    } else {
+        LineRule::Aliased {
+            width: (width.round() as u32).max(1),
+        }
+    })
+}
+
+/// Clips and sets up line segments as the pixels `line_rule` covers: the
+/// rectangle of a rectangular line, the runs of whole pixels of a
+/// non-antialiased one, two triangles each. Attributes vary along the
+/// segment only: the planes are those through the corners of the
+/// segment's rectangle with the values of the endpoint each corner lies
+/// beside, which is the interpolation of a line fragment at its
+/// projection onto the segment that OpenGL and Vulkan define. The
+/// provoking vertex of a segment is its second vertex, or its first with
+/// `SET_PROVOKING_VERTEX` FIRST; lines are front-facing and not culled
+/// [public: OpenGL 4.6 core, "Flatshading" and the fragment shader input
+/// `gl_FrontFacing`]. Only aliased-line pixels in `area` (scissor and
+/// surface clip) are set up.
+fn setup_lines(
+    r: Registers<'_>,
+    clip: &Clip,
+    list: &[[usize; 2]],
+    vertices: &[Option<Shaded>],
+    varyings: &[(usize, Interpolation)],
+    area: Rect,
+) -> Result<Vec<Triangle>, Unmodeled> {
+    let rule = line_rule(r)?;
+    let provoking_last = r.get(SET_PROVOKING_VERTEX) & 1 != 0;
+    let mut triangles = Vec::new();
+    let mut push = |points: [[f32; 2]; 3], planes: &[Plane; 256], depth: Plane| {
+        if let Some(triangle) = Triangle::new(points, Box::new(*planes), depth, true) {
+            triangles.push(triangle);
+        }
+    };
+    for &[a, b] in list {
+        let shaded = [a, b].map(|i| vertices[i].as_ref().expect("assembly skips restarts"));
+        let provoking = shaded[usize::from(provoking_last)];
+        let Some((a, b)) = clip.segment(
+            clip.vertex(shaded[0], varyings),
+            clip.vertex(shaded[1], varyings),
+        ) else {
+            continue;
+        };
+        let [wa, wb] = [&a, &b].map(|v| {
+            let [x, y, z, inv_w] = clip.window(v);
+            [raster::snap_to_grid(x), raster::snap_to_grid(y), z, inv_w]
+        });
+        let d = [wb[0] - wa[0], wb[1] - wa[1]];
+        let length = d[0].hypot(d[1]);
+        if length == 0.0 {
+            continue;
+        }
+        let half = match rule {
+            LineRule::Rectangle { width } => width / 2.0,
+            LineRule::Aliased { .. } => 0.5,
+        } / length;
+        let normal = [-d[1] * half, d[0] * half];
+        let at = |w: [f32; 4], side: f32| [w[0] + side * normal[0], w[1] + side * normal[1]];
+        let corners = [at(wa, 1.0), at(wb, 1.0), at(wb, -1.0), at(wa, -1.0)];
+        let (planes, depth) = primitive_planes(
+            varyings,
+            [corners[0], corners[1], corners[3]],
+            [(&a, wa), (&b, wb), (&a, wa)],
+            provoking,
+        );
+        match rule {
+            LineRule::Rectangle { .. } => {
+                push([corners[0], corners[1], corners[2]], &planes, depth);
+                push([corners[0], corners[2], corners[3]], &planes, depth);
+            }
+            LineRule::Aliased { width } => {
+                let runs = raster::aliased_line([wa[0], wa[1]], [wb[0], wb[1]], width, area);
+                for [x0, y0, x1, y1] in runs {
+                    let [x0, y0, x1, y1] = [x0, y0, x1, y1].map(|v| v as f32);
+                    push([[x0, y0], [x1, y0], [x1, y1]], &planes, depth);
+                    push([[x0, y0], [x1, y1], [x0, y1]], &planes, depth);
+                }
+            }
+        }
+    }
+    Ok(triangles)
+}
+
+/// The square a point covers: axis-aligned, of side `size`, centered at
+/// `center`, covering the pixels whose centers are inside.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PointSquare {
+    center: [f32; 2],
+    size: f32,
+}
+
+/// The square a point at window position (`x`, `y`) with point size
+/// `size` covers.
+///
+/// With `SET_POINT_SPRITE` enabled it is centered at the point, its side
+/// the point size [public: OpenGL 4.6 compatibility profile, "Basic
+/// Point Rasterization" (point sprites) and "Point Multisample
+/// Rasterization" (a square with point sprites)]. Without point sprites
+/// and without multisample rasterization (`SET_ANTI_ALIAS_ENABLE`) it is
+/// OpenGL's non-antialiased point: the size rounded to the nearest
+/// integer (at least 1), centered at the center of the pixel holding the
+/// point for odd sizes and at the pixel corner nearest it for even ones
+/// (same section). Without point sprites but with multisample
+/// rasterization the point is a circle there; that is refused, as are
+/// smooth points (`SET_ANTI_ALIASED_POINT`) and `SET_POINT_CENTER_MODE`
+/// D3D, whose effect is not documented. Sizes beyond 63, the largest
+/// point nouveau's OpenGL driver advertises (`max_point_size`, Mesa
+/// `nvc0_screen.c`), are refused like wide lines.
+fn point_rule(r: Registers<'_>, x: f32, y: f32, size: f32) -> Result<PointSquare, Unmodeled> {
+    require(r, "smooth points", SET_ANTI_ALIASED_POINT, 1, 0)?;
+    require(r, "point center mode D3D", SET_POINT_CENTER_MODE, !0, 0)?;
+    if !(size > 0.0 && size <= 63.0) {
+        return Err(Unmodeled(format!("3D: point size {size}")));
+    }
+    let sprite = r.enabled(SET_POINT_SPRITE);
+    let multisample = r.enabled(SET_ANTI_ALIAS_ENABLE);
+    Ok(match (sprite, multisample) {
+        (true, _) => PointSquare {
+            center: [raster::snap_to_grid(x), raster::snap_to_grid(y)],
+            size,
+        },
+        (false, false) => {
+            let size = size.round().max(1.0);
+            let center = |v: f32| {
+                if size % 2.0 == 1.0 {
+                    v.floor() + 0.5
+                } else {
+                    (v + 0.5).floor()
+                }
             };
-            planes_out[0x74 / 4] = Plane {
-                dx: 0.0,
-                dy: 1.0,
-                base: 0.0,
-            };
-            let depth = raster::plane(points, corners.map(|k| window[k][2]));
-            planes_out[0x78 / 4] = depth;
-            planes_out[0x7C / 4] = raster::plane(points, corners.map(|k| window[k][3]));
-            if let Some(triangle) = Triangle::new(points, planes_out, depth, front_facing) {
+            PointSquare {
+                center: [center(x), center(y)],
+                size,
+            }
+        }
+        (false, true) => {
+            return Err(refuse(
+                "round (multisample, non-sprite) points",
+                SET_POINT_SPRITE,
+                r.get(SET_POINT_SPRITE),
+            ));
+        }
+    })
+}
+
+/// The size of a point: the last vertex-pipeline shader's point size
+/// output a\[0x6c\] with `SET_ATTRIBUTE_POINT_SIZE` ENABLE, else
+/// `SET_POINT_SIZE` [public: envytools `gf100_3d.xml` `VP_POINT_SIZE`;
+/// NVK enables it with SLOT 0 for shaders that write the point size].
+/// Other SLOT values, and the attribute enabled for a shader that does
+/// not write it, are refused: what either selects is not established.
+fn point_size(r: Registers<'_>, last: &Program, vertex: &Shaded) -> Result<f32, Unmodeled> {
+    let control = r.get(SET_ATTRIBUTE_POINT_SIZE);
+    if control & 1 == 0 {
+        return Ok(r.float(SET_POINT_SIZE));
+    }
+    if control >> 4 & 0xFF != 0 || !last.header().vtg_output_used(0x6C / 4) {
+        return Err(refuse(
+            "point size attribute slot, or a shader that writes no point size",
+            SET_ATTRIBUTE_POINT_SIZE,
+            control,
+        ));
+    }
+    Ok(f32::from_bits(vertex.attributes.0[0x6C / 4]))
+}
+
+/// Clips and sets up points as the squares `point_rule` covers, two
+/// triangles each, with every input constant at the point's values. A
+/// point is discarded when its vertex is outside a clip plane [public:
+/// OpenGL 4.6 core, "Primitive Clipping"]. Point sprite coordinates
+/// (a\[0x2e0\], a\[0x2e4\]) and the coordinates point sprites replace
+/// (`SET_POINT_SPRITE_SELECT` GENERATE) are refused.
+fn setup_points(
+    r: Registers<'_>,
+    clip: &Clip,
+    list: &[usize],
+    vertices: &[Option<Shaded>],
+    varyings: &[(usize, Interpolation)],
+    last: &Program,
+    pixel: &Program,
+) -> Result<Vec<Triangle>, Unmodeled> {
+    if [0x2E0 / 4, 0x2E4 / 4]
+        .iter()
+        .any(|&word| pixel.header().ps_interpolation(word) != Interpolation::Unused)
+    {
+        return Err(Unmodeled(
+            "3D: pixel shader reads point sprite coordinates".into(),
+        ));
+    }
+    let select = r.get(SET_POINT_SPRITE_SELECT);
+    if r.enabled(SET_POINT_SPRITE) && select & 0x1FF8 != 0 {
+        return Err(refuse(
+            "point sprite texture coordinate generation",
+            SET_POINT_SPRITE_SELECT,
+            select,
+        ));
+    }
+    let mut triangles = Vec::new();
+    for &i in list {
+        let shaded = vertices[i].as_ref().expect("assembly skips restarts");
+        let v = clip.vertex(shaded, varyings);
+        if clip.planes.iter().any(|plane| plane.distance(&v) < 0.0) {
+            continue;
+        }
+        let window = clip.window(&v);
+        let size = point_size(r, last, shaded)?;
+        let square = point_rule(r, window[0], window[1], size)?;
+        let half = square.size / 2.0;
+        let [cx, cy] = square.center;
+        let corners = [
+            [cx - half, cy - half],
+            [cx + half, cy - half],
+            [cx + half, cy + half],
+            [cx - half, cy + half],
+        ];
+        let (planes, depth) = primitive_planes(
+            varyings,
+            [corners[0], corners[1], corners[3]],
+            [(&v, window); 3],
+            shaded,
+        );
+        for points in [
+            [corners[0], corners[1], corners[2]],
+            [corners[0], corners[2], corners[3]],
+        ] {
+            if let Some(triangle) = Triangle::new(points, planes.clone(), depth, true) {
                 triangles.push(triangle);
             }
         }

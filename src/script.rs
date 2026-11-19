@@ -23,6 +23,8 @@ use horizon_emu::{
 const HOLD: Duration = Duration::from_millis(300);
 /// How long a repeated press or touch is given to have its effect.
 const AGAIN: Duration = Duration::from_secs(3);
+/// How long a drag takes when a line does not say.
+const DRAG: Duration = Duration::from_secs(1);
 /// How far each of red, green and blue may be from the colour waited for.
 const TOLERANCE: u8 = 16;
 /// Size of the console's screen.
@@ -82,6 +84,13 @@ enum Step {
     Sleep(Duration),
     Press(Key, Duration),
     Touch((u16, u16), Duration),
+    /// A finger put down at `from`, moved along the straight line to `to`
+    /// over `span`, then lifted.
+    Drag {
+        from: (u16, u16),
+        to: (u16, u16),
+        span: Duration,
+    },
     /// A press or a touch done again, `every` so often, until the pixel
     /// at `(x, y)` has this colour; not at all if it has it already.
     Until {
@@ -103,6 +112,13 @@ enum Held {
     Nothing,
     Button(Key),
     Finger,
+    /// A dragging finger, at `from` at `start` and at `to` `span` later.
+    Drag {
+        from: (u16, u16),
+        to: (u16, u16),
+        start: Instant,
+        span: Duration,
+    },
 }
 
 /// Something a script did that the caller reports or carries out.
@@ -137,6 +153,9 @@ impl Script {
     /// touch X,Y [HOLD_MS] [until X,Y RRGGBB [SECONDS]]
     ///                       with `until`: again every SECONDS (3) until
     ///                       that pixel is that colour; not at all if it is
+    /// drag X,Y X,Y [MS]     a finger down at the first point, moved along
+    ///                       the straight line to the second over MS (1000),
+    ///                       then lifted
     /// type TEXT             the rest of the line, on the open on-screen
     ///                       keyboard, key by key
     /// joycons on|off
@@ -183,12 +202,25 @@ impl Script {
         loop {
             if let Some((end, held)) = self.until {
                 if Instant::now() < end {
+                    if let Held::Drag {
+                        from,
+                        to,
+                        start,
+                        span,
+                    } = held
+                    {
+                        machine.set_touch(Some(drag_point(from, to, start.elapsed(), span)));
+                    }
                     return;
                 }
                 match held {
                     Held::Nothing => {}
                     Held::Button(key) => key.hold(machine, false),
                     Held::Finger => {
+                        machine.set_touch(None);
+                    }
+                    Held::Drag { to, .. } => {
+                        machine.set_touch(Some(to));
                         machine.set_touch(None);
                     }
                 }
@@ -224,6 +256,20 @@ impl Script {
                         return;
                     }
                     self.until = hold(*span, Held::Finger);
+                }
+                Step::Drag { from, to, span } => {
+                    if !machine.set_touch(Some(*from)) {
+                        return;
+                    }
+                    self.until = hold(
+                        *span,
+                        Held::Drag {
+                            from: *from,
+                            to: *to,
+                            start: now,
+                            span: *span,
+                        },
+                    );
                 }
                 Step::Until {
                     action, x, y, rgb, ..
@@ -403,6 +449,19 @@ fn parse_step(line: &str) -> Option<Step> {
             let touch = Step::Touch((x as u16, y as u16), hold(&mut words)?);
             until(&mut words, touch)?
         }
+        "drag" => {
+            let (x0, y0) = place(&mut words)?;
+            let (x1, y1) = place(&mut words)?;
+            let span = match words.next() {
+                Some(milliseconds) => Duration::from_millis(milliseconds.parse().ok()?),
+                None => DRAG,
+            };
+            Step::Drag {
+                from: (x0 as u16, y0 as u16),
+                to: (x1 as u16, y1 as u16),
+                span,
+            }
+        }
         "joycons" => Step::Joycons(match words.next()? {
             "on" => true,
             "off" => false,
@@ -418,6 +477,14 @@ fn parse_step(line: &str) -> Option<Step> {
         _ => return None,
     };
     words.next().is_none().then_some(step)
+}
+
+/// Where a dragging finger is `elapsed` into a drag of `span` from `from`
+/// to `to`.
+fn drag_point(from: (u16, u16), to: (u16, u16), elapsed: Duration, span: Duration) -> (u16, u16) {
+    let t = (elapsed.as_secs_f64() / span.as_secs_f64().max(f64::EPSILON)).min(1.0);
+    let along = |a: u16, b: u16| (f64::from(a) + (f64::from(b) - f64::from(a)) * t).round() as u16;
+    (along(from.0, to.0), along(from.1, to.1))
 }
 
 #[cfg(test)]
@@ -521,5 +588,41 @@ mod tests {
             Script::parse("sleep 1\ntype é\n").err().unwrap(),
             "line 2: 'é' is on no page of the keyboard"
         );
+    }
+
+    /// `drag` reads two points and an optional duration, and moves the
+    /// finger along the line between them in proportion to the time.
+    #[test]
+    fn drag_is_read_and_moves_along_its_line() {
+        let script = Script::parse("drag 100,200 300,240 500\ndrag 0,0 10,10\n").unwrap();
+        let steps: Vec<_> = script.steps.iter().map(|(_, _, s)| s.clone()).collect();
+        assert_eq!(
+            steps,
+            [
+                Step::Drag {
+                    from: (100, 200),
+                    to: (300, 240),
+                    span: Duration::from_millis(500),
+                },
+                Step::Drag {
+                    from: (0, 0),
+                    to: (10, 10),
+                    span: DRAG,
+                },
+            ]
+        );
+        let span = Duration::from_millis(500);
+        let at = |ms| drag_point((100, 200), (300, 240), Duration::from_millis(ms), span);
+        assert_eq!(at(0), (100, 200));
+        assert_eq!(at(250), (200, 220));
+        assert_eq!(at(900), (300, 240));
+        for bad in [
+            "drag 1,1",
+            "drag 1,1 1280,1",
+            "drag 1,1 2,2 x",
+            "drag 1,1 2,2 3 4",
+        ] {
+            assert!(Script::parse(bad).is_err(), "{bad}");
+        }
     }
 }

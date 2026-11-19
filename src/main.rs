@@ -226,6 +226,10 @@ options:
                         sleep SECONDS
                         press BUTTON [HOLD_MS]    (default 300)
                         touch X,Y [HOLD_MS]
+                        drag X,Y X,Y [MS]    a finger down at the first point,
+                                             moved in a straight line to the
+                                             second over MS (default 1000),
+                                             then lifted
                         type TEXT            the rest of the line, key by key
                                              on the open on-screen keyboard
                         joycons on|off

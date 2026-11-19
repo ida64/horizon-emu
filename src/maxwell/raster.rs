@@ -1,6 +1,7 @@
 //! Triangle rasterization and the fragment back end: coverage with the
 //! top-left fill rule, fragment shading in 2x2 quads, depth test, blending
-//! and render target writes.
+//! and render target writes. Line segments and points reach it as the
+//! triangles of the quads they cover (`pipeline::setup`).
 //!
 //! Positions are snapped to 1/256 pixel, the precision the netlist's
 //! initial `SET_SNAP_GRID_NON_LINE` value 8 selects (`LOCATIONS_PER_PIXEL
@@ -134,6 +135,116 @@ fn orient(a: [i64; 2], b: [i64; 2], c: [i64; 2]) -> i64 {
 /// even.
 fn snap(value: f32) -> i64 {
     (f64::from(value) * SUBPIXEL).round_ties_even() as i64
+}
+
+/// A window coordinate snapped to the sub-pixel grid, in pixels.
+pub fn snap_to_grid(value: f32) -> f32 {
+    (snap(value) as f64 / SUBPIXEL) as f32
+}
+
+/// The pixels a non-antialiased line segment from `a` to `b` (window
+/// positions, snapped here) produces, `width` pixels wide, as runs of
+/// whole pixels `[x0, y0, x1, y1]` (end exclusive). Only pixels whose
+/// major-axis coordinate lies in `area` are produced (the rest is cut by
+/// the scissor anyway).
+///
+/// The rule is the diamond exit of OpenGL and of Vulkan's Bresenham lines
+/// [public: OpenGL 4.6 core, "Basic Line Segment Rasterization"; Vulkan
+/// 1.3, "Bresenham Line Segment Rasterization"]. A pixel is produced
+/// when the segment, with both endpoints perturbed by (-ε, -ε²),
+/// intersects the open diamond |x - x_c| + |y - y_c| < 1/2 around the
+/// pixel center and its perturbed end point is not inside it. A wide
+/// line is the segment offset by -(w - 1)/2 in the minor axis (y for an
+/// x-major segment, |Δx| >= |Δy|), each of its pixels widened to a run
+/// of `width` in the minor axis towards +y or +x (the same sections).
+/// Vulkan states the rule in framebuffer coordinates, whose y runs down
+/// as here; NVK selects these lines with `SET_LINE_MULTISAMPLE_OVERRIDE`
+/// (see `pipeline::line_rule`). \[assumption: the hardware implements
+/// this exact rule. Both APIs allow rules within one pixel of it, and
+/// NVIDIA's is not public.\]
+///
+/// For a segment with |slope| <= 1 in the major axis, a diamond the line
+/// enters is crossed on its minor-axis diagonal, so each column (or row)
+/// has one candidate: the pixel holding the perturbed line at the
+/// column's center. That pixel is produced when the end point is outside
+/// its diamond and past the center in the direction of travel, and the
+/// start point is inside the diamond or not yet past the center.
+pub fn aliased_line(a: [f32; 2], b: [f32; 2], width: u32, area: Rect) -> Vec<[i64; 4]> {
+    let unit = 1i64 << SUBPIXEL_BITS;
+    let half = unit / 2;
+    let [mut a, mut b] = [a, b].map(|p| p.map(snap));
+    let x_major = (b[0] - a[0]).abs() >= (b[1] - a[1]).abs();
+    let (major, minor) = if x_major { (0, 1) } else { (1, 0) };
+    let shift = i64::from(width.max(1) - 1) * half;
+    a[minor] -= shift;
+    b[minor] -= shift;
+    let dm = i128::from(b[major] - a[major]);
+    let dn = i128::from(b[minor] - a[minor]);
+    if dm == 0 {
+        return Vec::new();
+    }
+    // A perturbed line exactly on a pixel edge in the minor axis at a
+    // column's center leaves it by the perturbation: for an x-major
+    // segment by s ε - ε² in y (towards +y only with a positive slope),
+    // for a y-major one by s ε² - ε in x (towards -x).
+    let tie_after = x_major && dn != 0 && (dn > 0) == (dm > 0);
+    // A perturbed point inside the open diamond around `center`: on its
+    // boundary, the -ε in x moves points right of center inside.
+    let inside = |p: [i64; 2], center: [i64; 2]| {
+        let u = p[0] - center[0];
+        let distance = u.abs() + (p[1] - center[1]).abs();
+        distance < half || (distance == half && u > 0)
+    };
+    let (area_first, area_end) = if x_major {
+        (area.x0, area.x1)
+    } else {
+        (area.y0, area.y1)
+    };
+    let first = (a[major].min(b[major]).div_euclid(unit) - 1).max(i64::from(area_first));
+    let last = (a[major].max(b[major]).div_euclid(unit) + 1).min(i64::from(area_end) - 1);
+    let forward = dm > 0;
+    // Runs as (major start, major end, minor), merged while the minor
+    // index stays the same.
+    let mut runs: Vec<(i64, i64, i64)> = Vec::new();
+    for column in first..=last {
+        let center_major = column * unit + half;
+        // The minor coordinate of the line at the column's center is
+        // `num / den` (den > 0).
+        let num = i128::from(a[minor]) * dm + i128::from(center_major - a[major]) * dn;
+        let (num, den) = if dm < 0 { (-num, -dm) } else { (num, dm) };
+        let cell = den * i128::from(unit);
+        let mut row = num.div_euclid(cell);
+        if num.rem_euclid(cell) == 0 && !tie_after {
+            row -= 1;
+        }
+        let row = row as i64;
+        let mut center = [0; 2];
+        center[major] = center_major;
+        center[minor] = row * unit + half;
+        let produced = !inside(b, center)
+            && if forward {
+                b[major] > center_major && (a[major] <= center_major || inside(a, center))
+            } else {
+                b[major] <= center_major && (a[major] > center_major || inside(a, center))
+            };
+        if !produced {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(run) if run.1 == column && run.2 == row => run.1 = column + 1,
+            _ => runs.push((column, column + 1, row)),
+        }
+    }
+    let width = i64::from(width.max(1));
+    runs.into_iter()
+        .map(|(start, end, row)| {
+            if x_major {
+                [start, row, end, row + width]
+            } else {
+                [row, start, row + width, end]
+            }
+        })
+        .collect()
 }
 
 impl Triangle {

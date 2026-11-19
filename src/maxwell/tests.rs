@@ -1124,3 +1124,5 @@ fn empty_inline_transfer_completes_at_launch() {
     call(&mut channel, &ram, 0, 0x1b0, 0x1011);
     call(&mut channel, &ram, 0, 0x2380, 0x7000);
 }
+
+mod lines;
