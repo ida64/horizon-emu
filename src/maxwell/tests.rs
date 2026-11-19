@@ -899,6 +899,83 @@ fn window_origin_flip_sets_which_side_faces_front() {
     }
 }
 
+/// A program of `words` after a program header whose first word is
+/// `kind` (with `header` bytes set), followed by the padding the decoder
+/// reads past the end.
+fn program_bytes(kind: u32, header: &[(usize, u8)], words: &[u64]) -> Vec<u8> {
+    let mut bytes = vec![0u8; 0x50];
+    bytes[..4].copy_from_slice(&kind.to_le_bytes());
+    for &(at, value) in header {
+        bytes[at] = value;
+    }
+    for word in words {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes.extend_from_slice(&[0; 32]);
+    bytes
+}
+
+/// A quad whose vertex program, like the Mii editor's face-texture
+/// programs, stores only x, y and z of the position (ALD attribute 0 xyz,
+/// AST a[0x70..0x7c)): w starts at 1, so the quad is drawn; with the
+/// pixel program's color (1, 0.5, 0.25, 1).
+fn position_xyz_quad(kind: super::RendererKind) -> [u8; 4] {
+    let mut frame = Frame::sized_with(SIZE, SIZE, kind);
+    let vs = program_bytes(
+        0x0401,
+        // Imap: attribute 0 x, y, z; Omap: position x, y, z.
+        &[(0x18, 0x07), (0x35, 0x70)],
+        &[
+            0,
+            0xefd8_7f80_0807_ff00, // ALD R0, a[0x80]
+            0xefd8_7f80_0847_ff01, // ALD R1, a[0x84]
+            0xefd8_7f80_0887_ff02, // ALD R2, a[0x88]
+            0,
+            0xeff0_7f80_0707_ff00, // AST a[0x70], R0
+            0xeff0_7f80_0747_ff01, // AST a[0x74], R1
+            0xeff0_7f80_0787_ff02, // AST a[0x78], R2
+            0,
+            0xe300_0000_0007_000f, // EXIT
+            0xe240_0fff_ff07_000f, // BRA to itself
+            0x50b0_0000_0007_0f00, // NOP
+        ],
+    );
+    let mov = |rd: u64, v: f32| 0x010000000007f000u64 | (u64::from(v.to_bits()) << 20) | rd;
+    let ps = program_bytes(
+        0x1402,
+        &[(0x48, 15)],
+        &[
+            0,
+            mov(0, 1.0),
+            mov(1, 0.5),
+            mov(2, 0.25),
+            0,
+            mov(3, 1.0),
+            0xe300_0000_0007_000f, // EXIT
+            0xe240_0fff_ff07_000f, // BRA to itself
+        ],
+    );
+    frame.program(1, 0, &vs);
+    frame.program(5, 0x800, &ps);
+    let quad = [
+        -0.5, -0.5, 0.0, 0.25, -0.5, 0.0, 0.25, 0.75, 0.0, -0.5, 0.75, 0.0,
+    ];
+    frame.vertices(0x40_0000, 12, &quad, &[(0, 0x02)]);
+    frame.method(0x1618, 7);
+    frame.method(0x0d74, 0);
+    frame.method(0x0d78, 4);
+    frame.method(0x1614, 0);
+    frame.channel.flush(&frame.ram).unwrap();
+    frame.pixel(20, 20)
+}
+
+#[test]
+fn unstored_position_w_is_one() {
+    for kind in [super::RendererKind::Software, super::RendererKind::Metal] {
+        assert_eq!(position_xyz_quad(kind), [255, 128, 64, 255], "{kind:?}");
+    }
+}
+
 /// A draw whose pixel program names a texture slot the draw leaves unset
 /// (handle TIC index 0xfffff, as netConnect's uber-shader leaves on
 /// branches its draws do not take): P0 = c3[0] != 0; @P0 BRA over a TEXS

@@ -436,6 +436,29 @@ impl Default for Attributes {
     }
 }
 
+impl Attributes {
+    /// The output attribute space a vertex program starts from: the
+    /// position and every generic attribute (0, 0, 0, 1), everything else
+    /// 0. What the program does not store keeps these values
+    /// \[inference: the Mii editor's face-texture programs store only x,
+    /// y and z of the position (a\[0x070..0x07c)), and with w = 0 every
+    /// face part would be clipped away, leaving the preview without eyes,
+    /// eyebrows or mouth; Ryujinx `Translation/Translator.cs`
+    /// `EmitOutputsInitialization` (`InitializeOutput`,
+    /// `InitializeOutputComponent`) sets the position of a vertex program
+    /// and each generic component the next stage reads to (0, 0, 0, 1)
+    /// before the program runs\].
+    pub fn vertex_outputs() -> Attributes {
+        let mut words = [0; 256];
+        let one = 1.0f32.to_bits();
+        words[0x7C / 4] = one;
+        for generic in 0..32 {
+            words[(0x80 + 16 * generic + 12) / 4] = one;
+        }
+        Attributes(words)
+    }
+}
+
 impl std::fmt::Debug for Attributes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_map()
