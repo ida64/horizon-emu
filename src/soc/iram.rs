@@ -256,8 +256,11 @@ impl Iram {
     pub fn read_words(&self, offset: u32, words: &mut [u32]) -> Option<()> {
         let span = Self::span(u64::from(offset), 4 * words.len())?;
         let contents = self.contents.lock().unwrap();
-        for (word, chunk) in words.iter_mut().zip(contents.bytes[span].chunks_exact(4)) {
-            *word = u32::from_le_bytes(chunk.try_into().unwrap());
+        for (word, chunk) in words
+            .iter_mut()
+            .zip(contents.bytes[span].as_chunks::<4>().0)
+        {
+            *word = u32::from_le_bytes(*chunk);
         }
         Some(())
     }
@@ -270,8 +273,11 @@ impl Iram {
         if let Some(refusal) = contents.unestablished.first(span.clone()) {
             return Err(refusal);
         }
-        for (word, chunk) in words.iter_mut().zip(contents.bytes[span].chunks_exact(4)) {
-            *word = u32::from_le_bytes(chunk.try_into().unwrap());
+        for (word, chunk) in words
+            .iter_mut()
+            .zip(contents.bytes[span].as_chunks::<4>().0)
+        {
+            *word = u32::from_le_bytes(*chunk);
         }
         Ok(())
     }
@@ -283,9 +289,9 @@ impl Iram {
         let mut contents = self.contents.lock().unwrap();
         for (word, chunk) in words
             .iter()
-            .zip(contents.bytes[span.clone()].chunks_exact_mut(4))
+            .zip(contents.bytes[span.clone()].as_chunks_mut::<4>().0)
         {
-            chunk.copy_from_slice(&word.to_le_bytes());
+            *chunk = word.to_le_bytes();
         }
         contents.unestablished.establish(span);
         Some(())

@@ -44,7 +44,7 @@ use horizon_emu::{
     gic::Gic,
     image::KernelImage,
     keys::KeySet,
-    machine::{Bpmp, Env, PowerOn, Slice},
+    machine::{Bpmp, Env, NeverWakes, PowerOn, Slice},
     memory::GuestRam,
     nand::{self, boot_images::BootImages},
     secmon::{ColdBootContext, SecureMonitor},
@@ -257,7 +257,11 @@ fn power_on() -> Outcome {
     let handoff = bootrom::cold_boot(&boot_bytes[0], &boot_bytes[1], &fuses, 0, &mut iram)
         .expect("the boot ROM boots package1 from BOOT0");
     let entry = handoff.entry;
-    let power_on = PowerOn { handoff, iram };
+    let power_on = PowerOn {
+        handoff,
+        iram,
+        fuses,
+    };
 
     // The machine of `Machine::new` with `power_on`, without the VM and the
     // CPU cluster's devices only its cores reach.
@@ -291,6 +295,7 @@ fn power_on() -> Outcome {
         bus: &bus,
         clock: &clock,
         notes: &soc.notes,
+        power: &NeverWakes,
     };
 
     let progress = Arc::new(Progress::default());
@@ -350,8 +355,12 @@ fn power_on() -> Outcome {
                 }
             }
             match slice {
-                Slice::Ran | Slice::Halted(CopStatus::Running) => {}
+                Slice::Ran | Slice::Halted(CopStatus::Running) | Slice::Woke => {}
                 Slice::Paused | Slice::Held => thread::sleep(Duration::from_millis(1)),
+                // The harness has no wake source (`NeverWakes`): SC7 ends it.
+                Slice::PoweredDown | Slice::Asleep => {
+                    stopped = Some("the SoC entered SC7".into());
+                }
                 Slice::Halted(halt) => {
                     if progress.has(Stage::Package2Loaded) {
                         progress.reach(Stage::BpmpHalted, &clock);

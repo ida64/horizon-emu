@@ -4,7 +4,10 @@
 mod bpmp;
 mod snapshot;
 
-pub use self::bpmp::{BPMP_CORE, Bpmp, BpmpExit, Env, PowerOn, Slice, TsecPort, run};
+pub use self::bpmp::{
+    BPMP_CORE, Bpmp, BpmpExit, Env, NeverWakes, Power, PowerDomain, PowerOn, Slice, TsecPort,
+    WarmStart, apply_rom_bits, run,
+};
 pub use self::snapshot::SaveReport;
 
 use std::{
@@ -1169,9 +1172,15 @@ impl Machine {
     /// relies on, when a core first starts and when one starts again
     /// after having been switched off; the rest of its state it sets up
     /// itself, so what a core that starts again still holds from before
-    /// does not matter.
+    /// does not matter. In a machine powered on, `SCTLR_EL1` is what the
+    /// real monitor leaves ([`bpmp::MONITOR_SCTLR_EL1`]).
     fn start_vcpu(&self, vcpu: &Vcpu, entry: CoreEntry) -> Result<(), HvError> {
-        vcpu.set_sys_reg(SysReg::SCTLR_EL1, boot::ENTRY_SCTLR_EL1)?;
+        let sctlr = if self.bpmp.is_some() {
+            bpmp::MONITOR_SCTLR_EL1
+        } else {
+            boot::ENTRY_SCTLR_EL1
+        };
+        vcpu.set_sys_reg(SysReg::SCTLR_EL1, sctlr)?;
         vcpu.set_pstate(boot::ENTRY_PSTATE)?;
         vcpu.set_pc(entry.pc)?;
         vcpu.set_gpr(0, entry.x0)

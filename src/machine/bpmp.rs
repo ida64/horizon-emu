@@ -1,5 +1,5 @@
 //! The BPMP in a machine powered on from the boot ROM: its view of memory,
-//! its run loop, and the release of the CPU cluster.
+//! its run loop, the release of the CPU cluster, and SC7.
 //!
 //! # The BPMP's address space
 //!
@@ -10,7 +10,7 @@
 //! |---|---|---|
 //! | `0x0000_0000`..`0x0000_0020` | the architected vectors | never taken: exceptions go where `EVP_COP_*_VECTOR` say ([`crate::soc::evp`]); an exception whose register is unwritten stops the BPMP with that said |
 //! | `0x0010_0000`..`0x0012_0000` | IROM, the boot ROM | refused: no dump is available and the ROM is high-level emulated ([`crate::bootrom`]); it has also locked itself out before the bootloader runs (Fusée Gelée write-up) |
-//! | `0x4000_0000`..`0x4004_0000` | IRAM ([`crate::soc::iram`]) | read and written directly; bytes the ROM's hand-off does not establish refuse reads until written |
+//! | `0x4000_0000`..`0x4004_0000` | IRAM ([`crate::soc::iram`]) | read and written directly; bytes no master has written since the ROM's hand-off (or since SC7) refuse reads ([`Iram::bpmp_read`]) |
 //! | `0x5004_0000`..`0x5004_1000` | the BPMP's cache controller (hekate `BPMP_CACHE_BASE`) | refused: not modelled, and package1ldr does not use it |
 //! | `0x5004_1000`..`0x5004_3000` | the CPU cluster's GIC | refused: the BPMP takes its interrupts from the legacy interrupt controller ([`crate::soc::ictlr`]) \[inference: the GIC is the CPU complex's private peripheral, and Linux routes the BPMP's interrupts through the LIC\] |
 //! | DRAM (`0x8000_0000` up to 4 GiB) | [`GuestRam`] | read and written directly; the memory controller's carveouts are not applied to the BPMP (its client, AVPC, is not modelled) |
@@ -22,8 +22,9 @@
 //!
 //! # Running
 //!
-//! [`run`] steps the core in slices of [`SLICE`] instructions. Between
-//! slices it looks at what the core cannot see from inside an instruction:
+//! [`run`] steps the core in slices of [`SLICE`] instructions, with its
+//! code cache on IRAM ([`Assist`]). Between slices it looks at what the
+//! core cannot see from inside an instruction:
 //!
 //! * the flow controller's halt of the BPMP ([`FlowController::cop_status`]),
 //!   which the BPMP's own write to `HALT_COP_EVENTS` ends a slice for
@@ -39,8 +40,10 @@
 //!   15 C0NC, Linux `tegra210` power-gate table) and the secure boot
 //!   registers give an AArch64 reset vector; the vector is handed to the
 //!   release callback, which in the machine is the high-level emulated
-//!   secure monitor's cold boot on a thread of core 0's own. Anything else
-//!   (an unpowered core, a start in AArch32) is refused.
+//!   secure monitor's cold boot or SC7 resume on a thread of core 0's own.
+//!   Anything else (an unpowered core, a start in AArch32) is refused;
+//! * the SoC entering SC7 (PMC `DPD_ENABLE` bit 0), and while it is in SC7,
+//!   the wake (see below).
 //!
 //! The BPMP goes on after the release: the NX bootloader talks to the
 //! monitor through IRAM and halts itself through the flow controller.
@@ -50,9 +53,51 @@
 //! time. Snapshots: the core stands still while guest time is paused
 //! (checked under the core's lock before each slice), so the [`Snapshot`]
 //! of [`Bpmp`] and of every device is consistent once the clock stands.
+//! SC7 entry and exit happen inside one slice, so a snapshot sees the SoC
+//! before, in, or after SC7, never between. Refused: a snapshot while core
+//! 0 is being started, when the monitor's high-level emulated cold boot or
+//! resume runs on core 0's thread and its state is in that thread.
+//!
+//! # SC7
+//!
+//! On the console (`warmboot-research` §2, §5, §6): the secure monitor's
+//! SC7-entry stub on the BPMP ends with `DPD_ENABLE` bit 0, which powers
+//! the SoC down except the always-on domain (PMC, RTC), the PMIC and DRAM
+//! in self-refresh; a wake event at the PMC powers it up again, and the
+//! boot ROM's warm path loads the warmboot firmware and starts the BPMP
+//! there. Here, when a slice sees `DPD_ENABLE` bit 0 (`power_down`):
+//!
+//! * the BPMP is off: it does not run until the wake;
+//! * reset to their power-on state, because the warm path depends on them
+//!   (\[decision\]: only these; the list follows `warmboot-research` §13):
+//!   IRAM (zeroed and unestablished: it loses power), TZRAM (zeroed: it
+//!   loses power on Erista, and the warmboot firmware restores it from
+//!   DRAM), the flow controller, the exception vectors, the legacy
+//!   interrupt controller and the secure boot registers (the warmboot
+//!   writes the AArch64 reset vector again), the CPU cluster's resets in
+//!   the clock and reset controller (`RST_CPUG_CMPLX` asserted again, so
+//!   the warmboot's release is a release), and `MC_SECURITY_CFG3` (0 after
+//!   reset: how the monitor learns the SoC lost power);
+//! * kept, though lost on the console \[assumption\]: every other block,
+//!   among them the rest of the clock and reset controller, the memory and
+//!   EMC controllers (the boot ROM's restore from PMC scratch would write
+//!   back what they hold, `bootrom::warm_boot`), the GIC (the kernel
+//!   saves and restores what it uses around sleep) and the security engine
+//!   (its context comes back from the monitor's save on the warm path);
+//! * kept, as on the console: DRAM, the PMC (bar what the wake changes),
+//!   the PMIC and its clock.
+//!
+//! Then the SoC waits in SC7, a state of [`Bpmp`] that snapshots save,
+//! until the machine has a wake event ([`PowerDomain::wake_pending`]: the
+//! PMIC's interrupt at the PMC, the power key or an alarm). At the wake
+//! (`wake`) the PMC leaves deep power down and its secure-scratch locks
+//! reset ([`pmc::SECURE_LOCKS`]), the boot ROM's warm path runs
+//! ([`PowerDomain::warm_boot`]: `bootrom::warm_boot`, its register writes
+//! and the security engine's context), its IRAM image is loaded with what
+//! it leaves undefined unestablished, and the BPMP starts at the
+//! warmboot's entry.
 
 use std::{
-    collections::VecDeque,
     ops::Range,
     panic::{self, AssertUnwindSafe},
     sync::{
@@ -67,9 +112,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{CoreReport, CoreStop, Machine, Session, Start};
 use crate::{
-    boot::{CORE_COUNT, CoreEntry},
-    bootrom::BootRomHandoff,
-    bpmp::{Arm7, BpmpBus, BusError, Exception},
+    boot::{CORE_COUNT, CoreEntry, DRAM_BASE},
+    bootrom::{self, BootRomHandoff, Fuses, RegisterBits},
+    bpmp::{Arm7, Assist, BpmpBus, BusError, Exception},
     bus::{Access, Bus},
     clock::GuestClock,
     image::KernelImage,
@@ -78,12 +123,13 @@ use crate::{
     secmon::{ColdBootContext, Released},
     snapshot::{Snapshot, SnapshotError, decode, encode},
     soc::{
-        BootBlocks, BootSignals, Notes, Soc,
+        BootBlocks, BootSignals, Notes, Soc, car,
         flow::CopStatus,
-        iram::{self, Iram},
-        pmc,
+        iram::{self, Iram, Refusal},
+        mc, pmc, sb,
         se::Se,
         tsec::TsecSoc,
+        tzram,
     },
 };
 
@@ -97,6 +143,9 @@ pub const SLICE: u64 = 4096;
 /// interrupt, a register write by another master, a stop).
 const IDLE_POLL: Duration = Duration::from_millis(1);
 
+/// How often a SoC in SC7 looks for a wake event.
+const WAKE_POLL: Duration = Duration::from_millis(5);
+
 const IROM: Range<u32> = 0x0010_0000..0x0012_0000;
 const VECTORS: Range<u32> = 0..0x20;
 const BPMP_CACHE: Range<u32> = 0x5004_0000..0x5004_1000;
@@ -107,162 +156,203 @@ const IRAM: Range<u32> = iram::BASE as u32..(iram::BASE + iram::SIZE) as u32;
 /// (14), C0NC (15).
 const CPU0_PARTITIONS: u32 = 1 << 0 | 1 << 14 | 1 << 15;
 
+/// `SCTLR_EL1` as the 23.5.0 secure monitor leaves it when it enters the
+/// kernel (SecmonColdBoot's reading of the monitor's EL1 set-up): MMU and
+/// caches off, the RES1 bits and the EL0 controls it sets. A machine
+/// powered on enters the kernel with it instead of
+/// [`crate::boot::ENTRY_SCTLR_EL1`].
+pub(super) const MONITOR_SCTLR_EL1: u64 = 0x00C5_0838;
+
+/// Why IRAM holds nothing established after SC7.
+const IRAM_LOST: &str = "IRAM lost power in SC7";
+
+/// A [`PowerDomain`] with no wake source, for a harness that runs the BPMP
+/// without a machine: a SoC that enters SC7 stays there.
+pub struct NeverWakes;
+
+impl PowerDomain for NeverWakes {
+    fn wake_pending(&self) -> bool {
+        false
+    }
+
+    fn warm_boot(&self) -> Result<WarmStart, String> {
+        Err("no wake source".into())
+    }
+}
+
+/// What the SoC's power-up after SC7 resets outside the BPMP's own blocks,
+/// as register writes of the reset state: `RST_CPUG_CMPLX_SET` asserting
+/// the CPU cluster's resets as after SC7 (`car::CPUG_RESETS_AFTER_SC7`;
+/// the bits the warmboot firmware does not release are already clear,
+/// released by the NX bootloader at the cold boot), and `MC_SECURITY_CFG3`
+/// at 0 (`warmboot-research` §3: "0 after reset").
+const SC7_RESETS: [(u64, u32); 2] = [
+    (car::BASE + 0x450, car::CPUG_RESETS_AFTER_SC7),
+    (mc::BASE + 0x9BC, 0),
+];
+
 /// What a machine powered on starts from: the boot ROM's hand-off and the
-/// IRAM it wrote ([`crate::bootrom::cold_boot`]).
+/// IRAM it wrote ([`crate::bootrom::cold_boot`]), and the fuses the ROM
+/// read, which its warm path after SC7 reads again.
 pub struct PowerOn {
     pub handoff: BootRomHandoff,
     /// [`crate::bootrom::IRAM_SIZE`] bytes.
     pub iram: Vec<u8>,
+    pub fuses: Fuses,
 }
 
-/// The BPMP's state: the core, and which IRAM bytes hold nothing
-/// established yet.
+/// The BPMP: the core, what runs with it, whether the SoC is in SC7.
 pub struct Bpmp {
-    core: Mutex<Arm7>,
-    unestablished: Unestablished,
-    /// What [`Bpmp::set_trace`] asked to keep. A debugging aid, not state:
-    /// snapshots leave it out.
-    trace: Mutex<Trace>,
+    running: Mutex<Running>,
+    /// The fuses the boot ROM's warm path reads; `None` for a core not
+    /// started from the ROM's hand-off.
+    fuses: Option<Fuses>,
+    /// Core 0 was released and the monitor's cold boot or resume runs on
+    /// its thread: from the slice that saw the release until core 0 runs
+    /// or its start failed.
+    starting_core0: AtomicBool,
 }
 
-/// The last instructions and device accesses of the BPMP.
-#[derive(Default)]
-struct Trace {
-    capacity: usize,
-    instructions: VecDeque<(u32, bool)>,
-    accesses: VecDeque<String>,
+/// What [`Bpmp::slice`] works on, under one lock.
+struct Running {
+    core: Arm7,
+    /// The code cache and the trace: not state, snapshots leave it out.
+    assist: Assist,
+    power: Power,
 }
 
-impl Trace {
-    fn push<T>(capacity: usize, ring: &mut VecDeque<T>, item: T) {
-        if ring.len() == capacity {
-            ring.pop_front();
-        }
-        ring.push_back(item);
-    }
-}
-
-/// IRAM bytes the boot ROM's hand-off leaves unestablished, until the BPMP
-/// writes them.
-struct Unestablished {
-    ranges: Vec<(Range<u32>, &'static str)>,
-    /// A bit per IRAM byte, set while it is unestablished.
-    bits: Mutex<Vec<u64>>,
-}
-
-impl Unestablished {
-    fn new(ranges: Vec<(Range<u32>, &'static str)>) -> Self {
-        let mut bits = vec![0u64; (iram::SIZE / 64) as usize];
-        for (range, _) in &ranges {
-            for address in range.clone().filter(|a| IRAM.contains(a)) {
-                let byte = (address - IRAM.start) as usize;
-                bits[byte / 64] |= 1 << (byte % 64);
-            }
-        }
-        Self {
-            ranges,
-            bits: Mutex::new(bits),
-        }
-    }
-
-    /// The note of the first unestablished byte of `size` at IRAM offset
-    /// `offset`, if there is one.
-    fn check(&self, offset: u32, size: u8) -> Option<&'static str> {
-        let bits = self.bits.lock().unwrap();
-        let byte = (offset..offset + u32::from(size))
-            .find(|&b| bits[b as usize / 64] & 1 << (b % 64) != 0)?;
-        let address = IRAM.start + byte;
-        Some(
-            self.ranges
-                .iter()
-                .find(|(range, _)| range.contains(&address))
-                .map_or("unestablished", |(_, note)| note),
-        )
-    }
-
-    fn written(&self, offset: u32, size: u8) {
-        let mut bits = self.bits.lock().unwrap();
-        for byte in offset..offset + u32::from(size) {
-            bits[byte as usize / 64] &= !(1 << (byte % 64));
-        }
-    }
+/// Whether the SoC is powered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Power {
+    On,
+    /// In SC7 until a wake event: the BPMP does not run.
+    Sc7,
 }
 
 #[derive(Serialize, Deserialize)]
 struct SavedBpmp {
     core: Arm7,
-    unestablished: Vec<u64>,
+    power: Power,
+}
+
+/// Which data accesses the trace keeps: device accesses, not memory.
+fn traced_access(address: u32) -> bool {
+    !IRAM.contains(&address) && u64::from(address) < DRAM_BASE
+}
+
+/// A core at `entry` in ARM state with `cpsr` (its T bit clear).
+fn reset_core(core: &mut Arm7, entry: u32, cpsr: u32) -> Result<(), String> {
+    if crate::bpmp::Mode::from_bits(cpsr).is_none() || cpsr & crate::bpmp::PSR_T != 0 {
+        return Err(format!("BPMP CPSR {cpsr:#x} at hand-off"));
+    }
+    core.reset(entry);
+    core.set_cpsr(cpsr);
+    Ok(())
 }
 
 impl Bpmp {
     /// The BPMP as the boot ROM hands it over: `iram_image` (what the ROM
-    /// wrote, [`crate::bootrom::IRAM_SIZE`] bytes) loaded into `iram`, the
-    /// core at `handoff.entry` in ARM state with `handoff.cpsr`.
+    /// wrote, [`crate::bootrom::IRAM_SIZE`] bytes) loaded into `iram` with
+    /// what the ROM leaves undefined unestablished, the core at
+    /// `handoff.entry` in ARM state with `handoff.cpsr`; `fuses` for the
+    /// ROM's warm path.
     pub fn from_handoff(
         handoff: &BootRomHandoff,
         iram_image: &[u8],
-        iram: &iram::Iram,
+        iram: &Iram,
+        fuses: Fuses,
     ) -> Result<Self, String> {
         iram.load(0, iram_image)
             .ok_or_else(|| format!("{} bytes of IRAM image", iram_image.len()))?;
-        Self::new(handoff.entry, handoff.cpsr, handoff.iram_undefined.clone())
+        iram.set_unestablished(&handoff.iram_undefined);
+        let mut bpmp = Self::new(handoff.entry, handoff.cpsr, iram)?;
+        bpmp.fuses = Some(fuses);
+        Ok(bpmp)
     }
 
     /// A core starting at `entry` in ARM state with `cpsr` (its T bit
-    /// clear), with the IRAM bytes in `unestablished` refusing reads until
-    /// written.
-    pub fn new(
-        entry: u32,
-        cpsr: u32,
-        unestablished: Vec<(Range<u32>, &'static str)>,
-    ) -> Result<Self, String> {
-        if crate::bpmp::Mode::from_bits(cpsr).is_none() || cpsr & crate::bpmp::PSR_T != 0 {
-            return Err(format!("BPMP CPSR {cpsr:#x} at hand-off"));
-        }
+    /// clear), caching what it fetches from `iram`.
+    pub fn new(entry: u32, cpsr: u32, iram: &Iram) -> Result<Self, String> {
         let mut core = Arm7::new();
-        core.reset(entry);
-        core.set_cpsr(cpsr);
+        reset_core(&mut core, entry, cpsr)?;
+        let mut assist = Assist::new();
+        assist.set_code_cache(IRAM, iram.code_generation());
         Ok(Self {
-            core: Mutex::new(core),
-            unestablished: Unestablished::new(unestablished),
-            trace: Mutex::default(),
+            running: Mutex::new(Running {
+                core,
+                assist,
+                power: Power::On,
+            }),
+            fuses: None,
+            starting_core0: AtomicBool::new(false),
         })
     }
 
     /// Keeps the last `depth` instructions the core starts and the last
     /// `depth` accesses it makes outside IRAM and DRAM (with their value or
     /// refusal), for [`Bpmp::trace`]; 0 keeps none. Tracing steps the core
-    /// one instruction at a time from the run loop, which is slower.
+    /// one instruction at a time, which is slower.
     pub fn set_trace(&self, depth: usize) {
-        *self.trace.lock().unwrap() = Trace {
-            capacity: depth,
-            ..Trace::default()
-        };
+        let mut running = self.running.lock().unwrap();
+        running.assist.set_trace(depth, depth, traced_access);
     }
 
     /// What [`Bpmp::set_trace`] kept, oldest first: instructions, then
     /// device accesses.
     pub fn trace(&self) -> Vec<String> {
-        let trace = self.trace.lock().unwrap();
-        let instructions = trace
-            .instructions
-            .iter()
-            .map(|&(pc, thumb)| format!("at {pc:#010x} ({})", if thumb { "Thumb" } else { "ARM" }));
-        instructions.chain(trace.accesses.iter().cloned()).collect()
+        let running = self.running.lock().unwrap();
+        running
+            .assist
+            .trace()
+            .map(|trace| trace.lines())
+            .unwrap_or_default()
     }
 
     /// The core's registers, for reports and tests.
     pub fn core(&self) -> Arm7 {
-        self.core.lock().unwrap().clone()
+        self.running.lock().unwrap().core.clone()
+    }
+
+    /// Whether the SoC is powered or in SC7.
+    pub fn power(&self) -> Power {
+        self.running.lock().unwrap().power
+    }
+
+    /// The fuses the boot ROM's warm path reads, if this BPMP started from
+    /// its hand-off.
+    pub fn fuses(&self) -> Option<&Fuses> {
+        self.fuses.as_ref()
+    }
+
+    /// Core 0 runs, or its start failed: a snapshot can be taken again.
+    pub fn core0_started(&self) {
+        self.starting_core0.store(false, Ordering::Release);
     }
 
     /// Runs at most `budget` instructions, unless something outside the
     /// core must be looked at first; see the module documentation.
     pub fn slice(&self, env: &Env<'_>, budget: u64) -> Slice {
-        let mut core = self.core.lock().unwrap();
+        let mut running = self.running.lock().unwrap();
         if env.clock.is_paused() {
             return Slice::Paused;
         }
+        if running.power == Power::Sc7 {
+            if !env.power.wake_pending() {
+                return Slice::Asleep;
+            }
+            return match wake(&mut running, env) {
+                Ok(()) => Slice::Woke,
+                Err(fault) => Slice::Fault(format!("waking from SC7: {fault}")),
+            };
+        }
+        let dpd = env.bus.read(BPMP_CORE, pmc::BASE + pmc::DPD_ENABLE, 4);
+        if matches!(dpd, Access::Done(value) if pmc::dpd_entered(value as u32)) {
+            return match power_down(&mut running, env) {
+                Ok(()) => Slice::PoweredDown,
+                Err(fault) => Slice::Fault(format!("entering SC7: {fault}")),
+            };
+        }
+        let Running { core, assist, .. } = &mut *running;
         let signals = &env.blocks.signals;
         if signals.cop_restarted.swap(false, Ordering::AcqRel) {
             let requested = signals.restart_at.lock().unwrap().take();
@@ -279,7 +369,11 @@ impl Bpmp {
             return Slice::Held;
         }
         if signals.cpu0_released.swap(false, Ordering::AcqRel) {
-            return release(env);
+            let release = release(env);
+            if matches!(release, Slice::Released(_)) {
+                self.starting_core0.store(true, Ordering::Release);
+            }
+            return release;
         }
         let (irq, fiq) = env.blocks.ictlr.cop_lines();
         match env.blocks.flow.cop_status(irq, fiq) {
@@ -288,38 +382,112 @@ impl Bpmp {
         }
         core.set_irq(irq);
         core.set_fiq(fiq);
-        let mut trace = self.trace.lock().unwrap();
-        let capacity = trace.capacity;
         let mut view = BpmpView {
             env,
-            unestablished: &self.unestablished,
             missing_vector: None,
-            trace: (capacity > 0).then_some(&mut trace.accesses),
-            capacity,
         };
-        if capacity == 0 {
-            return match core.run(&mut view, budget) {
-                Ok(_) => Slice::Ran,
-                Err(fault) => Slice::Fault(fault.to_string()),
-            };
+        match core.run_assisted(&mut view, assist, budget) {
+            Ok(_) => Slice::Ran,
+            Err(fault) => Slice::Fault(fault.to_string()),
         }
-        let mut instructions = Vec::new();
-        let mut outcome = Slice::Ran;
-        for _ in 0..budget {
-            instructions.push((core.pc(), core.thumb()));
-            if let Err(fault) = core.step(&mut view) {
-                outcome = Slice::Fault(fault.to_string());
-                break;
-            }
-            if view.should_pause() {
-                break;
-            }
-        }
-        for instruction in instructions {
-            Trace::push(capacity, &mut trace.instructions, instruction);
-        }
-        outcome
     }
+}
+
+/// What the BPMP's loop needs of the machine around it for SC7.
+pub trait PowerDomain: Sync {
+    /// Whether a wake event is pending at the PMC.
+    fn wake_pending(&self) -> bool;
+    /// Runs the boot ROM's warm path on the SoC as SC7 left it and applies
+    /// what it does outside the BPMP and IRAM; gives what it leaves those.
+    fn warm_boot(&self) -> Result<WarmStart, String>;
+}
+
+/// What the boot ROM's warm path leaves the BPMP and IRAM.
+pub struct WarmStart {
+    /// Where the BPMP starts, in ARM state, with `cpsr`.
+    pub entry: u32,
+    pub cpsr: u32,
+    /// All of IRAM ([`crate::bootrom::IRAM_SIZE`] bytes).
+    pub iram: Vec<u8>,
+    /// IRAM the ROM leaves undefined, by bus address, with why.
+    pub undefined: Vec<(Range<u32>, &'static str)>,
+}
+
+/// Writes `value` to the register at `address` as the BPMP would.
+fn write_register(bus: &Bus, address: u64, value: u32) -> Result<(), String> {
+    match bus.write(BPMP_CORE, address, 4, u64::from(value)) {
+        Access::Done(()) => Ok(()),
+        _ => Err(format!("write of {value:#x} to {address:#010x} not served")),
+    }
+}
+
+fn read_register(bus: &Bus, address: u64) -> Result<u32, String> {
+    match bus.read(BPMP_CORE, address, 4) {
+        Access::Done(value) => Ok(value as u32),
+        _ => Err(format!("read of {address:#010x} not served")),
+    }
+}
+
+/// Applies what the boot ROM leaves in a register: the bits of `bits.mask`
+/// are `bits.value`. The secure boot registers take them as the ROM's own
+/// (lock-outs that bus writes cannot set, [`sb::Sb::apply_rom`]); every
+/// other register by read-modify-write as the BPMP.
+pub fn apply_rom_bits(blocks: &BootBlocks, bus: &Bus, bits: &RegisterBits) -> Result<(), String> {
+    let address = u64::from(bits.address);
+    if let Some(offset) = address
+        .checked_sub(sb::BASE)
+        .filter(|&offset| offset < sb::SIZE)
+    {
+        return blocks
+            .sb
+            .apply_rom(offset, bits.mask, bits.value)
+            .ok_or_else(|| format!("boot ROM lock-out at {address:#x}"));
+    }
+    let old = read_register(bus, address)?;
+    write_register(bus, address, old & !bits.mask | bits.value & bits.mask)
+}
+
+/// The SoC enters SC7: see the module documentation.
+fn power_down(running: &mut Running, env: &Env<'_>) -> Result<(), String> {
+    let blocks = env.blocks;
+    running.power = Power::Sc7;
+    running.core.reset(0);
+    let signals = &blocks.signals;
+    signals.cop_restarted.store(false, Ordering::Release);
+    signals.cpu0_released.store(false, Ordering::Release);
+    *signals.restart_at.lock().unwrap() = None;
+    blocks.flow.reset();
+    blocks.evp.reset();
+    blocks.ictlr.reset();
+    blocks.sb.reset();
+    blocks.iram.power_off(IRAM_LOST);
+    blocks
+        .tzram
+        .load(0, &vec![0; tzram::SIZE as usize])
+        .expect("all of TZRAM");
+    for (address, value) in SC7_RESETS {
+        write_register(env.bus, address, value)?;
+    }
+    Ok(())
+}
+
+/// The SoC wakes from SC7: see the module documentation.
+fn wake(running: &mut Running, env: &Env<'_>) -> Result<(), String> {
+    let bus = env.bus;
+    let dpd = pmc::BASE + pmc::DPD_ENABLE;
+    write_register(bus, dpd, read_register(bus, dpd)? & !pmc::DPD_ENABLE_ON)?;
+    for register in pmc::SECURE_LOCKS {
+        let value = pmc::power_on_value(register).unwrap_or(0);
+        write_register(bus, pmc::BASE + register, value)?;
+    }
+    let start = env.power.warm_boot()?;
+    let iram = &env.blocks.iram;
+    iram.load(0, &start.iram)
+        .ok_or_else(|| format!("{} bytes of IRAM image", start.iram.len()))?;
+    iram.set_unestablished(&start.undefined);
+    reset_core(&mut running.core, start.entry, start.cpsr)?;
+    running.power = Power::On;
+    Ok(())
 }
 
 /// The world the BPMP runs in.
@@ -329,6 +497,7 @@ pub struct Env<'a> {
     pub bus: &'a Bus,
     pub clock: &'a GuestClock,
     pub notes: &'a Notes,
+    pub power: &'a dyn PowerDomain,
 }
 
 /// What one [`Bpmp::slice`] came to.
@@ -344,6 +513,12 @@ pub enum Slice {
     Held,
     /// CPU-cluster core 0 was let out of reset at this AArch64 address.
     Released(u64),
+    /// The SoC entered SC7.
+    PoweredDown,
+    /// The SoC is in SC7 and nothing wakes it yet.
+    Asleep,
+    /// The SoC woke from SC7: the BPMP is at the warmboot's entry.
+    Woke,
     /// The BPMP cannot go on: what it ran into.
     Fault(String),
 }
@@ -392,10 +567,11 @@ pub fn run(
 ) -> BpmpExit {
     while !stop.load(Ordering::SeqCst) {
         match bpmp.slice(env, SLICE) {
-            Slice::Ran => {}
+            Slice::Ran | Slice::PoweredDown | Slice::Woke => {}
             Slice::Paused | Slice::Held | Slice::Halted(CopStatus::Halted) => {
                 thread::sleep(IDLE_POLL)
             }
+            Slice::Asleep => thread::sleep(WAKE_POLL),
             Slice::Halted(CopStatus::HaltedUntil(deadline)) => {
                 thread::sleep(env.clock.until(deadline).min(IDLE_POLL))
             }
@@ -414,16 +590,22 @@ pub fn run(
 /// The BPMP's bus: see the module documentation.
 struct BpmpView<'a> {
     env: &'a Env<'a>,
-    unestablished: &'a Unestablished,
     /// The exception last taken with its vector register unwritten.
     missing_vector: Option<Exception>,
-    /// Where device accesses are traced, if they are ([`Bpmp::set_trace`]).
-    trace: Option<&'a mut VecDeque<String>>,
-    capacity: usize,
 }
 
 fn refuse<T>(reason: impl Into<String>) -> Result<T, BusError> {
     Err(BusError::Unmodelled(reason.into()))
+}
+
+/// An IRAM read the BPMP cannot make.
+fn iram_refused<T>(refusal: Refusal) -> Result<T, BusError> {
+    match refusal {
+        Refusal::Outside => refuse("access across the end of IRAM"),
+        Refusal::Unestablished { address, note } => refuse(format!(
+            "IRAM at {address:#010x} holds nothing established: {note}"
+        )),
+    }
 }
 
 impl BpmpView<'_> {
@@ -460,48 +642,25 @@ impl BpmpView<'_> {
             .then_some(address)
     }
 
-    /// Keeps a device access (anything but IRAM and DRAM) in the trace.
-    fn traced<T: std::fmt::LowerHex>(
-        &mut self,
-        address: u32,
-        size: u8,
-        write: Option<u32>,
-        result: Result<T, BusError>,
-    ) -> Result<T, BusError> {
-        let memory = IRAM.contains(&address) || self.dram(address, size).is_some();
-        if let Some(ring) = self.trace.as_deref_mut()
-            && !memory
-        {
-            let outcome = match (&result, write) {
-                (Ok(_), Some(value)) => format!("write {value:#x}"),
-                (Ok(value), None) => format!("read {value:#x}"),
-                (Err(BusError::Abort), _) => "aborted".into(),
-                (Err(BusError::Unmodelled(reason)), _) => format!("refused: {reason}"),
-            };
-            let access = if write.is_some() { "W" } else { "R" };
-            Trace::push(
-                self.capacity,
-                ring,
-                format!("{access} {address:#010x}/{size}: {outcome}"),
-            );
-        }
-        result
+    /// Whether `len` bytes at `address` lie in IRAM, and where.
+    fn iram(address: u32, len: usize) -> Option<u32> {
+        let end = u64::from(address) + len as u64;
+        (IRAM.contains(&address) && end <= u64::from(IRAM.end)).then(|| address - IRAM.start)
     }
+}
 
-    fn read_inner(&mut self, address: u32, size: u8) -> Result<u32, BusError> {
-        self.unmodelled(address)?;
+impl BpmpBus for BpmpView<'_> {
+    fn read(&mut self, address: u32, size: u8) -> Result<u32, BusError> {
         if IRAM.contains(&address) {
             let offset = address - IRAM.start;
-            if let Some(note) = self.unestablished.check(offset, size) {
-                return refuse(format!("IRAM not established by the boot ROM: {note}"));
-            }
             return self
                 .env
                 .blocks
                 .iram
-                .read(offset, size)
-                .map_or_else(|| refuse("access across the end of IRAM"), Ok);
+                .bpmp_read(offset, size)
+                .or_else(iram_refused);
         }
+        self.unmodelled(address)?;
         if let Some(address) = self.dram(address, size) {
             let mut bytes = [0; 4];
             self.env
@@ -519,18 +678,17 @@ impl BpmpView<'_> {
         }
     }
 
-    fn write_inner(&mut self, address: u32, size: u8, value: u32) -> Result<(), BusError> {
-        self.unmodelled(address)?;
+    fn write(&mut self, address: u32, size: u8, value: u32) -> Result<(), BusError> {
         if IRAM.contains(&address) {
             let offset = address - IRAM.start;
-            self.env
+            return self
+                .env
                 .blocks
                 .iram
-                .write(offset, size, value)
-                .map_or_else(|| refuse("access across the end of IRAM"), Ok)?;
-            self.unestablished.written(offset, size);
-            return Ok(());
+                .bpmp_write(offset, size, value)
+                .map_or_else(|| refuse("access across the end of IRAM"), Ok);
         }
+        self.unmodelled(address)?;
         if let Some(address) = self.dram(address, size) {
             self.env
                 .ram
@@ -550,17 +708,39 @@ impl BpmpView<'_> {
             )),
         }
     }
-}
 
-impl BpmpBus for BpmpView<'_> {
-    fn read(&mut self, address: u32, size: u8) -> Result<u32, BusError> {
-        let result = self.read_inner(address, size);
-        self.traced(address, size, None, result)
+    /// IRAM in one go when all of it is established; word by word
+    /// otherwise, which finds the word that is refused.
+    fn read_words(&mut self, address: u32, words: &mut [u32]) -> Result<(), (usize, BusError)> {
+        if let Some(offset) = Self::iram(address, 4 * words.len())
+            && self.env.blocks.iram.bpmp_read_words(offset, words).is_ok()
+        {
+            return Ok(());
+        }
+        for (i, word) in words.iter_mut().enumerate() {
+            *word = self
+                .read(address.wrapping_add(4 * i as u32), 4)
+                .map_err(|error| (i, error))?;
+        }
+        Ok(())
     }
 
-    fn write(&mut self, address: u32, size: u8, value: u32) -> Result<(), BusError> {
-        let result = self.write_inner(address, size, value).map(|()| 0u32);
-        self.traced(address, size, Some(value), result).map(|_| ())
+    fn write_words(&mut self, address: u32, words: &[u32]) -> Result<(), (usize, BusError)> {
+        if let Some(offset) = Self::iram(address, 4 * words.len())
+            && self
+                .env
+                .blocks
+                .iram
+                .bpmp_write_words(offset, words)
+                .is_some()
+        {
+            return Ok(());
+        }
+        for (i, &word) in words.iter().enumerate() {
+            self.write(address.wrapping_add(4 * i as u32), 4, word)
+                .map_err(|error| (i, error))?;
+        }
+        Ok(())
     }
 
     fn exception_vector(&mut self, exception: Exception) -> u32 {
@@ -582,18 +762,28 @@ impl BpmpBus for BpmpView<'_> {
     }
 }
 
-/// The core's registers and which IRAM bytes are still unestablished.
+/// The core's registers and whether the SoC is in SC7 (which IRAM bytes
+/// are unestablished is IRAM's).
 impl Snapshot for Bpmp {
     /// A slice in progress ends; the next one sees guest time paused.
+    /// Refused while core 0 is being started ([`Bpmp::core0_started`]).
     fn quiesce(&self) -> Result<(), SnapshotError> {
-        drop(self.core.lock().unwrap());
+        drop(self.running.lock().unwrap());
+        if self.starting_core0.load(Ordering::Acquire) {
+            return Err(SnapshotError::Unsupported(
+                "core 0 being started: the secure monitor's cold boot or SC7 resume runs \
+                 on its thread"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
     fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        let running = self.running.lock().unwrap();
         encode(&SavedBpmp {
-            core: self.core.lock().unwrap().clone(),
-            unestablished: self.unestablished.bits.lock().unwrap().clone(),
+            core: running.core.clone(),
+            power: running.power,
         })
     }
 
@@ -602,12 +792,9 @@ impl Snapshot for Bpmp {
         if crate::bpmp::Mode::from_bits(saved.core.cpsr()).is_none() {
             return Err(SnapshotError::Corrupt("BPMP: reserved mode bits".into()));
         }
-        let mut bits = self.unestablished.bits.lock().unwrap();
-        if saved.unestablished.len() != bits.len() {
-            return Err(SnapshotError::Corrupt("BPMP: IRAM map size".into()));
-        }
-        *bits = saved.unestablished;
-        *self.core.lock().unwrap() = saved.core;
+        let mut running = self.running.lock().unwrap();
+        running.core = saved.core;
+        running.power = saved.power;
         Ok(())
     }
 }
@@ -731,16 +918,55 @@ impl Bpmp {
                 .load_key(usize::from(slot.slot), &slot.key, flags)
                 .map_err(|error| error.to_string())?;
         }
-        for lockout in crate::bootrom::ROM_LOCKOUTS {
-            let offset = u64::from(lockout.address)
-                .checked_sub(crate::soc::sb::BASE)
-                .filter(|&offset| offset < crate::soc::sb::SIZE);
-            offset
-                .and_then(|offset| boot.sb.apply_rom(offset, lockout.mask, lockout.value))
-                .ok_or_else(|| format!("boot ROM lock-out at {:#x}", lockout.address))?;
+        for lockout in &bootrom::ROM_LOCKOUTS {
+            apply_rom_bits(boot, bus, lockout)?;
         }
         TsecPort::connect(soc, bus, keys).ok_or("the SoC has no boot blocks")?;
-        Self::from_handoff(&power_on.handoff, &power_on.iram, &boot.iram)
+        Self::from_handoff(
+            &power_on.handoff,
+            &power_on.iram,
+            &boot.iram,
+            power_on.fuses.clone(),
+        )
+    }
+}
+
+/// The machine around the BPMP in SC7: the wake comes from the SoC's PMC
+/// and PMIC ([`Soc::wake_pending`]), the warm path is the boot ROM's
+/// ([`bootrom::warm_boot`]) with the fuses it read at power-on, the PMC and
+/// DRAM as the BPMP reads them.
+impl PowerDomain for Machine {
+    fn wake_pending(&self) -> bool {
+        self.soc.wake_pending()
+    }
+
+    fn warm_boot(&self) -> Result<WarmStart, String> {
+        let blocks = self.soc.boot.as_ref().ok_or("the SoC was not powered on")?;
+        let fuses = self
+            .bpmp
+            .as_ref()
+            .and_then(Bpmp::fuses)
+            .ok_or("the BPMP did not start from the boot ROM's hand-off")?;
+        let pmc = |offset: u32| read_register(&self.bus, pmc::BASE + u64::from(offset)).ok();
+        let dram = |address: u32, length: usize| {
+            let mut bytes = vec![0; length];
+            self.ram
+                .read(u64::from(address), &mut bytes)
+                .map(|()| bytes)
+        };
+        let mut iram = vec![0; bootrom::IRAM_SIZE];
+        let handoff =
+            bootrom::warm_boot(fuses, &pmc, &dram, &mut iram).map_err(|error| error.to_string())?;
+        for bits in &handoff.registers {
+            apply_rom_bits(blocks, &self.bus, bits)?;
+        }
+        self.soc.se.restore_context(&handoff.se_context);
+        Ok(WarmStart {
+            entry: handoff.entry,
+            cpsr: handoff.cpsr,
+            iram,
+            undefined: handoff.iram_undefined,
+        })
     }
 }
 
@@ -814,6 +1040,7 @@ impl Machine {
                 bus: &self.bus,
                 clock: &self.clock,
                 notes: &self.soc.notes,
+                power: self,
             },
         ))
     }
@@ -870,17 +1097,23 @@ impl<'env> Session<'env> {
     /// (concurrently with the BPMP), and core 0 then enters the kernel
     /// where it says.
     fn start_cold_boot<'scope>(&'env self, scope: &'scope thread::Scope<'scope, 'env>, entry: u64) {
-        self.spawn_reporting(scope, 0, move || match self.core0_released(entry) {
-            Ok(entry) => {
+        self.spawn_reporting(scope, 0, move || {
+            let released = self.core0_released(entry);
+            if released.is_ok() {
                 self.switches[0].lock().unwrap().0 = true;
                 self.machine.pause.state.lock().unwrap().threads[0] = true;
-                self.run_core(scope, 0, Start::Entry(entry))
             }
-            Err(stop) => CoreReport {
-                core: 0,
-                stop,
-                state: None,
-            },
+            if let Some(bpmp) = &self.machine.bpmp {
+                bpmp.core0_started();
+            }
+            match released {
+                Ok(entry) => self.run_core(scope, 0, Start::Entry(entry)),
+                Err(stop) => CoreReport {
+                    core: 0,
+                    stop,
+                    state: None,
+                },
+            }
         });
     }
 
@@ -979,19 +1212,45 @@ mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
 
     use super::*;
-    use crate::soc::{
-        BootSignals, car::Car, evp::Evp, flow::FlowController, ictlr::Ictlr, iram::Iram, pmc::Pmc,
-        sb::Sb,
+    use crate::{
+        bus::MmioDevice,
+        soc::{
+            BootSignals, car::Car, evp, evp::Evp, flow::FlowController, ictlr::Ictlr, iram::Iram,
+            pmc::Pmc, regs::RegisterFile, sb::Sb, tzram::Tzram,
+        },
     };
 
+    /// The machine's side of SC7, as a test drives it: a wake when `wake`
+    /// is set, and the warm start it holds.
+    #[derive(Default)]
+    struct MockPower {
+        wake: AtomicBool,
+        start: StdMutex<Option<WarmStart>>,
+    }
+
+    impl PowerDomain for MockPower {
+        fn wake_pending(&self) -> bool {
+            self.wake.load(Ordering::SeqCst)
+        }
+
+        fn warm_boot(&self) -> Result<WarmStart, String> {
+            self.start
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| "no warm start".into())
+        }
+    }
+
     /// The SoC as far as the BPMP needs it, wired as `Soc::new` wires a
-    /// machine powered on.
+    /// machine powered on (the memory controller as plain storage).
     struct Bench {
         blocks: BootBlocks,
         ram: GuestRam,
         bus: Bus,
         clock: Arc<GuestClock>,
         notes: Arc<Notes>,
+        power: MockPower,
     }
 
     impl Bench {
@@ -1004,21 +1263,50 @@ mod tests {
                 evp: Arc::new(Evp::new()),
                 sb: Arc::new(Sb::new()),
                 ictlr: Arc::new(Ictlr::new()),
-                tzram: Arc::default(),
+                tzram: Arc::new(Tzram::new()),
                 signals: Arc::new(BootSignals::default()),
             };
             let mut bus = Bus::default();
-            let signals = Arc::clone(&blocks.signals);
-            let car = Car::power_on().on_cpu0_released(Box::new(move || {
-                signals.cpu0_released.store(true, Ordering::Release)
-            }));
-            bus.map(
-                "clock and reset",
-                crate::soc::car::BASE,
-                crate::soc::car::SIZE,
-                Box::new(car),
-            );
+            let signal = |set: fn(&BootSignals)| {
+                let signals = Arc::clone(&blocks.signals);
+                Box::new(move || set(&signals))
+            };
+            // `RST_DEVICES_L` bit 1: the BPMP, as `Soc::new` wires it.
+            let car = Car::power_on()
+                .on_cpu0_released(signal(|s| s.cpu0_released.store(true, Ordering::Release)))
+                .on_reset_asserted(
+                    0x004,
+                    1,
+                    signal(|s| s.cop_held.store(true, Ordering::Release)),
+                )
+                .on_reset_released(
+                    0x004,
+                    1,
+                    signal(|s| {
+                        s.cop_held.store(false, Ordering::Release);
+                        s.cop_restarted.store(true, Ordering::Release);
+                    }),
+                );
+            bus.map("clock and reset", car::BASE, car::SIZE, Box::new(car));
             bus.map("PMC", pmc::BASE, pmc::SIZE, Box::new(Pmc::power_on()));
+            bus.map(
+                "memory controller",
+                mc::BASE,
+                0x1000,
+                Box::new(RegisterFile::zeroed([])),
+            );
+            bus.map(
+                "IRAM",
+                iram::BASE,
+                iram::SIZE,
+                Box::new(Arc::clone(&blocks.iram)),
+            );
+            bus.map(
+                "TZRAM",
+                tzram::BASE,
+                tzram::SIZE,
+                Box::new(Arc::clone(&blocks.tzram)),
+            );
             bus.map(
                 "flow controller",
                 crate::soc::flow::BASE,
@@ -1033,8 +1321,8 @@ mod tests {
             );
             bus.map(
                 "secure boot registers",
-                crate::soc::sb::BASE,
-                crate::soc::sb::SIZE,
+                sb::BASE,
+                sb::SIZE,
                 Box::new(Arc::clone(&blocks.sb)),
             );
             Self {
@@ -1043,6 +1331,7 @@ mod tests {
                 bus,
                 clock,
                 notes,
+                power: MockPower::default(),
             }
         }
 
@@ -1053,7 +1342,26 @@ mod tests {
                 bus: &self.bus,
                 clock: &self.clock,
                 notes: &self.notes,
+                power: &self.power,
             }
+        }
+
+        /// A register as the BPMP reads it.
+        fn register(&self, address: u64) -> u32 {
+            read_register(&self.bus, address).unwrap()
+        }
+
+        /// A register written by CPU-cluster core 0.
+        fn write(&self, address: u64, value: u32) {
+            assert_eq!(
+                self.bus.write(0, address, 4, u64::from(value)),
+                Access::Done(()),
+                "{address:#x}"
+            );
+        }
+
+        fn bpmp(&self, entry: u32) -> Bpmp {
+            Bpmp::new(entry, 0xD3, &self.blocks.iram).unwrap()
         }
     }
 
@@ -1130,7 +1438,7 @@ mod tests {
 
     fn load(bench: &Bench, program: &[u8]) -> Bpmp {
         bench.blocks.iram.load(BASE - IRAM.start, program).unwrap();
-        Bpmp::new(BASE, 0xD3, Vec::new()).unwrap()
+        bench.bpmp(BASE)
     }
 
     #[test]
@@ -1185,7 +1493,7 @@ mod tests {
     }
 
     #[test]
-    fn unestablished_iram_refuses_reads_until_written() {
+    fn unestablished_iram_refuses_reads_until_any_master_writes_it() {
         let bench = Bench::new();
         use Op::*;
         let program = assemble(&[
@@ -1197,12 +1505,11 @@ mod tests {
             Word(B_SELF),
         ]);
         bench.blocks.iram.load(BASE - IRAM.start, &program).unwrap();
-        let bpmp = Bpmp::new(
-            BASE,
-            0xD3,
-            vec![(0x4000_0000..0x4001_0000, "the ROM's work area")],
-        )
-        .unwrap();
+        bench
+            .blocks
+            .iram
+            .set_unestablished(&[(0x4000_0000..0x4001_0000, "the ROM's work area")]);
+        let bpmp = bench.bpmp(BASE);
         let Slice::Fault(fault) = bpmp.slice(&bench.env(), 100) else {
             panic!("the read must be refused")
         };
@@ -1210,6 +1517,11 @@ mod tests {
         assert!(fault.contains("0x40000044"), "{fault}");
         assert_eq!(bpmp.core().reg(2), 7);
         assert_eq!(bpmp.core().pc(), BASE + 4 * 4);
+        // The CPU cluster writes the word over the bus: the BPMP, still at
+        // the load that was refused, reads it.
+        bench.write(0x4000_0044, 0x1234);
+        assert_eq!(bpmp.slice(&bench.env(), 1), Slice::Ran);
+        assert_eq!(bpmp.core().reg(3), 0x1234);
     }
 
     #[test]
@@ -1218,7 +1530,7 @@ mod tests {
         let swi = 0xEF00_0000u32; // SWI #0
         let program = assemble(&[Op::Word(swi), Op::Word(B_SELF)]);
         bench.blocks.iram.load(BASE - IRAM.start, &program).unwrap();
-        let bpmp = Bpmp::new(BASE, 0xD3, Vec::new()).unwrap();
+        let bpmp = bench.bpmp(BASE);
         let Slice::Fault(fault) = bpmp.slice(&bench.env(), 10) else {
             panic!("an unwritten vector must stop the BPMP")
         };
@@ -1226,13 +1538,12 @@ mod tests {
         // With the vector written, the SWI lands there.
         let bench = Bench::new();
         bench.blocks.iram.load(BASE - IRAM.start, &program).unwrap();
-        use crate::bus::MmioDevice;
         bench
             .blocks
             .evp
             .write(BPMP_CORE, 0x208, 4, u64::from(BASE + 4))
             .unwrap();
-        let bpmp = Bpmp::new(BASE, 0xD3, Vec::new()).unwrap();
+        let bpmp = bench.bpmp(BASE);
         assert_eq!(bpmp.slice(&bench.env(), 3), Slice::Ran);
         assert_eq!(bpmp.core().pc(), BASE + 4);
         assert_eq!(bpmp.core().mode(), crate::bpmp::Mode::Supervisor);
@@ -1245,15 +1556,10 @@ mod tests {
             .ram
             .write(0x8000_0010, &0x1234_5678u32.to_le_bytes())
             .unwrap();
-        let bpmp = Bpmp::new(BASE, 0xD3, Vec::new()).unwrap();
-        let unestablished = &bpmp.unestablished;
         let env = bench.env();
         let mut view = BpmpView {
             env: &env,
-            unestablished,
             missing_vector: None,
-            trace: None,
-            capacity: 0,
         };
         assert_eq!(view.read(0x8000_0010, 4), Ok(0x1234_5678));
         view.write(0x8000_0014, 2, 0xBEEF).unwrap();
@@ -1265,7 +1571,6 @@ mod tests {
             );
         }
         // MMIO through the bus, as the BPMP.
-        use crate::bus::MmioDevice;
         view.write(0x6000_C230, 4, 0x4003_0001).unwrap();
         assert_eq!(bench.blocks.sb.read(0, 0x30, 4), Some(0x4003_0001));
         assert!(matches!(
@@ -1285,7 +1590,7 @@ mod tests {
             Word(B_SELF),
         ]);
         bench.blocks.iram.load(BASE - IRAM.start, &program).unwrap();
-        let bpmp = Bpmp::new(BASE, 0xD3, Vec::new()).unwrap();
+        let bpmp = bench.bpmp(BASE);
         bench.clock.pause();
         let env = bench.env();
         assert_eq!(bpmp.slice(&env, 100), Slice::Paused);
@@ -1305,14 +1610,19 @@ mod tests {
         let bench = Bench::new();
         let program = assemble(&[Op::Word(0xE3A0_0005), Op::Word(B_SELF)]); // MOV r0, #5
         bench.blocks.iram.load(BASE - IRAM.start, &program).unwrap();
-        let bpmp = Bpmp::new(BASE, 0xD3, vec![(0x4000_0000..0x4000_0010, "x")]).unwrap();
+        let bpmp = bench.bpmp(BASE);
         assert_eq!(bpmp.slice(&bench.env(), 1), Slice::Ran);
         bpmp.quiesce().unwrap();
         let saved = bpmp.save().unwrap();
-        let other = Bpmp::new(0, 0xD3, Vec::new()).unwrap();
+        let other = bench.bpmp(0);
         other.restore(&saved).unwrap();
         assert_eq!(other.core(), bpmp.core());
-        assert!(other.unestablished.check(0, 4).is_some());
+        assert_eq!(other.power(), Power::On);
+        // While core 0 is being started, a snapshot is refused.
+        bpmp.starting_core0.store(true, Ordering::Release);
+        assert!(bpmp.quiesce().is_err());
+        bpmp.core0_started();
+        assert!(bpmp.quiesce().is_ok());
     }
 
     /// What the NX bootloader's hardware check reads of keyslots 0x0C and
@@ -1320,10 +1630,7 @@ mod tests {
     /// SE+0x2B4/0x2B8).
     #[test]
     fn the_tsec_s_secure_only_keyslot_loses_only_its_per_key_bit() {
-        use crate::{
-            bus::MmioDevice,
-            soc::mc::{DeviceMemory, Mc, SMMU_SE_ASID},
-        };
+        use crate::soc::mc::{DeviceMemory, Mc, SMMU_SE_ASID};
         let mc = Arc::new(Mc::new(crate::boot::DramSize::Gb4));
         let ram = Arc::new(GuestRam::new(0x8000_0000, 0x1000).unwrap());
         let se = Arc::new(Se::new(
@@ -1343,5 +1650,196 @@ mod tests {
         assert_eq!(read(0x280) & 0xFFFF, 0xDFFF);
         assert_eq!(read(0x284 + 0x0C * 4) & 0x7F, 0x7F);
         assert_eq!(read(0x284 + 0x0D * 4) & 0x7F, 0x7F);
+    }
+
+    /// What the secure monitor's SC7-entry stub ends with: `DPD_ENABLE`
+    /// bit 0, then a loop.
+    fn sc7_stub() -> Vec<u8> {
+        use Op::*;
+        assemble(&[
+            LdrLiteral(0, 0x7000_E424), // DPD_ENABLE
+            LdrLiteral(1, 1),
+            Str(1, 0, 0),
+            Word(B_SELF),
+        ])
+    }
+
+    const WARMBOOT: u32 = 0x4001_0240;
+    const RESUME: u32 = 0x7C01_2800;
+    const SEC_DISABLE3: u64 = pmc::BASE + 0x2D8;
+
+    /// What the warmboot firmware does to start core 0 again: the reset
+    /// vector from `SECURE_SCRATCH34`, the CPU partitions on, the cluster's
+    /// clock, then `RST_CPUG_CMPLX_CLR` 0x20000000 and 0x10001
+    /// (`warmboot-research` §7), then a halt.
+    fn warmboot_program() -> Vec<u8> {
+        use Op::*;
+        assemble(&[
+            LdrLiteral(0, 0x6000_C230),
+            LdrLiteral(1, RESUME | 1),
+            Str(1, 0, 0),
+            LdrLiteral(1, 0),
+            Str(1, 0, 4),
+            LdrLiteral(0, 0x7000_E430),
+            LdrLiteral(1, 0x100),
+            Str(1, 0, 0),
+            LdrLiteral(1, 0x10F),
+            Str(1, 0, 0),
+            LdrLiteral(1, 0x10E),
+            Str(1, 0, 0),
+            LdrLiteral(0, 0x6000_6000),
+            LdrLiteral(1, 1),
+            Str(1, 0, 0x360),
+            LdrLiteral(1, 1 << 29),
+            Str(1, 0, 0x454),
+            LdrLiteral(1, 0x10001),
+            Str(1, 0, 0x454),
+            LdrLiteral(0, 0x6000_7000),
+            LdrLiteral(1, 0x5000_0000),
+            Str(1, 0, 4),
+            Word(B_SELF),
+        ])
+    }
+
+    /// The boot ROM's warm path as the mock gives it: the warmboot's code
+    /// at its destination, the rest of IRAM undefined.
+    fn warm_start(program: &[u8]) -> WarmStart {
+        let mut iram = vec![0; bootrom::IRAM_SIZE];
+        let at = (WARMBOOT - IRAM.start) as usize;
+        iram[at..at + program.len()].copy_from_slice(program);
+        WarmStart {
+            entry: WARMBOOT,
+            cpsr: 0xD3,
+            iram,
+            undefined: vec![(IRAM.start..WARMBOOT, "the boot ROM's work area")],
+        }
+    }
+
+    #[test]
+    fn sc7_entry_resets_the_documented_blocks_and_zeroes_tzram() {
+        let bench = Bench::new();
+        let bpmp = load(&bench, &sc7_stub());
+        let env = bench.env();
+        // What the SoC holds before: written by the cold boot and the
+        // monitor's suspend.
+        bench.blocks.tzram.load(0x2000, &[0xAB; 16]).unwrap();
+        bench.write(evp::BASE + 0x200, 0x4000_3000);
+        bench.write(sb::BASE + 0x30, RESUME | 1);
+        bench.write(mc::BASE + 0x9BC, 3);
+        bench.write(car::BASE + 0x454, 0x4101_0001);
+        bench.write(crate::soc::flow::BASE + 0x098, 1);
+        bench.write(SEC_DISABLE3, 0xFF);
+        assert_eq!(bpmp.slice(&env, 100), Slice::Ran);
+        assert_eq!(bpmp.slice(&env, 100), Slice::PoweredDown);
+        assert_eq!(bpmp.power(), Power::Sc7);
+        // Reset or lost.
+        let mut tzram = vec![0xFF; tzram::SIZE as usize];
+        bench.blocks.tzram.copy_out(0, &mut tzram).unwrap();
+        assert!(tzram.iter().all(|&byte| byte == 0), "TZRAM zeroed");
+        assert!(matches!(
+            bench.blocks.iram.bpmp_read(BASE - IRAM.start, 4),
+            Err(Refusal::Unestablished { note, .. }) if note == IRAM_LOST
+        ));
+        assert_eq!(
+            Iram::read(&bench.blocks.iram, BASE - IRAM.start, 4),
+            Some(0)
+        );
+        assert_eq!(bench.blocks.evp.cop_vector(0), None);
+        assert!(!bench.blocks.sb.aa64_reset_vector().aarch64);
+        assert_eq!(bench.register(mc::BASE + 0x9BC), 0);
+        assert_eq!(
+            bench.register(car::BASE + 0x450),
+            car::CPUG_RESETS_AFTER_SC7
+        );
+        assert_eq!(bench.register(crate::soc::flow::BASE + 0x098), 0);
+        // Kept until the wake: the PMC.
+        assert_eq!(bench.register(SEC_DISABLE3), 0xFF);
+        assert_eq!(bench.register(pmc::BASE + pmc::DPD_ENABLE), 1);
+        // Asleep until a wake event, a state snapshots keep.
+        assert_eq!(bpmp.slice(&env, 100), Slice::Asleep);
+        let other = bench.bpmp(0);
+        other.restore(&bpmp.save().unwrap()).unwrap();
+        assert_eq!(other.power(), Power::Sc7);
+
+        // The wake: the ROM's warm path starts the warmboot.
+        *bench.power.start.lock().unwrap() = Some(warm_start(&warmboot_program()));
+        bench.power.wake.store(true, Ordering::SeqCst);
+        assert_eq!(bpmp.slice(&env, 100), Slice::Woke);
+        assert_eq!(bpmp.power(), Power::On);
+        assert_eq!(bpmp.core().pc(), WARMBOOT);
+        assert_eq!(bench.register(pmc::BASE + pmc::DPD_ENABLE), 0);
+        assert_eq!(
+            bench.register(SEC_DISABLE3),
+            pmc::power_on_value(0x2D8).unwrap()
+        );
+        assert!(matches!(
+            bench.blocks.iram.bpmp_read(0x100, 4),
+            Err(Refusal::Unestablished { note, .. }) if note == "the boot ROM's work area"
+        ));
+        assert!(bench.blocks.iram.bpmp_read(0x2_0000, 4).is_ok());
+    }
+
+    /// The whole path through the hooks, with the test as the secure
+    /// monitor: the cold boot's release, `CPU_SUSPEND` (the stub copied to
+    /// IRAM over the bus, the BPMP restarted on it, core 0's partitions
+    /// off), SC7, the wake, the warmboot, and core 0's release at the
+    /// monitor's resume vector.
+    #[test]
+    fn core_0_suspends_and_is_released_again_at_the_resume_vector() {
+        let bench = Bench::new();
+        let bpmp = load(&bench, &release_program());
+        let stub_at = 0x4000_3000u32;
+        bench
+            .blocks
+            .iram
+            .set_unestablished(&[(stub_at..stub_at + 0x100, "not written yet")]);
+        let entries = StdMutex::new(Vec::new());
+        let stop = AtomicBool::new(false);
+        let env = bench.env();
+        let monitor = |entry: u64| {
+            entries.lock().unwrap().push(entry);
+            bpmp.core0_started();
+            if entry != u64::from(SECMON_ENTRY) {
+                return Ok(());
+            }
+            // CPU_SUSPEND, as the monitor's HLE does it over the bus.
+            for (offset, chunk) in sc7_stub().chunks(4).enumerate() {
+                let word = u32::from_le_bytes(chunk.try_into().unwrap());
+                bench.write(u64::from(stub_at) + 4 * offset as u64, word);
+            }
+            bench.write(evp::BASE + 0x200, stub_at);
+            bench.write(car::BASE + 0x300, 2);
+            bench.write(car::BASE + 0x304, 2);
+            bench.write(crate::soc::flow::BASE + 0x004, 0);
+            for partition in [14, 15, 0] {
+                bench.write(pmc::BASE + 0x30, 0x100 | partition);
+            }
+            *bench.power.start.lock().unwrap() = Some(warm_start(&warmboot_program()));
+            Ok(())
+        };
+        let mut monitor = monitor;
+        thread::scope(|scope| {
+            let runner = scope.spawn(|| run(&bpmp, &env, &stop, &mut monitor));
+            let wait = |done: &dyn Fn() -> bool| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !done() && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert!(done(), "timed out");
+            };
+            wait(&|| bpmp.power() == Power::Sc7);
+            // Asleep: nothing runs until the PMIC's wake event.
+            thread::sleep(Duration::from_millis(20));
+            assert_eq!(entries.lock().unwrap().len(), 1);
+            bench.power.wake.store(true, Ordering::SeqCst);
+            wait(&|| entries.lock().unwrap().len() == 2);
+            stop.store(true, Ordering::SeqCst);
+            assert_eq!(runner.join().unwrap(), BpmpExit::Stopped);
+        });
+        assert_eq!(
+            *entries.lock().unwrap(),
+            [u64::from(SECMON_ENTRY), u64::from(RESUME)]
+        );
+        assert_eq!(bpmp.power(), Power::On);
     }
 }

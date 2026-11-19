@@ -49,9 +49,10 @@
 //!   on, which does not model a SoC reset.
 //!
 //! In SC7 the PMC keeps its state (it is always on), except that the
-//! wake takes the SoC out of deep power down and the secure-scratch lock
-//! registers (`SEC_DISABLE` .. `SEC_DISABLE8`) reset: see
-//! [`SECURE_LOCKS`].
+//! wake takes the SoC out of deep power down (`DPD_ENABLE` bit 0 clear)
+//! and the secure-scratch lock registers (`SEC_DISABLE` .. `SEC_DISABLE8`)
+//! reset to their power-on values ([`SECURE_LOCKS`], [`power_on_value`]);
+//! the machine's SC7 cycle writes both when it wakes the SoC.
 
 use std::sync::Mutex;
 
