@@ -37,19 +37,19 @@
 //! it in slot order at its destination rectangle; outside the target
 //! rectangle the output surface is left as it was. Implemented: the 32-bit
 //! RGB formats 31-38, pitch-linear and block-linear (16Bx2 GOB) surfaces,
-//! the semi-planar 8-bit 4:2:0 input formats 67-68 (`SemiPlanar`, NVDEC's
-//! pictures), 1:1 source-to-destination copies, the slot and output colour
-//! matrices (Ryujinx `Blender.cs` formula, MIT), soft clamp, sRGB
+//! the 8-bit YUV input formats 67-72 (semi-planar 4:2:0, NVDEC's pictures,
+//! and fully planar; see `Yuv`), scaling (see `taps`), the slot and output
+//! colour matrices (Ryujinx `Blender.cs` formula, MIT), soft clamp, sRGB
 //! degamma/regamma (mode 1), planar/constant alpha, the blending factor
 //! selections (libdrm `vic.h` enum names), override and mask, alpha fill
 //! modes opaque, background and composited (DXVA-HD names in libdrm
 //! `vic.h`), the output flips, and as output the fully planar 8-bit YUV
 //! formats 69-72 (pitch-linear, chroma sited between the luma samples it
-//! is shared by; see `Planar`). Everything else (scaling and its filters,
-//! other YUV input, semi-planar output and 10-bit YUV, deinterlacing and
-//! denoise, luma key, gamut matrix, gamma modes 2-3, clear rectangles,
-//! decompression, output transposition, downsampling) refuses with the
-//! field named.
+//! is shared by; see `Planar`). Everything else (fractional source
+//! rectangles, noise and detail filters, other YUV input, semi-planar
+//! output and 10-bit YUV, deinterlacing and denoise, luma key, gamut
+//! matrix, gamma modes 2-3, clear rectangles, decompression, output
+//! transposition, downsampling) refuses with the field named.
 //!
 //! # The submission seen
 //!
@@ -66,6 +66,12 @@
 //! chroma planes 1280×360, vertical siting 1) through the BT.601 full-range
 //! RGB-to-YCbCr matrix (Y = 0.299 R + 0.587 G + 0.114 B, chroma offsets
 //! 128/255): a JPEG-style YCbCr picture of the frame.
+//!
+//! The capture button on HOME sends an EXECUTE that reads a 1280×720
+//! picture of that planar kind (slot format 71, through the inverse BT.601
+//! full-range matrix) and reduces it with ten-tap filters to a 96×54
+//! pitch-linear A8B8G8R8 thumbnail, the output's chroma addresses still
+//! those of the planar picture (see `Surface`).
 
 use std::sync::{Arc, Mutex};
 
@@ -327,6 +333,20 @@ enum Layout {
 
 /// One single-plane surface: the slot surface or the output surface
 /// configuration (same field layout) with its plane address.
+///
+/// A single-plane (pixel-interleaved) format uses only the luma plane
+/// address; the chroma U and V addresses beside it are not read. NVIDIA
+/// open-gpu-doc `classes/video/vic_ceb6_types.h` says so of the slot
+/// surface ("For single plane pixel format(ARGB), only use Luma surface";
+/// the chroma padded sizes are "not required for pixel interleaved
+/// surfaces such as ARGB"), and libdrm `tests/tegra/vic40.c` programs only
+/// `SET_OUTPUT_SURFACE_LUMA_OFFSET` and `SET_SURFACE0_SLOT0_LUMA_OFFSET`
+/// for its A8B8G8R8 surfaces. The output surface configuration has the
+/// same luma/chroma pairs and the same pixel formats, so the rule is taken
+/// to hold for it too [inference]. nvnflinger leaves the chroma addresses
+/// of an earlier configuration in place: the capture button's thumbnail
+/// EXECUTE writes an A8B8G8R8 output with 0x724/0x728 still naming the
+/// chroma planes of the planar YUV picture it reads.
 #[derive(Clone, Copy, Debug)]
 struct Surface {
     address: u64,
@@ -457,19 +477,30 @@ fn plane_layout(
     }
 }
 
-/// The semi-planar 8-bit 4:2:0 formats (`vic_ceb6_types.h`
-/// `PIXELFORMAT`, the same codes as libdrm `vic.h`'s for VIC 4.0
-/// [assumption, as for [`planar_subsampling`]]): 67 `T_Y8___U8V8_N420`
-/// and 68 `T_Y8___V8U8_N420`, luma in one plane, Cb/Cr pairs at half the
-/// resolution both ways in a second. By the naming rule of [`format`]
-/// the component named last is the lower byte, so 68 stores U first
-/// (NV12, what NVDEC writes and the browser hands the VIC as 68) and 67
-/// V first. Whether U comes first.
-fn semi_planar_u_first(code: u32) -> Option<bool> {
+/// How a YUV slot format stores chroma.
+#[derive(Clone, Copy, Debug)]
+enum ChromaLayout {
+    /// U/V pairs in one plane; whether U is the lower byte.
+    Interleaved { u_first: bool },
+    /// U and V each in a plane of its own.
+    Separate,
+}
+
+/// The 8-bit YUV slot input formats, their chroma layout and subsampling
+/// (horizontal, vertical): the semi-planar 4:2:0 formats
+/// (`vic_ceb6_types.h` `PIXELFORMAT`, the same codes as libdrm `vic.h`'s
+/// for VIC 4.0 [assumption, as for [`planar_subsampling`]]) 67
+/// `T_Y8___U8V8_N420` and 68 `T_Y8___V8U8_N420`, luma in one plane, Cb/Cr
+/// pairs at half the resolution both ways in a second, and the fully planar
+/// formats 69-72 of [`planar_subsampling`]. By the naming rule of
+/// [`format`] the component named last is the lower byte, so 68 stores U
+/// first (NV12, what NVDEC writes and the browser hands the VIC as 68) and
+/// 67 V first.
+fn yuv_input(code: u32) -> Option<(ChromaLayout, [u32; 2])> {
     match code {
-        67 => Some(false),
-        68 => Some(true),
-        _ => None,
+        67 => Some((ChromaLayout::Interleaved { u_first: false }, [2, 2])),
+        68 => Some((ChromaLayout::Interleaved { u_first: true }, [2, 2])),
+        _ => planar_subsampling(code).map(|subsampling| (ChromaLayout::Separate, subsampling)),
     }
 }
 
@@ -515,19 +546,32 @@ impl SamplePlane {
     }
 }
 
-/// A semi-planar 4:2:0 slot surface ([`semi_planar_u_first`]).
+/// The chroma planes of a [`Yuv`] slot surface.
+#[derive(Clone, Copy, Debug)]
+enum ChromaPlanes {
+    Interleaved {
+        plane: SamplePlane,
+        u_first: bool,
+    },
+    /// U, V.
+    Separate([SamplePlane; 2]),
+}
+
+/// A YUV slot surface ([`yuv_input`]).
 ///
 /// Chroma siting (w0 bits 7-8 horizontal, 9-10 vertical; 0 with the even
 /// luma sample, 1 between the even and the odd, 2 with the odd, as for
-/// the output in [`Planar`]) places chroma sample `k` at luma position
-/// `2k + siting / 2`; a luma sample's chroma is interpolated linearly
-/// between the two chroma samples around it, the edge ones repeated
-/// [inference: the VIC's upsampling filter is not public].
+/// the output in [`Planar`]) places chroma sample `k` of a subsampled axis
+/// at luma position `2k + siting / 2`; a luma sample's chroma is
+/// interpolated linearly between the two chroma samples around it, the
+/// edge ones repeated [inference: the VIC's upsampling filter is not
+/// public]. On a full-resolution axis chroma sample `k` is luma sample
+/// `k`'s, and any siting but 0 refuses.
 #[derive(Clone, Copy, Debug)]
-struct SemiPlanar {
+struct Yuv {
     luma: SamplePlane,
-    chroma: SamplePlane,
-    u_first: bool,
+    chroma: ChromaPlanes,
+    subsampling: [u32; 2],
     siting: [u32; 2],
     width: u32,
     height: u32,
@@ -535,16 +579,23 @@ struct SemiPlanar {
     chroma_size: [u32; 2],
 }
 
-impl SemiPlanar {
+impl Yuv {
     fn new(
         [w0, w1]: [u64; 2],
-        u_first: bool,
+        (layout, subsampling): (ChromaLayout, [u32; 2]),
         planes: [u32; 3],
         name: &str,
-    ) -> Result<SemiPlanar, String> {
+    ) -> Result<Yuv, String> {
         let siting = [field(w0, 7, 2), field(w0, 9, 2)];
-        if siting.contains(&3) {
-            return Err(format!("{name}: chroma siting {siting:?}"));
+        for (axis, (factor, siting)) in ["horizontal", "vertical"]
+            .into_iter()
+            .zip(subsampling.into_iter().zip(siting))
+        {
+            if siting == 3 || (factor == 1 && siting != 0) {
+                return Err(format!(
+                    "{name}: {axis} chroma siting {siting} with {factor}:1 subsampling"
+                ));
+            }
         }
         let kind = field(w0, 11, 4);
         let block_height_log2 = field(w0, 15, 4);
@@ -552,19 +603,27 @@ impl SemiPlanar {
         let height = field(w0, 46, 14) + 1;
         let luma = [field(w1, 0, 14) + 1, field(w1, 14, 14) + 1];
         let chroma = [field(w1, 32, 14) + 1, field(w1, 46, 14) + 1];
+        let chroma_size = [
+            width.div_ceil(subsampling[0]),
+            height.div_ceil(subsampling[1]),
+        ];
         if luma[0] < width
             || luma[1] < height
-            || chroma[0] < width.div_ceil(2)
-            || chroma[1] < height.div_ceil(2)
+            || chroma[0] < chroma_size[0]
+            || chroma[1] < chroma_size[1]
         {
             return Err(format!(
                 "{name}: planes {}x{} and {}x{} smaller than surface {width}x{height}",
                 luma[0], luma[1], chroma[0], chroma[1]
             ));
         }
-        if planes[0] == 0 || planes[1] == 0 || planes[2] != 0 {
+        let used = match layout {
+            ChromaLayout::Interleaved { .. } => 2,
+            ChromaLayout::Separate => 3,
+        };
+        if planes[..used].contains(&0) || planes[used..].iter().any(|&plane| plane != 0) {
             return Err(format!(
-                "{name}: plane addresses {planes:#x?} of a semi-planar surface"
+                "{name}: plane addresses {planes:#x?} of a {used}-plane YUV surface"
             ));
         }
         let plane = |address: u32, row_bytes: u32, rows: u32| {
@@ -575,19 +634,32 @@ impl SemiPlanar {
                 row_bytes,
             })
         };
-        Ok(SemiPlanar {
+        let chroma_planes = match layout {
+            ChromaLayout::Interleaved { u_first } => ChromaPlanes::Interleaved {
+                plane: plane(planes[1], 2 * chroma[0], chroma[1])?,
+                u_first,
+            },
+            ChromaLayout::Separate => ChromaPlanes::Separate([
+                plane(planes[1], chroma[0], chroma[1])?,
+                plane(planes[2], chroma[0], chroma[1])?,
+            ]),
+        };
+        Ok(Yuv {
             luma: plane(planes[0], luma[0], luma[1])?,
-            chroma: plane(planes[1], 2 * chroma[0], chroma[1])?,
-            u_first,
+            chroma: chroma_planes,
+            subsampling,
             siting,
             width,
             height,
-            chroma_size: [width.div_ceil(2), height.div_ceil(2)],
+            chroma_size,
         })
     }
 
     /// The chroma rows luma rows `top..bottom` interpolate from.
     fn chroma_rows(&self, top: u32, bottom: u32) -> (u32, u32) {
+        if self.subsampling[1] == 1 {
+            return (top, bottom);
+        }
         let last = self.chroma_size[1] - 1;
         (
             (top / 2).saturating_sub(1),
@@ -595,20 +667,30 @@ impl SemiPlanar {
         )
     }
 
-    fn read(&self, memory: &DeviceMemory, top: u32, bottom: u32) -> Result<[Rows; 2], String> {
+    /// Luma rows, then the rows of each chroma plane.
+    fn read(&self, memory: &DeviceMemory, top: u32, bottom: u32) -> Result<Vec<Rows>, String> {
         let (chroma_top, chroma_bottom) = self.chroma_rows(top, bottom);
-        Ok([
-            self.luma.read(memory, top, bottom)?,
-            self.chroma.read(memory, chroma_top, chroma_bottom)?,
-        ])
+        let mut rows = vec![self.luma.read(memory, top, bottom)?];
+        match &self.chroma {
+            ChromaPlanes::Interleaved { plane, .. } => {
+                rows.push(plane.read(memory, chroma_top, chroma_bottom)?);
+            }
+            ChromaPlanes::Separate(planes) => {
+                for plane in planes {
+                    rows.push(plane.read(memory, chroma_top, chroma_bottom)?);
+                }
+            }
+        }
+        Ok(rows)
     }
 
     /// Y, U, V of a pixel, normalized, and opaque alpha.
-    fn pixel(&self, [luma, chroma]: &[Rows; 2], x: u32, y: u32) -> [f32; 4] {
+    fn pixel(&self, rows: &[Rows], x: u32, y: u32) -> [f32; 4] {
         // The two chroma samples around luma position `p` on an axis and
         // the weight of the second.
         let around = |p: u32, axis: usize| {
-            let position = (p as f32 - self.siting[axis] as f32 / 2.0) / 2.0;
+            let factor = self.subsampling[axis] as f32;
+            let position = (p as f32 - self.siting[axis] as f32 / 2.0) / factor;
             let last = self.chroma_size[axis] - 1;
             let first = position.floor().max(0.0);
             let k = (first as u32).min(last);
@@ -618,17 +700,20 @@ impl SemiPlanar {
         let (y0, y1, ty) = around(y, 1);
         let mut uv = [0.0; 2];
         for (component, value) in uv.iter_mut().enumerate() {
-            let byte = if self.u_first {
-                component
-            } else {
-                1 - component
-            } as u32;
-            let at = |cx: u32, cy: u32| self.chroma.sample(chroma, 2 * cx + byte, cy);
+            let at = |cx: u32, cy: u32| match &self.chroma {
+                ChromaPlanes::Interleaved { plane, u_first } => {
+                    let byte = if *u_first { component } else { 1 - component } as u32;
+                    plane.sample(&rows[1], 2 * cx + byte, cy)
+                }
+                ChromaPlanes::Separate(planes) => {
+                    planes[component].sample(&rows[1 + component], cx, cy)
+                }
+            };
             let top = at(x0, y0) * (1.0 - tx) + at(x1, y0) * tx;
             let bottom = at(x0, y1) * (1.0 - tx) + at(x1, y1) * tx;
             *value = top * (1.0 - ty) + bottom * ty;
         }
-        [self.luma.sample(luma, x, y), uv[0], uv[1], 1.0]
+        [self.luma.sample(&rows[0], x, y), uv[0], uv[1], 1.0]
     }
 }
 
@@ -636,42 +721,38 @@ impl SemiPlanar {
 #[derive(Clone, Copy, Debug)]
 enum Source {
     Rgb(Surface),
-    SemiPlanar(SemiPlanar),
+    Yuv(Yuv),
 }
 
 /// Rows of a slot's input surface held in host memory.
 enum SourceRows {
     Rgb(Rows),
-    /// Luma and chroma rows.
-    SemiPlanar([Rows; 2]),
+    /// Luma rows, then each chroma plane's.
+    Yuv(Vec<Rows>),
 }
 
 impl Source {
     /// `words` are the slot surface configuration, `planes` the luma,
     /// chroma U and chroma V plane addresses.
     fn new(words: [u64; 2], planes: [u32; 3], name: &str) -> Result<Source, String> {
-        if let Some(u_first) = semi_planar_u_first(field(words[0], 0, 7)) {
-            return SemiPlanar::new(words, u_first, planes, name).map(Source::SemiPlanar);
+        if let Some(format) = yuv_input(field(words[0], 0, 7)) {
+            return Yuv::new(words, format, planes, name).map(Source::Yuv);
         }
-        if planes[1] != 0 || planes[2] != 0 {
-            return Err(format!("{name}: chroma planes"));
-        }
+        // Chroma plane addresses are ignored, see [`Surface`].
         Surface::new(words, planes[0], name).map(Source::Rgb)
     }
 
     fn size(&self) -> (u32, u32) {
         match self {
             Source::Rgb(surface) => (surface.width, surface.height),
-            Source::SemiPlanar(surface) => (surface.width, surface.height),
+            Source::Yuv(surface) => (surface.width, surface.height),
         }
     }
 
     fn read(&self, memory: &DeviceMemory, top: u32, bottom: u32) -> Result<SourceRows, String> {
         Ok(match self {
             Source::Rgb(surface) => SourceRows::Rgb(surface.read(memory, top, bottom)?),
-            Source::SemiPlanar(surface) => {
-                SourceRows::SemiPlanar(surface.read(memory, top, bottom)?)
-            }
+            Source::Yuv(surface) => SourceRows::Yuv(surface.read(memory, top, bottom)?),
         })
     }
 
@@ -679,9 +760,7 @@ impl Source {
     fn pixel(&self, rows: &SourceRows, x: u32, y: u32) -> [f32; 4] {
         match (self, rows) {
             (Source::Rgb(surface), SourceRows::Rgb(rows)) => surface.pixel(rows, x, y),
-            (Source::SemiPlanar(surface), SourceRows::SemiPlanar(rows)) => {
-                surface.pixel(rows, x, y)
-            }
+            (Source::Yuv(surface), SourceRows::Yuv(rows)) => surface.pixel(rows, x, y),
             _ => unreachable!("rows are read from the source they are used with"),
         }
     }
@@ -883,9 +962,7 @@ impl Output {
         if let Some(subsampling) = planar_subsampling(field(words[0], 0, 7)) {
             return Planar::new(words, planes, subsampling).map(Output::Planar);
         }
-        if planes[1] != 0 || planes[2] != 0 {
-            return Err("chroma planes of a single-plane output".into());
-        }
+        // Chroma plane addresses are ignored, see [`Surface`].
         Surface::new(words, planes[0], "output").map(Output::Rgb)
     }
 
@@ -1082,11 +1159,77 @@ impl Blend {
     }
 }
 
+/// The scaler on one axis (`vic_ceb6_types.h`: "SourceRect -> DestRect
+/// Shape Transform"): the source
+/// samples, with their weights, that destination sample `d` (counted from
+/// the destination rectangle's start) is filtered from. `start` and
+/// `source_size` are the source rectangle on this axis.
+///
+/// `length` is the slot's filter length (libdrm `vic40.h` `SlotConfig`
+/// `FilterLengthX`/`Y`, w0 bits 22-23 and 20-21; `vic_ceb6_types.h`
+/// `FILTER_LENGTH`: 0 one tap "(Nearst)", 1 two taps "(Bilinear)", 2 five
+/// taps, 3 ten taps). Destination sample `d`'s centre falls on source
+/// position `start + (d + ½)·ratio − ½` (sample centres on integers, ratio
+/// = source size / destination size) [inference: the rectangles' edges
+/// coincide]. One tap takes the sample nearest it; two interpolate
+/// linearly between the two around it. Positions past the rectangle take
+/// its edge samples (`vic_ceb6_types.h` `SrcMaskPixelFillMode` 0: "padding
+/// with nearest boundary pixels").
+///
+/// The five- and ten-tap filters read their coefficients from the filter
+/// structure at SET_FILTER_STRUCT_OFFSET, whose layout is not public
+/// (libdrm `vic30.c` and `vic41.c` hand the VIC a zeroed one; nvnflinger
+/// uploads a 0x2080-byte table from its read-only data at `0xFB988`,
+/// `0xAE960`). They are taken as interpolating linearly when enlarging and
+/// as the mean over each destination sample's footprint, each source
+/// sample weighted by the part of it covered, when reducing [inference: a
+/// low-pass filter as wide as the ratio, the response such a table is
+/// built to approach; the coefficients themselves are not decoded]. With
+/// equal sizes every filter copies [inference: at phase 0 an interpolating
+/// filter passes the sample through].
+fn taps(
+    length: u32,
+    start: u32,
+    source_size: u32,
+    destination_size: u32,
+    d: u32,
+) -> Vec<(u32, f32)> {
+    if source_size == destination_size {
+        return vec![(start + d, 1.0)];
+    }
+    let ratio = f64::from(source_size) / f64::from(destination_size);
+    let (first, last) = (f64::from(start), f64::from(start + source_size - 1));
+    let sample = |position: f64| position.clamp(first, last) as u32;
+    let centre = first + (f64::from(d) + 0.5) * ratio - 0.5;
+    if length == 0 {
+        return vec![(sample(centre.round()), 1.0)];
+    }
+    if length == 1 || ratio < 1.0 {
+        let below = centre.floor();
+        let weight = (centre - below) as f32;
+        return vec![(sample(below), 1.0 - weight), (sample(below + 1.0), weight)];
+    }
+    let low = first + f64::from(d) * ratio;
+    let high = low + ratio;
+    let mut taps = Vec::with_capacity(ratio.ceil() as usize + 1);
+    let mut edge = low.floor();
+    while edge < high {
+        let covered = high.min(edge + 1.0) - low.max(edge);
+        if covered > 0.0 {
+            taps.push((sample(edge), (covered / ratio) as f32));
+        }
+        edge += 1.0;
+    }
+    taps
+}
+
 /// One enabled slot, ready to draw.
 struct Slot {
     surface: Source,
     source: Rect,
     destination: Rect,
+    /// Filter lengths, horizontal and vertical ([`taps`]).
+    filter: [u32; 2],
     matrix: Option<Matrix>,
     /// sRGB decoding (degamma mode 1) after the colour matrix.
     degamma: bool,
@@ -1127,9 +1270,9 @@ impl Slot {
         if field(w0, 24, 12) != 0 {
             return unmodeled(&format!("panoramic {:#x}", field(w0, 24, 12)));
         }
-        // The w0 filter lengths and all of w1 (noise/detail filter
-        // strengths, deinterlace mode) act only when scaling, denoising or
-        // deinterlacing, all refused here.
+        // The noise and detail filter strengths of w1 act with the scaler
+        // (refused below when it resamples); its deinterlace mode only with
+        // interlaced frame formats, refused above.
         let w2 = config.word(base + 0x10);
         let clamp = (
             field(w2, 0, 10) as f32 / 1023.0,
@@ -1166,8 +1309,18 @@ impl Slot {
             bottom: bottom + 1,
         };
         let destination = Rect::inclusive(config.word(base + 0x30));
-        if source.width() != destination.width() || source.height() != destination.height() {
-            return unmodeled(&format!("scaling {source:?} to {destination:?}"));
+        if source.width() == 0 || source.height() == 0 {
+            return unmodeled(&format!("empty source rectangle {source:?}"));
+        }
+        let filter = [field(w0, 22, 2), field(w0, 20, 2)];
+        // FilterNoise, FilterDetail, ChromaNoise, ChromaDetail: w1 bits 0-39.
+        let strengths = config.word(base + 8) & ((1 << 40) - 1);
+        let scaling =
+            source.width() != destination.width() || source.height() != destination.height();
+        if scaling && strengths != 0 {
+            return unmodeled(&format!(
+                "noise/detail filter strengths {strengths:#x} while scaling"
+            ));
         }
         let plane = |p: usize| methods[method::SURFACES.start + index * 24 + p];
         let surface = Source::new(
@@ -1190,13 +1343,14 @@ impl Slot {
             return unmodeled("gamut matrix");
         }
         let matrix = Matrix::new(matrix_at(0x60));
-        if matches!(surface, Source::SemiPlanar(_)) && matrix.is_none() {
+        if matches!(surface, Source::Yuv(_)) && matrix.is_none() {
             return unmodeled("YUV input without a colour matrix");
         }
         Ok(Some(Slot {
             surface,
             source,
             destination,
+            filter,
             matrix,
             degamma: degamma == GAMMA_SRGB,
             clamp,
@@ -1204,6 +1358,36 @@ impl Slot {
             constant_alpha: flag(w2, 42),
             blend: Blend::new(config.pair(base + 0xA0)).map_err(|e| format!("{name}: {e}"))?,
         }))
+    }
+
+    /// The source samples and weights of destination column (`axis` 0) or
+    /// row (1) `at`, which lies in the destination rectangle.
+    fn taps(&self, axis: usize, at: u32) -> Vec<(u32, f32)> {
+        let (s, d) = (self.source, self.destination);
+        let (start, source, destination, origin) = if axis == 0 {
+            (s.left, s.width(), d.width(), d.left)
+        } else {
+            (s.top, s.height(), d.height(), d.top)
+        };
+        taps(self.filter[axis], start, source, destination, at - origin)
+    }
+
+    /// The scaled source pixel of `columns` × `lines` taps, its components
+    /// as stored: the scaler works ahead of the colour matrix [inference:
+    /// `vic_ceb6_types.h` lists the slot's scaler parameters before its
+    /// colour conversion].
+    fn sample(&self, rows: &SourceRows, columns: &[(u32, f32)], lines: &[(u32, f32)]) -> [f32; 4] {
+        let mut pixel = [0.0; 4];
+        for &(y, row_weight) in lines {
+            for &(x, column_weight) in columns {
+                let weight = row_weight * column_weight;
+                let value = self.surface.pixel(rows, x, y);
+                for (sum, value) in pixel.iter_mut().zip(value) {
+                    *sum += value * weight;
+                }
+            }
+        }
+        pixel
     }
 
     /// The slot's colour of a source pixel, before blending: colour matrix
@@ -1330,13 +1514,14 @@ fn compose_config(
         if drawn.width() == 0 || drawn.height() == 0 {
             continue;
         }
-        let top = slot.source.top + (drawn.top - slot.destination.top);
-        let rows = slot.surface.read(memory, top, top + drawn.height())?;
-        for y in drawn.top..drawn.bottom {
-            let source_y = slot.source.top + (y - slot.destination.top);
-            for x in drawn.left..drawn.right {
-                let source_x = slot.source.left + (x - slot.destination.left);
-                let color = slot.color(slot.surface.pixel(&rows, source_x, source_y));
+        let columns: Vec<_> = (drawn.left..drawn.right).map(|x| slot.taps(0, x)).collect();
+        let lines: Vec<_> = (drawn.top..drawn.bottom).map(|y| slot.taps(1, y)).collect();
+        let used = lines.iter().flatten().map(|&(y, _)| y);
+        let (top, bottom) = (used.clone().min().unwrap(), used.max().unwrap() + 1);
+        let rows = slot.surface.read(memory, top, bottom)?;
+        for (y, line) in (drawn.top..).zip(&lines) {
+            for (x, column) in (drawn.left..).zip(&columns) {
+                let color = slot.color(slot.sample(&rows, column, line));
                 let at = (y - area.top) as usize * width + (x - area.left) as usize;
                 picture[at] = slot.blend.apply(color, picture[at]);
             }
