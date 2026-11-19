@@ -229,7 +229,7 @@ impl Compute {
     fn kernel(&mut self, memory: &dyn GpuMemory, address: u64) -> Result<Arc<Kernel>, Unmodeled> {
         if let Some((raw, kernel)) = self.caches.kernels.get(&address) {
             let mut now = vec![0; raw.len()];
-            if memory.read(address, &mut now).is_some() && now == *raw {
+            if memory.probe(address, &mut now).is_some() && now == *raw {
                 return Ok(kernel.clone());
             }
         }

@@ -311,9 +311,9 @@ struct Observed<'a> {
     shadow: &'a Mutex<Shadow>,
 }
 
-impl GpuMemory for Observed<'_> {
-    fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
-        self.memory.read(address, buffer)?;
+impl Observed<'_> {
+    /// Records what a read returned, unless the shadow already holds it.
+    fn observe(&self, address: u64, buffer: &[u8]) {
         let mut shadow = self.shadow.lock().unwrap_or_else(|e| e.into_inner());
         if !shadow.matches(address, buffer) {
             shadow.store(address, buffer);
@@ -325,6 +325,13 @@ impl GpuMemory for Observed<'_> {
             record.extend_from_slice(buffer);
             self.capture.write(&record);
         }
+    }
+}
+
+impl GpuMemory for Observed<'_> {
+    fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
+        self.memory.read(address, buffer)?;
+        self.observe(address, buffer);
         Some(())
     }
 
@@ -334,6 +341,12 @@ impl GpuMemory for Observed<'_> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .store(address, data);
+        Some(())
+    }
+
+    fn probe(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
+        self.memory.probe(address, buffer)?;
+        self.observe(address, buffer);
         Some(())
     }
 }

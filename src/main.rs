@@ -254,7 +254,11 @@ options:
                       and is then done again every SECONDS (default 3) until
                       that pixel has that colour. Unlike the times of --press
                       and --touch, none of this depends on how fast the host
-                      gets the guest anywhere
+                      gets the guest anywhere. The lock screen sleeps 20 s
+                      after the last input (the firmware's handheld
+                      auto-sleep), and after a boot it can come up with that
+                      time nearly gone: to hold POWER there, wait for it with
+                        press zl 300 until 820,330 2d2d2d 4
   --debug-mode        report development functions as enabled to the kernel,
                       which turns on its debug log (UART-A, shown on stderr)
 

@@ -504,7 +504,9 @@ fn constant_buffers(
 /// stops at the first 4 KiB page (the SMMU's page size) that does not
 /// translate. A bound constant buffer may reach past the memory its owner
 /// mapped (NVN binds 0xE900 bytes of which nvservices mapped 0x7900, seen
-/// from starter); a shader reading there is refused when it does.
+/// from starter); a shader reading there is refused when it does. The
+/// unmapped page is no refusal here, so the reads are probes
+/// ([`GpuMemory::probe`]): a later, unrelated refusal does not carry it.
 pub(super) fn read_mapped(memory: &dyn GpuMemory, address: u64, length: usize) -> Vec<u8> {
     const PAGE: u64 = 0x1000;
     let mut bytes = vec![0; length];
@@ -512,7 +514,7 @@ pub(super) fn read_mapped(memory: &dyn GpuMemory, address: u64, length: usize) -
     while done < length {
         let at = address + done as u64;
         let chunk = ((PAGE - at % PAGE) as usize).min(length - done);
-        if memory.read(at, &mut bytes[done..done + chunk]).is_none() {
+        if memory.probe(at, &mut bytes[done..done + chunk]).is_none() {
             break;
         }
         done += chunk;
@@ -960,7 +962,7 @@ pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result
         fetch.fetch(context.memory, index, fetch_instance, &mut inputs)?;
         inputs.0[0x2F8 / 4] = batch.instance;
         inputs.0[0x2FC / 4] = id;
-        let mut outputs = Attributes([0; 256]);
+        let mut outputs = Attributes::vertex_outputs();
         vertex.run_vertex(&vertex_env, &inputs, fetch.inactive, &mut outputs)?;
         let clip = std::array::from_fn(|i| f32::from_bits(outputs.0[0x70 / 4 + i]));
         let done = Shaded {

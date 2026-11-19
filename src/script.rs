@@ -11,6 +11,37 @@
 //! on a busy host a short press can fall between two of the guest's
 //! frames. A press or a touch can therefore be given what it is for (a
 //! pixel again) and is then repeated until that has happened.
+//!
+//! The lock screen goes to sleep by itself 20 s after the last input in
+//! handheld mode. That is the firmware's doing (23.5.0), not the
+//! emulator's:
+//! - When the lock screen comes up, `am` hands `idle:sys` (in `omm`) the
+//!   handling context `[0x14, 0x3c, 0, ...]` (`SetHandlingContext`,
+//!   command 3). `omm` `0x48e10` takes the auto-sleep time from its first
+//!   word in handheld mode and from its second otherwise \[inference:
+//!   which flag tells the modes apart\], so 20 s in handheld mode.
+//! - Once a second (`0x6420`, `0x48930`) `idle` reads the time of the last
+//!   input from `ins:r` command 0 (a 19.2 MHz tick; in traces it follows
+//!   every button press \[inference\]). When that time is older than the
+//!   limit (`0x48cb0`), it signals its auto-power-down event.
+//! - `spsm` (in `omm`) turns that event into notification message 3 for
+//!   `am` (`0x78810` posts power state event 9, and `0x80970` maps it to
+//!   message 3). About 1.4 s later `qlaunch` calls `StartSleepSequence`.
+//!
+//! After a boot, the emulated lock screen comes up 14 to 23 s after the
+//! last input. The boot is slower than the hardware's, see `SDMMC2_BASE`
+//! in `soc` \[inference: hardware boot times not measured\]. So a script
+//! that waits for the lock screen and then holds POWER can lose the race
+//! with this auto-sleep. If the time has already run out, the console
+//! sleeps while POWER is held instead of opening the power menu, and with
+//! no press at all it sleeps the same way. To avoid this, press a button
+//! that does nothing there while waiting, so that the lock screen comes up
+//! with nearly all of its 20 s left:
+//!
+//! ```text
+//! press zl 300 until 820,330 2d2d2d 4   # the lock screen's home icon
+//! press power 3500                      # the power menu
+//! ```
 
 use std::time::{Duration, Instant};
 

@@ -1488,4 +1488,11 @@ impl GpuMemory for Coherent<'_> {
             .ok()?;
         self.memory.write(address, data)
     }
+
+    fn probe(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
+        self.renderer
+            .before_access(self.memory, self.writes, address, buffer.len())
+            .ok()?;
+        self.memory.probe(address, buffer)
+    }
 }

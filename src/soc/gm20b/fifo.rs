@@ -1106,6 +1106,8 @@ mod tests {
     const PUSHBUFFER: u64 = 0x2000;
     const SEMAPHORE: u64 = 0x3000;
     const ENTRIES: u32 = 16;
+    /// A virtual address no test page table maps.
+    const UNMAPPED: u64 = 0x9000;
 
     /// What test engines are flushed with: the call log gets this entry.
     const FLUSH: (u8, u32, u32) = (0xFF, 0, 0);
@@ -1120,10 +1122,18 @@ mod tests {
             subchannel: u8,
             method: u32,
             argument: u32,
-            _memory: &dyn GpuMemory,
+            memory: &dyn GpuMemory,
         ) -> Result<(), Unmodeled> {
-            if method == 0x7FF {
-                return Err(Unmodeled("method 0x7ff".into()));
+            // 0x7FF is refused; 0x7FE is refused for a read of unmapped
+            // memory; 0x7FD probes unmapped memory and takes the failure.
+            let mut word = [0; 4];
+            match method {
+                0x7FF => return Err(Unmodeled("method 0x7ff".into())),
+                0x7FE if memory.read(UNMAPPED, &mut word).is_none() => {
+                    return Err(Unmodeled("method 0x7fe".into()));
+                }
+                0x7FD => assert!(memory.probe(UNMAPPED, &mut word).is_none()),
+                _ => {}
             }
             self.0.lock().unwrap().push((subchannel, method, argument));
             Ok(())
@@ -1349,6 +1359,34 @@ mod tests {
         assert_eq!(context.run(&surveyed).unwrap(), Outcome::Idle);
         assert_eq!(syncpoints.get(3), Some(1));
         assert_eq!(notes.lock().unwrap().len(), 1);
+    }
+
+    /// A refusal carries the memory fault behind it, and no other: a
+    /// probe's failure, which its engine took, is not added to the
+    /// unrelated refusal after it.
+    #[test]
+    fn refusals_carry_only_their_own_memory_fault() {
+        let bus = TestBus::default();
+        let syncpoints = Syncpoints::default();
+        let attention = AtomicBool::new(false);
+        let env = Env {
+            bus: &bus,
+            syncpoints: &syncpoints,
+            attention: &attention,
+            now: &|| 0,
+            survey: false,
+            note: &|_| {},
+        };
+        let (mut context, _) = channel(&bus);
+        submit(&bus, 0, 0, &[0x2001_07FE, 0]);
+        let Unmodeled(what) = context.run(&env).unwrap_err();
+        assert!(what.starts_with("method 0x7fe ("), "{what}");
+        let (mut context, _) = channel(&bus);
+        submit(&bus, 0, 0, &[0x2001_07FD, 0, 0x2001_07FF, 1]);
+        assert_eq!(
+            context.run(&env).unwrap_err(),
+            Unmodeled("method 0x7ff".into())
+        );
     }
 
     #[test]
