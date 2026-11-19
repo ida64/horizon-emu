@@ -72,13 +72,14 @@ use objc2_metal::{
     MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions, MTLCreateSystemDefaultDevice,
     MTLDepthClipMode, MTLDevice, MTLLibrary, MTLLoadAction, MTLMathMode, MTLOrigin, MTLPixelFormat,
     MTLPrimitiveType, MTLRegion, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
-    MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLResourceOptions, MTLSamplerAddressMode,
-    MTLSamplerBorderColor, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
-    MTLSamplerState, MTLScissorRect, MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture,
-    MTLTextureDescriptor, MTLTextureUsage, MTLViewport,
+    MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLResource, MTLResourceOptions,
+    MTLSamplerAddressMode, MTLSamplerBorderColor, MTLSamplerDescriptor, MTLSamplerMinMagFilter,
+    MTLSamplerMipFilter, MTLSamplerState, MTLScissorRect, MTLSize, MTLStorageMode, MTLStoreAction,
+    MTLTexture, MTLTextureDescriptor, MTLTextureUsage, MTLViewport,
 };
 
 use super::blend::{Blend, Factor, Operation};
+use super::lru::Lru;
 use super::raster::{ColorOutput, Compare, Triangle};
 use super::resources::{DrawTextures, Stamp, Writes};
 use super::shader::Program;
@@ -136,6 +137,8 @@ struct Resident {
     dirty: Option<Rect>,
     /// When `mirror` was last known to equal guest memory.
     stamp: Option<Stamp>,
+    /// [`State::clock`] when a draw or clear last used it.
+    used: u64,
 }
 
 /// The attachments of a render pass: resident index and whether the sRGB
@@ -162,25 +165,51 @@ impl Drop for Frame {
 }
 
 struct Program2 {
-    /// Keeps the program alive so its address is not reused as a key.
-    _program: Arc<Program>,
+    /// Keeps the program alive so its address is not reused as a key;
+    /// once this is the last reference (the program cache dropped it),
+    /// the translation and its pipelines are dropped ([`State::trim`]).
+    program: Arc<Program>,
     translated: Result<Arc<Translated>, String>,
 }
 
-#[derive(Default)]
+/// Compiled MSL libraries kept \[assumption: a library is one translated
+/// pixel program, tens to hundreds of KiB of host memory; this is more
+/// than the programs a HOME menu session draws with\].
+const LIBRARY_LIMIT: usize = 512;
+/// Render pipeline states kept (programs by attachment formats and
+/// blending) \[assumption: as [`LIBRARY_LIMIT`]\].
+const PIPELINE_LIMIT: usize = 1024;
+/// Sampler states kept \[assumption: a sampler state is a few hundred
+/// bytes; guests use a handful of distinct samplers\].
+const SAMPLER_LIMIT: usize = 512;
+/// Host memory the render targets held on the GPU may take (texture and
+/// mirror) before the least recently used clean ones are dropped
+/// \[assumption: sized as the texture cache, `resources::TEXTURE_BUDGET`;
+/// a dropped target is loaded from guest memory when next drawn to\].
+const RESIDENT_BUDGET: usize = 512 << 20;
+
+/// The renderer's host objects. Every cache is bounded: by
+/// least-recent use (`maxwell::lru`) for libraries, pipelines and
+/// samplers, by the software caches' own bounds for programs and
+/// textures (an entry here goes once its program or texture is dropped
+/// there), and by [`RESIDENT_BUDGET`] for render targets.
+/// `clear_pipelines` holds at most one pipeline per pixel format and
+/// write mask.
 struct State {
     residents: Vec<Resident>,
     frame: Option<Frame>,
     programs: HashMap<usize, Program2>,
     /// Compiled MSL by source: programs drawn with different attachment
     /// formats or blending share their functions.
-    libraries: HashMap<String, Retained<Library>>,
-    pipelines: HashMap<PipelineKey, Retained<Pipeline>>,
+    libraries: Lru<String, Retained<Library>>,
+    pipelines: Lru<PipelineKey, Retained<Pipeline>>,
     clear_pipelines: HashMap<(usize, u8), Retained<Pipeline>>,
     /// Uploaded textures by decoded texture (kept alive with it while the
     /// texture cache holds it too).
     textures: HashMap<usize, (Arc<Texture>, Retained<MetalTexture>)>,
-    samplers: HashMap<[u32; 8], Retained<Sampler>>,
+    samplers: Lru<[u32; 8], Retained<Sampler>>,
+    /// Counts uses of residents (`Resident::used`).
+    clock: u64,
     fallbacks: HashMap<String, u64>,
     draws: u64,
     /// Texture fault words of the draws recorded since the last flush
@@ -190,6 +219,26 @@ struct State {
     /// What an unbound texture slot is bound to: a 1x1 texture and a
     /// sampler, never read into a result that reaches guest memory.
     placeholder: Option<(Retained<MetalTexture>, Retained<Sampler>)>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        State {
+            residents: Vec::new(),
+            frame: None,
+            programs: HashMap::new(),
+            libraries: Lru::new(LIBRARY_LIMIT),
+            pipelines: Lru::new(PIPELINE_LIMIT),
+            clear_pipelines: HashMap::new(),
+            textures: HashMap::new(),
+            samplers: Lru::new(SAMPLER_LIMIT),
+            clock: 0,
+            fallbacks: HashMap::new(),
+            draws: 0,
+            faults: Vec::new(),
+            placeholder: None,
+        }
+    }
 }
 
 // SAFETY: the Metal objects of a channel (textures, buffers, pipeline
@@ -339,10 +388,7 @@ impl Renderer {
         for (resident, current) in state.residents.iter_mut().zip(current) {
             resident.stamp = current.then_some(stamp);
         }
-        // Uploads of textures the texture cache dropped are dropped too.
-        state
-            .textures
-            .retain(|_, (texture, _)| Arc::strong_count(texture) > 1);
+        state.trim();
         result
     }
 
@@ -389,7 +435,7 @@ impl Renderer {
             let mut state = self.state.lock().unwrap();
             let key = Arc::as_ptr(draw.program) as usize;
             let entry = state.programs.entry(key).or_insert_with(|| Program2 {
-                _program: Arc::clone(draw.program),
+                program: Arc::clone(draw.program),
                 translated: msl::translate(draw.program, constant_buffer_1).map(Arc::new),
             });
             if let Ok(t) = &entry.translated
@@ -536,7 +582,7 @@ impl Renderer {
                 let source = translated.source(draw.program, &outputs, key.alpha_test);
                 let library = state.library(gpu, source)?;
                 let pipeline = build_pipeline(gpu, &library, "fragment_main", &key.attachments)?;
-                state.pipelines.insert(key.clone(), pipeline.clone());
+                state.pipelines.insert(key.clone(), pipeline.clone(), 1);
                 pipeline
             }
         };
@@ -560,7 +606,7 @@ impl Renderer {
                 Some(s) => s.clone(),
                 None => {
                     let s = build_sampler(gpu, texture, tsc);
-                    state.samplers.insert(tsc.words, s.clone());
+                    state.samplers.insert(tsc.words, s.clone(), 1);
                     s
                 }
             };
@@ -765,6 +811,7 @@ impl Renderer {
         writes: &Writes,
         targets: &[(Surface, ColorFormat)],
     ) -> Result<Vec<usize>, Unmodeled> {
+        self.state.lock().unwrap().trim_residents(targets);
         // A resident of other dimensions or format at overlapping memory is
         // written back and dropped, before any index is taken.
         for &(surface, format) in targets {
@@ -840,10 +887,17 @@ impl Renderer {
                         mirror: window,
                         dirty: None,
                         stamp: Some(stamp),
+                        used: 0,
                     });
                     indices.push(state.residents.len() - 1);
                 }
             }
+        }
+        let mut state = self.state.lock().unwrap();
+        state.clock += 1;
+        let now = state.clock;
+        for &index in &indices {
+            state.residents[index].used = now;
         }
         Ok(indices)
     }
@@ -859,6 +913,60 @@ impl State {
             frame.command.commit();
             frame.command.waitUntilCompleted();
         }
+    }
+
+    /// Drops what the software caches no longer hold: uploads of textures
+    /// the texture cache dropped, and translations of programs the program
+    /// cache dropped, with every pipeline made from them (a pipeline is
+    /// keyed by the program's address, which may be reused once the
+    /// program is freed). Run after a flush, when no draw holds either.
+    fn trim(&mut self) {
+        self.textures
+            .retain(|_, (texture, _)| Arc::strong_count(texture) > 1);
+        let before = self.programs.len();
+        self.programs
+            .retain(|_, entry| Arc::strong_count(&entry.program) > 1);
+        if self.programs.len() != before {
+            let programs = &self.programs;
+            self.pipelines
+                .retain(|key, _| programs.contains_key(&key.program));
+        }
+    }
+
+    /// With no frame recording (so no resident is dirty or an attachment
+    /// of an open pass, and no index is held), drops the least recently
+    /// used residents other than `targets` while all of them take more
+    /// than [`RESIDENT_BUDGET`]. Guest memory holds everything they hold.
+    fn trim_residents(&mut self, targets: &[(Surface, ColorFormat)]) {
+        if self.frame.is_some() {
+            return;
+        }
+        let size = |r: &Resident| r.texture.allocatedSize() + r.mirror.data().len();
+        let mut total: usize = self.residents.iter().map(size).sum();
+        if total <= RESIDENT_BUDGET {
+            return;
+        }
+        let mut order: Vec<(u64, usize)> = self
+            .residents
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.dirty.is_none() && !targets.contains(&(r.surface, r.format)))
+            .map(|(i, r)| (r.used, i))
+            .collect();
+        order.sort_unstable();
+        let mut drop = vec![false; self.residents.len()];
+        for (_, index) in order {
+            if total <= RESIDENT_BUDGET {
+                break;
+            }
+            total -= size(&self.residents[index]);
+            drop[index] = true;
+        }
+        let mut index = 0;
+        self.residents.retain(|_| {
+            index += 1;
+            !drop[index - 1]
+        });
     }
 
     /// Resident `index` got `rect` rendered by the GPU. The first draw
@@ -910,13 +1018,14 @@ impl State {
         Ok((texture, sampler))
     }
 
-    /// The compiled library of `source`, compiled once.
+    /// The compiled library of `source`, compiled once while kept
+    /// ([`LIBRARY_LIMIT`]).
     fn library(&mut self, gpu: &Gpu, source: String) -> Result<Retained<Library>, Unmodeled> {
         if let Some(library) = self.libraries.get(&source) {
             return Ok(library.clone());
         }
         let library = compile_library(gpu, &source)?;
-        self.libraries.insert(source, library.clone());
+        self.libraries.insert(source, library.clone(), 1);
         Ok(library)
     }
 
