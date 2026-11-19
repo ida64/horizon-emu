@@ -8,11 +8,14 @@
 //! ([`super::pipeline`]): vertex fetch, the vertex program (interpreted),
 //! clipping, the viewport transform and triangle setup. Metal receives
 //! the set-up triangles (snapped window positions) with each triangle's
-//! interpolation planes, rasterizes them, runs the pixel program
-//! translated to MSL ([`super::shader::msl`]), which evaluates the planes
-//! exactly as the interpreter does, samples textures decoded by
-//! [`super::texture`], and blends into render targets held as Metal
-//! textures. A draw or clear the Metal path cannot express (an
+//! interpolation planes, draws each over its pixel bounding box, keeps
+//! the pixels the software rasterizer's exact edge test keeps, runs the
+//! pixel program translated to MSL ([`super::shader::msl`]), which
+//! evaluates the planes exactly as the interpreter does, samples textures
+//! decoded by [`super::texture`], tests depth against the depth buffer
+//! held as its raw words (read and written in the fragment function with
+//! the format's own encoding), and blends into render targets held as
+//! Metal textures. A draw or clear the Metal path cannot express (an
 //! untranslated instruction, a format, blend factor, sampler mode or
 //! pipeline state it does not map) runs in the software renderer instead,
 //! after the render targets it touches are written back; the reason is
@@ -70,8 +73,8 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBlendFactor, MTLBlendOperation, MTLBuffer, MTLColorWriteMask, MTLCommandBuffer,
-    MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions, MTLCreateSystemDefaultDevice,
-    MTLDepthClipMode, MTLDevice, MTLLibrary, MTLLoadAction, MTLMathMode, MTLOrigin, MTLPixelFormat,
+    MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLGPUFamily, MTLLibrary, MTLLoadAction, MTLMathMode, MTLOrigin, MTLPixelFormat,
     MTLPrimitiveType, MTLRegion, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
     MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLResource, MTLResourceOptions,
     MTLSamplerAddressMode, MTLSamplerBorderColor, MTLSamplerDescriptor, MTLSamplerMinMagFilter,
@@ -81,12 +84,12 @@ use objc2_metal::{
 
 use super::blend::{Blend, Factor, Operation};
 use super::lru::Lru;
-use super::raster::{ColorOutput, Compare, Triangle};
+use super::raster::{ColorOutput, Compare, DepthOutput, Triangle};
 use super::resources::{DrawTextures, Stamp, Writes};
 use super::shader::Program;
 use super::shader::msl::{self, Translated};
 use super::surface::{Rect, Surface, Window};
-use super::texture::format::ColorFormat;
+use super::texture::format::{ColorFormat, DepthFormat};
 use super::texture::{Texture, Tsc};
 use super::{GpuMemory, Unmodeled};
 
@@ -107,6 +110,11 @@ type Faults = (Retained<MetalBuffer>, Vec<(usize, String)>);
 struct Gpu {
     device: Retained<Device>,
     queue: Retained<Queue>,
+    /// Whether fragment functions can read color attachments (Apple GPU
+    /// families: programmable blending [public: Apple, Metal feature set
+    /// tables, "Programmable blending": Apple1 and later]), which the depth
+    /// test is made of (see [`Translated::source`]).
+    fetch: bool,
 }
 
 // SAFETY: Metal devices and command queues are thread-safe [public: Apple
@@ -118,7 +126,12 @@ unsafe impl Sync for Gpu {}
 static GPU: LazyLock<Option<Gpu>> = LazyLock::new(|| {
     let device = MTLCreateSystemDefaultDevice()?;
     let queue = device.newCommandQueue()?;
-    Some(Gpu { device, queue })
+    let fetch = device.supportsFamily(MTLGPUFamily::Apple1);
+    Some(Gpu {
+        device,
+        queue,
+        fetch,
+    })
 });
 
 /// Whether a Metal device is present.
@@ -126,10 +139,29 @@ pub fn available() -> bool {
     GPU.is_some()
 }
 
-/// A render target held on the GPU.
+/// What a resident holds: a color target, or a depth buffer as its raw
+/// words (see [`format::depth_pixel_format`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Content {
+    Color(ColorFormat),
+    Depth(DepthFormat),
+}
+
+impl Content {
+    /// The Metal pixel format of the resident's texture, if Metal has one
+    /// with the surface's bytes.
+    fn pixel_format(self) -> Option<MTLPixelFormat> {
+        match self {
+            Content::Color(format) => format::pixel_format(format),
+            Content::Depth(format) => Some(format::depth_pixel_format(format)),
+        }
+    }
+}
+
+/// A render target or depth buffer held on the GPU.
 struct Resident {
     surface: Surface,
-    format: ColorFormat,
+    format: Content,
     texture: Retained<MetalTexture>,
     /// The whole surface as guest memory held it when it and `texture`
     /// were last equal.
@@ -195,7 +227,7 @@ const RESIDENT_BUDGET: usize = 512 << 20;
 /// textures (an entry here goes once its program or texture is dropped
 /// there), and by [`RESIDENT_BUDGET`] for render targets.
 /// `clear_pipelines` holds at most one pipeline per pixel format and
-/// write mask.
+/// write mask (mask `u8::MAX`: the depth clear).
 struct State {
     residents: Vec<Resident>,
     frame: Option<Frame>,
@@ -253,11 +285,15 @@ struct PipelineKey {
     program: usize,
     /// The constant buffer 1 a translation with BRX was made for.
     jump_tables: Option<Vec<u8>>,
-    /// Per attachment: pixel format, blend, write mask, program output.
+    /// Per color attachment: pixel format, blend, write mask, program
+    /// output.
     attachments: Vec<(usize, Option<Blend>, u8, usize)>,
     /// Whether the function tests alpha (its function and reference are
     /// draw-time values).
     alpha_test: bool,
+    /// The depth buffer's format and whether depth is written (the
+    /// comparison and clamp range are draw-time values).
+    depth: Option<(DepthFormat, bool)>,
 }
 
 /// The Metal renderer of one channel.
@@ -288,6 +324,8 @@ pub struct Draw<'a> {
     pub texture_buffer_index: u32,
     /// The alpha test (see `raster::Backend::alpha_test`).
     pub alpha_test: Option<(Compare, f32)>,
+    /// The depth buffer and test (see `raster::Backend::depth`).
+    pub depth: Option<(Surface, DepthOutput)>,
 }
 
 impl Renderer {
@@ -460,8 +498,28 @@ impl Renderer {
             Ok(t) => t,
             Err(reason) => return self.fall_back(format!("pixel program: {reason}")),
         };
-        if draw.program.header().ps_writes_depth() {
-            return self.fall_back("pixel program writes depth".into());
+        if draw.depth.is_some() && !Self::gpu().fetch {
+            return self.fall_back("depth test without framebuffer fetch".into());
+        }
+        // Per triangle: the exact coverage test and the depth plane (see
+        // `Translated::source`).
+        let mut triangle_words = Vec::with_capacity(draw.triangles.len() * msl::TRIANGLE_WORDS);
+        for triangle in draw.triangles {
+            let (vertices, outside) = triangle.edges();
+            for coordinate in vertices.into_iter().flatten() {
+                let Ok(coordinate) = i32::try_from(coordinate) else {
+                    return self.fall_back("vertex beyond 2^23 pixels".into());
+                };
+                triangle_words.push(coordinate as u32);
+            }
+            triangle_words.push(
+                outside
+                    .iter()
+                    .enumerate()
+                    .fold(0, |bits, (edge, &o)| bits | (u32::from(o) << edge)),
+            );
+            let depth = triangle.depth;
+            triangle_words.extend([depth.dx, depth.dy, depth.base].map(f32::to_bits));
         }
         // Slots read at register offsets (LDC): their readable part of the
         // bound range, in words, and its size in bytes (see
@@ -555,17 +613,21 @@ impl Renderer {
             let surface = draw.surfaces[color.window];
             attachments.push((surface, color, pixel_format));
         }
-        if attachments.is_empty() {
-            return self.fall_back("draw without color targets".into());
+        if attachments.len() == 8 && draw.depth.is_some() {
+            return self.fall_back("depth test with eight color targets".into());
         }
-        let residents = self.residents(
-            memory,
-            writes,
-            &attachments
-                .iter()
-                .map(|a| (a.0, a.1.format))
-                .collect::<Vec<_>>(),
-        )?;
+        if attachments.is_empty() && draw.depth.is_none() {
+            return self.fall_back("draw without color or depth targets".into());
+        }
+        let targets: Vec<(Surface, Content)> = attachments
+            .iter()
+            .map(|a| (a.0, Content::Color(a.1.format)))
+            .chain(
+                draw.depth
+                    .map(|(surface, depth)| (surface, Content::Depth(depth.format))),
+            )
+            .collect();
+        let residents = self.residents(memory, writes, &targets)?;
 
         let mut state = self.state.lock().unwrap();
         let gpu = Self::gpu();
@@ -590,14 +652,24 @@ impl Renderer {
                 })
                 .collect(),
             alpha_test: draw.alpha_test.is_some(),
+            depth: draw.depth.map(|(_, depth)| (depth.format, depth.write)),
         };
         let pipeline = match state.pipelines.get(&key) {
             Some(p) => p.clone(),
             None => {
                 let outputs: Vec<usize> = key.attachments.iter().map(|a| a.3).collect();
-                let source = translated.source(draw.program, &outputs, key.alpha_test);
+                let source = translated.source(
+                    draw.program,
+                    &outputs,
+                    key.alpha_test,
+                    key.depth.map(|d| d.0),
+                );
                 let library = state.library(gpu, source)?;
-                let pipeline = build_pipeline(gpu, &library, "fragment_main", &key.attachments)?;
+                let depth = key
+                    .depth
+                    .map(|(format, write)| (format::depth_pixel_format(format), write));
+                let pipeline =
+                    build_pipeline(gpu, &library, "fragment_main", &key.attachments, depth)?;
                 state.pipelines.insert(key.clone(), pipeline.clone(), 1);
                 pipeline
             }
@@ -628,22 +700,23 @@ impl Renderer {
             };
             gpu_textures.push((metal, sampler));
         }
-        // Geometry: window positions to normalized device coordinates of
-        // a viewport covering the first target.
-        let width = attachments[0].0.width as f32;
-        let height = attachments[0].0.height as f32;
-        let mut positions = Vec::with_capacity(draw.triangles.len() * 12);
+        // Geometry: each triangle's pixel bounding box as two triangles,
+        // in normalized device coordinates of a viewport covering the
+        // first target; the fragment function keeps the pixels the
+        // triangle covers. The box's edges lie half a pixel from the
+        // nearest pixel center, so how Metal rounds them does not matter,
+        // and Metal's fill rule gives each pixel of the box to one half.
+        let (width, height) = (targets[0].0.width as f32, targets[0].0.height as f32);
+        let mut positions = Vec::with_capacity(draw.triangles.len() * 24);
         let mut planes =
             Vec::with_capacity(draw.triangles.len() * translated.ipa_words.len().max(1) * 3);
         for triangle in draw.triangles {
-            for [x, y] in triangle.vertices() {
-                let depth = triangle.depth.base + triangle.depth.dx * x + triangle.depth.dy * y;
-                positions.extend_from_slice(&[
-                    x / width * 2.0 - 1.0,
-                    1.0 - y / height * 2.0,
-                    depth.clamp(0.0, 1.0),
-                    1.0,
-                ]);
+            let b = triangle.bounds();
+            let x = |x: u32| x as f32 / width * 2.0 - 1.0;
+            let y = |y: u32| 1.0 - y as f32 / height * 2.0;
+            let (x0, y0, x1, y1) = (x(b.x0), y(b.y0), x(b.x1), y(b.y1));
+            for [x, y] in [[x0, y0], [x1, y0], [x0, y1], [x1, y0], [x1, y1], [x0, y1]] {
+                positions.extend_from_slice(&[x, y, 0.0, 1.0]);
             }
             if translated.ipa_words.is_empty() {
                 planes.extend_from_slice(&[0.0; 3]);
@@ -663,10 +736,12 @@ impl Renderer {
         for &(slot, _) in &unbound {
             fault_words[2 * slot] = 1;
         }
-        let encoder = state.encoder(
-            &residents,
-            &attachments.iter().map(|a| a.1.srgb).collect::<Vec<_>>(),
-        )?;
+        let srgb: Vec<bool> = attachments
+            .iter()
+            .map(|a| a.1.srgb)
+            .chain(draw.depth.map(|_| false))
+            .collect();
+        let encoder = state.encoder(&residents, &srgb)?;
         encoder.setRenderPipelineState(&pipeline);
         encoder.setViewport(MTLViewport {
             originX: 0.0,
@@ -676,12 +751,11 @@ impl Renderer {
             znear: 0.0,
             zfar: 1.0,
         });
-        encoder.setDepthClipMode(MTLDepthClipMode::Clamp);
         let scissor = draw.bounds.intersect(&Rect {
             x0: 0,
             y0: 0,
-            x1: attachments.iter().map(|a| a.0.width).min().unwrap_or(0),
-            y1: attachments.iter().map(|a| a.0.height).min().unwrap_or(0),
+            x1: targets.iter().map(|t| t.0.width).min().unwrap_or(0),
+            y1: targets.iter().map(|t| t.0.height).min().unwrap_or(0),
         });
         if scissor.is_empty() {
             return Ok(true);
@@ -710,20 +784,24 @@ impl Renderer {
                 bind(gpu, &encoder, Stage::Fragment, bytes_of_u32(&sizes), 20)?;
             }
             if let Some((compare, reference)) = draw.alpha_test {
-                // The comparison numbering of `Translated::source`.
-                let function = match compare {
-                    Compare::Never => 0u32,
-                    Compare::Less => 1,
-                    Compare::Equal => 2,
-                    Compare::LessEqual => 3,
-                    Compare::Greater => 4,
-                    Compare::NotEqual => 5,
-                    Compare::GreaterEqual => 6,
-                    Compare::Always => 7,
-                };
-                let words = [function, reference.to_bits()];
+                let words = [compare_number(compare), reference.to_bits()];
                 bind(gpu, &encoder, Stage::Fragment, bytes_of_u32(&words), 22)?;
             }
+            if let Some((_, depth)) = draw.depth {
+                let words = [
+                    compare_number(depth.compare),
+                    depth.clamp.0.to_bits(),
+                    depth.clamp.1.to_bits(),
+                ];
+                bind(gpu, &encoder, Stage::Fragment, bytes_of_u32(&words), 23)?;
+            }
+            bind(
+                gpu,
+                &encoder,
+                Stage::Fragment,
+                bytes_of_u32(&triangle_words),
+                24,
+            )?;
             for (i, (texture, sampler)) in gpu_textures.iter().enumerate() {
                 encoder.setFragmentTexture_atIndex(Some(texture), i);
                 encoder.setFragmentSamplerState_atIndex(Some(sampler), i);
@@ -744,10 +822,14 @@ impl Renderer {
             encoder.drawPrimitives_vertexStart_vertexCount(
                 MTLPrimitiveType::Triangle,
                 0,
-                draw.triangles.len() * 3,
+                draw.triangles.len() * 6,
             );
         }
-        for &index in &residents {
+        // A depth buffer the draw does not write stays clean.
+        for (&index, (_, content)) in residents.iter().zip(&targets) {
+            if matches!(content, Content::Depth(_)) && draw.depth.is_some_and(|d| !d.1.write) {
+                continue;
+            }
             state.rendered(index, scissor, writes);
             self.any_dirty
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -780,7 +862,7 @@ impl Renderer {
         if rect.is_empty() {
             return Ok(true);
         }
-        let residents = self.residents(memory, writes, &[(surface, format)])?;
+        let residents = self.residents(memory, writes, &[(surface, Content::Color(format))])?;
         let mut state = self.state.lock().unwrap();
         let gpu = Self::gpu();
         let key = (pixel_format.0, components);
@@ -793,6 +875,7 @@ impl Renderer {
                     &library,
                     "clear_main",
                     &[(pixel_format.0, None, components, 0)],
+                    None,
                 )?;
                 state.clear_pipelines.insert(key, p.clone());
                 p
@@ -825,13 +908,114 @@ impl Renderer {
         Ok(true)
     }
 
+    /// A depth/stencil clear on Metal: each texel of `rect` of the depth
+    /// buffer becomes `apply` of it. `apply` must set each bit to a
+    /// constant or leave it (as `DepthFormat::write_depth` and
+    /// `write_stencil` do); the clear is then the same bitwise operation
+    /// on the buffer's words, found by applying it to texels of all zeros
+    /// and all ones, and checked on two more.
+    pub fn clear_depth(
+        &self,
+        memory: &dyn GpuMemory,
+        writes: &Writes,
+        (surface, format): (Surface, DepthFormat),
+        rect: Rect,
+        apply: impl Fn(&mut [u8]),
+    ) -> Result<bool, Unmodeled> {
+        if !Self::gpu().fetch {
+            return self.fall_back("depth clear without framebuffer fetch".into());
+        }
+        let bytes = format.bytes_per_pixel() as usize;
+        let probe = |fill: u8| {
+            let mut texel = vec![fill; bytes];
+            apply(&mut texel);
+            texel
+        };
+        let (zeros, ones) = (probe(0), probe(0xFF));
+        let keep: Vec<u8> = zeros.iter().zip(&ones).map(|(a, b)| a ^ b).collect();
+        for fill in [0x55, 0xA6] {
+            let expected: Vec<u8> = (0..bytes).map(|i| (fill & keep[i]) | zeros[i]).collect();
+            if probe(fill) != expected {
+                return self.fall_back("depth clear that is not bitwise".into());
+            }
+        }
+        // Keep and set masks per word (a 16-bit texel in the low half).
+        let word = |bytes: &[u8], i: usize| {
+            let mut w = [0u8; 4];
+            for (k, b) in w.iter_mut().enumerate() {
+                *b = bytes.get(4 * i + k).copied().unwrap_or(0);
+            }
+            u32::from_le_bytes(w)
+        };
+        let masks = [
+            word(&keep, 0),
+            word(&zeros, 0),
+            word(&keep, 1),
+            word(&zeros, 1),
+        ];
+        let rect = rect.intersect(&Rect {
+            x0: 0,
+            y0: 0,
+            x1: surface.width,
+            y1: surface.height,
+        });
+        if rect.is_empty() {
+            return Ok(true);
+        }
+        let residents = self.residents(memory, writes, &[(surface, Content::Depth(format))])?;
+        let mut state = self.state.lock().unwrap();
+        let gpu = Self::gpu();
+        let pixel_format = format::depth_pixel_format(format);
+        let key = (pixel_format.0, u8::MAX);
+        let pipeline = match state.clear_pipelines.get(&key) {
+            Some(p) => p.clone(),
+            None => {
+                let library =
+                    state.library(gpu, format!("{CLEAR_SOURCE}{DEPTH_CLEAR_FUNCTIONS}"))?;
+                let function = if pixel_format == MTLPixelFormat::RG32Uint {
+                    "clear_words"
+                } else {
+                    "clear_word"
+                };
+                let p = build_pipeline(gpu, &library, function, &[], Some((pixel_format, true)))?;
+                state.clear_pipelines.insert(key, p.clone());
+                p
+            }
+        };
+        let encoder = state.encoder(&residents, &[false])?;
+        encoder.setRenderPipelineState(&pipeline);
+        encoder.setViewport(MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: f64::from(surface.width),
+            height: f64::from(surface.height),
+            znear: 0.0,
+            zfar: 1.0,
+        });
+        encoder.setScissorRect(MTLScissorRect {
+            x: rect.x0 as usize,
+            y: rect.y0 as usize,
+            width: (rect.x1 - rect.x0) as usize,
+            height: (rect.y1 - rect.y0) as usize,
+        });
+        // SAFETY: as in `draw`.
+        unsafe {
+            bind(gpu, &encoder, Stage::Fragment, bytes_of_u32(&masks), 0)?;
+            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+        }
+        state.rendered(residents[0], rect, writes);
+        self.any_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(true)
+    }
+
     /// The residents for `targets`, created, checked against guest memory
     /// or reloaded as needed; their indices.
     fn residents(
         &self,
         memory: &dyn GpuMemory,
         writes: &Writes,
-        targets: &[(Surface, ColorFormat)],
+        targets: &[(Surface, Content)],
     ) -> Result<Vec<usize>, Unmodeled> {
         self.state.lock().unwrap().trim_residents(targets);
         // A resident of other dimensions or format at overlapping memory is
@@ -909,7 +1093,7 @@ impl Renderer {
                     indices.push(index);
                 }
                 None => {
-                    let pixel_format = format::pixel_format(format).expect("checked by the caller");
+                    let pixel_format = format.pixel_format().expect("checked by the caller");
                     let mut window = Window::load(memory, surface, full)?;
                     let stamp = writes.stamp();
                     let texture =
@@ -973,7 +1157,7 @@ impl State {
     /// of an open pass, and no index is held), drops the least recently
     /// used residents other than `targets` while all of them take more
     /// than [`RESIDENT_BUDGET`]. Guest memory holds everything they hold.
-    fn trim_residents(&mut self, targets: &[(Surface, ColorFormat)]) {
+    fn trim_residents(&mut self, targets: &[(Surface, Content)]) {
         if self.frame.is_some() {
             return;
         }
@@ -1161,6 +1345,32 @@ vertex Vertex vertex_main(uint id [[vertex_id]]) {
 fragment float4 clear_main(const device float4* color [[buffer(0)]]) { return color[0]; }
 "#;
 
+/// The depth clear's fragment functions (after [`CLEAR_SOURCE`]): the
+/// texel's words kept where `masks` (keep, set per word) keep them, set
+/// elsewhere (see [`Renderer::clear_depth`]).
+const DEPTH_CLEAR_FUNCTIONS: &str = r#"
+fragment uint clear_word(uint old [[color(0)]], constant uint* masks [[buffer(0)]]) {
+    return (old & masks[0]) | masks[1];
+}
+fragment uint2 clear_words(uint2 old [[color(0)]], constant uint* masks [[buffer(0)]]) {
+    return (old & uint2(masks[0], masks[2])) | uint2(masks[1], masks[3]);
+}
+"#;
+
+/// The comparison numbering of [`Translated::source`].
+fn compare_number(compare: Compare) -> u32 {
+    match compare {
+        Compare::Never => 0,
+        Compare::Less => 1,
+        Compare::Equal => 2,
+        Compare::LessEqual => 3,
+        Compare::Greater => 4,
+        Compare::NotEqual => 5,
+        Compare::GreaterEqual => 6,
+        Compare::Always => 7,
+    }
+}
+
 fn compile_library(gpu: &Gpu, source: &str) -> Result<Retained<Library>, Unmodeled> {
     let options = MTLCompileOptions::new();
     options.setMathMode(MTLMathMode::Safe);
@@ -1169,11 +1379,15 @@ fn compile_library(gpu: &Gpu, source: &str) -> Result<Retained<Library>, Unmodel
         .map_err(|e| Unmodeled(format!("Metal: shader compilation failed: {e}\n{source}")))
 }
 
+/// A pipeline of `vertex_main` and `fragment` with color `attachments`
+/// (pixel format, blend, write mask, program output) and, after them, the
+/// depth buffer's words `depth` (pixel format, written), never blended.
 fn build_pipeline(
     gpu: &Gpu,
     library: &Library,
     fragment: &str,
     attachments: &[(usize, Option<Blend>, u8, usize)],
+    depth: Option<(MTLPixelFormat, bool)>,
 ) -> Result<Retained<Pipeline>, Unmodeled> {
     let vertex = library
         .newFunctionWithName(&NSString::from_str("vertex_main"))
@@ -1212,6 +1426,20 @@ fn build_pipeline(
             attachment.setSourceAlphaBlendFactor(factor(blend.alpha_source));
             attachment.setDestinationAlphaBlendFactor(factor(blend.alpha_destination));
         }
+    }
+    if let Some((pixel_format, write)) = depth {
+        // SAFETY: fewer than 8 attachments with the colors.
+        let attachment = unsafe {
+            descriptor
+                .colorAttachments()
+                .objectAtIndexedSubscript(attachments.len())
+        };
+        attachment.setPixelFormat(pixel_format);
+        attachment.setWriteMask(if write {
+            MTLColorWriteMask::All
+        } else {
+            MTLColorWriteMask::None
+        });
     }
     gpu.device
         .newRenderPipelineStateWithDescriptor_error(&descriptor)

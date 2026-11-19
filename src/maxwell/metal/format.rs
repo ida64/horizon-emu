@@ -6,7 +6,7 @@ use objc2_metal::{MTLPixelFormat, MTLSamplerBorderColor};
 
 use super::super::blend::{Blend, Factor};
 use super::super::sampling::Target;
-use super::super::texture::format::ColorFormat;
+use super::super::texture::format::{ColorFormat, DepthFormat};
 use super::super::texture::{Texture, Tsc};
 
 /// The Metal pixel format with the same bytes per pixel and component
@@ -44,9 +44,25 @@ pub fn pixel_format(format: ColorFormat) -> Option<MTLPixelFormat> {
     })
 }
 
+/// The Metal pixel format holding a depth buffer of `format` as its raw
+/// words, one texel per pixel with the surface's bytes: the depth test
+/// reads and writes them in the fragment function with the format's own
+/// encoding (`DepthFormat::read_depth`, `write_depth`), so stencil bits
+/// and the 24-bit UNORM layouts (which Apple GPUs have no depth format
+/// for) are kept exactly.
+pub fn depth_pixel_format(format: DepthFormat) -> MTLPixelFormat {
+    match format {
+        DepthFormat::Z16Unorm => MTLPixelFormat::R16Uint,
+        DepthFormat::Z32FloatX24S8 => MTLPixelFormat::RG32Uint,
+        DepthFormat::Z32Float | DepthFormat::Z24S8 | DepthFormat::X8Z24 | DepthFormat::S8Z24 => {
+            MTLPixelFormat::R32Uint
+        }
+    }
+}
+
 /// The sRGB view format of a linear 8-bit format (Metal converts linear
-/// shader output to sRGB on write and back for blending, as
-/// `SET_SRGB_WRITE` asks); other formats unchanged.
+/// shader output to sRGB on write and back for blending, as a target of
+/// an sRGB format does); other formats unchanged.
 pub fn srgb(format: MTLPixelFormat) -> MTLPixelFormat {
     match format {
         MTLPixelFormat::RGBA8Unorm => MTLPixelFormat::RGBA8Unorm_sRGB,

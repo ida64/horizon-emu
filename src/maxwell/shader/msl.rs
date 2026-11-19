@@ -76,6 +76,7 @@ use super::Program;
 use super::decode::Op;
 use super::exec::{bit, bits, branch_target, is_branch_to_self, sext};
 use super::header::ShaderType;
+use crate::maxwell::texture::format::DepthFormat;
 
 const RZ: u32 = 255;
 /// Entries of a lane's reconvergence stack (the interpreter's
@@ -85,6 +86,9 @@ const PT: u32 = 7;
 
 /// Constant buffer slots a stage has (`Env::const_buffers`).
 const SLOTS: u32 = 18;
+
+/// Words per triangle of the triangle buffer (see [`Translated::source`]).
+pub const TRIANGLE_WORDS: usize = 10;
 
 /// A pixel program in MSL, and what a draw must supply for it.
 #[derive(Debug, Clone)]
@@ -464,6 +468,59 @@ static inline float plane(const device float* planes, uint k, float x, float y) 
     uint i = k * 3u;
     return (planes[i + 2] + planes[i] * x) + planes[i + 1] * y;
 }
+/// `raster::Compare::test` by the numbering of `Translated::source`.
+static inline bool compare(uint f, float a, float b) {
+    return f == 1u ? a < b : f == 2u ? a == b : f == 3u ? a <= b : f == 4u ? a > b : f == 5u ? a != b : f == 6u ? a >= b : f == 7u;
+}
+/// `raster::Triangle::covers`: whether the center of the pixel at window
+/// position (x, y) (a pixel center) is inside triangle `t` (see
+/// `Translated::source`), with the 1/256-pixel edge functions and the
+/// top-left rule of the software rasterizer.
+static inline bool covers(const device int* t, float x, float y) {
+    const long cx = (long(x - 0.5f) << 8) + 128;
+    const long cy = (long(y - 0.5f) << 8) + 128;
+    bool inside = true;
+    for (uint e = 0u; e < 3u; e++) {
+        const uint n = e == 2u ? 0u : e + 1u;
+        const long ax = t[2u * e], ay = t[2u * e + 1u], bx = t[2u * n], by = t[2u * n + 1u];
+        const long o = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+        const long bias = ((uint(t[6]) >> e) & 1u) != 0u ? -1 : 0;
+        inside = inside && o + bias >= 0;
+    }
+    return inside;
+}
+/// `unorm_to_f32(v, n)` for n = 16 or 24: v / (2^n - 1) correctly
+/// rounded, which the interpreter's f64 quotient rounded to f32 is (a
+/// double rounding would need 28 equal bits in a row of the quotient,
+/// whose bits repeat v's n bits). Those bits give the 24 significant bits
+/// from v's leading one and the rounding bit from two or three copies of
+/// v, and the bits after them are never all zero (0 < v < 2^n - 1): no tie.
+static inline float unorm_to_float(uint v, uint n) {
+    const uint top = (1u << n) - 1u;
+    if (v == 0u) { return 0.0f; }
+    if (v >= top) { return 1.0f; }
+    const uint copies = n == 16u ? 32u : 24u;
+    const ulong w = n == 16u ? (ulong(v) << 32) | (ulong(v) << 16) | ulong(v) : (ulong(v) << 24) | ulong(v);
+    const uint lead = 31u - clz(v);
+    const uint p = copies + lead;
+    const uint m = uint(w >> (p - 23u)) & 0xffffffu;
+    const uint round = uint(w >> (p - 24u)) & 1u;
+    const int e = int(lead) - 23 - int(n);
+    return float(m + round) * as_type<float>(uint(127 + e) << 23);
+}
+/// `f32_to_unorm(v, n)` for n <= 24: floor(v (2^n - 1) + 1/2) of v clamped
+/// to [0, 1] (NaN 0), exactly, as the interpreter's f64 arithmetic.
+static inline uint float_to_unorm(float v, uint n) {
+    if (isnan(v) || !(v > 0.0f)) { return 0u; }
+    if (v >= 1.0f) { return (1u << n) - 1u; }
+    const uint bits = as_type<uint>(v);
+    const uint biased = bits >> 23;
+    const ulong m = biased == 0u ? ulong(bits & 0x7fffffu) : ulong((bits & 0x7fffffu) | 0x800000u);
+    // v = m 2^-s.
+    const uint s = biased == 0u ? 149u : 150u - biased;
+    if (s > 62u) { return 0u; }
+    return uint((m * ulong((1u << n) - 1u) + (1ul << (s - 1u))) >> s);
+}
 
 struct Vertex { float4 position [[position]]; };
 
@@ -482,23 +539,32 @@ impl Translated {
     /// positions from buffer 0) and the fragment function
     /// `fragment_main`, whose color attachment `i` receives the pixel
     /// program's output target `outputs[i]` (components the SPH does not
-    /// declare are 0). With an SPH depth output, `Output` also has
-    /// `depth [[depth(any)]]`.
+    /// declare are 0).
     ///
-    /// Fragment bindings: buffer 0 the primitive planes (per primitive,
-    /// `ipa_words.len().max(1)` planes of (dx, dy, base), indexed by
-    /// `[[primitive_id]]`), buffer 1 the texture LOD biases (one f32 per
-    /// texture slot), buffer `2 + slot` constant buffer `slot` as words
-    /// (for [`Translated::indirect`] slots the readable part of the bound
-    /// range, padded to a multiple of 4 bytes), buffer 20 the sizes in
-    /// bytes of those readable parts for the 18 slots (u32 each; bound only
-    /// when `indirect` is not empty: indexed reads past it return 0, which
-    /// is the interpreter's value past the bound size, and its refusal
-    /// where the bound range is not mapped); texture and sampler `i` for
-    /// `textures[i]`; buffer 21, when there are textures, the texture
-    /// fault words: word `2i` non-zero marks texture `i` as unbound (its
-    /// handle names no texture; a placeholder is bound), and a sample of
-    /// such a texture sets word `2i + 1` (see `texture.rs`).
+    /// Each set-up triangle is drawn as two Metal triangles covering its
+    /// pixel bounding box (primitives `2t` and `2t + 1` for triangle `t`),
+    /// and a fragment is kept only where `raster::Triangle::covers` holds:
+    /// pixels on an edge are decided by the software rasterizer's exact
+    /// rule, not by Metal's (which sees the vertices as rounded floats).
+    ///
+    /// Fragment bindings: buffer 0 the triangle planes (per triangle,
+    /// `ipa_words.len().max(1)` planes of (dx, dy, base)), buffer 1 the
+    /// texture LOD biases (one f32 per texture slot), buffer `2 + slot`
+    /// constant buffer `slot` as words (for [`Translated::indirect`] slots
+    /// the readable part of the bound range, padded to a multiple of 4
+    /// bytes), buffer 20 the sizes in bytes of those readable parts for the
+    /// 18 slots (u32 each; bound only when `indirect` is not empty: indexed
+    /// reads past it return 0, which is the interpreter's value past the
+    /// bound size, and its refusal where the bound range is not mapped);
+    /// texture and sampler `i` for `textures[i]`; buffer 21, when there are
+    /// textures, the texture fault words: word `2i` non-zero marks texture
+    /// `i` as unbound (its handle names no texture; a placeholder is
+    /// bound), and a sample of such a texture sets word `2i + 1` (see
+    /// `texture.rs`); buffer 24 [`TRIANGLE_WORDS`] words per triangle:
+    /// the snapped vertices (x, y in 1/256 pixels, i32) in edge order,
+    /// a word whose bit `e` marks edge `e` as not top-left
+    /// (`raster::Triangle::edges`), and the depth plane (dx, dy, base,
+    /// f32).
     ///
     /// With `alpha_test`, buffer 22 holds the alpha test as two words: the
     /// comparison (0 never, 1 less, 2 equal, 3 less-or-equal, 4 greater, 5
@@ -507,15 +573,57 @@ impl Translated {
     /// program and before any output (the software back end's order). The
     /// comparison is a draw-time value, so one pipeline serves every
     /// function and reference.
-    pub fn source(&self, program: &Program, outputs: &[usize], alpha_test: bool) -> String {
-        let header = &program.header;
+    ///
+    /// With `depth`, color attachment `outputs.len()` is the depth buffer
+    /// of that format as its raw words (see `metal::depth_pixel_format`),
+    /// read in the fragment function (Apple GPUs order such reads of one
+    /// pixel by primitive), and buffer 23 holds the depth test as three
+    /// words: the comparison (numbered as the alpha test's) and the clamp
+    /// range (two f32). The fragment depth (the program's depth output if
+    /// it has one, else the depth plane at the pixel center), clamped, is
+    /// compared with the stored depth as `raster::shade_quad` does, after
+    /// the alpha test; a failing fragment is discarded, a passing one
+    /// stores its depth with the format's encoding, other bits kept (the
+    /// pipeline's write mask drops the store when depth writes are off).
+    pub fn source(
+        &self,
+        program: &Program,
+        outputs: &[usize],
+        alpha_test: bool,
+        depth: Option<DepthFormat>,
+    ) -> String {
         let mut s = String::from(PRELUDE);
+        // The depth attachment's words and how its depth is read and
+        // written (`DepthFormat::read_depth`, `write_depth`).
+        let depth = depth.map(|format| match format {
+            DepthFormat::Z32Float => ("uint", "as_type<float>(zin)", "as_type<uint>(z)"),
+            DepthFormat::Z32FloatX24S8 => (
+                "uint2",
+                "as_type<float>(zin.x)",
+                "uint2(as_type<uint>(z), zin.y)",
+            ),
+            DepthFormat::Z16Unorm => (
+                "uint",
+                "unorm_to_float(zin & 0xffffu, 16u)",
+                "float_to_unorm(z, 16u)",
+            ),
+            DepthFormat::Z24S8 => (
+                "uint",
+                "unorm_to_float(zin >> 8, 24u)",
+                "(zin & 0xffu) | (float_to_unorm(z, 24u) << 8)",
+            ),
+            DepthFormat::X8Z24 | DepthFormat::S8Z24 => (
+                "uint",
+                "unorm_to_float(zin & 0xffffffu, 24u)",
+                "(zin & 0xff000000u) | float_to_unorm(z, 24u)",
+            ),
+        });
         let _ = writeln!(s, "struct Output {{");
         for (attachment, _) in outputs.iter().enumerate() {
             let _ = writeln!(s, "    float4 c{attachment} [[color({attachment})]];");
         }
-        if header.ps_writes_depth() {
-            let _ = writeln!(s, "    float depth [[depth(any)]];");
+        if let Some((words, _, _)) = depth {
+            let _ = writeln!(s, "    {words} z [[color({})]];", outputs.len());
         }
         let _ = writeln!(s, "}};");
         let mut parameters = vec![
@@ -523,6 +631,7 @@ impl Translated {
             "uint primitive [[primitive_id]]".to_string(),
             "const device float* planes [[buffer(0)]]".to_string(),
             "const device float* lod_bias [[buffer(1)]]".to_string(),
+            "const device int* triangles [[buffer(24)]]".to_string(),
         ];
         let slots: BTreeSet<u32> = self
             .constants
@@ -549,6 +658,10 @@ impl Translated {
         if alpha_test {
             parameters.push("constant uint* alpha_test [[buffer(22)]]".to_string());
         }
+        if let Some((words, _, _)) = depth {
+            parameters.push("constant uint* depth_test [[buffer(23)]]".to_string());
+            parameters.push(format!("{words} zin [[color({})]]", outputs.len()));
+        }
         let _ = writeln!(
             s,
             "fragment Output fragment_main({}) {{",
@@ -556,12 +669,15 @@ impl Translated {
         );
         let _ = writeln!(
             s,
-            "    const float px = position.x; const float py = position.y;\n    const uint plane_base = primitive * {}u;",
+            "    const float px = position.x; const float py = position.y;\n    const uint plane_base = (primitive >> 1u) * {}u;\n    const device int* tri = triangles + (primitive >> 1u) * {TRIANGLE_WORDS}u;",
             self.ipa_words.len().max(1)
         );
         s.push_str(&self.body);
-        let _ = writeln!(s, "    if (killed) {{ discard_fragment(); }}");
-        let (registers, depth) = output_registers(program);
+        let _ = writeln!(
+            s,
+            "    if (killed || !covers(tri, px, py)) {{ discard_fragment(); }}"
+        );
+        let (registers, depth_register) = output_registers(program);
         if alpha_test {
             // Output 0 alpha (the draw refuses a test that needs it when
             // the program does not write it).
@@ -571,10 +687,20 @@ impl Translated {
             };
             let _ = writeln!(
                 s,
-                "    {{ const float a = {alpha}; const uint f = alpha_test[0]; const float ref = as_type<float>(alpha_test[1]);\n      const bool pass = f == 1u ? a < ref : f == 2u ? a == ref : f == 3u ? a <= ref : f == 4u ? a > ref : f == 5u ? a != ref : f == 6u ? a >= ref : f == 7u;\n      if (!pass) {{ discard_fragment(); }} }}"
+                "    if (!compare(alpha_test[0], {alpha}, as_type<float>(alpha_test[1]))) {{ discard_fragment(); }}"
             );
         }
         let _ = writeln!(s, "    Output out;");
+        if let Some((_, read, write)) = depth {
+            let incoming = match depth_register {
+                Some(register) => format!("as_type<float>(r{register})"),
+                None => "(as_type<float>(tri[9]) + as_type<float>(tri[7]) * px) + as_type<float>(tri[8]) * py".into(),
+            };
+            let _ = writeln!(
+                s,
+                "    {{ float z = {incoming};\n      const float lo = as_type<float>(depth_test[1]); const float hi = as_type<float>(depth_test[2]);\n      z = z < lo ? lo : (z > hi ? hi : z);\n      if (!compare(depth_test[0], z, {read})) {{ discard_fragment(); }}\n      out.z = {write}; }}"
+            );
+        }
         // Outputs as the interpreter gathers them: each target with a
         // component mask takes the next four registers from R0; depth is
         // one register after the colors.
@@ -595,9 +721,6 @@ impl Translated {
                 None => "float4(0.0f)".into(),
             };
             let _ = writeln!(s, "    out.c{attachment} = {value};");
-        }
-        if let Some(register) = depth {
-            let _ = writeln!(s, "    out.depth = as_type<float>(r{register});");
         }
         let _ = writeln!(s, "    return out;\n}}");
         s

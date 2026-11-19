@@ -526,10 +526,18 @@ fn clears_respect_rectangles_and_component_masks() {
     }
 }
 
+/// Depth and stencil clears, in both renderers (Metal clears its copy of
+/// the depth buffer and writes it back).
 #[test]
 fn depth_and_stencil_clear_together_or_apart() {
+    for kind in [super::RendererKind::Software, super::RendererKind::Metal] {
+        depth_and_stencil_clears(kind);
+    }
+}
+
+fn depth_and_stencil_clears(kind: super::RendererKind) {
     let ram = Ram::new(0x20000);
-    let mut channel = Channel::new();
+    let mut channel = Channel::with_renderer(kind);
     call(&mut channel, &ram, 0, 0, 0xB197);
     initial_state(&mut channel);
     bind_color_target(&mut channel, &ram, 0x1000, 16, 8);
@@ -553,7 +561,8 @@ fn depth_and_stencil_clear_together_or_apart() {
     ] {
         call(&mut channel, &ram, 0, method, value);
     }
-    let words = |ram: &Ram| -> Vec<u32> {
+    let words = |channel: &mut Channel, ram: &Ram| -> Vec<u32> {
+        channel.flush(ram).unwrap();
         ram.bytes(0x4000, 16 * 8 * 4)
             .as_chunks::<4>()
             .0
@@ -563,22 +572,45 @@ fn depth_and_stencil_clear_together_or_apart() {
     };
     // Depth and stencil, as deko3d clears them.
     call(&mut channel, &ram, 0, 0x19d0, 3);
-    assert!(words(&ram).iter().all(|&word| word == 0xFFFF_FF7F));
+    assert!(
+        words(&mut channel, &ram)
+            .iter()
+            .all(|&word| word == 0xFFFF_FF7F),
+        "{kind:?}"
+    );
     // Stencil alone leaves the depth.
     call(&mut channel, &ram, 0, 0x0da0, 1);
     call(&mut channel, &ram, 0, 0x19d0, 2);
-    assert!(words(&ram).iter().all(|&word| word == 0xFFFF_FF01));
+    assert!(
+        words(&mut channel, &ram)
+            .iter()
+            .all(|&word| word == 0xFFFF_FF01),
+        "{kind:?}"
+    );
     // Depth alone leaves the stencil.
     call(&mut channel, &ram, 0, 0x0d90, 0.0f32.to_bits());
     call(&mut channel, &ram, 0, 0x19d0, 1);
-    assert!(words(&ram).iter().all(|&word| word == 0x0000_0001));
+    assert!(
+        words(&mut channel, &ram)
+            .iter()
+            .all(|&word| word == 0x0000_0001),
+        "{kind:?}"
+    );
     // Under the stencil mask (control bit 0, with the viewport clip and
     // clear rect bits as before) only the mask's bits change.
     call(&mut channel, &ram, 0, 0x10f8, 0x1011);
     call(&mut channel, &ram, 0, 0x139c, 0xF0);
     call(&mut channel, &ram, 0, 0x0da0, 0xAA);
     call(&mut channel, &ram, 0, 0x19d0, 2);
-    assert!(words(&ram).iter().all(|&word| word == 0x0000_00A1));
+    assert!(
+        words(&mut channel, &ram)
+            .iter()
+            .all(|&word| word == 0x0000_00A1),
+        "{kind:?}"
+    );
+    if let Some(metal) = &channel.hooks.metal {
+        assert_eq!(metal.fallbacks().1, vec![], "Metal cleared");
+    }
 }
 
 /// The starter applet's ELF, which embeds the nn::ui2d built-in shaders
@@ -969,11 +1001,228 @@ fn position_xyz_quad(kind: super::RendererKind) -> [u8; 4] {
     frame.pixel(20, 20)
 }
 
+/// A target of an sRGB format (`A8BL8GL8RL8`, 0xD6) encodes the program's
+/// linear color with `SET_SRGB_WRITE` (0x15b8) left 0, as the Mii editor
+/// draws its Mii, in both renderers.
+#[test]
+fn srgb_target_encodes_without_srgb_write() {
+    use super::texture::format::linear_to_srgb;
+    let color = [0.25f32, 0.5, 1.0, 1.0];
+    let expected: Vec<u8> = (0..4)
+        .map(|c| {
+            let v = if c < 3 {
+                linear_to_srgb(color[c])
+            } else {
+                color[c]
+            };
+            (v * 255.0).round() as u8
+        })
+        .collect();
+    for kind in [super::RendererKind::Software, super::RendererKind::Metal] {
+        let elf = std::fs::read(STARTER).expect("starter ELF (fw_elf) must be present");
+        let mut frame = Frame::sized_with(SIZE, SIZE, kind);
+        frame.method(0x810, 0xD6); // SET_COLOR_TARGET_FORMAT(0) A8BL8GL8RL8
+        frame.method(0x15b8, 0); // SET_SRGB_WRITE
+        frame.program(1, 0, starter_program(&elf, 0x4c0e00));
+        frame.program(5, 0x800, starter_program(&elf, 0x4be400));
+        frame.constants(0, 3, 0x30_0000, &ui2d_vertex_constants(&[]));
+        frame.constants(4, 3, 0x30_1000, &floats(&color));
+        let quad = [
+            -0.5, -0.5, 0.0, 0.25, -0.5, 0.0, 0.25, 0.75, 0.0, -0.5, 0.75, 0.0,
+        ];
+        frame.vertices(0x40_0000, 12, &quad, &[(0, 0x02)]);
+        frame.method(0x1618, 7);
+        frame.method(0x0d74, 0);
+        frame.method(0x0d78, 4);
+        frame.method(0x1614, 0);
+        frame.channel.flush(&frame.ram).unwrap();
+        assert_eq!(frame.pixel(20, 20).to_vec(), expected, "{kind:?}");
+    }
+}
+
 #[test]
 fn unstored_position_w_is_one() {
     for kind in [super::RendererKind::Software, super::RendererKind::Metal] {
         assert_eq!(position_xyz_quad(kind), [255, 128, 64, 255], "{kind:?}");
     }
+}
+
+/// A small xorshift generator for test data.
+struct Random(u64);
+
+impl Random {
+    fn next(&mut self) -> u32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 16) as u32
+    }
+
+    /// A float in [0, 1) with 24 random bits.
+    fn unit(&mut self) -> f32 {
+        (self.next() >> 8) as f32 / (1 << 24) as f32
+    }
+}
+
+/// Where `depth_tested_frame` puts its depth buffer.
+const DEPTH: u64 = 0x60_0000;
+
+/// The 64x64 frame drawn by `kind` with a block-linear depth buffer of
+/// `SET_ZT_FORMAT` `raw` holding `fill`, the depth test `function`
+/// (`SET_DEPTH_FUNC`) and depth writes `write`: two solid ui2d quads
+/// across the target, each with its own color and its four corners at
+/// different depths (so each of its triangles has its own depth plane).
+/// The color target and the depth buffer after a write-back.
+fn depth_tested_frame(
+    kind: super::RendererKind,
+    raw: u32,
+    function: u32,
+    write: bool,
+    fill: &[u8],
+) -> (Vec<u8>, Vec<u8>) {
+    let elf = std::fs::read(STARTER).expect("starter ELF (fw_elf) must be present");
+    let mut frame = Frame::sized_with(SIZE, SIZE, kind);
+    frame.program(1, 0, starter_program(&elf, 0x4c0e00));
+    frame.program(5, 0x800, starter_program(&elf, 0x4be400));
+    frame.constants(0, 3, 0x30_0000, &ui2d_vertex_constants(&[]));
+    frame.ram.put(DEPTH, fill);
+    for (offset, value) in [
+        (0x0fe0, (DEPTH >> 32) as u32),
+        (0x0fe4, DEPTH as u32),
+        (0x0fe8, raw),
+        (0x0fec, 0),
+        (0x1228, SIZE),
+        (0x122c, SIZE),
+        (0x1230, 1),
+        (0x1538, 1),
+        (0x12cc, 1),
+        (0x130c, function),
+        (0x12e8, u32::from(write)),
+    ] {
+        frame.method(offset, value);
+    }
+    for (i, (color, depths)) in [
+        ([0.25, 0.5, 1.0, 1.0], [-0.9, 0.7, 0.1, -0.2]),
+        ([1.0, 0.25, 0.0, 1.0], [0.8, -0.6, -0.1, 0.3]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        frame.constants(4, 3, 0x30_1000 + 0x100 * i as u64, &floats(&color));
+        let corners = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
+        let quad: Vec<f32> = corners
+            .iter()
+            .zip(depths)
+            .flat_map(|(&[x, y], z)| [x, y, z])
+            .collect();
+        frame.vertices(0x40_0000 + 0x100 * i as u64, 12, &quad, &[(0, 0x02)]);
+        frame.method(0x1618, 7);
+        frame.method(0x0d74, 0);
+        frame.method(0x0d78, 4);
+        frame.method(0x1614, 0);
+    }
+    frame.channel.flush(&frame.ram).unwrap();
+    if let Some(metal) = &frame.channel.hooks.metal {
+        assert_eq!(metal.fallbacks(), (2, vec![]), "Metal drew both quads");
+    }
+    (
+        frame.ram.bytes(TARGET, (SIZE * SIZE * 4) as usize),
+        frame.ram.bytes(DEPTH, fill.len()),
+    )
+}
+
+/// The depth test on Metal gives the software renderer's colors and
+/// depth buffer, bit for bit, for every depth format, several functions,
+/// with and without depth writes, over a buffer of random stored depths
+/// (and stencil bits, which stay).
+#[test]
+fn depth_test_matches_software() {
+    use super::RendererKind::{Metal, Software};
+    use super::texture::format::DepthFormat;
+    let mut random = Random(0x2545_f491_4f6c_dd1d);
+    for raw in [0x0a, 0x13, 0x14, 0x15, 0x16, 0x19] {
+        let format = DepthFormat::from_raw(raw).unwrap();
+        let bytes = format.bytes_per_pixel() as usize;
+        let mut fill = vec![0u8; (SIZE * SIZE) as usize * bytes];
+        for texel in fill.chunks_mut(bytes) {
+            for byte in texel.iter_mut() {
+                *byte = random.next() as u8;
+            }
+            if !format.is_unorm() {
+                // Normal floats in [0, 1).
+                texel[..4].copy_from_slice(&random.unit().max(1e-30).to_le_bytes());
+            }
+        }
+        // OGL_LESS, OGL_LEQUAL, D3D_GREATER, D3D_GREATEREQUAL.
+        for function in [0x201, 0x203, 5, 7] {
+            for write in [true, false] {
+                let software = depth_tested_frame(Software, raw, function, write, &fill);
+                let metal = depth_tested_frame(Metal, raw, function, write, &fill);
+                let what = format!("{format:?} function {function:#x} write {write}");
+                // Both quads and the clear color show: the test both
+                // passed and failed.
+                let mut colors: Vec<&[u8]> = software.0.chunks(4).collect();
+                colors.sort();
+                colors.dedup();
+                assert!(colors.len() >= 2, "{what}: {colors:?}");
+                assert!(software.0 == metal.0, "{what}: colors differ");
+                assert!(software.1 == metal.1, "{what}: depth buffers differ");
+                assert_eq!(software.1 != fill, write, "{what}: depth written");
+            }
+        }
+    }
+}
+
+/// Triangles with vertices on pixel centers and pixel edges of a target
+/// whose size is no power of two (so window positions are not exact in
+/// Metal's normalized coordinates) cover the same pixels on Metal as in
+/// the software rasterizer (8-bit sub-pixel snapping, top-left rule).
+#[test]
+fn exact_edges_match_software() {
+    use super::RendererKind::{Metal, Software};
+    let (width, height) = (60u32, 36u32);
+    let image = |kind| {
+        let elf = std::fs::read(STARTER).expect("starter ELF (fw_elf) must be present");
+        let mut frame = Frame::sized_with(width, height, kind);
+        frame.program(1, 0, starter_program(&elf, 0x4c0e00));
+        frame.program(5, 0x800, starter_program(&elf, 0x4be400));
+        frame.constants(0, 3, 0x30_0000, &ui2d_vertex_constants(&[]));
+        let mut random = Random(0x9e37_79b9_7f4a_7c15);
+        let draws = 48u64;
+        for i in 0..draws {
+            let color = [random.unit(), random.unit(), random.unit(), 1.0];
+            frame.constants(4, 3, 0x30_1000 + 0x100 * i, &floats(&color));
+            // Corners on the half-pixel grid, in normalized coordinates.
+            let triangle: Vec<f32> = (0..3)
+                .flat_map(|_| {
+                    let x = (random.next() % (2 * width + 1)) as f32 / 2.0;
+                    let y = (random.next() % (2 * height + 1)) as f32 / 2.0;
+                    [
+                        x / width as f32 * 2.0 - 1.0,
+                        y / height as f32 * 2.0 - 1.0,
+                        0.0,
+                    ]
+                })
+                .collect();
+            frame.vertices(0x40_0000 + 0x100 * i, 12, &triangle, &[(0, 0x02)]);
+            frame.method(0x1618, 4); // BEGIN triangles
+            frame.method(0x0d74, 0);
+            frame.method(0x0d78, 3);
+            frame.method(0x1614, 0);
+        }
+        frame.channel.flush(&frame.ram).unwrap();
+        if let Some(metal) = &frame.channel.hooks.metal {
+            assert_eq!(metal.fallbacks().1, vec![], "Metal drew every triangle");
+        }
+        frame.ram.bytes(TARGET, (width * height * 4) as usize)
+    };
+    let software = image(Software);
+    let metal = image(Metal);
+    let differing: Vec<(u32, u32)> = (0..width * height)
+        .filter(|&i| software[4 * i as usize..][..4] != metal[4 * i as usize..][..4])
+        .map(|i| (i % width, i / width))
+        .collect();
+    assert!(differing.is_empty(), "pixels differ: {differing:?}");
 }
 
 /// A draw whose pixel program names a texture slot the draw leaves unset

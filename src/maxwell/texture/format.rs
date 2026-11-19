@@ -663,7 +663,7 @@ fn encode_float(value: f32, bits: u8) -> u32 {
 /// and UINT G). `ZF32_X24S8` is a float32 depth word followed by a word
 /// with stencil in bits 0-7. The stencil-only `S8` and the VCAA formats
 /// are not modeled ([`DepthFormat::from_raw`] returns `None`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DepthFormat {
     /// `ZF32` (0x0A).
     Z32Float,

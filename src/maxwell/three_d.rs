@@ -915,24 +915,32 @@ impl ThreeD {
             };
             let depth = f32::from_bits(r.get(SET_Z_CLEAR_VALUE * 4));
             let stencil = r.get(SET_STENCIL_CLEAR_VALUE * 4) as u8;
-            let mut window = Window::load(memory, surface, rect)?;
-            for mut band in window.bands_mut() {
-                for y in band.y0.max(rect.y0)..(band.y0 + 8).min(rect.y1) {
-                    for x in rect.x0..rect.x1.min(surface.width) {
-                        let texel = band.pixel_mut(x, y);
-                        if argument & 1 != 0 {
-                            format.write_depth(depth, texel);
-                        }
-                        if argument & 2 != 0
-                            && let Some(kept) = format.read_stencil(texel)
-                        {
-                            let merged = kept & !stencil_mask | stencil & stencil_mask;
-                            format.write_stencil(merged, texel);
+            let apply = |texel: &mut [u8]| {
+                if argument & 1 != 0 {
+                    format.write_depth(depth, texel);
+                }
+                if argument & 2 != 0
+                    && let Some(kept) = format.read_stencil(texel)
+                {
+                    let merged = kept & !stencil_mask | stencil & stencil_mask;
+                    format.write_stencil(merged, texel);
+                }
+            };
+            if let Some(metal) = &hooks.metal
+                && metal.clear_depth(memory, &hooks.writes, (surface, format), rect, apply)?
+            {
+                // Done on the GPU.
+            } else {
+                let mut window = Window::load(memory, surface, rect)?;
+                for mut band in window.bands_mut() {
+                    for y in band.y0.max(rect.y0)..(band.y0 + 8).min(rect.y1) {
+                        for x in rect.x0..rect.x1.min(surface.width) {
+                            apply(band.pixel_mut(x, y));
                         }
                     }
                 }
+                window.store(memory)?;
             }
-            window.store(memory)?;
         }
         Ok(())
     }

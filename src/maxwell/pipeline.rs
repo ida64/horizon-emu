@@ -212,7 +212,6 @@ const SET_TEX_SAMPLER_POOL_C: u32 = 0x1564;
 const SET_TEX_HEADER_POOL_A: u32 = 0x1574;
 const SET_TEX_HEADER_POOL_B: u32 = 0x1578;
 const SET_TEX_HEADER_POOL_C: u32 = 0x157c;
-const SET_SRGB_WRITE: u32 = 0x15b8;
 const SET_RT_LAYER: u32 = 0x15cc;
 const SET_ANTI_ALIAS: u32 = 0x15d0;
 const SET_PROGRAM_REGION_A: u32 = 0x1608;
@@ -1133,7 +1132,6 @@ fn rasterize(
     }
     let per_target = r.enabled(SET_BLEND_STATE_PER_TARGET);
     let single_write = r.enabled(SET_SINGLE_CT_WRITE_CONTROL);
-    let srgb_write = r.enabled(SET_SRGB_WRITE);
     let mut targets = Vec::new();
     for output in 0..count {
         let target = (select >> (4 + 3 * output)) & 7;
@@ -1158,7 +1156,18 @@ fn rasterize(
             format,
             blend,
             write,
-            srgb: srgb_write && format.is_srgb(),
+            // A target of an sRGB format encodes what the program writes
+            // (and decodes what blending reads) whatever `SET_SRGB_WRITE`
+            // (0x15b8) holds. \[inference: the Mii editor draws its 3D Mii
+            // into an `A8BL8GL8RL8` target with the register 0, writing
+            // the linear colors nn::mii gives for sRGB targets, then samples
+            // it with sRGB decoding and composes into an sRGB target, again
+            // with the register 0; without the encodings the skin shows
+            // decoded once too often (orange). eden and Ryujinx
+            // render to sRGB formats with Vulkan, whose sRGB attachments
+            // always encode, and apply the register only on OpenGL as
+            // `GL_FRAMEBUFFER_SRGB`.\]
+            srgb: format.is_srgb(),
         });
     }
     let blend_constant = std::array::from_fn(|i| r.float(SET_BLEND_CONST_RED + 4 * i as u32));
@@ -1278,25 +1287,22 @@ fn rasterize(
     }
     let pixel_buffers = constant_buffers(context, PIXEL_PIPELINE, pixel)?;
     if let Some(metal) = context.metal {
-        if depth.is_some() {
-            metal.note_fallback("depth test");
-        } else {
-            let surfaces: Vec<Surface> = targets.iter().map(|(surface, _)| *surface).collect();
-            let draw = super::metal::Draw {
-                program: pixel,
-                triangles: &triangles,
-                colors: &colors,
-                surfaces: &surfaces,
-                bounds,
-                blend_constant,
-                constants: &pixel_buffers,
-                textures,
-                texture_buffer_index: r.get(SET_BINDLESS_TEXTURE) & 0x1F,
-                alpha_test,
-            };
-            if metal.draw(context.memory, context.writes, &draw)? {
-                return Ok(());
-            }
+        let surfaces: Vec<Surface> = targets.iter().map(|(surface, _)| *surface).collect();
+        let draw = super::metal::Draw {
+            program: pixel,
+            triangles: &triangles,
+            colors: &colors,
+            surfaces: &surfaces,
+            bounds,
+            blend_constant,
+            constants: &pixel_buffers,
+            textures,
+            texture_buffer_index: r.get(SET_BINDLESS_TEXTURE) & 0x1F,
+            alpha_test,
+            depth,
+        };
+        if metal.draw(context.memory, context.writes, &draw)? {
+            return Ok(());
         }
         // The software renderer reads memory from several threads; all
         // of Metal's work is made visible before it starts.

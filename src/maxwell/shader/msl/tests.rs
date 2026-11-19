@@ -224,7 +224,7 @@ fn corpus_translates_and_compiles() {
             Ok(t) => {
                 if let Some(gpu) = &gpu {
                     let outputs = targets(program);
-                    let source = t.source(program, &outputs, false);
+                    let source = t.source(program, &outputs, false, None);
                     let start = std::time::Instant::now();
                     if let Err(e) = gpu.pipeline(&source, outputs.len()) {
                         panic!("{name}: {e}\n{source}");
@@ -348,6 +348,11 @@ impl GpuMemory for NoMemory {
 
 const WIDTH: usize = 8;
 const HEIGHT: usize = 8;
+/// A triangle (`Translated::source` buffer 24) covering the target: corners
+/// 256 pixels out, counter-clockwise with y down.
+const COVERING: [i32; super::TRIANGLE_WORDS] = [
+    -0x1_0000, -0x1_0000, 0x4_0000, -0x1_0000, -0x1_0000, 0x4_0000, 0, 0, 0, 0,
+];
 /// The bound-texture constant buffer slot of the tests.
 const TEXTURE_SLOT: u32 = 2;
 /// What a discarded pixel keeps on the GPU.
@@ -454,7 +459,7 @@ fn render(
     input: &Inputs,
 ) -> Result<Vec<Vec<[f32; 4]>>, String> {
     let outputs = targets(program);
-    let pipeline = gpu.pipeline(&t.source(program, &outputs, false), outputs.len())?;
+    let pipeline = gpu.pipeline(&t.source(program, &outputs, false, None), outputs.len())?;
     let positions: [[f32; 4]; 6] = [
         [-1.0, -1.0, 0.0, 1.0],
         [1.0, -1.0, 0.0, 1.0],
@@ -538,6 +543,9 @@ fn render(
         .chain([bytes(&sizes)])
         // Texture fault words: every texture bound.
         .chain([vec![0u8; 8 * t.textures.len().max(1)]])
+        // The triangle (both halves of the quad are triangle 0): one
+        // covering the target, no depth plane.
+        .chain([bytes(&COVERING)])
         .map(|data| gpu.buffer(&data))
         .collect();
     // SAFETY: buffers and textures outlive the command buffer; indices are
@@ -551,6 +559,7 @@ fn render(
         }
         encoder.setFragmentBuffer_offset_atIndex(Some(&buffers[21]), 0, 20);
         encoder.setFragmentBuffer_offset_atIndex(Some(&buffers[22]), 0, 21);
+        encoder.setFragmentBuffer_offset_atIndex(Some(&buffers[23]), 0, 24);
         for (i, texture) in textures.iter().enumerate() {
             encoder.setFragmentTexture_atIndex(Some(texture), i);
             encoder.setFragmentSamplerState_atIndex(Some(&sampler), i);
@@ -773,5 +782,65 @@ fn control_flow_matches_interpreter() {
                 }
             }
         }
+    }
+}
+
+/// `I2I` R form [public: Ryujinx `InstI2iR`]: destination format `dst`
+/// (bits 9:8, signed bit 12), source format `src` (bits 11:10, signed bit
+/// 13), byte selector, -b, |b| and SAT.
+#[allow(clippy::too_many_arguments)]
+fn i2i(
+    rd: u64,
+    rb: u64,
+    dst: (u64, bool),
+    src: (u64, bool),
+    sel: u64,
+    neg: bool,
+    abs: bool,
+    sat: bool,
+) -> u64 {
+    0x5ce0_0000_0007_0000
+        | rd
+        | dst.0 << 8
+        | src.0 << 10
+        | u64::from(dst.1) << 12
+        | u64::from(src.1) << 13
+        | rb << 20
+        | sel << 41
+        | u64::from(neg) << 45
+        | u64::from(abs) << 49
+        | u64::from(sat) << 50
+}
+
+/// Integer conversions (the Mii editor's pixel programs take |x| of a
+/// signed word with `I2I`) give the interpreter's results on Metal:
+/// extension by source format and byte, wrapping |x| and -x, SAT.
+#[test]
+fn integer_conversions_match_interpreter() {
+    let program = assembled(&[
+        mov(4, 0x8000_0000),
+        mov(5, 0xffff_fff3),
+        mov(6, 0x89ab_cdef),
+        // |s32 R4| wraps to i32::MIN.
+        i2i(0, 4, (2, true), (2, true), 0, false, true, false),
+        // -(s8 byte 2 of R6) = -(-0x55).
+        i2i(1, 6, (2, true), (0, true), 2, true, false, false),
+        // -(u16 half 1 of R6), SAT to u32: 0.
+        i2i(2, 6, (2, false), (1, false), 2, true, false, true),
+        // |s32 R5| = 13.
+        i2i(3, 5, (2, true), (2, true), 0, false, true, false),
+        0xe30000000007000f, // EXIT
+    ]);
+    let t = translate(&program, &[]).expect("translates");
+    let input = inputs(&t, 1);
+    let expected = interpret(&program, &input).expect("interprets");
+    let words = [0x8000_0000u32, 0x55, 0, 13];
+    assert_eq!(expected[0].colors[0].map(f32::to_bits), words);
+    let Some(gpu) = Gpu::new() else {
+        return;
+    };
+    let colors = render(&gpu, &program, &t, &input).expect("renders");
+    for pixel in &colors[0] {
+        assert_eq!(pixel.map(f32::to_bits), words);
     }
 }

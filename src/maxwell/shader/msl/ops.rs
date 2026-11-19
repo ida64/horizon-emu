@@ -172,6 +172,9 @@ impl Writer<'_> {
             Op::I2fR => ("I2F", Form::R),
             Op::I2fI => ("I2F", Form::I),
             Op::I2fC => ("I2F", Form::C),
+            Op::I2iR => ("I2I", Form::R),
+            Op::I2iI => ("I2I", Form::I),
+            Op::I2iC => ("I2I", Form::C),
             Op::F2fR => ("F2F", Form::R),
             Op::F2fI => ("F2F", Form::F),
             Op::F2fC => ("F2F", Form::C),
@@ -238,6 +241,20 @@ impl Writer<'_> {
             }
             "I2F" => {
                 self.require(bits(w, 8, 2) == 2, "destination format")?;
+                let format = bits(w, 10, 2) | (bits(w, 13, 1) << 2);
+                self.require(
+                    (format & 3) != 2 || bits(w, 41, 2) == 0,
+                    "byte selector with 32-bit source",
+                )?;
+                self.require(
+                    matches!(format, 0 | 1 | 2 | 4 | 5 | 6),
+                    &format!("source format {format}"),
+                )?;
+            }
+            "I2I" => {
+                let destination = bits(w, 8, 2) | (bits(w, 12, 1) << 2);
+                self.require(destination & 3 == 2, "destination narrower than 32 bits")?;
+                self.require(!bit(w, 47), "condition code write")?;
                 let format = bits(w, 10, 2) | (bits(w, 13, 1) << 2);
                 self.require(
                     (format & 3) != 2 || bits(w, 41, 2) == 0,
@@ -538,7 +555,7 @@ impl Writer<'_> {
                     cc = bit(w, 47).then_some(false);
                 }
             }
-            "I2F" => {
+            "I2F" | "I2I" => {
                 let format = bits(w, 10, 2) | (bits(w, 13, 1) << 2);
                 let selection = bits(w, 41, 2);
                 let value = format!("(b >> {}u)", selection * 8);
@@ -554,16 +571,34 @@ impl Writer<'_> {
                 if bit(w, 49) {
                     self.line("x = abs(x);");
                 }
-                let mode = bits(w, 39, 2);
-                if bit(w, 45) {
-                    // -(0.0) is -0.0 in the interpreter's binary64.
-                    self.line(&format!(
-                        "float f = x == 0 ? -0.0f : i2f(-x, {mode}u); uint v = as_type<uint>(f);"
-                    ));
+                if name == "I2I" {
+                    // `exec/alu.rs` "I2I": wrapping negation of the
+                    // extended value, SAT clamps to the destination's
+                    // range, the low 32 bits are stored.
+                    if bit(w, 45) {
+                        self.line("x = -x;");
+                    }
+                    if bit(w, 50) {
+                        let signed = (bits(w, 8, 2) | (bits(w, 12, 1) << 2)) == 6;
+                        self.line(if signed {
+                            "x = clamp(x, -2147483648l, 2147483647l);"
+                        } else {
+                            "x = clamp(x, 0l, 4294967295l);"
+                        });
+                    }
+                    self.line("uint v = uint(ulong(x));");
                 } else {
-                    self.line(&format!("uint v = as_type<uint>(i2f(x, {mode}u));"));
+                    let mode = bits(w, 39, 2);
+                    if bit(w, 45) {
+                        // -(0.0) is -0.0 in the interpreter's binary64.
+                        self.line(&format!(
+                            "float f = x == 0 ? -0.0f : i2f(-x, {mode}u); uint v = as_type<uint>(f);"
+                        ));
+                    } else {
+                        self.line(&format!("uint v = as_type<uint>(i2f(x, {mode}u));"));
+                    }
+                    cc = bit(w, 47).then_some(true);
                 }
-                cc = bit(w, 47).then_some(true);
             }
             _ => unreachable!("every name is handled"),
         }
