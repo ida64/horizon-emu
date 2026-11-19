@@ -133,11 +133,15 @@ mod register {
     pub const WINBUF_SURFACE_KIND: u64 = 0x80B;
 }
 
-/// Window header: one select bit per window, A first. There are three
-/// windows, A to C, as Linux's `dc.h` names them and nvservices programs
-/// them (annex §3.4).
+/// Window header: one select bit per window, A first. There are four
+/// windows: A to C, as Linux's `dc.h` names them and nvservices programs
+/// them (annex §3.4), and D, which this chip adds and hekate uses (its
+/// `di.h`: select bit 7, activation request bit 4, update bit 12, in line
+/// with the others). \[assumption\] D is modelled as a window like the
+/// others; the chip's is said to be simpler (no scaling), and hekate asks
+/// nothing of it the others lack.
 const WINDOW_SELECT_SHIFT: u32 = 4;
-const WINDOW_COUNT: usize = 3;
+const WINDOW_COUNT: usize = 4;
 
 /// Parts of the double-buffered registers: the general ones, then one per
 /// window. In the state control register, part `p`'s activation request is

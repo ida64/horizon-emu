@@ -391,10 +391,8 @@ pub struct BootRomHandoff {
     /// FIQ masked, as out of reset. Package1ldr sets its own stack pointer
     /// and does not read the mode; a dump would settle it.
     pub cpsr: u32,
-    /// The block whose BCT was taken.
-    pub bct_block: u32,
-    /// The bootloader entry of that BCT that was started.
-    pub bootloader: usize,
+    /// What was started.
+    pub started: Started,
     /// What the ROM wrote into IRAM, by address.
     pub iram_written: Vec<Range<u32>>,
     /// The rest of IRAM: what the real ROM leaves there is not established.
@@ -403,6 +401,15 @@ pub struct BootRomHandoff {
     pub iram_undefined: Vec<(Range<u32>, &'static str)>,
     /// SBK, then SSK.
     pub keyslots: [SeKeyslot; 2],
+}
+
+/// What the ROM started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Started {
+    /// Bootloader entry `index` of the BCT in block `bct_block`.
+    Bootloader { bct_block: u32, index: usize },
+    /// A payload given to it ([`payload_start`]).
+    Payload,
 }
 
 /// A security engine AES keyslot the ROM fills.
@@ -483,12 +490,19 @@ pub enum BootRomError {
     /// The bootloader started has an odd entry point: whether the ROM
     /// would enter it in Thumb state is not established.
     ThumbEntry(u32),
+    /// A payload of this many bytes: empty, or more than IRAM holds from
+    /// [`PAYLOAD_ADDRESS`] on.
+    PayloadSize(usize),
 }
 
 impl fmt::Display for BootRomError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::IramSize(size) => write!(f, "IRAM is {size} bytes, not {IRAM_SIZE}"),
+            Self::PayloadSize(size) => write!(
+                f,
+                "a payload of {size} bytes does not fit IRAM from {PAYLOAD_ADDRESS:#x} on"
+            ),
             Self::WarmBoot => write!(f, "PMC_SCRATCH0 asks for a warm boot, not modelled"),
             Self::ForcedRecovery => write!(f, "PMC_SCRATCH0 forces recovery mode, not modelled"),
             Self::Unmodelled(what) => write!(f, "boot ROM: {what}, not modelled"),
@@ -689,23 +703,76 @@ pub fn cold_boot(
         adjacent
     });
     let iram_undefined = undefined(&written, &COLD_REGIONS);
+    Ok(BootRomHandoff {
+        entry: bootloader.entry_point,
+        cpsr: ENTRY_CPSR,
+        started: Started::Bootloader { bct_block, index },
+        iram_written: written,
+        iram_undefined,
+        keyslots: rom_keyslots(fuses),
+    })
+}
 
+/// The security engine keyslots as the ROM leaves them: SBK, then SSK.
+fn rom_keyslots(fuses: &Fuses) -> [SeKeyslot; 2] {
     let keyslot = |slot, key| SeKeyslot {
         slot,
         key,
         access: ROM_KEYSLOT_ACCESS,
     };
+    [
+        keyslot(KEYSLOT_SBK, fuses.secure_boot_key),
+        keyslot(KEYSLOT_SSK, secure_storage_key(fuses)),
+    ]
+}
+
+/// Where a payload is put and started: the address the recovery mode
+/// launchers and the modchips' loaders build their payloads for (hekate's
+/// own first instructions move it from there if it finds itself
+/// elsewhere).
+pub const PAYLOAD_ADDRESS: u32 = 0x4001_0000;
+
+/// The hand-off of a ROM that started `payload` where it would have
+/// started package1: the payload at [`PAYLOAD_ADDRESS`] in `iram`
+/// ([`IRAM_SIZE`] bytes), entered at its first word in ARM state, the
+/// keyslots as [`cold_boot`] leaves them, no BCT and no boot information
+/// table.
+///
+/// \[assumption\] The rest of IRAM reads zero. What it holds on a console
+/// is whatever the memory came up with and the ROM's leftovers, neither
+/// established; package1ldr never reads it, so [`cold_boot`] has such
+/// reads refused, but a payload may: hekate looks at the top of IRAM for
+/// a mark its own exception handlers leave across a reset, and takes
+/// anything else for none.
+///
+/// This is a shortcut, not a path of the ROM: the ROM starts only what
+/// the BCT's key signed. On a console a payload gets there through a
+/// fault in the ROM (Fusée Gelée in recovery mode, which leaves the ROM's
+/// lock-outs undone, or a glitched signature check, after which the ROM
+/// finishes as on any cold boot). \[decision\] The second state is the
+/// one given, because it is [`cold_boot`]'s own.
+pub fn payload_start(
+    payload: &[u8],
+    fuses: &Fuses,
+    iram: &mut [u8],
+) -> Result<BootRomHandoff, BootRomError> {
+    if iram.len() != IRAM_SIZE {
+        return Err(BootRomError::IramSize(iram.len()));
+    }
+    let start = (PAYLOAD_ADDRESS - IRAM_BASE) as usize;
+    if payload.len() < 4 || payload.len() > IRAM_SIZE - start {
+        return Err(BootRomError::PayloadSize(payload.len()));
+    }
+    iram.fill(0);
+    iram[start..start + payload.len()].copy_from_slice(payload);
+    let written = PAYLOAD_ADDRESS..PAYLOAD_ADDRESS + payload.len() as u32;
     Ok(BootRomHandoff {
-        entry: bootloader.entry_point,
+        entry: PAYLOAD_ADDRESS,
         cpsr: ENTRY_CPSR,
-        bct_block,
-        bootloader: index,
-        iram_written: written,
-        iram_undefined,
-        keyslots: [
-            keyslot(KEYSLOT_SBK, fuses.secure_boot_key),
-            keyslot(KEYSLOT_SSK, secure_storage_key(fuses)),
-        ],
+        started: Started::Payload,
+        iram_written: vec![written],
+        iram_undefined: Vec::new(),
+        keyslots: rom_keyslots(fuses),
     })
 }
 
@@ -1306,7 +1373,8 @@ mod tests {
         let handoff = handoff.unwrap();
 
         let entry = Bootloader::of(&normal.bct, 0);
-        assert_eq!((handoff.bct_block, handoff.bootloader), (0, 0));
+        let started = |bct_block, index| Started::Bootloader { bct_block, index };
+        assert_eq!(handoff.started, started(0, 0));
         assert_eq!(handoff.entry, entry.entry_point);
         assert_eq!(handoff.entry, 0x4001_0040);
         assert_eq!(handoff.cpsr, 0xD3);
@@ -1425,7 +1493,8 @@ mod tests {
         boot[0][0x600] ^= 0x80;
         let handoff = power_on_retail(&boot).0.unwrap();
         // Block 1: the safe mode BCT, whose bootloader is in boot partition 1.
-        assert_eq!((handoff.bct_block, handoff.bootloader), (1, 0));
+        let started = |bct_block, index| Started::Bootloader { bct_block, index };
+        assert_eq!(handoff.started, started(1, 0));
         assert_eq!(
             handoff.entry,
             Bootloader::of(&images.safe.bct, 0).entry_point
@@ -1453,7 +1522,13 @@ mod tests {
         boot[0][0x10_0000 + 0x1000] ^= 1;
         let (handoff, iram) = power_on_retail(&boot);
         let handoff = handoff.unwrap();
-        assert_eq!((handoff.bct_block, handoff.bootloader), (0, 1));
+        assert_eq!(
+            handoff.started,
+            Started::Bootloader {
+                bct_block: 0,
+                index: 1
+            }
+        );
         assert_eq!(iram_word(&iram, IRAM_BASE + 0x50 + 0x18), 1);
         assert_eq!(handoff.iram_undefined[2].0, 0x4000_0050..0x4000_0068);
 

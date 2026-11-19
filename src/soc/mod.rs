@@ -12,6 +12,7 @@ pub mod apb_security;
 pub mod bcm4356;
 pub mod bh1730;
 pub mod bluetooth_uart;
+pub mod bpmp_cache;
 pub mod bq24193;
 pub mod car;
 pub mod cldvfs;
@@ -56,6 +57,7 @@ pub mod pg_up;
 pub mod pinmux;
 pub mod pmc;
 pub mod regs;
+pub mod rtc;
 pub mod sb;
 pub mod sdcard;
 pub mod sdmmc;
@@ -151,8 +153,13 @@ const SDMMC4_INTID: u32 = 32 + 31;
 const SDMMC2_BASE: u64 = 0x700B_0200;
 const SDMMC2_INTID: u32 = 32 + 15;
 
-/// The BPMP's cache controller (hekate `bpmp.c` `BPMP_CACHE_BASE`).
-const BPMP_CACHE_BASE: u64 = 0x5004_0000;
+/// The AHB arbiter's priority registers (hekate `t210.h` `ARB_PRI_BASE`:
+/// one each for the CPU, the BPMP, the VCP and DMA, and one more), which
+/// hekate writes once at start (`hw_init.c`). Buses are not arbitrated
+/// here, so they keep what is written and do nothing; unwritten, their
+/// values are not public and they refuse to be read.
+const ARB_PRI_BASE: u64 = 0x6000_3000;
+const ARB_PRI_SIZE: u64 = 0x14;
 
 /// Explanations devices leave when they refuse an access, for whoever reads
 /// the machine's stop report.
@@ -400,6 +407,9 @@ pub struct BootBlocks {
     /// What the clock and reset controller tells the BPMP's machine: see
     /// [`BootSignals`].
     pub signals: Arc<BootSignals>,
+    /// The timer block, whose watchdogs the BPMP's machine watches
+    /// ([`tmr::Timers::watchdog_expired`]).
+    pub timers: Arc<tmr::Timers>,
     /// What only a machine that runs the boot ROM itself has
     /// ([`Start::Reset`]); without, the ROM is high-level emulated.
     pub rom: Option<RomBlocks>,
@@ -426,8 +436,10 @@ pub enum Start<'a> {
     /// Out of reset, as far as the high-level emulated boot ROM
     /// ([`crate::bootrom`]) leaves it for package1ldr: the boot chain runs
     /// from there ([`BootBlocks`], [`car::Car::power_on`],
-    /// [`pmc::Pmc::power_on`]).
-    AfterRom,
+    /// [`pmc::Pmc::power_on`]). The fuse block holds the console's fuses
+    /// and patch records as at reset, with the private key hidden as the
+    /// ROM leaves it.
+    AfterRom { fuses: &'a crate::bootrom::Fuses },
     /// At reset, with a dump of the boot ROM in IROM and the fuses the ROM
     /// reads: the BPMP runs the ROM itself.
     Reset {
@@ -717,6 +729,7 @@ impl Soc {
                 sb,
                 ictlr: Arc::default(),
                 signals: Arc::default(),
+                timers: Arc::new(Timers::power_on(elapsed(clock))),
                 rom,
             }),
             se,
@@ -1024,21 +1037,17 @@ impl Soc {
                     iram::RESERVED_SIZE,
                     Box::new(iram::AfterIram::new(Arc::clone(&soc.notes))),
                 );
-                // The BPMP's cache controller (hekate `bpmp.c`
-                // `BPMP_CACHE_CONFIG`; Atmosphère `tegra_avp_cache.hpp`):
-                // only its configuration register, which the monitor's SC7
-                // stub changes by read-modify-write (it sets DISABLE_WB and
-                // DISABLE_RB, bits 10 and 11, text `0x40003464`). No cache
-                // is emulated, so its bits only store. \[assumption\] It
-                // reads 0 (cache disabled) until written: no stage of the
-                // boot chain writes it before the stub, and its power-on
-                // value is not public. Its other registers keep what is
-                // written and refuse reads until then.
                 bus.map(
                     "BPMP cache controller",
-                    BPMP_CACHE_BASE,
-                    0x1000,
-                    Box::new(RegisterFile::strict([(0x000, 0)])),
+                    bpmp_cache::BASE,
+                    bpmp_cache::SIZE,
+                    Box::new(bpmp_cache::BpmpCache::new()),
+                );
+                bus.map(
+                    "bus arbitration priorities",
+                    ARB_PRI_BASE,
+                    ARB_PRI_SIZE,
+                    Box::new(RegisterFile::strict([])),
                 );
                 bus.map(
                     "TZRAM",
@@ -1150,12 +1159,27 @@ impl Soc {
             let port = EmcPort::new(&emc, View::Channel(channel));
             bus.map(["EMC0", "EMC1"][channel], base, emc::SIZE, Box::new(port));
         }
-        let timers = if power_on {
-            Timers::power_on(elapsed(clock))
+        if let Some(boot) = &soc.boot {
+            bus.map(
+                "timers",
+                tmr::BASE,
+                tmr::SIZE,
+                Box::new(Arc::clone(&boot.timers)),
+            );
         } else {
-            Timers::new(elapsed(clock))
-        };
-        bus.map("timers", tmr::BASE, tmr::SIZE, Box::new(timers));
+            bus.map(
+                "timers",
+                tmr::BASE,
+                tmr::SIZE,
+                Box::new(Timers::new(elapsed(clock))),
+            );
+        }
+        bus.map(
+            "RTC",
+            rtc::BASE,
+            rtc::SIZE,
+            Box::new(rtc::Rtc::new(elapsed(clock))),
+        );
         let measurements = [
             FUSE_CPU_SPEEDO_0_CALIB,
             FUSE_CPU_IDDQ_CALIB,
@@ -1186,16 +1210,32 @@ impl Soc {
             .chain(FUSES_THE_BOOTLOADER_CHECKS)
             .chain(configuration);
         let fuse = Arc::new(match &start {
-            Start::Reset { fuses, .. } => {
+            Start::Reset { fuses, .. } | Start::AfterRom { fuses } => {
                 let (array, size) = fuse::patch_records();
-                fuse::Fuse::new(
+                let fuse = fuse::Fuse::new(
                     registers
                         .chain(fuses.at_reset())
                         .chain([(fuse::FIRST_BOOTROM_PATCH_SIZE, size)]),
                     array,
-                )
+                );
+                if matches!(start, Start::AfterRom { .. }) {
+                    // The ROM's last word on the fuses: the private key
+                    // hidden.
+                    let hide = (fuse::PRIVATEKEYDISABLE, 1);
+                    crate::bus::MmioDevice::write(
+                        &fuse,
+                        crate::boot::CORE_COUNT,
+                        hide.0,
+                        4,
+                        hide.1,
+                    )
+                    .expect("the register exists");
+                }
+                fuse
             }
-            _ => fuse::Fuse::new(registers.chain(crate::bootrom::fuses_after_boot()), []),
+            Start::Kernel => {
+                fuse::Fuse::new(registers.chain(crate::bootrom::fuses_after_boot()), [])
+            }
         });
         bus.map("fuses", FUSE_BASE, FUSE_SIZE, Box::new(Arc::clone(&fuse)));
         soc.fuse

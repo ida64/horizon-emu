@@ -65,6 +65,12 @@ pub trait BpmpBus {
     fn read(&mut self, address: u32, size: u8) -> Result<u32, BusError>;
     /// Writes the low `size` bytes of `value` at `address`.
     fn write(&mut self, address: u32, size: u8, value: u32) -> Result<(), BusError>;
+    /// Reads the instruction of `size` bytes at `address`. The default is
+    /// [`BpmpBus::read`]; a bus overrides it where data may be read and
+    /// nothing run.
+    fn fetch(&mut self, address: u32, size: u8) -> Result<u32, BusError> {
+        self.read(address, size)
+    }
     /// Reads consecutive words from `address` (aligned) into `words`, as
     /// that many 4-byte [`BpmpBus::read`]s in ascending order would; at
     /// the first that fails, stops and returns its index and error. `LDM`
@@ -483,7 +489,7 @@ impl Arm7 {
         let width = if thumb { 2 } else { 4 };
         let fetched = match &mut cache {
             Some(cache) => cache.fetch(bus, pc, width),
-            None => bus.read(pc, width),
+            None => bus.fetch(pc, width),
         };
         let insn = match fetched {
             Ok(insn) => insn,

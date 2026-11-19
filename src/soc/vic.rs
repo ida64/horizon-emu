@@ -43,13 +43,14 @@
 //! degamma/regamma (mode 1), planar/constant alpha, the blending factor
 //! selections (libdrm `vic.h` enum names), override and mask, alpha fill
 //! modes opaque, background and composited (DXVA-HD names in libdrm
-//! `vic.h`), the output flips, and as output the fully planar 8-bit YUV
+//! `vic.h`), the output flips, transposition of a pitch-linear RGB output
+//! (`Surface::transposed`), and as output the fully planar 8-bit YUV
 //! formats 69-72 (pitch-linear, chroma sited between the luma samples it
 //! is shared by; see `Planar`). Everything else (fractional source
 //! rectangles, noise and detail filters, other YUV input, semi-planar
 //! output and 10-bit YUV, deinterlacing and denoise, luma key, gamut
-//! matrix, gamma modes 2-3, clear rectangles, decompression, output
-//! transposition, downsampling) refuses with the field named.
+//! matrix, gamma modes 2-3, clear rectangles, decompression,
+//! downsampling) refuses with the field named.
 //!
 //! # The submission seen
 //!
@@ -101,8 +102,34 @@
 //! picture is not public for VIC 4.0; at one pixel a clock and several
 //! hundred MHz it would be a few milliseconds \[assumption\], the order of
 //! what the model now takes.
+//!
+//! # Without the firmware
+//!
+//! hekate's Nyx turns its picture for the panel with the VIC and loads no
+//! Falcon firmware for it: it writes the VIC's own registers through the
+//! Falcon's private register window (`vic.c`, reference for facts; the
+//! window is the host interface's, [`super::falcon_host`]). In its order:
+//! the fetch control engine's microcode, word by word (`FCE_UCODE_ADDR`,
+//! `FCE_UCODE_INST`), and its start (`FCE_CTRL` 1); the configuration
+//! structure's address and size (`SC_PRAMBASE`, `SC_PRAMSIZE`: the same
+//! structure the firmware takes, 0x610 bytes); the slot map; the first
+//! slot's surface and the output (`SC_SFC0_BASE_LUMA`, `BL_TARGET_BASADR`,
+//! addresses >> 8 as in the methods); `BL_CONFIG`, which has the blending
+//! output take the structure; then `FC_COMPOSE` 1 for every frame.
+//!
+//! Here `FC_COMPOSE` runs the same composition an EXECUTE does, on that
+//! structure and those two surfaces, at once (the Falcon's idle state
+//! reads idle). The microcode is not run: only hekate's is accepted, by
+//! its digest, as the one known to make the engine fetch what the
+//! structure says. \[assumption\] The structure is read when a frame is
+//! composed; on the chip the surface cache parses it when its address is
+//! written, and hekate never changes it afterwards. Only what hekate
+//! writes is taken (one slot, its one `BL_CONFIG`); private registers
+//! cannot be read.
 
 use std::sync::{Arc, Mutex};
+
+use sha2::Digest as _;
 
 use serde::{Deserialize, Serialize};
 
@@ -171,7 +198,59 @@ struct State {
     offset: u32,
     #[serde(with = "crate::snapshot::array")]
     methods: [u32; method::COUNT],
+    direct: Direct,
 }
+
+/// What was written through the private registers.
+#[derive(Default, Serialize, Deserialize)]
+struct Direct {
+    ucode_address: u32,
+    /// The fetch control engine's microcode, by word.
+    ucode: Vec<u32>,
+    /// The engine was started with the known microcode.
+    started: bool,
+    slot_map: u32,
+    /// The configuration structure's address and size, the first slot's
+    /// first surface and the output, as written (addresses >> 8, the size
+    /// >> 6).
+    config: u32,
+    config_size: u32,
+    source: u32,
+    target: u32,
+    /// The blending output was told to take the configuration structure.
+    configured: bool,
+}
+
+/// The VIC's own registers hekate writes (`vic.c`; its names without
+/// `VIC_FC_`, `VIC_SC_` and `VIC_BL_`).
+mod private {
+    pub const COMPOSE: u32 = 0x10000;
+    pub const SLOT_MAP: u32 = 0x10C00;
+    pub const FCE_CTRL: u32 = 0x11000;
+    pub const FCE_UCODE_ADDR: u32 = 0x11200;
+    pub const FCE_UCODE_INST: u32 = 0x11300;
+    pub const PRAMBASE: u32 = 0x14000;
+    pub const PRAMSIZE: u32 = 0x14100;
+    pub const SFC0_BASE_LUMA: u32 = 0x14300;
+    pub const TARGET_BASADR: u32 = 0x22000;
+    pub const BL_CONFIG: u32 = 0x22800;
+}
+
+const COMPOSE_START: u32 = 1;
+const FCE_START: u32 = 1;
+/// Slot 0 takes surface 0, the other seven none.
+const SLOT_MAP_FIRST_ONLY: u32 = 0xFFFF_FFF0;
+/// Slot mask `0x1F`, the configuration structure trigger, subpartition
+/// mode: the one value hekate writes.
+const BL_CONFIG_ONE_PASS: u32 = 0x1F << 8 | 1 << 2 | 1 << 0;
+/// Microcode addresses are bytes below this.
+const UCODE_LIMIT: u32 = 0x1000;
+/// SHA-256 of the fetch control engine microcode hekate loads ("Dumped
+/// from L4T r33", 241 words).
+const FCE_UCODE_SHA256: [u8; 32] = [
+    0xAC, 0x41, 0xB5, 0xEA, 0x51, 0x29, 0x18, 0xE2, 0xF1, 0xB1, 0xCE, 0x34, 0x78, 0xF9, 0xA3, 0x73,
+    0xCB, 0x56, 0x60, 0xFA, 0x1F, 0xF8, 0xE5, 0xA8, 0xFB, 0xA9, 0x6B, 0xB8, 0x54, 0x6B, 0x6F, 0x3C,
+];
 
 impl Vic {
     /// `memory` is memory as the VIC's SMMU client reaches it.
@@ -183,6 +262,7 @@ impl Vic {
             state: Mutex::new(State {
                 offset: 0,
                 methods: [0; method::COUNT],
+                direct: Direct::default(),
             }),
         }
     }
@@ -255,6 +335,78 @@ impl Vic {
     fn refuse(&self, reason: String) -> Option<()> {
         self.notes.add(format!("VIC: {reason}"));
         None
+    }
+
+    /// A write of the VIC's own register at `address`, reached through the
+    /// Falcon's private register window: see "Without the firmware" in the
+    /// module.
+    pub fn private_write(&self, address: u32, value: u32) -> Option<()> {
+        let mut state = self.state.lock().unwrap();
+        let direct = &mut state.direct;
+        match address {
+            private::FCE_UCODE_ADDR if value.is_multiple_of(4) && value < UCODE_LIMIT => {
+                direct.ucode_address = value
+            }
+            private::FCE_UCODE_INST => {
+                let index = direct.ucode_address as usize / 4;
+                if direct.ucode.len() <= index {
+                    direct.ucode.resize(index + 1, 0);
+                }
+                direct.ucode[index] = value;
+                direct.started = false;
+            }
+            private::FCE_CTRL if value == FCE_START => {
+                let bytes: Vec<u8> = direct
+                    .ucode
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .collect();
+                let digest = sha2::Sha256::digest(&bytes);
+                if digest[..] != FCE_UCODE_SHA256 {
+                    drop(state);
+                    return self.refuse(
+                        "fetch control engine started with a microcode other than the one \
+                         hekate loads: what it would fetch is not known"
+                            .into(),
+                    );
+                }
+                direct.started = true;
+            }
+            private::SLOT_MAP => direct.slot_map = value,
+            private::PRAMBASE => direct.config = value,
+            private::PRAMSIZE => direct.config_size = value,
+            private::SFC0_BASE_LUMA => direct.source = value,
+            private::TARGET_BASADR => direct.target = value,
+            private::BL_CONFIG if value == BL_CONFIG_ONE_PASS => direct.configured = true,
+            private::COMPOSE if value == COMPOSE_START => {
+                let ready = direct.started
+                    && direct.configured
+                    && direct.slot_map == SLOT_MAP_FIRST_ONLY
+                    && (direct.config_size as usize) << 6 >= CONFIG_SIZE & !0x3F;
+                if !ready {
+                    drop(state);
+                    return self.refuse(
+                        "composition started before the engine was set up the way hekate \
+                         sets it up"
+                            .into(),
+                    );
+                }
+                let mut methods = [0; method::COUNT];
+                methods[method::SET_CONFIG_STRUCT_OFFSET] = direct.config;
+                methods[method::SURFACES.start] = direct.source;
+                methods[method::SET_OUTPUT_SURFACE.start] = direct.target;
+                drop(state);
+                return match compose(&self.memory, &methods) {
+                    Ok(()) => Some(()),
+                    Err(reason) => self.refuse(format!("composition: {reason}")),
+                };
+            }
+            _ => {
+                drop(state);
+                return self.refuse(format!("private register {address:#x} = {value:#x}"));
+            }
+        }
+        Some(())
     }
 }
 
@@ -492,6 +644,31 @@ impl Surface {
                 top / lines * lines,
             ),
         }
+    }
+
+    /// The surface a picture of this output configuration is written to
+    /// with `OutputTranspose`: its rows are the picture's columns.
+    ///
+    /// hekate's Nyx turns its 1280×720 drawing for the 720×1280 panel this
+    /// way (`vic.c`, "rotation 270": transpose and flip X). It declares the
+    /// output surface with the picture's size, 1280×720, and the display
+    /// controller then scans the buffer 720 pixels to the row: so the
+    /// memory holds the transposed picture with rows as long as the
+    /// declared luma plane is high \[inference from those two\]. That the
+    /// flips come before the transposition, in the picture's own axes, is
+    /// \[inference\] from the result: Nyx then stands upright on the
+    /// screen, and flipped after it would stand on its head.
+    fn transposed(self, [_, w1]: [u64; 2]) -> Result<Surface, String> {
+        let Layout::Pitch(_) = self.layout else {
+            return Err("transposed block-linear output".into());
+        };
+        let luma_height = field(w1, 14, 14) + 1;
+        Ok(Surface {
+            layout: Layout::Pitch(u64::from(luma_height * BYTES_PER_PIXEL)),
+            width: self.height,
+            height: self.width,
+            ..self
+        })
     }
 }
 
@@ -1205,7 +1382,7 @@ struct Blend {
 
 impl Blend {
     fn new([w0, w1]: [u64; 2]) -> Result<Blend, String> {
-        let blend = Blend {
+        let mut blend = Blend {
             k1: field(w0, 0, 10) as f32 / 1023.0,
             k2: field(w0, 16, 10) as f32 / 1023.0,
             source_color: field(w0, 32, 3),
@@ -1218,6 +1395,14 @@ impl Blend {
             }),
             masks: std::array::from_fn(|channel| flag(w1, 48 + channel as u32)),
         };
+        // A blending structure left all zero copies the slot over what is
+        // below it [inference: hekate leaves it so ("No need to configure.
+        // Reset to zeros", `vic.c`) and its picture arrives; by the
+        // selections' numbering zero would be "source × K1" with K1 0,
+        // nothing at all].
+        if w0 == 0 && w1 == 0 {
+            (blend.k1, blend.destination_color, blend.destination_alpha) = (1.0, 5, 2);
+        }
         if blend.source_color > 4
             || blend.destination_color > 6
             || blend.source_alpha > 3
@@ -1377,7 +1562,10 @@ impl Slot {
                 field(w0, 1, 5)
             ));
         }
-        if !flag(w0, 8) || field(w0, 9, 7) != 0 {
+        // The current field alone, or none named at all: hekate leaves all
+        // eight clear for its progressive frame and the frame is fetched
+        // all the same [inference: its picture arrives].
+        if field(w0, 9, 7) != 0 {
             return unmodeled(&format!("field enables {:#x}", field(w0, 8, 8)));
         }
         if field(w0, 16, 4) != 0 {
@@ -1602,10 +1790,10 @@ fn compose_config(
     // `OutputConfig`). The flips mirror the composed picture within the
     // target rectangle [inference: the rectangle is what is written];
     // the browser's frames come bottom-up and are flipped vertically.
+    // Transposition then writes the picture's rows as the output's
+    // columns: see `Surface::transposed`.
     let (flip_x, flip_y) = (flag(output, 48), flag(output, 49));
-    if flag(output, 50) {
-        return Err("output transpose".into());
-    }
+    let transpose = flag(output, 50);
     if !matches!(alpha_fill, 0 | 1 | 4) {
         return Err(format!("alpha fill mode {alpha_fill}"));
     }
@@ -1699,7 +1887,26 @@ fn compose_config(
             }
         }
     });
-    output.write(memory, area, &colors)
+    if !transpose {
+        return output.write(memory, area, &colors);
+    }
+    let Output::Rgb(surface) = output else {
+        return Err("transposed planar output".into());
+    };
+    let turned = surface.transposed(config.pair(0x20))?;
+    let mut turned_colors = vec![[0.0; 4]; colors.len()];
+    for (y, row) in colors.chunks(width).enumerate() {
+        for (x, color) in row.iter().enumerate() {
+            turned_colors[x * height + y] = *color;
+        }
+    }
+    let turned_area = Rect {
+        left: area.top,
+        top: area.left,
+        right: area.bottom,
+        bottom: area.right,
+    };
+    Output::Rgb(turned).write(memory, turned_area, &turned_colors)
 }
 
 /// A slot's part of the picture: the rectangle it draws, the source

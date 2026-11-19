@@ -159,6 +159,11 @@ options:
                       processor then runs from its reset vector instead of
                       the high-level emulation, at power-on and again at
                       every wake from sleep
+  --payload FILE      with power-on: a program for the boot processor (such
+                      as hekate), started at 0x40010000 where the boot ROM
+                      would have started package1, the console otherwise as
+                      the high-level emulated ROM leaves it. It finds its
+                      files on the --sd card; no eMMC boot images are needed
   --emmc-writable     write to the eMMC images instead: what the guest
                       stores is there on the next run
   --sd FILE           raw image of a microSD card, in the slot from power
@@ -417,6 +422,7 @@ const MACHINE_FLAGS: &[(&str, bool)] = &[
     ("--emmc-boot0", true),
     ("--emmc-boot1", true),
     ("--bootrom", true),
+    ("--payload", true),
     ("--emmc-writable", false),
     ("--sd", true),
     ("--sd-writable", false),
@@ -438,6 +444,7 @@ const MACHINE_FLAGS: &[(&str, bool)] = &[
 const FILE_FLAGS: &[&str] = &[
     "--keys",
     "--bootrom",
+    "--payload",
     "--homebrew",
     "--hbl",
     "--homebrew-app",
@@ -856,6 +863,7 @@ fn boot_rom(
     keys: &KeySet,
     boot: [Option<&String>; 2],
     rom: Option<&String>,
+    payload: Option<&String>,
 ) -> Result<PowerOn, String> {
     let secure_boot_key = keys
         .secure_boot_key()
@@ -866,7 +874,7 @@ fn boot_rom(
             .map(Option::unwrap_or_default)
     };
     let (boot0, boot1) = (read(boot[0])?, read(boot[1])?);
-    if boot0.is_empty() && boot1.is_empty() {
+    if payload.is_none() && boot0.is_empty() && boot1.is_empty() {
         return Err("power-on needs --emmc-boot0 or --emmc-boot1 with a BCT and package1".into());
     }
     // The device key fuse and the die's identity fuses belong to one chip,
@@ -889,9 +897,18 @@ fn boot_rom(
         return Ok(PowerOn::Rom { rom, fuses });
     }
     let mut iram = vec![0; bootrom::IRAM_SIZE];
-    // PMC_SCRATCH0 is clear on a cold boot: no warm boot, no forced recovery.
-    let handoff = bootrom::cold_boot(&boot0, &boot1, &fuses, 0, &mut iram)
-        .map_err(|error| format!("boot ROM: {error}"))?;
+    let handoff = match payload {
+        Some(path) => {
+            let payload =
+                std::fs::read(path).map_err(|error| format!("--payload {path}: {error}"))?;
+            bootrom::payload_start(&payload, &fuses, &mut iram)
+                .map_err(|error| format!("--payload {path}: {error}"))?
+        }
+        // PMC_SCRATCH0 is clear on a cold boot: no warm boot, no forced
+        // recovery.
+        None => bootrom::cold_boot(&boot0, &boot1, &fuses, 0, &mut iram)
+            .map_err(|error| format!("boot ROM: {error}"))?,
+    };
     Ok(PowerOn::Emulated {
         handoff,
         iram,
@@ -925,7 +942,7 @@ fn boot(
     let mut pokes = Vec::new();
     let mut steps_after_breakpoint = 0;
     let (mut emmc_user, mut emmc_boot) = (None, [None, None]);
-    let mut rom = None;
+    let (mut rom, mut payload) = (None, None);
     let mut emmc_writable = false;
     let (mut sd_card, mut sd_writable) = (None, false);
     let mut screenshot = None;
@@ -1057,6 +1074,7 @@ fn boot(
             "--emmc-boot0" => emmc_boot[0] = Some(value()?),
             "--emmc-boot1" => emmc_boot[1] = Some(value()?),
             "--bootrom" => rom = Some(value()?),
+            "--payload" => payload = Some(value()?),
             "--emmc-writable" => emmc_writable = true,
             "--sd" => sd_card = Some(value()?),
             "--sd-writable" => sd_writable = true,
@@ -1164,6 +1182,16 @@ fn boot(
     if kernel.is_some() && rom.is_some() {
         return Err(
             "--bootrom is power-on's: boot starts at the kernel's entry, after the ROM".into(),
+        );
+    }
+    if kernel.is_some() && payload.is_some() {
+        return Err("--payload is power-on's: it runs on the boot processor".into());
+    }
+    if rom.is_some() && payload.is_some() {
+        return Err(
+            "--payload stands in for what the boot ROM starts; with --bootrom the ROM starts \
+             package1 itself"
+                .into(),
         );
     }
     if wifi_ssid.is_none() {
@@ -1303,7 +1331,7 @@ fn boot(
                 changed = installed;
                 Firmware::Kernel(image)
             }
-            None => Firmware::PowerOn(boot_rom(&keys, emmc_boot, rom)?),
+            None => Firmware::PowerOn(boot_rom(&keys, emmc_boot, rom, payload)?),
         };
         if first {
             for line in &changed {

@@ -11,7 +11,7 @@
 //! | `0x0000_0000`..`0x0000_0020` | the architected vectors | never taken: exceptions go where `EVP_COP_*_VECTOR` say ([`crate::soc::evp`]); an exception whose register is unwritten stops the BPMP with that said |
 //! | `0x0010_0000`..`0x0012_0000` | IROM, the boot ROM | with a dump of the ROM ([`PowerOn::Rom`]): its first 96 KiB read through the patch unit, until the ROM's lock-out hides them ([`crate::soc::irom`]); writes and the rest refused. Without a dump refused: the ROM is high-level emulated ([`crate::bootrom`]) |
 //! | `0x4000_0000`..`0x4004_0000` | IRAM ([`crate::soc::iram`]) | read and written directly; bytes no master has written since the ROM's hand-off (or since SC7) refuse reads ([`Iram::bpmp_read`]) |
-//! | `0x5004_0000`..`0x5004_1000` | the BPMP's cache controller (hekate `BPMP_CACHE_BASE`) | on the [`Bus`]: its configuration register alone, as storage; no cache is emulated |
+//! | `0x5004_0000`..`0x5004_1000` | the BPMP's cache controller ([`crate::soc::bpmp_cache`]) | on the [`Bus`]: its configuration, maintenance and memory-region commands accepted, each done at once; no cache is emulated |
 //! | `0x5004_1000`..`0x5004_3000` | the CPU cluster's GIC | refused: the BPMP takes its interrupts from the legacy interrupt controller ([`crate::soc::ictlr`]) \[inference: the GIC is the CPU complex's private peripheral, and Linux routes the BPMP's interrupts through the LIC\] |
 //! | DRAM (`0x8000_0000` up to 4 GiB) | [`GuestRam`] | read and written directly; the memory controller's carveouts are not applied to the BPMP (its client, AVPC, is not modelled) |
 //! | anything else | [`Bus`] with core index [`BPMP_CORE`] | as the device says; unmapped or unmodelled accesses stop the BPMP |
@@ -47,6 +47,12 @@
 //!
 //! The BPMP goes on after the release: the NX bootloader talks to the
 //! monitor through IRAM and halts itself through the flow controller.
+//!
+//! The same loop runs a payload started in the ROM's place
+//! ([`crate::bootrom::payload_start`]). One thing more is looked at
+//! between slices then: a watchdog the payload armed and did not feed
+//! ([`crate::soc::tmr::Timers::watchdog_expired`]), which stops the BPMP
+//! with a note instead of the reset or FIQ a console would take.
 //!
 //! One instruction takes no guest time of its own: the BPMP runs as fast as
 //! the host interprets it, and what it reads of time (`TIMERUS`) is guest
@@ -165,6 +171,20 @@ const IROM: Range<u32> = 0x0010_0000..0x0012_0000;
 /// The part of [`IROM`] a dump of the ROM fills.
 const IROM_IMAGE: Range<u32> = irom::BASE..irom::BASE + irom::SIZE as u32;
 const VECTORS: Range<u32> = 0..0x20;
+/// Below the ROM, past the vectors. NVIDIA's coreboot port names
+/// `0x0`..`0x00FF_FFFF` `IROM_LOVEC` ("t210: Correct device MMIO range",
+/// commit 7fea270); what it shows below the ROM is not public.
+///
+/// hekate reads there by mistake: after it has verified a backup it
+/// closes a file it only opens for another setting (`fe_emmc_tools.c`,
+/// the hash file), and FatFs follows the pointer in that handle, which is
+/// whatever the stack had (seen: a byte read at `0x2D`). \[inference\]
+/// Such a read does not abort on a console, where the backup ends
+/// normally. \[assumption\] It gives zero, which the ROM's own bytes at
+/// that offset also are, should the window show the ROM from zero as its
+/// name suggests. Each read leaves a note ([`BpmpView`]); writes there,
+/// and running code there, stay refused.
+const BELOW_IROM: Range<u32> = VECTORS.end..IROM.start;
 const GIC: Range<u32> = 0x5004_1000..0x5004_3000;
 const IRAM: Range<u32> = iram::BASE as u32..(iram::BASE + iram::SIZE) as u32;
 
@@ -243,7 +263,7 @@ impl PowerOn {
     /// The state the SoC is built in for this start.
     pub fn soc_start(&self) -> crate::soc::Start<'_> {
         match self {
-            Self::Emulated { .. } => crate::soc::Start::AfterRom,
+            Self::Emulated { fuses, .. } => crate::soc::Start::AfterRom { fuses },
             Self::Rom { rom, fuses } => crate::soc::Start::Reset {
                 rom: rom.clone(),
                 fuses,
@@ -432,6 +452,9 @@ impl Bpmp {
                 Ok(()) => Slice::PoweredDown,
                 Err(fault) => Slice::Fault(format!("entering SC7: {fault}")),
             };
+        }
+        if let Some(expired) = env.blocks.timers.watchdog_expired() {
+            return Slice::Fault(expired);
         }
         let Running { core, assist, .. } = &mut *running;
         let signals = &env.blocks.signals;
@@ -808,6 +831,12 @@ impl BpmpBus for BpmpView<'_> {
                 .bpmp_read(offset, size)
                 .or_else(iram_refused);
         }
+        if BELOW_IROM.contains(&address) {
+            self.env.notes.add(format!(
+                "BPMP: {size}-byte read at {address:#010x}, below the boot ROM, taken to give 0"
+            ));
+            return Ok(0);
+        }
         self.unmodelled(address)?;
         if let Some(address) = self.dram(address, size) {
             let mut bytes = [0; 4];
@@ -826,6 +855,13 @@ impl BpmpBus for BpmpView<'_> {
         };
         self.surveyed(format!("{size}-byte read at {address:#010x}"), why)
             .map(|()| 0)
+    }
+
+    fn fetch(&mut self, address: u32, size: u8) -> Result<u32, BusError> {
+        if BELOW_IROM.contains(&address) {
+            return refuse("execution below the boot ROM: what is there is not established");
+        }
+        self.read(address, size)
     }
 
     fn write(&mut self, address: u32, size: u8, value: u32) -> Result<(), BusError> {
@@ -1463,6 +1499,10 @@ mod tests {
                 ictlr: Arc::new(Ictlr::new()),
                 tzram: Arc::new(Tzram::new()),
                 signals: Arc::new(BootSignals::default()),
+                timers: Arc::new(crate::soc::tmr::Timers::power_on({
+                    let clock = Arc::clone(&clock);
+                    Box::new(move || clock.now())
+                })),
                 rom: None,
             };
             let mut bus = Bus::default();
@@ -1775,6 +1815,20 @@ mod tests {
         assert_eq!(bench.blocks.sb.read(0, 0x30, 4), Some(0x4003_0001));
         assert!(matches!(
             view.read(0x6000_C238, 4),
+            Err(BusError::Unmodelled(_))
+        ));
+        // Below the ROM a stray data read goes on, noted; nothing runs or
+        // is written there.
+        assert_eq!(view.read(0x2D, 1), Ok(0));
+        assert!(
+            env.notes
+                .take()
+                .iter()
+                .any(|note| note.contains("0x0000002d"))
+        );
+        assert!(matches!(view.fetch(0x2C, 4), Err(BusError::Unmodelled(_))));
+        assert!(matches!(
+            view.write(0x2C, 4, 0),
             Err(BusError::Unmodelled(_))
         ));
     }

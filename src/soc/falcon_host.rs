@@ -39,7 +39,23 @@ pub trait Engine: Snapshot {
     /// CPUCTL starts the processor with these memories; an error refuses
     /// the start.
     fn start(&self, imem: &[u8], dmem: &[u8]) -> Result<(), String>;
+    /// A write of the engine's own register at `address`, through the
+    /// private register window. Refused unless the engine models it.
+    fn private_write(&self, _address: u32, _value: u32) -> Option<()> {
+        None
+    }
 }
+
+/// The Falcon's window on its engine's own registers: the word at
+/// `0x1000 + (address >> 6)` is the engine's register `address`, the low
+/// address bits coming from the register at `0x10AC` (hekate `vic.c`
+/// `_vic_write_priv`, `PVIC_FALCON_PA_OFFSET` and `PVIC_FALCON_ADDR`,
+/// reference for facts). The engines' registers start at `0x10000`, past
+/// the Falcon's own. A register of the window this model keeps itself
+/// (`0x1604`, which nvservices writes) is not passed to the engine.
+const PRIVATE_BASE: u64 = 0x1000;
+const PRIVATE_SHIFT: u32 = 6;
+const PRIVATE_WINDOW: std::ops::Range<u64> = 0x1400..0x2000;
 
 /// The VIC's firmware is not checked: any firmware starts it (the
 /// compositor is modeled whatever runs on its Falcon).
@@ -57,6 +73,10 @@ impl Engine for super::vic::Vic {
 
     fn start(&self, _imem: &[u8], _dmem: &[u8]) -> Result<(), String> {
         Ok(())
+    }
+
+    fn private_write(&self, address: u32, value: u32) -> Option<()> {
+        super::vic::Vic::private_write(self, address, value)
     }
 }
 
@@ -144,6 +164,12 @@ impl<E: Engine> MmioDevice for HostFalcon<E> {
         }
         if size == 4 && matches!(offset, 0x40 | 0x44) {
             return self.engine.thi_write(offset as u32 / 4, value as u32);
+        }
+        if size == 4 && PRIVATE_WINDOW.contains(&offset) && !Self::known(offset) {
+            // The low address bits come from 0x10AC, which nothing here
+            // lets be written: they are zero.
+            let address = ((offset - PRIVATE_BASE) << PRIVATE_SHIFT) as u32;
+            return self.engine.private_write(address, value as u32);
         }
         if size != 4 || !Self::known(offset) {
             return self.refuse(format!("unmodeled write +{offset:#x}/{size}={value:#x}"));
@@ -246,6 +272,11 @@ mod tests {
         engine.write(0, 0x8c, 4, 0x010000dd).unwrap();
         assert_eq!(engine.read(0, 0x8c, 4), Some(0x010000dd));
         engine.write(0, 0x8c, 4, 0).unwrap();
+        // nvservices' write inside the private register window stays the
+        // host's own; the window's other words are the engine's to refuse.
+        engine.write(0, 0x1604, 4, 3).unwrap();
+        assert_eq!(engine.read(0, 0x1604, 4), Some(3));
+        assert_eq!(engine.write(0, 0x1608, 4, 3), None);
         // The boot methods nvservices sends through the THI port (survey
         // run: 0x80 = 1, 0x1c7 = 0x3c0, 0x1cb = 0xe0043d).
         for (method, value) in [(0x80, 1), (0x1c7, 0x3c0), (0x1cb, 0xe0043d)] {

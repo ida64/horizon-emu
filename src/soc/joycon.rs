@@ -653,10 +653,17 @@ impl JoyCon {
             payload_crc,
             crc,
         ] = *envelope.first_chunk().ok_or(())?;
+        // hekate sends its reports to a Joy-Con with both checksums zero
+        // and notes that nothing checks them (`joycon.c`
+        // `_jc_packet_add_uart_hdr`; only its packets to a HORI pad carry
+        // them), and its driver works on consoles. \[inference: a Joy-Con
+        // takes a report whose checksums are zero; what it does with other
+        // wrong ones is not known, so those are refused\]
+        let unchecked = command == REPORT && payload_crc == 0 && crc == 0;
+        let checked = payload_crc == crc8(payload) && crc == crc8(&envelope[..ENVELOPE - 1]);
         let sound = usize::from(u16::from_le_bytes([size_low, size_high])) == payload.len()
             && status == 0
-            && payload_crc == crc8(payload)
-            && crc == crc8(&envelope[..ENVELOPE - 1]);
+            && (checked || unchecked);
         if !sound {
             return Err(());
         }
@@ -956,6 +963,12 @@ impl JoyCon {
             // Battery voltage, in units of 2.5 mV: 4.0 V, within the range
             // the notes give for the "full" the reports claim.
             0x50 => (0xD0, 1600u16.to_le_bytes().to_vec()),
+            // How the Joy-Con charges from the rail, with the settings of
+            // wired command 2 (hekate `joycon.c` "charge set"; the notes
+            // call it two output pins). hekate waits for an answer with
+            // this subcommand and reads no more of it; that the
+            // acknowledgement is the plain one is an assumption.
+            0x51 if matches!(argument(0)?, 0x00 | 0x04 | 0x10 | 0x14) => DONE,
             _ => return Err(()),
         })
     }

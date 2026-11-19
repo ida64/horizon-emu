@@ -88,6 +88,9 @@ const MRW12: u64 = 0x4BC;
 const MRW13: u64 = 0x4C0;
 const TRAINING_OPT_DQ_OB_VREF: u64 = 0xEC4;
 
+/// `EMC_SCRATCH0` (hekate `emc_t210.h`).
+const SCRATCH0: u64 = 0x324;
+
 /// What the boot chain's SDRAM bring-up leaves in the registers the
 /// clock driver reads before writing them. The first-stage bootloader
 /// programs the EMC from the boot configuration table's SDRAM parameters
@@ -166,9 +169,12 @@ impl Emc {
     /// until written. The NX bootloader programs it during its SDRAM
     /// bring-up (about 273 registers, `0x40015348`, research §2.5) and
     /// reads none of them back; whatever of `ENTRY_STATE` it does not
-    /// write refuses when the kernel's clock driver reads it.
+    /// write refuses when the kernel's clock driver reads it. The one
+    /// exception is `EMC_SCRATCH0`, which holds 0 \[assumption: a scratch
+    /// register nothing has written; hekate reads it before its SDRAM
+    /// bring-up for a mark its own memory training leaves there\].
     pub fn power_on() -> Self {
-        Self::with_registers(HashMap::new())
+        Self::with_registers([(SCRATCH0, 0)].into_iter().collect())
     }
 
     fn with_registers(channel: HashMap<u64, u32>) -> Self {

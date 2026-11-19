@@ -39,7 +39,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -182,8 +182,14 @@ impl Progress {
 /// a partitioned user area with package2 in its BCPKG2 partitions, and
 /// both boot partitions with their BCTs and package1.
 fn media(keys: &KeySet) -> (EmmcImages, [Vec<u8>; 2]) {
-    let directory =
-        std::env::temp_dir().join(format!("horizon-emu-power-on-{}", std::process::id()));
+    // One directory per call: the tests of this file run in one process
+    // at the same time, and each removes its directory.
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    let directory = std::env::temp_dir().join(format!(
+        "horizon-emu-power-on-{}-{}",
+        std::process::id(),
+        CALLS.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&directory).unwrap();
     let create = |name: &str| {
         OpenOptions::new()

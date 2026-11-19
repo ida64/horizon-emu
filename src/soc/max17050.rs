@@ -45,6 +45,8 @@ impl Battery {
 
 mod register {
     pub const STATUS: u8 = 0x00;
+    /// The reported state of charge, in 1/256 percent.
+    pub const REP_SOC: u8 = 0x06;
     /// Age, in 1/256 percent: public hekate `bdk/power/max17050.h`.
     pub const AGE: u8 = 0x07;
     pub const TEMPERATURE: u8 = 0x08;
@@ -185,6 +187,14 @@ impl Max17050 {
             ),
             // 1/256 percent per unit.
             register::SOCVF => (battery.percent * 256) as u16,
+            // Until the driver seeds it: the reported state of charge of a
+            // gauge fresh out of reset starts from the voltage gauge's
+            // (the datasheet's account of the mixing algorithm, recalled),
+            // and this battery holds still, so no charge is counted to
+            // move it. hekate shows it and writes nothing.
+            register::REP_SOC if !self.registers.contains_key(&register) => {
+                (battery.percent * 256) as u16
+            }
             // Nothing has been counted yet.
             register::QH => 0,
             // The table reads as zeros while it is locked.

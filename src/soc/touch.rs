@@ -287,22 +287,40 @@ impl I2cDevice for Touch {
     fn read(&mut self, data: &mut [u8]) -> Option<bool> {
         let mut s = self.input.state.lock().unwrap();
         match self.command {
-            [0xb6, 0, 4] if data.len() == 7 || data.len() == 3 => {
+            // Hardware registers: a dummy byte, then the bytes from the
+            // address on. hekate tells the controller from a clone by
+            // reading the same identity two bytes earlier (`touch.c`
+            // `touch_get_chip_info`: from 0x0002 the chip ID must still be
+            // where 0x0004 has it).
+            [0xb6, 0, address] if !data.is_empty() => {
                 // Version and configuration bytes are consistent with the
                 // shipped firmware family; no measured panel calibration.
-                let info = [
-                    0,
-                    CHIP_ID[0],
-                    CHIP_ID[1],
-                    (FIRMWARE_VERSION >> 8) as u8,
-                    FIRMWARE_VERSION as u8,
-                    0,
-                    0,
-                ];
-                data.copy_from_slice(&info[..data.len()]);
+                let register = |address: u8| {
+                    Some(match address {
+                        // Not public; hekate reads past them [assumption].
+                        2 | 3 => 0,
+                        4 => CHIP_ID[0],
+                        5 => CHIP_ID[1],
+                        6 => (FIRMWARE_VERSION >> 8) as u8,
+                        7 => FIRMWARE_VERSION as u8,
+                        8 | 9 => 0,
+                        0x23 => (s.count as u8) << 1,
+                        0x2c => s.interrupt_control,
+                        _ => return None,
+                    })
+                };
+                let mut bytes = vec![0];
+                for offset in 0..data.len() as u8 - 1 {
+                    match register(address.wrapping_add(offset)) {
+                        Some(byte) => bytes.push(byte),
+                        None => {
+                            drop(s);
+                            return self.refuse(data);
+                        }
+                    }
+                }
+                data.copy_from_slice(&bytes);
             }
-            [0xb6, 0, 0x23] if data.len() == 2 => data.copy_from_slice(&[0, (s.count as u8) << 1]),
-            [0xb6, 0, 0x2c] if data.len() == 2 => data.copy_from_slice(&[0, s.interrupt_control]),
             [0xd0, 0, 0x60] if data.len() == 3 => {
                 data.copy_from_slice(&[0, INFO_ADDRESS as u8, (INFO_ADDRESS >> 8) as u8])
             }
@@ -369,6 +387,12 @@ mod tests {
         assert!(!irq.load(Ordering::SeqCst));
         t.read(&mut event);
         assert_eq!(event, [0; 8]);
+        // Read two bytes earlier, the identity is still where 0x0004 has
+        // it: how hekate tells this controller from a clone.
+        t.write(&[0xb6, 0, 2]);
+        let mut early = [0xff; 7];
+        assert_eq!(t.read(&mut early), Some(true));
+        assert_eq!(early[3..5], CHIP_ID);
         t.write(&[0xb6, 0, 0xff]);
         assert_eq!(t.read(&mut count), None);
     }

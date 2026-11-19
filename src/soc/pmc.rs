@@ -232,8 +232,10 @@ const HWCHECK_STATE: [(u64, u32); 143] = [
 
 /// Registers the boot chain reads that the check does not: see
 /// [`Pmc::power_on`].
-const POWER_ON_UNCHECKED: [(u64, u32); 9] = [
+const POWER_ON_UNCHECKED: [(u64, u32); 11] = [
     (SCRATCH0, 0),
+    (SCRATCH20, 0),
+    (SCRATCH37, 0),
     (USB_AO, 0),
     (RST_STATUS, 0),
     (SCRATCH49, 0),
@@ -255,6 +257,13 @@ const USB_AO: u64 = 0x0F0;
 /// leaves a cold boot (`0x101328`). 0 at power-on like the other scratch
 /// registers ([`Pmc::power_on`]).
 const SCRATCH49: u64 = 0x244;
+/// `SCRATCH20`: "ODM data/config scratch" in hekate's header; hekate
+/// clears its debug console bits 19:18 by read-modify-write at start.
+/// 0 at power-on like the other scratch registers.
+const SCRATCH20: u64 = 0x0A0;
+/// `SCRATCH37`: hekate looks there for the mark of a kernel panic it left
+/// before a reboot. 0 at power-on like the other scratch registers.
+const SCRATCH37: u64 = 0x130;
 
 /// `SCRATCH0`: the boot ROM's flags, which it reads first of all
 /// (`0x1023BE`): bit 0 a warm boot (the monitor sets it before SC7), bit 1

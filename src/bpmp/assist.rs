@@ -229,11 +229,11 @@ impl CodeCache {
             if entry.tag == tag {
                 return Ok(entry.instruction);
             }
-            let instruction = bus.read(pc, width)?;
+            let instruction = bus.fetch(pc, width)?;
             *entry = Entry { instruction, tag };
             return Ok(instruction);
         }
-        bus.read(pc, width)
+        bus.fetch(pc, width)
     }
 
     /// Drops the entries a write of `len` bytes at `address` overlaps.
@@ -254,6 +254,10 @@ pub(super) struct Invalidating<'a> {
 impl BpmpBus for Invalidating<'_> {
     fn read(&mut self, address: u32, size: u8) -> Result<u32, BusError> {
         self.inner.read(address, size)
+    }
+
+    fn fetch(&mut self, address: u32, size: u8) -> Result<u32, BusError> {
+        self.inner.fetch(address, size)
     }
 
     fn write(&mut self, address: u32, size: u8, value: u32) -> Result<(), BusError> {
@@ -450,6 +454,19 @@ impl TracingBus<'_> {
 impl BpmpBus for TracingBus<'_> {
     fn read(&mut self, address: u32, size: u8) -> Result<u32, BusError> {
         let result = self.inner.read(address, size);
+        let value = result.as_ref().ok().copied();
+        self.record(
+            address,
+            size,
+            false,
+            value,
+            result.as_ref().map(|_| ()).map_err(Clone::clone),
+        );
+        result
+    }
+
+    fn fetch(&mut self, address: u32, size: u8) -> Result<u32, BusError> {
+        let result = self.inner.fetch(address, size);
         let value = result.as_ref().ok().copied();
         self.record(
             address,

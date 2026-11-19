@@ -86,6 +86,10 @@ const INT_BUS_CLEAR_DONE: u32 = 1 << 11;
 const INT_LEVELS: u32 = INT_RX_FIFO_DATA_REQ | INT_TX_FIFO_DATA_REQ;
 
 const TRANSFER_STATUS_NO_ACK_FOR_ADDRESS: u32 = 1 << 3;
+/// Bits 15:4: the number of the last byte transferred, counted from 0
+/// (Linux `i2c-tegra.c` names the field `TRANSFER_BYTENUM`; hekate waits
+/// for it to reach the packet's size less one before it goes on, `i2c.c`).
+const TRANSFER_STATUS_BYTE_SHIFT: u32 = 4;
 const TRANSFER_STATUS_COMPLETE: u32 = 1 << 24;
 
 const BUS_CLEAR_ENABLE: u32 = 1 << 0;
@@ -256,7 +260,8 @@ impl State {
                 u32::from_le_bytes(word)
             }));
         }
-        self.transfer_status = TRANSFER_STATUS_COMPLETE;
+        self.transfer_status =
+            TRANSFER_STATUS_COMPLETE | (size as u32 - 1) << TRANSFER_STATUS_BYTE_SHIFT;
         self.interrupt_status |= INT_PACKET_XFER_COMPLETE | INT_ALL_PACKETS_XFER_COMPLETE;
         Ok(())
     }
@@ -636,6 +641,8 @@ mod tests {
         bench.write(TX_PACKET_FIFO, 0x0000_0504).unwrap();
         assert!(bench.line.load(Ordering::SeqCst));
         assert_ne!(bench.read(INTERRUPT_STATUS) & INT_PACKET_XFER_COMPLETE, 0);
+        // hekate's driver waits for the number of the last byte sent.
+        assert_eq!(bench.read(PACKET_TRANSFER_STATUS) >> 4 & 0xFFF, 5);
         bench.write(INTERRUPT_STATUS, 0xFC).unwrap();
         assert!(!bench.line.load(Ordering::SeqCst));
 
