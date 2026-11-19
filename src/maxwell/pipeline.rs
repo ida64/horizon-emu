@@ -475,7 +475,7 @@ fn constant_buffers(
 /// translate. A bound constant buffer may reach past the memory its owner
 /// mapped (NVN binds 0xE900 bytes of which nvservices mapped 0x7900, seen
 /// from starter); a shader reading there is refused when it does.
-fn read_mapped(memory: &dyn GpuMemory, address: u64, length: usize) -> Vec<u8> {
+pub(super) fn read_mapped(memory: &dyn GpuMemory, address: u64, length: usize) -> Vec<u8> {
     const PAGE: u64 = 0x1000;
     let mut bytes = vec![0; length];
     let mut done = 0;

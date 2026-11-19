@@ -68,6 +68,35 @@
 //! starts the next one from zeros: after `OUT.EMIT` the outputs are
 //! undefined (the compiler stores every output again).
 //!
+//! # Compute programs
+//!
+//! A compute thread block (CTA) runs as warps of [`WARP`] lanes, each
+//! warp in the same lockstep as a fragment quad: thread `t` (linear index
+//! `x + y * Dx + z * Dx * Dy` of its thread ID in a block of
+//! `Dx * Dy * Dz` threads) is lane `t % 32` of warp `t / 32`, and a last warp the
+//! block does not fill has absent lanes [public: NVIDIA CUDA C
+//! Programming Guide, "SIMT Architecture": warps hold threads of
+//! consecutive, increasing thread IDs, the first warp thread 0; "Thread
+//! Hierarchy" for the linear thread ID]. A warp runs until every lane
+//! has exited or waits at `BAR.SYNC`; once every warp of the block has,
+//! the waiting lanes go on. A barrier that some threads of the block can
+//! no longer reach (they exited), or lanes waiting at two different
+//! barriers, are refused: the CUDA programming guide leaves such code's
+//! behaviour undefined ("`__syncthreads()` is allowed in conditional code
+//! but only if the conditional evaluates identically across the entire
+//! thread block").
+//!
+//! Shared memory (`LDS`/`STS`) is one byte array per block, as large as
+//! the launch declares; its contents at the start of a block are
+//! undefined on hardware, so a read of a byte no thread of the block has
+//! written is refused. Accesses outside it are refused (they trap on
+//! hardware). The blocks of a grid run one after another in raster order
+//! (x fastest) \[inference: hardware runs them concurrently in an order
+//! it does not define, so one sequential order is one of the orders a
+//! correct kernel must allow\]. Generic `LD`/`ST`, which reach shared or
+//! local memory inside the windows `SET_SHADER_SHARED_MEMORY_WINDOW` and
+//! `SET_SHADER_LOCAL_MEMORY_WINDOW` set, are refused in compute programs.
+//!
 //! # Instructions executed
 //!
 //! Float: `FADD`, `FADD32I`, `FMUL`, `FMUL32I`, `FFMA`, `FFMA32I`, `FMNMX`,
@@ -75,23 +104,29 @@
 //! Integer: `IADD`, `IADD32I`, `IADD3`, `ISCADD`, `ISCADD32I`, `IMNMX`,
 //! `ISETP`, `ISET`, `ICMP`, `LOP`, `LOP32I`, `LOP3`, `SHL`, `SHR`, `BFE`,
 //! `BFI`, `XMAD`, `SEL`, `MOV`, `MOV32I`, `VMAD`, `VSETP`.
-//! Predicates: `PSETP`, `P2R`, `R2P`. System: `S2R SR_Y_DIRECTION`,
-//! `S2R SR_INVOCATION_INFO` (geometry). Memory: `LDC`, `LDG`, `STG`,
-//! `LD`, `ST` (global through [`super::Env::memory`]). Attributes: `ALD`,
-//! `AST` (vertex, geometry), `ISBERD`, `OUT` (geometry), `IPA`
-//! (fragment). Textures: `TEX`, `TEX.B`, `TEXS`, `TLD`, `TLD.B`, `TLDS`,
-//! `TLD4`, `TLD4.B`, `TLD4S`, `TXQ`, `TXQ.B`, `TMML`, `TMML.B`, `TXD`,
-//! `TXD.B`. Control: `BRA`, `BRX`, `SSY`, `SYNC`, `PBK`, `BRK`, `PCNT`,
-//! `CONT`, `EXIT`, `KIL`, `NOP`, `DEPBAR`, `BAR`, `MEMBAR`.
+//! Predicates: `PSETP`, `P2R`, `R2P`. System: `S2R SR_Y_DIRECTION`
+//! (graphics), `S2R SR_INVOCATION_INFO` (geometry), `S2R SR_LANEID`,
+//! `SR_TID`, `SR_TID.X/Y/Z`, `SR_CTAID.X/Y/Z` (compute). Memory: `LDC`,
+//! `LDG`, `STG`, `LD`, `ST` (global through [`super::Env::memory`];
+//! `LD`/`ST` outside compute programs), `LDS`, `STS` (compute).
+//! Attributes: `ALD`, `AST` (vertex, geometry), `ISBERD`, `OUT`
+//! (geometry), `IPA` (fragment). Textures: `TEX`, `TEX.B`, `TEXS`, `TLD`,
+//! `TLD.B`, `TLDS`, `TLD4`, `TLD4.B`, `TLD4S`, `TXQ`, `TXQ.B`, `TMML`,
+//! `TMML.B`, `TXD`, `TXD.B` (in compute programs with explicit levels of
+//! detail only: there are no quad derivatives). Control: `BRA`, `BRX`,
+//! `SSY`, `SYNC`, `PBK`, `BRK`, `PCNT`, `CONT`, `EXIT`, `KIL`, `NOP`,
+//! `DEPBAR`, `BAR`, `MEMBAR`.
 //!
 //! Every other decodable instruction, and every modifier of the above that
 //! is not modeled (each is named at its check), returns [`Unmodeled`] when
 //! executed, naming the mnemonic, what is unmodeled, the word and the pc.
 //!
-//! `DEPBAR` (wait for scoreboard), `BAR` (CTA barrier) and `MEMBAR`
-//! (memory ordering) have no observable effect here: an invocation runs to
-//! completion, each instruction's results are visible to the next one, and
-//! memory accesses happen in program order. The `NOP` field `TRIG` and
+//! `DEPBAR` (wait for scoreboard) and `MEMBAR` (memory ordering) have no
+//! observable effect here: an invocation's instructions run in order,
+//! each one's results visible to the next, and memory accesses happen in
+//! program order. `BAR` has none outside compute programs, where one
+//! invocation runs at a time; in compute programs `BAR.SYNC` is the
+//! block-wide barrier described above. The `NOP` field `TRIG` and
 //! the cache-policy fields of `LDG`/`STG`/`LD`/`ST` are hints that do not
 //! change values in a model without caches.
 
@@ -100,6 +135,8 @@ mod integer;
 mod tex;
 mod texture_vector;
 mod video;
+
+use std::cell::RefCell;
 
 use super::super::Unmodeled;
 use super::decode::Op;
@@ -119,6 +156,13 @@ const CC_Z: u8 = 1;
 const CC_S: u8 = 2;
 const CC_C: u8 = 4;
 const CC_O: u8 = 8;
+
+/// A set of lanes of a [`Machine`], bit `i` lane `i`.
+pub(super) type Mask = u32;
+
+/// Threads per warp [public: NVIDIA CUDA C Programming Guide, "SIMT
+/// Architecture"; `SR_LANEID` counts 0-31].
+pub const WARP: usize = 32;
 
 /// One decoded instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +217,10 @@ enum State {
     Running,
     Exited,
     Killed,
+    /// Waiting at `BAR.SYNC` (compute).
+    Barrier,
+    /// A lane of a compute warp the thread block does not fill.
+    Absent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +265,7 @@ enum Io<'a> {
         output: &'a mut Attributes,
     },
     Geometry(Geometry<'a>),
+    Compute(Compute<'a>),
     Fragment {
         planes: &'a [Plane; 256],
         x: u32,
@@ -238,8 +287,71 @@ struct Geometry<'a> {
     emitted: &'a mut Vec<Option<Attributes>>,
 }
 
+/// The thread IDs and shared memory of a compute warp.
+struct Compute<'a> {
+    /// Linear thread index of lane 0 in the block.
+    first: u32,
+    /// Threads of the block per dimension.
+    block: [u32; 3],
+    /// The block's coordinates in the grid.
+    cta: [u32; 3],
+    shared: &'a RefCell<Shared>,
+    /// Barriers the launch declares.
+    barriers: u32,
+}
+
+/// The shared memory of a thread block, and which of its bytes threads
+/// of the block have written.
+struct Shared {
+    bytes: Vec<u8>,
+    written: Vec<bool>,
+}
+
+impl Shared {
+    fn new(size: usize) -> Shared {
+        Shared {
+            bytes: vec![0; size],
+            written: vec![false; size],
+        }
+    }
+
+    /// A new block starts: nothing is written.
+    fn reset(&mut self) {
+        self.written.fill(false);
+    }
+
+    fn load(&self, address: usize, out: &mut [u8]) -> Result<(), String> {
+        let range = self.range(address, out.len())?;
+        if let Some(at) = self.written[range.clone()].iter().position(|w| !w) {
+            return Err(format!(
+                "reads shared byte {:#x}, which no thread of the block wrote",
+                address + at
+            ));
+        }
+        out.copy_from_slice(&self.bytes[range]);
+        Ok(())
+    }
+
+    fn store(&mut self, address: usize, data: &[u8]) -> Result<(), String> {
+        let range = self.range(address, data.len())?;
+        self.written[range.clone()].fill(true);
+        self.bytes[range].copy_from_slice(data);
+        Ok(())
+    }
+
+    fn range(&self, address: usize, length: usize) -> Result<std::ops::Range<usize>, String> {
+        match address.checked_add(length) {
+            Some(end) if end <= self.bytes.len() => Ok(address..end),
+            _ => Err(format!(
+                "address {address:#x} outside the block's {:#x} bytes of shared memory",
+                self.bytes.len()
+            )),
+        }
+    }
+}
+
 struct Machine<'a, const L: usize> {
-    program: &'a Program,
+    code: &'a [Option<Inst>],
     env: &'a Env<'a>,
     lanes: [Lane; L],
     io: Io<'a>,
@@ -247,6 +359,8 @@ struct Machine<'a, const L: usize> {
     op: Op,
     word: u64,
     pc: u32,
+    /// Instructions executed so far.
+    steps: u64,
 }
 
 pub(super) fn run_vertex(
@@ -263,7 +377,7 @@ pub(super) fn run_vertex(
         )));
     }
     let mut machine = Machine::<1> {
-        program,
+        code: &program.code,
         env,
         lanes: [Lane::new()],
         io: Io::Vertex {
@@ -274,6 +388,7 @@ pub(super) fn run_vertex(
         op: Op::Invalid,
         word: 0,
         pc: 0,
+        steps: 0,
     };
     machine.run()?;
     if machine.lanes[0].state == State::Killed {
@@ -297,7 +412,7 @@ pub(super) fn run_geometry(
     }
     let mut current = Attributes::default();
     let mut machine = Machine::<1> {
-        program,
+        code: &program.code,
         env,
         lanes: [Lane::new()],
         io: Io::Geometry(Geometry {
@@ -310,6 +425,7 @@ pub(super) fn run_geometry(
         op: Op::Invalid,
         word: 0,
         pc: 0,
+        steps: 0,
     };
     machine.run()?;
     if machine.lanes[0].state == State::Killed {
@@ -335,7 +451,7 @@ pub(super) fn run_fragment(
     }
     let lanes = [Lane::new(), Lane::new(), Lane::new(), Lane::new()];
     let mut machine = Machine::<4> {
-        program,
+        code: &program.code,
         env,
         lanes,
         io: Io::Fragment {
@@ -347,6 +463,7 @@ pub(super) fn run_fragment(
         op: Op::Invalid,
         word: 0,
         pc: 0,
+        steps: 0,
     };
     if !quad.front_facing {
         // Nothing in the modeled instruction set reads the facing of the
@@ -391,9 +508,118 @@ pub(super) fn run_fragment(
     Ok(())
 }
 
+/// Runs every thread block of `launch` (see the module documentation).
+pub(super) fn run_grid(
+    code: &[Option<Inst>],
+    env: &Env<'_>,
+    launch: &super::Launch,
+) -> Result<(), Unmodeled> {
+    let [bx, by, bz] = launch.block;
+    let threads = bx * by * bz;
+    if threads == 0 || launch.grid.contains(&0) {
+        return Ok(());
+    }
+    let shared = RefCell::new(Shared::new(launch.shared as usize));
+    let warps = (threads as usize).div_ceil(WARP);
+    let mut machines: Vec<Box<Machine<'_, WARP>>> = (0..warps)
+        .map(|warp| {
+            Box::new(Machine {
+                code,
+                env,
+                lanes: std::array::from_fn(|_| Lane::new()),
+                io: Io::Compute(Compute {
+                    first: (warp * WARP) as u32,
+                    block: launch.block,
+                    cta: [0; 3],
+                    shared: &shared,
+                    barriers: launch.barriers,
+                }),
+                op: Op::Invalid,
+                word: 0,
+                pc: 0,
+                steps: 0,
+            })
+        })
+        .collect();
+    for z in 0..launch.grid[2] {
+        for y in 0..launch.grid[1] {
+            for x in 0..launch.grid[0] {
+                shared.borrow_mut().reset();
+                for (warp, machine) in machines.iter_mut().enumerate() {
+                    for (index, lane) in machine.lanes.iter_mut().enumerate() {
+                        *lane = Lane::new();
+                        if warp * WARP + index >= threads as usize {
+                            lane.state = State::Absent;
+                        }
+                    }
+                    machine.steps = 0;
+                    if let Io::Compute(compute) = &mut machine.io {
+                        compute.cta = [x, y, z];
+                    }
+                }
+                run_block(&mut machines).map_err(|Unmodeled(what)| {
+                    Unmodeled(format!("{what} (thread block {x}, {y}, {z})"))
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Runs the warps of one thread block to completion, releasing them from
+/// each barrier once all have reached it.
+fn run_block(machines: &mut [Box<Machine<'_, WARP>>]) -> Result<(), Unmodeled> {
+    loop {
+        for machine in machines.iter_mut() {
+            machine.run()?;
+        }
+        // Every lane has exited, is absent, or waits at a barrier.
+        let mut waiting = None;
+        let mut exited = 0;
+        for lane in machines.iter().flat_map(|m| m.lanes.iter()) {
+            match lane.state {
+                State::Barrier => match waiting {
+                    None => waiting = Some(lane.pc),
+                    Some(pc) if pc != lane.pc => {
+                        return Err(Unmodeled(format!(
+                            "shader: threads of a block wait at two barriers (continuing at \
+                             {pc:#x} and {:#x})",
+                            lane.pc
+                        )));
+                    }
+                    Some(_) => {}
+                },
+                State::Exited => exited += 1,
+                State::Absent => {}
+                State::Running | State::Killed => {
+                    return Err(Unmodeled(format!(
+                        "shader: compute lane stopped {:?}",
+                        lane.state
+                    )));
+                }
+            }
+        }
+        let Some(pc) = waiting else {
+            return Ok(());
+        };
+        if exited != 0 {
+            return Err(Unmodeled(format!(
+                "shader: BAR.SYNC (continuing at {pc:#x}) waits for {exited} threads of the \
+                 block that exited: undefined"
+            )));
+        }
+        for lane in machines.iter_mut().flat_map(|m| m.lanes.iter_mut()) {
+            if lane.state == State::Barrier {
+                lane.state = State::Running;
+            }
+        }
+    }
+}
+
 impl<'a, const L: usize> Machine<'a, L> {
+    /// Runs until no lane is running: all have exited or been killed, or
+    /// (compute) wait at a barrier.
     fn run(&mut self) -> Result<(), Unmodeled> {
-        let mut steps = 0u64;
         loop {
             let pc = self
                 .lanes
@@ -404,14 +630,13 @@ impl<'a, const L: usize> Machine<'a, L> {
             let Some(pc) = pc else {
                 return Ok(());
             };
-            let mut mask = 0u8;
+            let mut mask: Mask = 0;
             for (index, lane) in self.lanes.iter().enumerate() {
                 if lane.state == State::Running && lane.pc == pc {
                     mask |= 1 << index;
                 }
             }
             let inst = self
-                .program
                 .code
                 .get((pc / 8) as usize)
                 .copied()
@@ -424,8 +649,8 @@ impl<'a, const L: usize> Machine<'a, L> {
             self.op = inst.op;
             self.word = inst.word;
             self.pc = pc;
-            steps += 1;
-            if steps > STEP_LIMIT {
+            self.steps += 1;
+            if self.steps > STEP_LIMIT {
                 return Err(self.unmodeled(&format!("more than {STEP_LIMIT} steps")));
             }
             self.step(mask)?;
@@ -456,6 +681,10 @@ impl<'a, const L: usize> Machine<'a, L> {
 
     fn is_fragment(&self) -> bool {
         matches!(self.io, Io::Fragment { .. })
+    }
+
+    fn is_compute(&self) -> bool {
+        matches!(self.io, Io::Compute(_))
     }
 
     // Register file access.
@@ -608,7 +837,7 @@ impl<'a, const L: usize> Machine<'a, L> {
         })
     }
 
-    fn step(&mut self, mask: u8) -> Result<(), Unmodeled> {
+    fn step(&mut self, mask: Mask) -> Result<(), Unmodeled> {
         let next = next_pc(self.pc);
         // SSY, PBK and PCNT have no guard predicate: their encoding is
         // the target (bits 20-43) and CA (bit 5) only, bits 16-19 are not
@@ -616,7 +845,7 @@ impl<'a, const L: usize> Machine<'a, L> {
         // `InstPbk`, `InstPcnt`]. Compilers leave them as they please
         // (0, read as P0, in a scene of starter's).
         let unpredicated = matches!(self.op, Op::Ssy | Op::Pbk | Op::Pcnt);
-        let mut active = 0u8;
+        let mut active: Mask = 0;
         for lane in 0..L {
             if mask & (1 << lane) != 0 {
                 self.lanes[lane].pc = next;
@@ -650,7 +879,7 @@ impl<'a, const L: usize> Machine<'a, L> {
     #[inline]
     fn each(
         &mut self,
-        active: u8,
+        active: Mask,
         mut f: impl FnMut(&mut Self, usize) -> Result<(), Unmodeled>,
     ) -> Result<(), Unmodeled> {
         for lane in 0..L {
@@ -661,7 +890,7 @@ impl<'a, const L: usize> Machine<'a, L> {
         Ok(())
     }
 
-    fn execute_other(&mut self, active: u8) -> Result<(), Unmodeled> {
+    fn execute_other(&mut self, active: Mask) -> Result<(), Unmodeled> {
         let w = self.word;
         match self.op {
             Op::Bra => {
@@ -768,32 +997,172 @@ impl<'a, const L: usize> Machine<'a, L> {
                     Ok(())
                 })
             }
-            Op::Nop | Op::Depbar | Op::Membar | Op::Bar => Ok(()),
+            Op::Nop | Op::Depbar | Op::Membar => Ok(()),
+            Op::Bar if self.is_compute() => self.barrier(active),
+            Op::Bar => Ok(()),
             Op::S2r => {
                 let sr = bits(w, 20, 8);
-                // SR_Y_DIRECTION (18), SR_INVOCATION_INFO (29) [public:
-                // eden `translate/impl/move_special_register.cpp`]; see the
-                // module documentation for the latter.
-                let value = match (sr, &self.io) {
-                    (18, _) => self.env.y_direction.to_bits(),
-                    (29, Io::Geometry(geometry)) => (geometry.inputs.len() as u32) << 16,
-                    _ => return self.fail(&format!("special register {sr}")),
-                };
                 let rd = bits(w, 0, 8);
                 self.each(active, |m, lane| {
+                    let value = m.special_register(lane, sr)?;
                     m.set(lane, rd, value);
                     Ok(())
                 })
             }
+            Op::Lds => self.shared_access(active, false),
+            Op::Sts => self.shared_access(active, true),
             Op::Isberd => self.isberd(active),
             Op::OutR | Op::OutI | Op::OutC => self.out(active),
             Op::Ldc => self.ldc(active),
+            Op::Ld | Op::St if self.is_compute() => self.fail(
+                "generic address in a compute program (the shared and local memory windows \
+                 are not modeled)",
+            ),
             Op::Ldg | Op::Ld => self.load_global(active),
             Op::Stg | Op::St => self.store_global(active),
             Op::Ald => self.ald(active),
             Op::Ast => self.ast(active),
             Op::Ipa => self.ipa(active),
             _ => self.fail("not modeled"),
+        }
+    }
+
+    /// `S2R`: dest 0-7, register 20-27 [public: Ryujinx
+    /// `Decoders/InstDecoders.cs` `InstS2r`, `SReg`; eden
+    /// `translate/impl/move_special_register.cpp`]: SR_LANEID (0),
+    /// SR_Y_DIRECTION (18), SR_INVOCATION_INFO (29, see the module
+    /// documentation), SR_TID (32: x in bits 0-15, y from bit 16, z from
+    /// bit 26, as both sources pack it), SR_TID.X/Y/Z (33-35),
+    /// SR_CTAID.X/Y/Z (37-39).
+    fn special_register(&self, lane: usize, sr: u32) -> Result<u32, Unmodeled> {
+        Ok(match (&self.io, sr) {
+            (Io::Compute(compute), 0 | 32..=35 | 37..=39) => {
+                let [x, y, _] = compute.block;
+                let thread = compute.first + lane as u32;
+                let tid = [thread % x, thread / x % y, thread / (x * y)];
+                match sr {
+                    0 => lane as u32,
+                    32 => tid[0] | tid[1] << 16 | tid[2] << 26,
+                    33..=35 => tid[(sr - 33) as usize],
+                    _ => compute.cta[(sr - 37) as usize],
+                }
+            }
+            (Io::Compute(_), _) => return self.fail(&format!("special register {sr}")),
+            (_, 18) => self.env.y_direction.to_bits(),
+            (Io::Geometry(geometry), 29) => (geometry.inputs.len() as u32) << 16,
+            _ => return self.fail(&format!("special register {sr}")),
+        })
+    }
+
+    /// `BAR` in a compute program: mode 32-34, reduction 35-36, predicate
+    /// operand 39-41 negated by 42, `B` (thread count) immediate flag 43,
+    /// `A` (barrier) immediate flag 44, barrier 8-15 or register A,
+    /// thread count 20-31 or register B [public: eden
+    /// `translate/impl/barrier_operations.cpp` `BAR`, Ryujinx
+    /// `Decoders/InstDecoders.cs` `InstBar`]. Only `BAR.SYNC 0` with the
+    /// default count (0: every thread of the block), which is what
+    /// `__syncthreads()`/GLSL `barrier()` compile to, is modeled.
+    fn barrier(&mut self, active: Mask) -> Result<(), Unmodeled> {
+        let w = self.word;
+        let mode = bits(w, 32, 3);
+        self.require(mode == 0, format_args!("mode {mode} (only SYNC)"))?;
+        self.require(bits(w, 35, 2) == 0, "reduction")?;
+        self.require(bits(w, 39, 3) == PT && !bit(w, 42), "predicate operand")?;
+        self.require(
+            bit(w, 43) && bit(w, 44),
+            "barrier or thread count in a register",
+        )?;
+        self.require(bits(w, 8, 8) == 0, "barrier other than 0")?;
+        self.require(bits(w, 20, 12) == 0, "thread count")?;
+        let Io::Compute(compute) = &self.io else {
+            return self.fail("outside a compute program");
+        };
+        self.require(
+            compute.barriers > 0,
+            "barrier 0, which the launch does not declare (QMD BARRIER_COUNT 0)",
+        )?;
+        self.each(active, |m, lane| {
+            m.lanes[lane].state = State::Barrier;
+            Ok(())
+        })
+    }
+
+    /// `LDS`/`STS`: data register 0-7, address register 8-15, offset 20-43
+    /// (signed, unsigned when the address register is RZ), size 48-50
+    /// (as `LDG`), `LDS.U` bit 44 [public: Ryujinx
+    /// `Decoders/InstDecoders.cs` `InstLds`/`InstSts`, eden
+    /// `translate/impl/load_store_local_shared.cpp` `Offset`].
+    fn shared_access(&mut self, active: Mask, store: bool) -> Result<(), Unmodeled> {
+        let w = self.word;
+        let Io::Compute(compute) = &self.io else {
+            return self.fail("outside a compute program");
+        };
+        let shared = compute.shared;
+        if !store {
+            self.require(!bit(w, 44), "U")?;
+        }
+        let size = bits(w, 48, 3);
+        let width = global_width(size).ok_or_else(|| self.unmodeled(&format!("size {size}")))?;
+        let count = width.div_ceil(4) as u32;
+        let (rd, ra) = (bits(w, 0, 8), bits(w, 8, 8));
+        self.require(
+            rd == RZ || rd.is_multiple_of(count),
+            "vector register not aligned",
+        )?;
+        let immediate = bits(w, 20, 24);
+        let offset = if ra == RZ {
+            immediate
+        } else {
+            sext(immediate, 24) as u32
+        };
+        self.each(active, |m, lane| {
+            let address = m.r(lane, ra).wrapping_add(offset);
+            m.require(
+                address.is_multiple_of(width as u32),
+                format_args!("unaligned address {address:#x}"),
+            )?;
+            let mut bytes = [0u8; 16];
+            if store {
+                for i in 0..count {
+                    let at = i as usize * 4;
+                    bytes[at..at + 4].copy_from_slice(&m.r(lane, rd + i).to_le_bytes());
+                }
+                let stored = shared.borrow_mut().store(address as usize, &bytes[..width]);
+                return stored.map_err(|what| m.unmodeled(&what));
+            }
+            let loaded = shared.borrow().load(address as usize, &mut bytes[..width]);
+            loaded.map_err(|what| m.unmodeled(&what))?;
+            m.write_loaded(lane, rd, size, &bytes);
+            Ok(())
+        })
+    }
+
+    /// Writes what a load of size code `size` read into `bytes` to the
+    /// registers from `rd`: 8- and 16-bit sizes zero- or sign-extended.
+    fn write_loaded(&mut self, lane: usize, rd: u32, size: u32, bytes: &[u8; 16]) {
+        if rd == RZ {
+            return;
+        }
+        let word = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().expect("4"));
+        match size {
+            0 => self.set(lane, rd, u32::from(bytes[0])),
+            1 => self.set(lane, rd, bytes[0] as i8 as i32 as u32),
+            2 => self.set(
+                lane,
+                rd,
+                u32::from(u16::from_le_bytes([bytes[0], bytes[1]])),
+            ),
+            3 => self.set(
+                lane,
+                rd,
+                i16::from_le_bytes([bytes[0], bytes[1]]) as i32 as u32,
+            ),
+            _ => {
+                let count = global_width(size).unwrap_or(4).div_ceil(4);
+                for i in 0..count {
+                    self.set(lane, rd + i as u32, word(i));
+                }
+            }
         }
     }
 
@@ -809,7 +1178,7 @@ impl<'a, const L: usize> Machine<'a, L> {
     /// slot 36-40, address mode 44-45, size 48-50 [public: Ryujinx
     /// `Decoders/InstDecoders.cs` `InstLdc`, `Instructions/InstEmitMemory.cs`
     /// `Ldc`].
-    fn ldc(&mut self, active: u8) -> Result<(), Unmodeled> {
+    fn ldc(&mut self, active: Mask) -> Result<(), Unmodeled> {
         let w = self.word;
         self.require(bits(w, 44, 2) == 0, "address mode IL/IS/ISL")?;
         let size = bits(w, 48, 3);
@@ -898,11 +1267,18 @@ impl<'a, const L: usize> Machine<'a, L> {
         )
     }
 
-    fn load_global(&mut self, active: u8) -> Result<(), Unmodeled> {
+    /// `LDG`/`LD`. Size code 7 (`u b128` in envydis `gm107.c` `tabeed0sz`,
+    /// `UB128` in Ryujinx, `U128 // ???` in eden) loads 128 bits like B128
+    /// in both emulators
+    /// \[inference: what the `U` adds is not documented; at a 16-byte
+    /// aligned address, which is required here, a 128-bit load reads the
+    /// same bytes whatever it means\].
+    fn load_global(&mut self, active: Mask) -> Result<(), Unmodeled> {
         self.check_global()?;
         let rd = bits(self.word, 0, 8);
         self.each(active, |m, lane| {
             let (address, size) = m.global_access(lane)?;
+            let size = if size == 7 { 6 } else { size };
             let width = global_width(size).ok_or_else(|| m.unmodeled(&format!("size {size}")))?;
             m.require(
                 address % width as u64 == 0,
@@ -917,44 +1293,21 @@ impl<'a, const L: usize> Machine<'a, L> {
             if m.env.memory.read(address, &mut bytes[..width]).is_none() {
                 return m.fail(&format!("load from unmapped {address:#x}"));
             }
-            if rd == RZ {
-                return Ok(());
-            }
-            let word =
-                |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().expect("4"));
-            match size {
-                0 => m.set(lane, rd, u32::from(bytes[0])),
-                1 => m.set(lane, rd, bytes[0] as i8 as i32 as u32),
-                2 => m.set(
-                    lane,
-                    rd,
-                    u32::from(u16::from_le_bytes([bytes[0], bytes[1]])),
-                ),
-                3 => m.set(
-                    lane,
-                    rd,
-                    i16::from_le_bytes([bytes[0], bytes[1]]) as i32 as u32,
-                ),
-                _ => {
-                    for i in 0..count {
-                        m.set(lane, rd + i, word(i as usize));
-                    }
-                }
-            }
+            m.write_loaded(lane, rd, size, &bytes);
             Ok(())
         })
     }
 
-    fn store_global(&mut self, active: u8) -> Result<(), Unmodeled> {
+    fn store_global(&mut self, active: Mask) -> Result<(), Unmodeled> {
         self.check_global()?;
         let rd = bits(self.word, 0, 8);
-        let helpers = match self.io {
-            Io::Fragment { covered, .. } => covered,
-            Io::Vertex { .. } | Io::Geometry(_) => [true; 4],
+        let covered = match self.io {
+            Io::Fragment { covered, .. } => Some(covered),
+            Io::Vertex { .. } | Io::Geometry(_) | Io::Compute(_) => None,
         };
         self.each(active, |m, lane| {
             // Helper lanes (outside the primitive) do not write memory.
-            if !helpers[lane] {
+            if covered.is_some_and(|covered| !covered[lane]) {
                 return Ok(());
             }
             let (address, size) = m.global_access(lane)?;
@@ -988,7 +1341,7 @@ impl<'a, const L: usize> Machine<'a, L> {
     /// executed read of an inactive vertex attribute refuses (see
     /// `pipeline::VertexFetch`); a program that only names one in its
     /// header, on a path the draw does not take, runs.
-    fn ald(&mut self, active: u8) -> Result<(), Unmodeled> {
+    fn ald(&mut self, active: Mask) -> Result<(), Unmodeled> {
         let w = self.word;
         self.require(!bit(w, 31), "P (patch)")?;
         self.require(bits(w, 8, 8) == RZ, "indexed address")?;
@@ -1034,6 +1387,7 @@ impl<'a, const L: usize> Machine<'a, L> {
                     }
                 }
                 Io::Fragment { .. } => return m.fail("in a fragment program"),
+                Io::Compute(_) => return m.fail("in a compute program"),
             };
             let mut values = [0u32; 4];
             for (i, value) in values.iter_mut().take(count as usize).enumerate() {
@@ -1050,7 +1404,7 @@ impl<'a, const L: usize> Machine<'a, L> {
     /// vertex register 39-46, size 47-48 [public: eden
     /// `translate/impl/load_store_attribute.cpp` `AST`]. In a geometry
     /// program the vertex register holds the current output handle.
-    fn ast(&mut self, active: u8) -> Result<(), Unmodeled> {
+    fn ast(&mut self, active: Mask) -> Result<(), Unmodeled> {
         let w = self.word;
         self.require(!bit(w, 31), "P (patch)")?;
         self.require(bits(w, 8, 8) == RZ, "indexed address")?;
@@ -1076,12 +1430,13 @@ impl<'a, const L: usize> Machine<'a, L> {
                 return self.fail(&format!("output vertex handle {handle:#x}"));
             }
             Io::Fragment { .. } => return self.fail("in a fragment program"),
+            Io::Compute(_) => return self.fail("in a compute program"),
             _ => {}
         }
         let output = match &mut self.io {
             Io::Vertex { output, .. } => &mut **output,
             Io::Geometry(geometry) => &mut *geometry.current,
-            Io::Fragment { .. } => unreachable!("refused above"),
+            Io::Fragment { .. } | Io::Compute(_) => unreachable!("refused above"),
         };
         for (i, value) in values.iter().take(count as usize).enumerate() {
             output.0[(offset / 4) as usize + i] = *value;
@@ -1094,7 +1449,7 @@ impl<'a, const L: usize> Machine<'a, L> {
     /// envytools `envydis/gm107.c` `isberd`]. Only the default form, which
     /// reads the input vertex handle of an ISBE entry (see the module
     /// documentation), is modeled.
-    fn isberd(&mut self, active: u8) -> Result<(), Unmodeled> {
+    fn isberd(&mut self, active: Mask) -> Result<(), Unmodeled> {
         let w = self.word;
         let Io::Geometry(geometry) = &self.io else {
             return self.fail("outside a geometry program");
@@ -1122,7 +1477,7 @@ impl<'a, const L: usize> Machine<'a, L> {
     /// `translate/impl/output_geometry.cpp`]. Emits beyond
     /// `MaxOutputVertexCount` are no-ops (Shader-Program-Header). Only
     /// stream 0 is modeled.
-    fn out(&mut self, active: u8) -> Result<(), Unmodeled> {
+    fn out(&mut self, active: Mask) -> Result<(), Unmodeled> {
         let w = self.word;
         let form = match self.op {
             Op::OutR => Form::R,
@@ -1173,7 +1528,7 @@ impl<'a, const L: usize> Machine<'a, L> {
     /// `MUFU.RCP` of `IPA.PASS a[0x7c]`, for perspective inputs). Neither
     /// public source defines CONSTANT or SC; they, indexed reads,
     /// non-default sample modes and the predicate operand are not modeled.
-    fn ipa(&mut self, active: u8) -> Result<(), Unmodeled> {
+    fn ipa(&mut self, active: Mask) -> Result<(), Unmodeled> {
         let w = self.word;
         let Io::Fragment { planes, x, y, .. } = self.io else {
             return self.fail("outside a fragment program");

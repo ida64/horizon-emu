@@ -36,7 +36,7 @@ fn boolean(a: bool, b: bool, op: u32) -> bool {
     }
 }
 impl<const L: usize> Machine<'_, L> {
-    pub(super) fn execute_video(&mut self, active: u8) -> Result<bool, Unmodeled> {
+    pub(super) fn execute_video(&mut self, active: Mask) -> Result<bool, Unmodeled> {
         if !matches!(self.op, Op::Vmad | Op::Vsetp) {
             return Ok(false);
         }

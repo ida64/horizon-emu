@@ -36,7 +36,7 @@ impl<const L: usize> Machine<'_, L> {
             index += 1;
         }
     }
-    pub(super) fn execute_texture_vector(&mut self, active: u8) -> Result<bool, Unmodeled> {
+    pub(super) fn execute_texture_vector(&mut self, active: Mask) -> Result<bool, Unmodeled> {
         let op = self.op;
         let w = self.word;
         if matches!(op, Op::Tlds | Op::Tld4s) {
@@ -168,6 +168,10 @@ impl<const L: usize> Machine<'_, L> {
             }
             if tmml {
                 m.require(mask & 12 == 0, "LOD components Z/W")?;
+                m.require(
+                    !m.is_compute(),
+                    "in a compute program (no quad derivatives)",
+                )?;
                 let values = m.env.textures.lod(handle, target, ddx, ddy)?;
                 m.store_texture(
                     l,
@@ -278,6 +282,10 @@ impl<const L: usize> Machine<'_, L> {
                         },
                     }
                 } else {
+                    m.require(
+                        !m.is_compute(),
+                        "implicit level of detail in a compute program",
+                    )?;
                     Lod::Level(0.0)
                 };
                 m.env.textures.sample(
@@ -298,7 +306,7 @@ impl<const L: usize> Machine<'_, L> {
         })?;
         Ok(true)
     }
-    fn scalar_fetch(&mut self, active: u8) -> Result<(), Unmodeled> {
+    fn scalar_fetch(&mut self, active: Mask) -> Result<(), Unmodeled> {
         let w = self.word;
         let a = bits(w, 8, 8);
         let b = bits(w, 20, 8);

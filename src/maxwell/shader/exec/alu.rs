@@ -81,7 +81,7 @@ fn boolean(a: bool, b: bool, op: u32) -> bool {
     }
 }
 impl<const L: usize> Machine<'_, L> {
-    pub(super) fn execute_alu(&mut self, active: u8) -> Result<bool, Unmodeled> {
+    pub(super) fn execute_alu(&mut self, active: Mask) -> Result<bool, Unmodeled> {
         let (name, form) = match self.op {
             Op::MovR => ("MOV", Form::R),
             Op::MovI => ("MOV", Form::I),
