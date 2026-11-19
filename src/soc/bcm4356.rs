@@ -1225,6 +1225,13 @@ impl State {
 
     /// The host changed the ARM core's wrapper: holding it halted marks a
     /// download; releasing it afterwards starts the downloaded firmware.
+    /// A halted firmware is gone, and so is the work it had scheduled on
+    /// the air: the next firmware starts with none. `wlan` halts it to
+    /// download the firmware again each time the console wakes (traced:
+    /// before sleeping it disassociates, takes the radio down and puts the
+    /// function in D3hot; `pcie` holds the GPIO pad 0x38000002 low through
+    /// the sleep and raises it again on waking, then `wlan` enumerates the
+    /// function and downloads anew).
     fn arm_changed(&mut self) {
         let wrapper = self.wrappers[WRAPPER_ARMCR4];
         let in_reset = wrapper.resetctrl & AIRC_RESET != 0;
@@ -1234,6 +1241,7 @@ impl State {
                 self.halted = true;
                 self.dongle = None;
                 self.image_end = 0;
+                self.scheduled.clear();
             }
             return;
         }
@@ -4013,6 +4021,25 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(restored.memory_read(BAR2 + d2h_w, 2), Some(3), "once");
         assert_eq!(escan_result_event(&host), (WLC_E_STATUS_SUCCESS, 0x1234));
+    }
+
+    /// A new download (what `wlan` does on every wake) halts the running
+    /// firmware: the work it had scheduled goes with it, and nothing of it
+    /// reaches the firmware started next.
+    #[test]
+    fn a_new_download_drops_the_work_the_old_firmware_scheduled() {
+        let (wifi, host) = setup();
+        start_escan(&wifi, &host, 300);
+        assert!(!wifi.state.lock().unwrap().scheduled.is_empty());
+        boot(&wifi);
+        let state = wifi.state.lock().unwrap();
+        assert!(state.scheduled.is_empty());
+        assert!(
+            state
+                .dongle
+                .as_ref()
+                .is_some_and(|d| d.scan_in_flight.is_none())
+        );
     }
 
     /// After "up" the firmware announces wl0 (WLC_E_IF, ADD) when the
