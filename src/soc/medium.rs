@@ -17,7 +17,10 @@
 //! gives: the medium hands back the error ([`MediumError::Host`]) for the
 //! machine to stop on, naming the file.
 
-use std::{borrow::Cow, collections::HashMap, fs::File, io, os::unix::fs::FileExt, path::PathBuf};
+use std::{
+    borrow::Cow, collections::HashMap, fs::File, io, os::unix::fs::FileExt, path::PathBuf,
+    sync::Mutex,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -60,8 +63,35 @@ enum Backing {
         image: ImageFile,
         /// Whether writes go to the file.
         write_through: bool,
+        /// Sectors read from the file ahead of a run of reads.
+        ahead: Mutex<ReadAhead>,
     },
     Memory(Vec<u8>),
+}
+
+/// How many sectors one host read of an image file takes at most, once the
+/// guest reads sectors one after the other.
+const READ_AHEAD_SECTORS: u64 = 256;
+
+/// Sectors of an image file read in one host read, for the reads of the
+/// run of sectors the guest is making. Only the file's own contents: the
+/// sectors this run wrote or overlays are looked up before them, and a
+/// write to the file drops them.
+#[derive(Default)]
+struct ReadAhead {
+    /// The sector after the last one read from the file.
+    next: u64,
+    /// The first sector `bytes` holds.
+    first: u64,
+    bytes: Vec<u8>,
+}
+
+impl ReadAhead {
+    /// `sector` as read ahead, if it was.
+    fn get(&self, sector: u64) -> Option<&[u8]> {
+        let at = usize::try_from(sector.checked_sub(self.first)?).ok()? * SECTOR_SIZE;
+        self.bytes.get(at..at + SECTOR_SIZE)
+    }
 }
 
 pub struct Medium {
@@ -128,6 +158,22 @@ fn nonzero_runs(memory: &[u8]) -> Vec<(u64, Cow<'_, [u8]>)> {
     runs
 }
 
+/// Fills `bytes` from `file` at `offset`; what lies beyond the end of the
+/// file reads as zeros, erased.
+fn read_fully(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match file.read_at(&mut bytes[filled..], offset + filled as u64) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    bytes[filled..].fill(0);
+    Ok(())
+}
+
 impl Medium {
     /// `sectors` sectors over `image`, written to only if `writable`.
     pub fn new(
@@ -140,6 +186,7 @@ impl Medium {
             Some(image) => Backing::File {
                 image,
                 write_through: writable,
+                ahead: Mutex::default(),
             },
             None => Backing::Erased,
         };
@@ -184,37 +231,45 @@ impl Medium {
         if sector >= self.sectors || block.len() != SECTOR_SIZE {
             return Err(MediumError::OutOfRange);
         }
-        if let Some(sector) = self
-            .written
-            .get(&sector)
-            .or_else(|| self.overlay.get(&sector))
+        if !(self.written.is_empty() && self.overlay.is_empty())
+            && let Some(sector) = self
+                .written
+                .get(&sector)
+                .or_else(|| self.overlay.get(&sector))
         {
             block.copy_from_slice(&sector[..]);
             return Ok(());
         }
         let offset = sector * SECTOR_SIZE as u64;
-        block.fill(0);
         match &self.backing {
-            Backing::Erased => {}
+            Backing::Erased => block.fill(0),
             Backing::Memory(memory) => {
                 block.copy_from_slice(&memory[offset as usize..][..SECTOR_SIZE]);
             }
-            Backing::File { image, .. } => {
-                // A short image leaves the rest erased.
-                let mut filled = 0;
-                while filled < SECTOR_SIZE {
-                    match image
-                        .file
-                        .read_at(&mut block[filled..], offset + filled as u64)
-                    {
-                        Ok(0) => break,
-                        Ok(count) => filled += count,
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                        Err(error) => {
-                            return Err(image.failed(self.device, "read", sector, error));
-                        }
+            Backing::File { image, ahead, .. } => {
+                let mut ahead = ahead.lock().unwrap();
+                let sequential = ahead.next == sector;
+                ahead.next = sector + 1;
+                if let Some(bytes) = ahead.get(sector) {
+                    block.copy_from_slice(bytes);
+                    return Ok(());
+                }
+                // The second sector of a run reads the run's next sectors
+                // with it; a host error there leaves it to the sector's own
+                // read below, which reports it as every read did.
+                if sequential {
+                    let count = READ_AHEAD_SECTORS.min(self.sectors - sector);
+                    let mut bytes = std::mem::take(&mut ahead.bytes);
+                    bytes.resize(count as usize * SECTOR_SIZE, 0);
+                    if read_fully(&image.file, &mut bytes, offset).is_ok() {
+                        block.copy_from_slice(&bytes[..SECTOR_SIZE]);
+                        ahead.first = sector;
+                        ahead.bytes = bytes;
+                        return Ok(());
                     }
                 }
+                read_fully(&image.file, block, offset)
+                    .map_err(|error| image.failed(self.device, "read", sector, error))?;
             }
         }
         Ok(())
@@ -234,7 +289,10 @@ impl Medium {
             Backing::File {
                 image,
                 write_through: true,
+                ahead,
             } => {
+                // What was read ahead is the file as it was.
+                ahead.get_mut().unwrap().bytes.clear();
                 if let Err(error) = image.file.write_all_at(block, offset) {
                     return Err(image.failed(self.device, "write", sector, error));
                 }
@@ -306,11 +364,15 @@ impl Medium {
         match (&mut self.backing, state.backing) {
             (Backing::Erased, BackingState::Erased) => {}
             (
-                Backing::File { write_through, .. },
+                Backing::File {
+                    write_through,
+                    ahead,
+                    ..
+                },
                 BackingState::File {
                     write_through: saved,
                 },
-            ) if *write_through == saved => {}
+            ) if *write_through == saved => *ahead.get_mut().unwrap() = ReadAhead::default(),
             (Backing::Memory(memory), BackingState::Memory(runs)) => {
                 let fits = |(first, bytes): &(u64, Cow<'_, [u8]>)| {
                     bytes.len().is_multiple_of(SECTOR_SIZE)
@@ -420,5 +482,65 @@ mod tests {
         assert_eq!(block, [7; SECTOR_SIZE]);
         assert_eq!(std::fs::read(&path).unwrap(), [1; 2 * SECTOR_SIZE]);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Runs of sector reads are read ahead from the file; whatever the
+    /// guest reads must still be what a sector by sector read of the file
+    /// and this run's writes gives, for writable and read-only images, one
+    /// shorter than the medium among them.
+    #[test]
+    fn reads_ahead_of_a_run_give_what_the_file_and_the_writes_hold() {
+        let sectors = 700u64;
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut random = move |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % below
+        };
+        for (index, writable) in [true, false].into_iter().enumerate() {
+            let path = std::env::temp_dir().join(format!(
+                "horizon-emu-medium-ahead-{}-{index}",
+                std::process::id()
+            ));
+            // The image stops short of the medium's last 40 sectors.
+            let image: Vec<u8> = (0..(sectors - 40) as usize * SECTOR_SIZE)
+                .map(|byte| (byte / 3 + byte / SECTOR_SIZE) as u8)
+                .collect();
+            std::fs::write(&path, &image).unwrap();
+            let mut model = image.clone();
+            model.resize(sectors as usize * SECTOR_SIZE, 0);
+            let file = File::options().read(true).write(true).open(&path).unwrap();
+            let mut medium = Medium::new(
+                "test",
+                sectors,
+                Some(ImageFile {
+                    file,
+                    path: path.clone(),
+                }),
+                writable,
+            );
+            let mut block = [0; SECTOR_SIZE];
+            for step in 0..3000 {
+                let first = random(sectors);
+                let run = 1 + random(40);
+                for sector in first..(first + run).min(sectors) {
+                    if random(12) == 0 {
+                        let written = [random(256) as u8; SECTOR_SIZE];
+                        medium.write(sector, &written).unwrap();
+                        model[sector as usize * SECTOR_SIZE..][..SECTOR_SIZE]
+                            .copy_from_slice(&written);
+                    } else {
+                        medium.read(sector, &mut block).unwrap();
+                        assert_eq!(
+                            block[..],
+                            model[sector as usize * SECTOR_SIZE..][..SECTOR_SIZE],
+                            "step {step}, sector {sector}, writable {writable}"
+                        );
+                    }
+                }
+            }
+            std::fs::remove_file(&path).unwrap();
+        }
     }
 }

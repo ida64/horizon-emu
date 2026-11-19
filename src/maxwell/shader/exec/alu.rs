@@ -142,6 +142,9 @@ impl<const L: usize> Machine<'_, L> {
             Op::I2fR => ("I2F", Form::R),
             Op::I2fI => ("I2F", Form::I),
             Op::I2fC => ("I2F", Form::C),
+            Op::I2iR => ("I2I", Form::R),
+            Op::I2iI => ("I2I", Form::I),
+            Op::I2iC => ("I2I", Form::C),
             Op::F2fR => ("F2F", Form::R),
             Op::F2fI => ("F2F", Form::F),
             Op::F2fC => ("F2F", Form::C),
@@ -463,6 +466,51 @@ impl<const L: usize> Machine<'_, L> {
                         x = -x;
                     }
                     round_f64(x, bits(w, 39, 2)).to_bits()
+                }
+                // Integer to integer: source format bits 11:10 with signed
+                // bit 13, byte selector 42:41, |b| bit 49, -b bit 45, as
+                // `I2F`; destination format bits 9:8 with signed bit 12,
+                // saturate bit 50 [public: Ryujinx `InstI2iR` field layout;
+                // eden `integer_to_integer_conversion.cpp`]. The source is
+                // extended per its format, then negated or made absolute
+                // (wrapping, as 32-bit integer arithmetic does), then, with
+                // SAT, clamped to the destination's range. Only 32-bit
+                // destinations are modeled: how a narrower one is stored
+                // (truncated or extended) is not established here.
+                "I2I" => {
+                    let destination = bits(w, 8, 2) | (bits(w, 12, 1) << 2);
+                    m.require(destination & 3 == 2, "destination narrower than 32 bits")?;
+                    m.require(!bit(w, 47), "condition code write")?;
+                    let fmt = bits(w, 10, 2) | (bits(w, 13, 1) << 2);
+                    let selection = bits(w, 41, 2);
+                    m.require(
+                        (fmt & 3) != 2 || selection == 0,
+                        "byte selector with 32-bit source",
+                    )?;
+                    let value = b >> (selection * 8);
+                    let mut x: i64 = match fmt {
+                        0 => value as u8 as i64,
+                        1 => value as u16 as i64,
+                        2 => value as i64,
+                        4 => value as i8 as i64,
+                        5 => value as i16 as i64,
+                        6 => value as i32 as i64,
+                        v => return m.fail(&format!("source format {v}")),
+                    };
+                    if bit(w, 49) {
+                        x = x.abs();
+                    }
+                    if bit(w, 45) {
+                        x = -x;
+                    }
+                    if bit(w, 50) {
+                        x = if destination == 6 {
+                            x.clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                        } else {
+                            x.clamp(0, i64::from(u32::MAX))
+                        };
+                    }
+                    x as u32
                 }
                 _ => return m.fail("arithmetic operation"),
             };

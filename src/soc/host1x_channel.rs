@@ -242,6 +242,41 @@ impl Channel {
             }),
         }
     }
+
+    /// The channel's CBSTAT and CBREAD, as the host1x sync block shows
+    /// them: the class (bits 25:16) and method offset (bits 15:0) its
+    /// command processor stands at, and that method's data (Linux
+    /// `hw_host1x04_sync.h` `CBSTAT_CBCLASS`/`CBOFFSET`; `debug_hw_1x01.c`
+    /// reads class 1 offset `WAIT_SYNCPT` as "waiting on syncpt
+    /// CBREAD >> 24 val CBREAD & 0xffffff"). nvservices' CDMA timeout
+    /// thread (`0x828A0`) reads both and lets a channel standing at a wait
+    /// for one of its job's syncpoints run on (offset 8: id in CBREAD bits
+    /// 31:24; offset 0x50: id in CBREAD bits 7:0).
+    ///
+    /// Known while the stream stands at a host syncpoint wait, the one
+    /// method that stays in the command processor here (every other one
+    /// completes within the DMAPUT write that reaches it). Otherwise, idle
+    /// or faulted, the method the processor last held is not kept, and
+    /// this refuses with a note.
+    pub fn command_status(&self) -> Option<(u32, u32)> {
+        let state = self.inner.state.lock().unwrap();
+        let Some(wait) = state.wait else {
+            self.inner.notes.add(format!(
+                "host1x channel: CBSTAT/CBREAD read while the stream stands at no \
+                 syncpoint wait (faulted: {}); its last method is not kept",
+                state.fault
+            ));
+            return None;
+        };
+        // Class 1 (host), at WAIT_SYNCPT (0x8, the legacy 24-bit wait) or
+        // WAIT_SYNCPT_32 (0x50, data the id; its threshold came by 0x4e).
+        let index = wait.index as u32;
+        Some(if wait.bits == 24 {
+            (1 << 16 | 0x8, index << 24 | wait.threshold)
+        } else {
+            (1 << 16 | 0x50, index)
+        })
+    }
 }
 
 impl Inner {
@@ -645,7 +680,7 @@ mod tests {
         syncpoints: Arc<Syncpoints>,
         notes: Arc<Notes>,
         calls: Arc<Mutex<Vec<(u32, u32, u32)>>>,
-        channel: Channel,
+        channel: Arc<Channel>,
     }
 
     impl Bench {
@@ -660,7 +695,7 @@ mod tests {
             let notes: Arc<Notes> = Arc::default();
             let calls = Arc::new(Mutex::new(Vec::new()));
             let record = Arc::clone(&calls);
-            let channel = Channel::new(
+            let channel = Arc::new(Channel::new(
                 DeviceMemory::new(&mc, &ram, SMMU_HOST1X_ASID),
                 Arc::clone(&syncpoints),
                 Arc::new(GuestClock::new()),
@@ -669,7 +704,7 @@ mod tests {
                     Some(())
                 }),
                 Arc::clone(&notes),
-            );
+            ));
             for (register, value) in [(0x14, RING), (0x20, RING + 0x1000), (0x18, RING)] {
                 channel.write(0, register, 4, value.into()).unwrap();
             }
@@ -738,6 +773,43 @@ mod tests {
             [(0x5d, 0x10, 0xc0), (0x5d, 0x11, 0x100)]
         );
         assert!(bench.idle());
+        assert!(bench.notes.take().is_empty());
+    }
+
+    /// CBSTAT and CBREAD of channel 0, read through the sync block as
+    /// nvservices' CDMA timeout thread reads them: the wait the stream
+    /// stands at, either kind; nothing for a channel that stands at none.
+    #[test]
+    fn the_sync_block_shows_the_wait_a_channel_stands_at() {
+        use crate::soc::host1x::Host1xSync;
+        let sync = |bench: &Bench| {
+            Host1xSync::new(
+                Arc::clone(&bench.syncpoints),
+                Vec::new(),
+                vec![Arc::clone(&bench.channel)],
+            )
+        };
+        let bench = Bench::new();
+        let host1x = sync(&bench);
+        assert_eq!(host1x.read(0, 0xCC0, 4), None);
+        assert!(
+            bench.notes.take()[0].contains("stands at no syncpoint wait"),
+            "an idle channel's last method is not kept"
+        );
+        bench.syncpoints.add(7, 4);
+        bench.submit(&wait32(7, 5)).unwrap();
+        // Class 1, WAIT_SYNCPT_32; CBREAD the syncpoint id.
+        assert_eq!(host1x.read(0, 0xCC0, 4), Some(0x1_0050));
+        assert_eq!(host1x.read(0, 0xC80, 4), Some(7));
+        // Channel 1 is not there.
+        assert_eq!(host1x.read(0, 0xCC4, 4), None);
+
+        let bench = Bench::new();
+        let host1x = sync(&bench);
+        bench.submit(&[setclass(1, 0x8, 1), 3 << 24 | 9]).unwrap();
+        // Class 1, WAIT_SYNCPT; CBREAD id << 24 | threshold.
+        assert_eq!(host1x.read(0, 0xCC0, 4), Some(0x1_0008));
+        assert_eq!(host1x.read(0, 0xC80, 4), Some(0x0300_0009));
         assert!(bench.notes.take().is_empty());
     }
 

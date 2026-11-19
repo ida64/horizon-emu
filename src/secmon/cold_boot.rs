@@ -210,7 +210,7 @@ const PACKAGE2_SIZE: RangeInclusive<u64> = 0x200..=0x7F_C000;
 /// its register call, and the kernel carveouts start empty in
 /// [`crate::soc::mc::Mc`]), walling the halted BPMP off (its exception
 /// vectors, SMMU address space and the activity monitor's watch on it,
-/// whose clock alone is set up: [`actmon_clock`]), `SCR_EL3` and the
+/// whose clock alone is set up, by `actmon_clock`), `SCR_EL3` and the
 /// EL2/EL1 system registers (the kernel overwrites the EL1 ones it needs;
 /// `SCTLR_EL1` is entered as `0x00C50838`).
 pub const NOT_MODELLED: &str = "SoC security, counter and power set-up";

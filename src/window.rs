@@ -170,10 +170,12 @@ impl ScreenWindow {
         }
         let problem = match machine.screen() {
             Ok(screen) if screen.panel_on && screen.backlight_on => {
-                let frame = screen.frame;
+                let frame = &screen.frame;
                 self.size = (frame.width as usize, frame.height as usize);
-                // Already in the window's 0x00RRGGBB words.
-                self.pixels = frame.pixels;
+                // Already in the window's 0x00RRGGBB words; the log is
+                // drawn over a copy, the frame being shared.
+                self.pixels.clear();
+                self.pixels.extend_from_slice(&frame.pixels);
                 None
             }
             // A picture nobody can see.

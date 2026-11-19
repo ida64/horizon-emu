@@ -187,20 +187,28 @@ impl Program {
         SPH_SIZE + self.code.len() * 8
     }
 
+    /// Host memory the decoded program takes.
+    pub fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + std::mem::size_of_val(self.code.as_slice())
+    }
+
     /// Always false: a program has at least its terminating branch.
     pub fn is_empty(&self) -> bool {
         self.code.is_empty()
     }
 
     /// Runs one vertex: `input` is the attribute space `ALD` reads,
-    /// `output` the one `AST` writes (and `ALD.O` reads back).
+    /// `output` the one `AST` writes (and `ALD.O` reads back). Bit `a` of
+    /// `inactive` marks generic attribute `a` as having no established
+    /// value: an executed `ALD` of it refuses.
     pub fn run_vertex(
         &self,
         env: &Env<'_>,
         input: &Attributes,
+        inactive: u32,
         output: &mut Attributes,
     ) -> Result<(), Unmodeled> {
-        exec::run_vertex(self, env, input, output)
+        exec::run_vertex(self, env, input, inactive, output)
     }
 
     /// Runs one geometry shader thread on an input primitive (`inputs`,

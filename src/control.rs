@@ -29,7 +29,10 @@
 
 use std::{
     io::{BufRead, BufReader, ErrorKind, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    os::{
+        fd::AsRawFd,
+        unix::net::{UnixListener, UnixStream},
+    },
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
@@ -89,7 +92,17 @@ pub fn serve(listener: UnixListener, controlled: &Controlled) {
     while !controlled.ended.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => connection(stream, controlled),
-            Err(error) if error.kind() == ErrorKind::WouldBlock => thread::sleep(POLL),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                // Until someone connects, or for a look at whether the
+                // machine has ended.
+                let mut waiting = libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one valid pollfd, for as long as the call.
+                unsafe { libc::poll(&mut waiting, 1, POLL.as_millis() as libc::c_int) };
+            }
             Err(_) => return,
         }
     }

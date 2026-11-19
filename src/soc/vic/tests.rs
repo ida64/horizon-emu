@@ -104,12 +104,23 @@ impl Bench {
 
     /// Sends the methods nvnflinger sends, directly to the THI.
     fn execute(&self, input: Option<u64>) -> Option<()> {
+        self.send(methods(input))
+    }
+
+    /// Writes the configuration and sends `methods` to the THI.
+    fn send(&self, methods: Vec<(u32, u32)>) -> Option<()> {
         self.poke(CONFIG, &self.config.map(u64::to_le_bytes).concat());
-        for (method, value) in methods(input) {
+        for (method, value) in methods {
             self.vic.thi_write(THI_METHOD_OFFSET, method >> 2)?;
             self.vic.thi_write(THI_METHOD_DATA, value)?;
         }
         Some(())
+    }
+
+    fn peek_bytes(&self, address: u64, count: usize) -> Vec<u8> {
+        let mut bytes = vec![0; count];
+        self.ram.read(WINDOW + address, &mut bytes).unwrap();
+        bytes
     }
 }
 
@@ -291,31 +302,372 @@ fn a_channel_submission_composes_and_signals_its_syncpoint() {
     assert!(bench.notes.take().is_empty());
 }
 
-/// The EXECUTE nvnflinger sends when starter launches netConnect, replayed
-/// from the refusal note of that run (methods and every non-zero
-/// configuration word, real device addresses): an opaque 1:1 copy of a
-/// 1280x720 block-linear A8B8G8R8 frame through sRGB degamma/regamma and
-/// an identity output matrix, sent as a CDMA stream through a channel.
+/// BT.601 full-range RGB to YCbCr (JFIF), as the output matrix of the
+/// EXECUTE seen when News opens: coefficients over 2^19 (shift 11), chroma
+/// offsets 131458 / 256 / 1023 = 128/255.
+const YCBCR_MATRIX: [(usize, u64); 4] = [
+    (0x30, 0xb40000ea66f2645a),
+    (0x38, 0x8ca688d59934b22d),
+    (0x40, 0x0f597a400000e979),
+    (0x48, 0x0201822018200000),
+];
+
+/// Planar output surface configuration: `format`, vertical chroma siting
+/// `vertical` and horizontal `horizontal`, pitch-linear, `size`, the luma
+/// and chroma plane extents.
+fn planar_words(
+    format: u64,
+    [horizontal, vertical]: [u64; 2],
+    (width, height): (u64, u64),
+    (luma_width, luma_height): (u64, u64),
+    (chroma_width, chroma_height): (u64, u64),
+) -> (u64, u64) {
+    (
+        format | horizontal << 7 | vertical << 9 | (width - 1) << 32 | (height - 1) << 46,
+        (luma_width - 1)
+            | (luma_height - 1) << 14
+            | (chroma_width - 1) << 32
+            | (chroma_height - 1) << 46,
+    )
+}
+
+const CHROMA_U: u64 = 0x1_1000;
+const CHROMA_V: u64 = 0x1_2000;
+
+/// nvnflinger's methods with the three output planes.
+fn planar_methods() -> Vec<(u32, u32)> {
+    let mut methods = methods(Some(INPUT));
+    let execute = methods.pop().unwrap();
+    methods.extend([
+        (0x724, (CHROMA_U >> 8) as u32),
+        (0x728, (CHROMA_V >> 8) as u32),
+    ]);
+    methods.push(execute);
+    methods
+}
+
+/// A 4x4 `T_Y8___U8___V8_N422R` output with padded planes (luma pitch 8,
+/// chroma pitch 6) and the target its left two columns: each luma sample
+/// is Y of its pixel, each chroma sample the mean of the U (V) of the two
+/// pixels above each other it is sited between, every value rounded.
+#[test]
+fn a_planar_n422r_output_has_luma_per_pixel_and_chroma_per_vertical_pair() {
+    let mut bench = Bench::new();
+    bench.set(0x18, rect([0, 0, 1, 3]));
+    let (w0, w1) = planar_words(71, [0, 1], (4, 4), (8, 4), (6, 2));
+    bench.set(0x20, w0);
+    bench.set(0x28, w1);
+    for (offset, word) in YCBCR_MATRIX {
+        bench.set(offset, word);
+    }
+    bench.slot(0, 31, None, (2, 4), [0, 0, 1, 3], [0, 0, 1, 3]);
+    // R, G, B, A rows of two: red, white; green, black; blue, brown twice.
+    let brown = [0x80, 0x40, 0x20, 0xff];
+    let blue = [0, 0, 0xff, 0xff];
+    let pixels = [
+        [0xff, 0, 0, 0xff],
+        [0xff; 4],
+        [0, 0xff, 0, 0xff],
+        [0, 0, 0, 0xff],
+        blue,
+        brown,
+        blue,
+        brown,
+    ];
+    bench.poke(INPUT, &pixels.concat());
+    bench.poke(OUTPUT, &[0x11; 32]);
+    bench.poke(CHROMA_U, &[0x22; 12]);
+    bench.poke(CHROMA_V, &[0x33; 12]);
+    bench.send(planar_methods()).unwrap();
+    assert!(bench.notes.take().is_empty());
+    // Y = 0.299 R + 0.587 G + 0.114 B: red 76.2, white 255, green 149.7,
+    // black 0, blue 29.1, brown 79.5.
+    let luma = [[76, 255], [150, 0], [29, 79], [29, 79]];
+    let luma_rows = bench.peek_bytes(OUTPUT, 32);
+    for (y, row) in luma.iter().enumerate() {
+        let mut expected = [0x11; 8];
+        expected[..2].copy_from_slice(row);
+        assert_eq!(luma_rows[y * 8..y * 8 + 8], expected, "luma row {y}");
+    }
+    // U = 128 − 0.1687 R − 0.3313 G + 0.5 B, V = 128 + 0.5 R − 0.4187 G −
+    // 0.0813 B, each clamped: red (85.0, 255), green (43.5, 21.2) → (64.3,
+    // 138.1); white and black (128, 128); blue (255, 107.3) twice; brown
+    // (101.2, 162.6) twice.
+    for (address, rows) in [
+        (CHROMA_U, [[64, 128], [255, 101]]),
+        (CHROMA_V, [[138, 128], [107, 163]]),
+    ] {
+        let fill = if address == CHROMA_U { 0x22 } else { 0x33 };
+        let plane = bench.peek_bytes(address, 12);
+        for (y, row) in rows.iter().enumerate() {
+            let mut expected = [fill; 6];
+            expected[..2].copy_from_slice(row);
+            assert_eq!(plane[y * 6..y * 6 + 6], expected, "{address:#x} row {y}");
+        }
+    }
+}
+
+/// 4:2:0 with both axes subsampled: the chroma sample of each 2x2 block is
+/// the mean of the four.
+#[test]
+fn a_planar_n420_output_averages_each_two_by_two_block() {
+    let mut bench = Bench::new();
+    bench.set(0x18, rect([0, 0, 1, 1]));
+    let (w0, w1) = planar_words(72, [1, 1], (2, 2), (2, 2), (1, 1));
+    bench.set(0x20, w0);
+    bench.set(0x28, w1);
+    for (offset, word) in YCBCR_MATRIX {
+        bench.set(offset, word);
+    }
+    bench.slot(0, 31, None, (2, 2), [0, 0, 1, 1], [0, 0, 1, 1]);
+    // Red, green, blue, black.
+    let pixels = [
+        [0xff, 0, 0, 0xff],
+        [0, 0xff, 0, 0xff],
+        [0, 0, 0xff, 0xff],
+        [0, 0, 0, 0xff],
+    ];
+    bench.poke(INPUT, &pixels.concat());
+    bench.send(planar_methods()).unwrap();
+    assert_eq!(bench.peek(OUTPUT), [76, 150, 29, 0]);
+    // U: (85.0 + 43.5 + 255 + 128) / 4 = 127.9; V: (255 + 21.2 + 107.3 +
+    // 128) / 4 = 127.9.
+    assert_eq!(bench.peek_bytes(CHROMA_U, 1), [128]);
+    assert_eq!(bench.peek_bytes(CHROMA_V, 1), [128]);
+}
+
+#[test]
+fn planar_outputs_the_model_does_not_establish_refuse_and_name_themselves() {
+    let cases = [
+        // Chroma co-sited with the even luma sample on a subsampled axis.
+        (72, [0, 1], [0, 0, 3, 3], true, "horizontal chroma siting 0"),
+        // A target whose top row shares its chroma with the row above.
+        (71, [0, 1], [0, 1, 3, 2], true, "splits"),
+        // No output matrix: what would be Y, U and V is not said.
+        (
+            71,
+            [0, 1],
+            [0, 0, 3, 3],
+            false,
+            "without an output colour matrix",
+        ),
+        // Chroma planes for a single-plane format.
+        (
+            31,
+            [0, 0],
+            [0, 0, 3, 3],
+            true,
+            "chroma planes of a single-plane output",
+        ),
+    ];
+    for (format, siting, target, matrix, reason) in cases {
+        let mut bench = Bench::new();
+        bench.set(0x18, rect(target));
+        let (w0, w1) = planar_words(format, siting, (4, 4), (4, 4), (4, 4));
+        bench.set(0x20, w0);
+        bench.set(0x28, w1);
+        if matrix {
+            for (offset, word) in YCBCR_MATRIX {
+                bench.set(offset, word);
+            }
+        }
+        bench.slot(0, 31, None, (4, 4), [0, 0, 3, 3], [0, 0, 3, 3]);
+        bench.poke(OUTPUT, &[0x11; 16]);
+        assert_eq!(bench.send(planar_methods()), None, "{reason}");
+        let notes = bench.notes.take();
+        assert!(notes[0].contains(reason), "{notes:?}");
+        assert_eq!(bench.peek_bytes(OUTPUT, 16), [0x11; 16], "{reason}");
+    }
+}
+
+/// RAM behind 4 MiB SMMU sections of device address space, and a VIC
+/// behind a host1x channel, to replay an EXECUTE from a refusal note
+/// (methods and every non-zero configuration word, real device addresses).
+struct Capture {
+    ram: Arc<GuestRam>,
+    mc: Arc<Mc>,
+    syncpoints: Arc<Syncpoints>,
+    notes: Arc<Notes>,
+}
+
+/// The block-linear layout (16-GOB blocks) of the 1280x720 A8B8G8R8 frames
+/// both captures read.
+fn frame_layout() -> BlockLinearSurface {
+    BlockLinearSurface::new(
+        1280 * 4,
+        720,
+        BlockLinear {
+            block_height_log2: 4,
+            block_depth_log2: 0,
+        },
+    )
+}
+
+/// R, G, B, A of the frame at (`x`, `y`).
+fn pattern(x: u32, y: u32) -> [u8; 4] {
+    [x as u8, y as u8, (x ^ y) as u8, 0x40]
+}
+
+impl Capture {
+    /// `sections` are the device sections the submission uses.
+    fn new(sections: &[u64]) -> Capture {
+        let ram = Arc::new(GuestRam::new(RAM_BASE, (sections.len() + 1) << 22).unwrap());
+        let mc = Arc::new(Mc::new(DramSize::Gb4));
+        mc.write(0, 0x1c, 4, 1).unwrap();
+        mc.write(0, 0x20, 4, 0xe008_0000).unwrap();
+        for client in [SMMU_VIC_ASID, SMMU_HOST1X_ASID] {
+            mc.write(0, client, 4, 0x8000_0001).unwrap();
+        }
+        for (n, section) in sections.iter().enumerate() {
+            let frame = (RAM_BASE + ((n as u64 + 1) << 22)) >> 12;
+            let entry = 0xc000_0000 | frame as u32;
+            ram.write(RAM_BASE + section * 4, &entry.to_le_bytes())
+                .unwrap();
+        }
+        Capture {
+            ram,
+            mc,
+            syncpoints: Arc::default(),
+            notes: Arc::default(),
+        }
+    }
+
+    fn memory(&self) -> DeviceMemory {
+        DeviceMemory::new(&self.mc, &self.ram, SMMU_VIC_ASID)
+    }
+
+    /// Writes the [`pattern`] frame at `address`.
+    fn frame(&self, address: u64) {
+        let layout = frame_layout();
+        let mut input = vec![0u8; layout.size(1) as usize];
+        for y in 0..720 {
+            for x in 0..1280 {
+                let at = layout.offset(x * 4, y, 0) as usize;
+                input[at..at + 4].copy_from_slice(&pattern(x, y));
+            }
+        }
+        self.memory().write(address, &input).unwrap();
+    }
+
+    /// Writes the configuration at `config`, then sends `methods`, EXECUTE
+    /// and a THI increment with condition 1 as a CDMA stream.
+    fn submit(&self, config: u64, words: &[(u64, u64)], methods: &[(u32, u32)]) {
+        let mut bytes = [0u8; CONFIG_SIZE];
+        for &(offset, word) in words {
+            bytes[offset as usize..offset as usize + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        self.memory().write(config, &bytes).unwrap();
+        let vic = Arc::new(Vic::new(
+            self.memory(),
+            Arc::clone(&self.syncpoints),
+            Arc::clone(&self.notes),
+        ));
+        let channel = Channel::new(
+            DeviceMemory::new(&self.mc, &self.ram, SMMU_HOST1X_ASID),
+            Arc::clone(&self.syncpoints),
+            Arc::default(),
+            Arc::new(move |class, offset, value| {
+                (class == CLASS).then_some(())?;
+                vic.thi_write(offset, value)
+            }),
+            Arc::clone(&self.notes),
+        );
+        let mut stream = vec![CLASS << 6];
+        for &(method, value) in methods.iter().chain(&[(0x300, 0x100)]) {
+            stream.extend([0x1010_0002, method >> 2, value]);
+        }
+        stream.extend([0x2000_0001, SYNCPOINT as u32 | 1 << 8]);
+        let push = 0xff00_0000u32;
+        let bytes: Vec<u8> = stream.iter().flat_map(|w| w.to_le_bytes()).collect();
+        DeviceMemory::new(&self.mc, &self.ram, SMMU_HOST1X_ASID)
+            .write(push.into(), &bytes)
+            .unwrap();
+        for (register, value) in [
+            (0x14, 0),
+            (0x20, push + 0x1000),
+            (0x18, push),
+            (0x24, 7),
+            (0x24, 0),
+        ] {
+            channel.write(0, register, 4, value.into()).unwrap();
+        }
+        channel
+            .write(0, 0x18, 4, (push + bytes.len() as u32).into())
+            .unwrap();
+        assert!(self.notes.take().is_empty());
+        assert_eq!(self.syncpoints.get(SYNCPOINT), Some(1));
+    }
+}
+
+/// The EXECUTE nvnflinger sends when starter launches netConnect: an
+/// opaque 1:1 copy of a 1280x720 block-linear A8B8G8R8 frame through sRGB
+/// degamma/regamma and an identity output matrix.
 #[test]
 fn the_netconnect_launch_capture_copies_the_frame_and_signals() {
-    const METHODS: [(u32, u32); 8] = [
-        (0x200, 0x1),
-        (0x704, 0x610110),
-        (0x708, 0xe2aa00),
-        (0x70c, 0xe2ac00),
-        (0x71c, 0x3c0),
-        (0x72c, 0xe0043d),
-        (0x720, 0xe01600),
-        (0x400, 0xe26e00),
-    ];
-    const CONFIG_WORDS: [(u64, u64); 16] = [
+    let capture = Capture::new(&[0x380, 0x381, 0x389, 0x38a, 0x38b, 0x3fc]);
+    capture.frame(0xe26e_0000);
+    let size = frame_layout().size(1) as usize;
+    capture
+        .memory()
+        .write(0xe016_0000, &vec![0x5a; size])
+        .unwrap();
+    capture.submit(
+        0xe2aa_0000,
+        &[
+            (0x010, 0x0000400000000004),
+            (0x018, 0x02cf000004ff0000),
+            (0x020, 0x00b3c4ff00020a1f),
+            (0x028, 0x0fffffff00b3c4ff),
+            (0x030, 0xa000000000040000),
+            (0x038, 0x8000004000000000),
+            (0x040, 0x0400000000000000),
+            (0x090, 0x0000000000000101),
+            (0x0a0, 0x008003ff000ffc00),
+            (0x0b0, 0x04ff000000000000),
+            (0x0b8, 0x02cf000000000000),
+            (0x0c0, 0x02cf000004ff0000),
+            (0x0d0, 0x00b3c4ff000a0a1f),
+            (0x0d8, 0x0fffffff00b3c4ff),
+            (0x130, 0x00002050000003ff),
+            (0x138, 0x000083ff00000000),
+        ],
+        &[
+            (0x200, 0x1),
+            (0x704, 0x610110),
+            (0x708, 0xe2aa00),
+            (0x70c, 0xe2ac00),
+            (0x71c, 0x3c0),
+            (0x72c, 0xe0043d),
+            (0x720, 0xe01600),
+            (0x400, 0xe26e00),
+        ],
+    );
+    let layout = frame_layout();
+    let mut output = vec![0u8; size];
+    capture.memory().read(0xe016_0000, &mut output).unwrap();
+    for y in 0..720 {
+        for x in 0..1280 {
+            let at = layout.offset(x * 4, y, 0) as usize;
+            let [r, g, b, _] = pattern(x, y);
+            assert_eq!(output[at..at + 4], [r, g, b, 0xff], "pixel ({x}, {y})");
+        }
+    }
+}
+
+/// The EXECUTE seen when News opens from HOME (`/tmp/gapgpu/run2.log`):
+/// the same slot copied into a pitch-linear 1280x720
+/// `T_Y8___U8___V8_N422R` output (chroma planes 1280x360) through the
+/// BT.601 full-range matrix. Checked against the textbook JFIF formulas
+/// in f64, within one step of rounding.
+#[test]
+fn the_news_capture_converts_the_frame_to_planar_ycbcr_422r() {
+    let capture = Capture::new(&[0x380, 0x384, 0x385, 0x388, 0x389, 0x3fc]);
+    capture.frame(0xe106_0000);
+    let mut words = vec![
         (0x010, 0x0000400000000004),
         (0x018, 0x02cf000004ff0000),
-        (0x020, 0x00b3c4ff00020a1f),
-        (0x028, 0x0fffffff00b3c4ff),
-        (0x030, 0xa000000000040000),
-        (0x038, 0x8000004000000000),
-        (0x040, 0x0400000000000000),
+        (0x020, 0x00b3c4ff00000247),
+        (0x028, 0x0059c4ff00b3c4ff),
         (0x090, 0x0000000000000101),
         (0x0a0, 0x008003ff000ffc00),
         (0x0b0, 0x04ff000000000000),
@@ -326,95 +678,58 @@ fn the_netconnect_launch_capture_copies_the_frame_and_signals() {
         (0x130, 0x00002050000003ff),
         (0x138, 0x000083ff00000000),
     ];
-    // 4 MiB SMMU sections for the device addresses the submission uses.
-    let sections = [0x380u64, 0x381, 0x389, 0x38a, 0x38b, 0x3fc];
-    let ram = Arc::new(GuestRam::new(RAM_BASE, (sections.len() + 1) << 22).unwrap());
-    let mc = Arc::new(Mc::new(DramSize::Gb4));
-    mc.write(0, 0x1c, 4, 1).unwrap();
-    mc.write(0, 0x20, 4, 0xe008_0000).unwrap();
-    for client in [SMMU_VIC_ASID, SMMU_HOST1X_ASID] {
-        mc.write(0, client, 4, 0x8000_0001).unwrap();
-    }
-    for (n, section) in sections.iter().enumerate() {
-        let frame = (RAM_BASE + ((n as u64 + 1) << 22)) >> 12;
-        let entry = 0xc000_0000 | frame as u32;
-        ram.write(RAM_BASE + section * 4, &entry.to_le_bytes())
-            .unwrap();
-    }
-    let memory = || DeviceMemory::new(&mc, &ram, SMMU_VIC_ASID);
-    let mut config = [0u8; CONFIG_SIZE];
-    for (offset, word) in CONFIG_WORDS {
-        config[offset as usize..offset as usize + 8].copy_from_slice(&word.to_le_bytes());
-    }
-    memory().write(0xe2aa_0000, &config).unwrap();
-    let layout = BlockLinearSurface::new(
-        1280 * 4,
-        720,
-        BlockLinear {
-            block_height_log2: 4,
-            block_depth_log2: 0,
-        },
+    words.extend(YCBCR_MATRIX.map(|(offset, word)| (offset as u64, word)));
+    capture.submit(
+        0xe238_0000,
+        &words,
+        &[
+            (0x200, 0x1),
+            (0x400, 0xe10600),
+            (0x704, 0x610110),
+            (0x708, 0xe23800),
+            (0x70c, 0xe23a00),
+            (0x71c, 0x3c0),
+            (0x720, 0xe23c00),
+            (0x724, 0xe24c00),
+            (0x728, 0xe25600),
+            (0x72c, 0xe0043d),
+        ],
     );
-    let size = layout.size(1) as usize;
-    let mut input = vec![0u8; size];
-    let pattern = |x: u32, y: u32| [x as u8, y as u8, (x ^ y) as u8, 0x40];
+    let read = |address: u64, size: usize| {
+        let mut bytes = vec![0u8; size];
+        capture.memory().read(address, &mut bytes).unwrap();
+        bytes
+    };
+    let luma = read(0xe23c_0000, 1280 * 720);
+    let chroma = [read(0xe24c_0000, 1280 * 360), read(0xe256_0000, 1280 * 360)];
+    let ycbcr = |x: u32, y: u32| {
+        let [r, g, b, _] = pattern(x, y).map(f64::from);
+        [
+            0.299 * r + 0.587 * g + 0.114 * b,
+            128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b,
+            128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b,
+        ]
+        .map(|value| value.clamp(0.0, 255.0))
+    };
+    let close = |actual: u8, expected: f64, what: &str| {
+        assert!(
+            (f64::from(actual) - expected).abs() <= 1.0,
+            "{what}: {actual} for {expected}"
+        );
+    };
     for y in 0..720 {
         for x in 0..1280 {
-            let at = layout.offset(x * 4, y, 0) as usize;
-            input[at..at + 4].copy_from_slice(&pattern(x, y));
+            let at = (y * 1280 + x) as usize;
+            close(luma[at], ycbcr(x, y)[0], &format!("Y ({x}, {y})"));
         }
     }
-    memory().write(0xe26e_0000, &input).unwrap();
-    memory().write(0xe016_0000, &vec![0x5a; size]).unwrap();
-
-    let syncpoints = Arc::new(Syncpoints::default());
-    let notes: Arc<Notes> = Arc::default();
-    let vic = Arc::new(Vic::new(
-        memory(),
-        Arc::clone(&syncpoints),
-        Arc::clone(&notes),
-    ));
-    let channel = Channel::new(
-        DeviceMemory::new(&mc, &ram, SMMU_HOST1X_ASID),
-        Arc::clone(&syncpoints),
-        Arc::default(),
-        Arc::new(move |class, offset, value| {
-            (class == CLASS).then_some(())?;
-            vic.thi_write(offset, value)
-        }),
-        Arc::clone(&notes),
-    );
-    let mut words = vec![CLASS << 6];
-    for (method, value) in METHODS.into_iter().chain([(0x300, 0x100)]) {
-        words.extend([0x1010_0002, method >> 2, value]);
-    }
-    words.extend([0x2000_0001, SYNCPOINT as u32 | 1 << 8]);
-    let push = 0xff00_0000u32;
-    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    DeviceMemory::new(&mc, &ram, SMMU_HOST1X_ASID)
-        .write(push.into(), &bytes)
-        .unwrap();
-    for (register, value) in [
-        (0x14, 0),
-        (0x20, push + 0x1000),
-        (0x18, push),
-        (0x24, 7),
-        (0x24, 0),
-    ] {
-        channel.write(0, register, 4, value.into()).unwrap();
-    }
-    channel
-        .write(0, 0x18, 4, (push + bytes.len() as u32).into())
-        .unwrap();
-    assert!(notes.take().is_empty());
-    assert_eq!(syncpoints.get(SYNCPOINT), Some(1));
-    let mut output = vec![0u8; size];
-    memory().read(0xe016_0000, &mut output).unwrap();
-    for y in 0..720 {
+    for y in 0..360 {
         for x in 0..1280 {
-            let at = layout.offset(x * 4, y, 0) as usize;
-            let [r, g, b, _] = pattern(x, y);
-            assert_eq!(output[at..at + 4], [r, g, b, 0xff], "pixel ({x}, {y})");
+            let at = (y * 1280 + x) as usize;
+            for (plane, component) in chroma.iter().zip(1..) {
+                let mean = (ycbcr(x, 2 * y)[component] + ycbcr(x, 2 * y + 1)[component]) / 2.0;
+                close(plane[at], mean, &format!("chroma {component} ({x}, {y})"));
+            }
         }
     }
 }

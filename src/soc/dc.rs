@@ -42,16 +42,18 @@
 //! the saved time reaches its next boundary when the saved one would have.
 //!
 //! Nothing is scanned out continuously. [`Dc::frame_turned_clockwise`]
-//! produces the picture the controller would be sending at that moment, as
-//! the screen shows it, from the active copy:
-//! the enabled windows' frame buffers, fetched through the SMMU like the
-//! hardware fetches them, layered on the active area.
+//! produces the picture the controller sends in the frame under way, as
+//! the screen shows it, from the active copy: the enabled windows' frame
+//! buffers, fetched through the SMMU like the hardware fetches them,
+//! layered on the active area. It is put together at the first look in a
+//! frame; later looks in the same frame get the same picture unless the
+//! active copy changed.
 
 use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::Duration,
@@ -333,7 +335,7 @@ impl std::fmt::Display for NoFrame {
 }
 
 /// One copy of the double-buffered registers.
-#[derive(Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Clone, PartialEq, Serialize, Deserialize)]
 struct Copy {
     general: HashMap<u64, u32>,
     windows: [HashMap<u64, u32>; WINDOW_COUNT],
@@ -418,6 +420,12 @@ impl Registers {
 
 pub struct Dc {
     registers: Mutex<Registers>,
+    /// Guest time in nanoseconds before which [`Dc::settle`] finds nothing
+    /// to do unless a register is accessed: the next frame boundary while
+    /// the controller sends frames, [`u64::MAX`] while it does not. Lets
+    /// [`Dc::count_frames`], which host1x calls on every syncpoint read,
+    /// skip the register lock between boundaries.
+    settled_until: AtomicU64,
     syncpoints: Arc<Syncpoints>,
     clock: Clock,
     /// INTID 105 for DC0, 106 for DC1 (nvservices text `0x23634`).
@@ -425,6 +433,20 @@ pub struct Dc {
     /// Buffers the picture is put together in, kept between pictures so
     /// that showing one 60 times a second does not allocate them anew.
     scratch: Mutex<Scratch>,
+    /// The picture last put together, given again to every look within the
+    /// same frame while the active copy stays as it was.
+    shown: Mutex<Option<Shown>>,
+}
+
+/// See [`Dc::shown`].
+struct Shown {
+    /// The frame it was put together in: when the controller started
+    /// sending and how many frames it had sent.
+    frame: (Duration, u128),
+    turned: bool,
+    /// The active copy it was put together from.
+    active: Copy,
+    picture: Result<Arc<Frame>, NoFrame>,
 }
 
 /// See [`Dc::scratch`].
@@ -448,16 +470,22 @@ impl Dc {
     pub fn new(syncpoints: Arc<Syncpoints>, clock: Clock, line: InterruptLine) -> Self {
         Self {
             registers: Mutex::default(),
+            settled_until: AtomicU64::new(0),
             syncpoints,
             clock,
             line,
             scratch: Mutex::default(),
+            shown: Mutex::default(),
         }
     }
 
     /// Brings the controller up to date with the frames sent since the last
     /// look.
     pub fn count_frames(&self) {
+        let until = self.settled_until.load(Ordering::Acquire);
+        if ((self.clock)().as_nanos()) < u128::from(until) {
+            return;
+        }
         self.settle(&mut self.registers.lock().unwrap());
     }
 
@@ -531,6 +559,11 @@ impl Dc {
             registers.asserted = level;
             (self.line)(level);
         }
+        let until = registers.running.as_ref().map_or(u64::MAX, |running| {
+            let boundary = (running.frames + 1) * NANOS_PER_SECOND / REFRESH_RATE;
+            u64::try_from(running.since.as_nanos() + boundary).unwrap_or(u64::MAX)
+        });
+        self.settled_until.store(until, Ordering::Release);
     }
 
     /// Write of the state control register.
@@ -573,23 +606,65 @@ impl Dc {
     /// through `memory`, unturned: what the tests compare against the
     /// controller's own coordinates.
     #[cfg(test)]
-    pub fn frame(&self, memory: &DeviceMemory) -> Result<Frame, NoFrame> {
+    pub fn frame(&self, memory: &DeviceMemory) -> Result<Arc<Frame>, NoFrame> {
         self.render(memory, false)
     }
 
     /// The same picture turned a quarter turn clockwise, as the console's
     /// screen shows the panel, put together in one pass.
-    pub fn frame_turned_clockwise(&self, memory: &DeviceMemory) -> Result<Frame, NoFrame> {
+    pub fn frame_turned_clockwise(&self, memory: &DeviceMemory) -> Result<Arc<Frame>, NoFrame> {
         self.render(memory, true)
     }
 
-    fn render(&self, memory: &DeviceMemory, turned: bool) -> Result<Frame, NoFrame> {
-        let mut registers = self.registers.lock().unwrap();
-        self.settle(&mut registers);
-        if !registers.sending() {
-            return Err(NoFrame::NotRunning);
+    /// The picture from the active copy as it stands. It is put together
+    /// once per frame the controller sends: a look within the same frame,
+    /// with the active copy unchanged, is given the picture put together
+    /// at the first. The register lock is held only for taking a copy of
+    /// the active registers, so the guest's accesses to the controller
+    /// (and host1x's syncpoint reads, which count its frames) do not wait
+    /// for the frame buffers to be read.
+    fn render(&self, memory: &DeviceMemory, turned: bool) -> Result<Arc<Frame>, NoFrame> {
+        let (frame, active) = {
+            let mut registers = self.registers.lock().unwrap();
+            self.settle(&mut registers);
+            let Some(running) = &registers.running else {
+                return Err(NoFrame::NotRunning);
+            };
+            ((running.since, running.frames), registers.active.clone())
+        };
+        let mut shown = self.shown.lock().unwrap();
+        if let Some(last) = &*shown
+            && last.frame == frame
+            && last.turned == turned
+            && last.active == active
+        {
+            return last.picture.clone();
         }
-        let active = &registers.active;
+        // The last picture's pixels, unless someone still holds it.
+        let reused = shown
+            .take()
+            .and_then(|last| Arc::into_inner(last.picture.ok()?))
+            .map(|last| last.pixels)
+            .unwrap_or_default();
+        let picture = self.compose(memory, &active, turned, reused).map(Arc::new);
+        *shown = Some(Shown {
+            frame,
+            turned,
+            active,
+            picture: picture.clone(),
+        });
+        picture
+    }
+
+    /// Puts the picture together from `active` into `pixels`, whatever
+    /// they held before.
+    fn compose(
+        &self,
+        memory: &DeviceMemory,
+        active: &Copy,
+        turned: bool,
+        mut pixels: Vec<u32>,
+    ) -> Result<Frame, NoFrame> {
         let halves = |value: u32| (value & 0xFFFF, value >> 16);
         let (width, height) = halves(active.general(register::DISP_ACTIVE));
         if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
@@ -622,8 +697,10 @@ impl Dc {
             });
         }
         // The background is black, and opaque.
+        pixels.clear();
+        pixels.resize((width * height) as usize, 0);
         let mut canvas = Canvas {
-            pixels: vec![0; (width * height) as usize],
+            pixels,
             area: [width, height],
             turned,
         };
@@ -872,86 +949,122 @@ impl Window<'_> {
         let blend = Blend::of(self)?;
         let pixels = &scratch.fetched;
         let (width, height) = (layout.width as usize, layout.height as usize);
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
         let (left, top) = (left as usize, top as usize);
         let (area_width, area_height) = (area_width as usize, area_height as usize);
         // Visit the window in the order the canvas is laid out: lines of
         // the canvas one after the other, and the window's pixels along a
         // canvas line as a start and a step in `pixels`.
-        let lines: Box<dyn Iterator<Item = (usize, isize, isize)>> = if canvas.turned {
+        let lines = if canvas.turned {
             // Canvas line `left + x` holds window column `x`, bottom up.
-            Box::new((0..width).map(move |x| {
-                let start = layout.at(x, height - 1);
-                let canvas_start = (left + x) * area_height + (area_height - top - height);
-                (canvas_start, start, -layout.steps[1])
-            }))
+            Lines {
+                count: width,
+                length: height,
+                canvas: left * area_height + (area_height - top - height),
+                canvas_stride: area_height,
+                start: layout.at(0, height - 1),
+                start_stride: layout.steps[0],
+                step: -layout.steps[1],
+            }
         } else {
-            Box::new((0..height).map(move |y| {
-                let start = layout.at(0, y);
-                ((top + y) * area_width + left, start, layout.steps[0])
-            }))
+            Lines {
+                count: height,
+                length: width,
+                canvas: top * area_width + left,
+                canvas_stride: area_width,
+                start: layout.at(0, 0),
+                start_stride: layout.steps[1],
+                step: layout.steps[0],
+            }
         };
-        let length = if canvas.turned { height } else { width };
-        for (canvas_start, start, step) in lines {
-            let line = &mut canvas.pixels[canvas_start..][..length];
-            match &blend {
-                // The two orders the firmware's 32-bit formats come in get a
-                // copy of their own, which the compiler can make tight:
-                // red first (`R8G8B8A8`) needs the word's bytes reversed,
-                // blue first only alpha cleared.
-                Blend::Opaque => match layout.order {
-                    [0, 1, 2, _] => copy(line, pixels, start, step, |pixel| {
-                        u32::from_le_bytes(*pixel).swap_bytes() >> 8
-                    }),
-                    [2, 1, 0, _] => copy(line, pixels, start, step, |pixel| {
-                        u32::from_le_bytes(*pixel) & 0x00FF_FFFF
-                    }),
-                    [red, green, blue, _] => copy(line, pixels, start, step, |pixel| {
-                        u32::from_be_bytes([0, pixel[red], pixel[green], pixel[blue]])
-                    }),
-                },
-                blend => {
-                    let mut at = start;
-                    for out in line {
-                        let pixel = pixels[at as usize];
-                        *out = blend.apply(layout.order.map(|byte| pixel[byte]), *out);
-                        at += step;
-                    }
-                }
+        let canvas = &mut canvas.pixels[..];
+        match blend {
+            // The two orders the firmware's 32-bit formats come in get a
+            // copy of their own, which the compiler can make tight: red
+            // first (`R8G8B8A8`) needs the word's bytes reversed, blue first
+            // only alpha cleared.
+            Blend::Opaque => match layout.order {
+                [0, 1, 2, _] => lay(canvas, pixels, lines, |pixel, _| {
+                    u32::from_le_bytes(*pixel).swap_bytes() >> 8
+                }),
+                [2, 1, 0, _] => lay(canvas, pixels, lines, |pixel, _| {
+                    u32::from_le_bytes(*pixel) & 0x00FF_FFFF
+                }),
+                [red, green, blue, _] => lay(canvas, pixels, lines, |pixel, _| {
+                    u32::from_be_bytes([0, pixel[red], pixel[green], pixel[blue]])
+                }),
+            },
+            Blend::Factors { select, k1, k2 } => {
+                let table = BlendTable::new(select, k1, k2);
+                lay(canvas, pixels, lines, |pixel, below| {
+                    table.apply(layout.order.map(|byte| pixel[byte]), below)
+                })
             }
         }
         Ok(())
     }
 }
 
-/// Copies `line.len()` pixels from `pixels`, starting at `start` and
-/// stepping by `step`, into `line`, each as `convert` takes it.
-fn copy(
-    line: &mut [u32],
-    pixels: &[[u8; 4]],
+/// The canvas lines a window covers and where their pixels are in the
+/// window's: line `k` starts at `canvas + k * canvas_stride` and takes its
+/// `length` pixels from `start + k * start_stride` on, `step` apart.
+#[derive(Clone, Copy)]
+struct Lines {
+    count: usize,
+    length: usize,
+    canvas: usize,
+    canvas_stride: usize,
     start: isize,
+    start_stride: isize,
     step: isize,
-    convert: impl Fn(&[u8; 4]) -> u32,
-) {
-    let length = line.len();
-    match step {
+}
+
+/// How many canvas lines are filled side by side when a line's pixels lie
+/// apart in the window's (a window turned by the canvas): each position
+/// along them then takes neighbouring pixels of the window, not one from
+/// each of as many window lines.
+const LINES_TOGETHER: usize = 16;
+
+/// Lays `lines` of `pixels` onto `canvas`, each canvas pixel becoming what
+/// `put` makes of the window's pixel and the canvas pixel below it.
+fn lay(canvas: &mut [u32], pixels: &[[u8; 4]], lines: Lines, put: impl Fn(&[u8; 4], u32) -> u32) {
+    let Lines {
+        count,
+        length,
+        canvas: first_line,
+        canvas_stride,
+        start,
+        start_stride,
+        step,
+    } = lines;
+    let line_start = |line: usize| start + line as isize * start_stride;
+    if step.abs() == 1 {
         // Pixels next to each other, forwards or backwards: a straight copy.
-        1 => {
-            let source = &pixels[start as usize..][..length];
-            for (out, pixel) in line.iter_mut().zip(source) {
-                *out = convert(pixel);
+        for line in 0..count {
+            let out = &mut canvas[first_line + line * canvas_stride..][..length];
+            let from = line_start(line) as usize;
+            if step == 1 {
+                for (out, pixel) in out.iter_mut().zip(&pixels[from..][..length]) {
+                    *out = put(pixel, *out);
+                }
+            } else {
+                let source = &pixels[from + 1 - length..][..length];
+                for (out, pixel) in out.iter_mut().zip(source.iter().rev()) {
+                    *out = put(pixel, *out);
+                }
             }
         }
-        -1 => {
-            let source = &pixels[start as usize + 1 - length..][..length];
-            for (out, pixel) in line.iter_mut().zip(source.iter().rev()) {
-                *out = convert(pixel);
-            }
-        }
-        _ => {
-            let mut at = start;
-            for out in line {
-                *out = convert(&pixels[at as usize]);
-                at += step;
+        return;
+    }
+    for group in (0..count).step_by(LINES_TOGETHER) {
+        let group = group..count.min(group + LINES_TOGETHER);
+        for along in 0..length {
+            let offset = along as isize * step;
+            for line in group.clone() {
+                let out = &mut canvas[first_line + line * canvas_stride + along];
+                *out = put(&pixels[(line_start(line) + offset) as usize], *out);
             }
         }
     }
@@ -1144,7 +1257,9 @@ impl Blend {
         })
     }
 
-    /// `below` and the result are `0x00RRGGBB` words.
+    /// `below` and the result are `0x00RRGGBB` words. What [`BlendTable`]
+    /// works out with less arithmetic per pixel.
+    #[cfg(test)]
     fn apply(&self, [red, green, blue, alpha]: [u8; 4], below: u32) -> u32 {
         let Self::Factors { select, k1, k2 } = *self else {
             return u32::from_be_bytes([0, red, green, blue]);
@@ -1153,7 +1268,17 @@ impl Blend {
         let source = [red, green, blue].map(unit);
         let [_, below @ ..] = below.to_be_bytes();
         let below = below.map(unit);
-        let alpha = unit(alpha);
+        let (source_factor, below_factor) = Self::factors(select, k1, k2, unit(alpha));
+        let [red, green, blue]: [u8; 3] = std::array::from_fn(|channel| {
+            let value = source[channel] * source_factor + below[channel] * below_factor;
+            (value * 255.0).round().clamp(0.0, 255.0) as u8
+        });
+        u32::from_be_bytes([0, red, green, blue])
+    }
+
+    /// The factors of the window's color and of the color below for a
+    /// window pixel of `alpha`, from zero to one.
+    fn factors(select: u32, k1: f32, k2: f32, alpha: f32) -> (f32, f32) {
         // Linux's `BLEND_FACTOR_*_COLOR_*` encodings, where "DST" is the
         // alpha below, one, and "SRC" the window's.
         let source_factor = match select & 7 {
@@ -1171,8 +1296,35 @@ impl Blend {
             5 | 7 => 1.0 - k1,
             _ => 1.0 - k1 * alpha,
         };
+        (source_factor, below_factor)
+    }
+}
+
+/// [`Blend::Factors`] for a whole window: each byte value as a fraction of
+/// one and the factors for each alpha, worked out once instead of per
+/// pixel, with the same arithmetic, so the results are the same.
+struct BlendTable {
+    units: [f32; 256],
+    factors: [(f32, f32); 256],
+}
+
+impl BlendTable {
+    fn new(select: u32, k1: f32, k2: f32) -> Self {
+        let units = std::array::from_fn(|byte| f32::from(byte as u8) / 255.0);
+        Self {
+            units,
+            factors: std::array::from_fn(|alpha| Blend::factors(select, k1, k2, units[alpha])),
+        }
+    }
+
+    /// `below` and the result are `0x00RRGGBB` words.
+    fn apply(&self, [red, green, blue, alpha]: [u8; 4], below: u32) -> u32 {
+        let (source_factor, below_factor) = self.factors[usize::from(alpha)];
+        let [_, below @ ..] = below.to_be_bytes();
+        let source = [red, green, blue];
         let [red, green, blue]: [u8; 3] = std::array::from_fn(|channel| {
-            let value = source[channel] * source_factor + below[channel] * below_factor;
+            let value = self.units[usize::from(source[channel])] * source_factor
+                + self.units[usize::from(below[channel])] * below_factor;
             (value * 255.0).round().clamp(0.0, 255.0) as u8
         });
         u32::from_be_bytes([0, red, green, blue])
@@ -1310,7 +1462,9 @@ impl MmioDevice for Dc {
             }
             number => {
                 let direct = registers.command(register::STATE_ACCESS) & WRITE_MUX != 0;
-                let selected: Vec<usize> = registers.selected_windows().collect();
+                let selected = registers
+                    .selected_windows()
+                    .fold(0u32, |selected, window| selected | 1 << window);
                 let copy = if direct {
                     &mut registers.active
                 } else {
@@ -1318,9 +1472,11 @@ impl MmioDevice for Dc {
                 };
                 if (register::WINDOW_START..register::WINDOW_END).contains(&number) {
                     // A window register with no window selected has no home.
-                    (!selected.is_empty()).then_some(())?;
-                    for window in selected {
-                        copy.windows[window].insert(number, value);
+                    (selected != 0).then_some(())?;
+                    for (window, registers) in copy.windows.iter_mut().enumerate() {
+                        if selected >> window & 1 != 0 {
+                            registers.insert(number, value);
+                        }
                     }
                 } else {
                     copy.general.insert(number, value);
@@ -1358,7 +1514,9 @@ impl Snapshot for Dc {
     fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
         let registers = decode("display controller", state)?;
         *self.registers.lock().unwrap() = registers;
+        self.settled_until.store(0, Ordering::Release);
         *self.scratch.lock().unwrap() = Scratch::default();
+        *self.shown.lock().unwrap() = None;
         Ok(())
     }
 }
@@ -1689,6 +1847,17 @@ mod tests {
         }
     }
 
+    /// The two windows HOME shows (a `--verbose` run at the lock screen): a
+    /// 2x2 fill scaled up and blended with premultiplied alpha over a
+    /// block-linear picture behind it.
+    fn home_windows(dc: &Dc) {
+        full_screen_window(dc, 2, (720, 1280), (0x42, 0x1400));
+        write(dc, register::WIN_BLEND_LAYER_CONTROL, 0x0100_00FF);
+        full_screen_window(dc, 1, (2, 2), (0, 8));
+        write(dc, register::WIN_BLEND_LAYER_CONTROL, 0x00FF_FF80);
+        write(dc, register::WIN_BLEND_MATCH_SELECT, 0x262);
+    }
+
     /// Time `Soc::screen` spends on the panel's picture, per kind of window
     /// nvnflinger flips. A measurement, not a check: run with
     /// `cargo test --release --lib soc::dc::tests::screen_timing -- --ignored --nocapture`.
@@ -1701,20 +1870,30 @@ mod tests {
             .collect();
         ram.write(BUFFER_PHYSICAL - 0x4000 + 0x40_0000, &pattern)
             .unwrap();
-        let cases = [
-            ("pitch-linear 1280x720", (720, 1280), (0, 0x1400)),
-            ("block-linear 1280x720", (720, 1280), (0x42, 0x1400)),
-            ("2x2 blank fill scaled up", (2, 2), (0, 8)),
+        let single = |source, surface| move |dc: &Dc| full_screen_window(dc, 1, source, surface);
+        type SetUp<'a> = &'a dyn Fn(&Dc);
+        let cases: [(&str, SetUp); 4] = [
+            ("pitch-linear 1280x720", &single((720, 1280), (0, 0x1400))),
+            (
+                "block-linear 1280x720",
+                &single((720, 1280), (0x42, 0x1400)),
+            ),
+            ("2x2 blank fill scaled up", &single((2, 2), (0, 8))),
+            ("HOME: fill blended over block-linear", &home_windows),
         ];
-        for (name, source, surface) in cases {
+        for (name, set_up) in cases {
             let dc = controller();
             write(&dc, register::DISP_ACTIVE, 1280 << 16 | 720);
-            full_screen_window(&dc, 1, source, surface);
+            set_up(&dc);
             write(&dc, register::DISPLAY_COMMAND, DISPLAY_MODE_CONTINUOUS);
             write(&dc, register::STATE_CONTROL, 0x0F);
             // The best and the median of many, the machine being shared.
+            // Each is put together anew, as in a frame of its own.
             let mut times: Vec<_> = (0..50)
                 .map(|_| {
+                    if let Some(shown) = &mut *dc.shown.lock().unwrap() {
+                        shown.frame.1 += 1;
+                    }
                     let start = std::time::Instant::now();
                     let frame = dc.frame_turned_clockwise(&memory).unwrap();
                     assert_eq!((frame.width, frame.height), (1280, 720));
@@ -1938,7 +2117,7 @@ mod tests {
             }
         }
         assert_eq!(
-            dc.frame_turned_clockwise(&memory).unwrap(),
+            *dc.frame_turned_clockwise(&memory).unwrap(),
             portrait.rotated_clockwise()
         );
 
@@ -1962,6 +2141,119 @@ mod tests {
         for y in 0..5 {
             for x in 0..3 {
                 assert_eq!(out[y * 3 + x], pixels[layout.at(x, y) as usize]);
+            }
+        }
+    }
+
+    /// [`lay`] fills canvas lines side by side when their pixels lie apart;
+    /// it must come out as taking each line's pixels one after the other.
+    #[test]
+    fn laying_lines_side_by_side_matches_laying_them_one_after_the_other() {
+        let (across, down) = (37usize, 23usize);
+        let pixels: Vec<[u8; 4]> = (0..across * down)
+            .map(|n| (n as u32 * 0x0101_0007).to_le_bytes())
+            .collect();
+        let put = |pixel: &[u8; 4], below: u32| below.rotate_left(5) ^ u32::from_le_bytes(*pixel);
+        let (a, d) = (across as isize, down as isize);
+        // Rows forwards and backwards, and columns (a turned canvas) up and
+        // down, from either end.
+        let cases = [
+            (down, across, 0, a, 1),
+            (down, across, a - 1, a, -1),
+            (across, down, (d - 1) * a, 1, -a),
+            (across, down, (d - 1) * a + a - 1, -1, -a),
+            (across, down, 0, 1, a),
+            (across, down, a - 1, -1, a),
+        ];
+        for (count, length, start, start_stride, step) in cases {
+            let lines = Lines {
+                count,
+                length,
+                canvas: 5,
+                canvas_stride: length + 3,
+                start,
+                start_stride,
+                step,
+            };
+            let below: Vec<u32> = (0..5 + count * (length + 3) + 7)
+                .map(|n| n as u32 * 2_654_435_761)
+                .collect();
+            let mut laid = below.clone();
+            lay(&mut laid, &pixels, lines, put);
+            let mut expected = below;
+            for line in 0..count {
+                let mut at = start + line as isize * start_stride;
+                for along in 0..length {
+                    let out = &mut expected[5 + line * (length + 3) + along];
+                    *out = put(&pixels[at as usize], *out);
+                    at += step;
+                }
+            }
+            assert_eq!(laid, expected, "{count} lines from {start}, step {step}");
+        }
+    }
+
+    /// A scaled window, whose pixels a turned canvas takes a column at a
+    /// time, and a block-linear one: the turned picture is the rotation.
+    #[test]
+    fn turned_pictures_of_full_screen_windows_are_the_rotations() {
+        let (ram, memory) = screen_memory();
+        let pattern: Vec<u8> = (0..0x80_0000u32)
+            .map(|byte| (byte.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        ram.write(BUFFER_PHYSICAL - 0x4000 + 0x40_0000, &pattern)
+            .unwrap();
+        let cases = [
+            ((720, 1280), (0x42, 0x1400)),
+            ((5, 7), (0, 0x40)),
+            ((360, 640), (0, 0x1400)),
+        ];
+        for (source, surface) in cases {
+            let dc = controller();
+            write(&dc, register::DISP_ACTIVE, 1280 << 16 | 720);
+            full_screen_window(&dc, 1, source, surface);
+            write(&dc, register::DISPLAY_COMMAND, DISPLAY_MODE_CONTINUOUS);
+            write(&dc, register::STATE_CONTROL, 0x0F);
+            let unturned = dc.frame(&memory).unwrap();
+            assert_eq!(
+                *dc.frame_turned_clockwise(&memory).unwrap(),
+                unturned.rotated_clockwise(),
+                "{source:?}"
+            );
+        }
+        let dc = controller();
+        write(&dc, register::DISP_ACTIVE, 1280 << 16 | 720);
+        home_windows(&dc);
+        write(&dc, register::DISPLAY_COMMAND, DISPLAY_MODE_CONTINUOUS);
+        write(&dc, register::STATE_CONTROL, 0x0F);
+        let unturned = dc.frame(&memory).unwrap();
+        assert_eq!(
+            *dc.frame_turned_clockwise(&memory).unwrap(),
+            unturned.rotated_clockwise()
+        );
+    }
+
+    /// The blend table's arithmetic is the per-pixel one's, for every
+    /// selection, alpha and a spread of colors and constants.
+    #[test]
+    fn blending_through_the_table_gives_what_blending_each_pixel_gives() {
+        let colors = [0u8, 1, 37, 127, 128, 200, 254, 255];
+        for select in (0..=5).flat_map(|low| (0..8).map(move |high| high << 4 | low)) {
+            for (k1, k2) in [(255u32, 0u32), (128, 255), (1, 77), (0, 0)] {
+                let (k1, k2) = (k1 as f32 / 255.0, k2 as f32 / 255.0);
+                let blend = Blend::Factors { select, k1, k2 };
+                let table = BlendTable::new(select, k1, k2);
+                for alpha in 0..=255u8 {
+                    for (&source, &below) in colors.iter().zip(colors.iter().rev()) {
+                        let pixel = [source, below, source / 2, alpha];
+                        let below = u32::from_be_bytes([0, below, source, 99]);
+                        assert_eq!(
+                            table.apply(pixel, below),
+                            blend.apply(pixel, below),
+                            "select {select:#x}, alpha {alpha}"
+                        );
+                    }
+                }
             }
         }
     }

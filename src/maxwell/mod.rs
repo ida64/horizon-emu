@@ -33,6 +33,7 @@ pub mod blend;
 pub mod capture;
 pub mod copy;
 pub mod inline;
+mod lru;
 pub mod metal;
 pub mod mme;
 pub mod pipeline;

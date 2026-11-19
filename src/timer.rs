@@ -94,6 +94,11 @@ impl Timers {
     /// Reads a register as `core` sees it.
     pub fn read(&self, core: usize, register: TimerRegister) -> u64 {
         let count = self.count();
+        // The counter is the kernel's time source, read far more often than
+        // the timers: it does not need their lock.
+        if register == TimerRegister::Count {
+            return count;
+        }
         let timer = self.timers.lock().unwrap()[core];
         match register {
             TimerRegister::Count => count,
