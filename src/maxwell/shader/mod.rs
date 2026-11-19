@@ -110,6 +110,7 @@ pub mod msl;
 #[cfg(test)]
 mod tests;
 
+pub use exec::WARP;
 pub use header::{Header, Interpolation, SPH_SIZE, ShaderType};
 
 use super::sampling::TextureUnit;
@@ -140,7 +141,8 @@ impl Program {
                 "shader: program header at {address:#x} is not mapped"
             ))
         })?;
-        let mut builder = Builder::new(Header::parse(&sph)?);
+        let header = Header::parse(&sph)?;
+        let mut builder = Builder::default();
         let mut group = [0u8; 32];
         loop {
             let offset = builder.code.len() * 8;
@@ -150,8 +152,11 @@ impl Program {
                     "shader: code group at {group_address:#x} is not mapped"
                 ))
             })?;
-            if builder.push_group(&group)? {
-                return Ok(builder.finish());
+            if builder.push_group(&group, SPH_SIZE)? {
+                return Ok(Program {
+                    header,
+                    code: builder.code,
+                });
             }
         }
     }
@@ -162,19 +167,9 @@ impl Program {
             .get(..SPH_SIZE)
             .and_then(|s| s.try_into().ok())
             .ok_or_else(|| Unmodeled("shader: shorter than a program header".into()))?;
-        let mut builder = Builder::new(Header::parse(sph)?);
-        loop {
-            let start = SPH_SIZE + builder.code.len() * 8;
-            let group = bytes.get(start..start + 32).ok_or_else(|| {
-                Unmodeled(format!(
-                    "shader: program runs past the end of its {} bytes",
-                    bytes.len()
-                ))
-            })?;
-            if builder.push_group(group.try_into().expect("32-byte group"))? {
-                return Ok(builder.finish());
-            }
-        }
+        let header = Header::parse(sph)?;
+        let code = Builder::from_bytes(&bytes[SPH_SIZE..], SPH_SIZE)?;
+        Ok(Program { header, code })
     }
 
     pub fn header(&self) -> &Header {
@@ -235,28 +230,131 @@ impl Program {
     }
 }
 
+/// A compute program (kernel). Unlike graphics programs it has no program
+/// header: code starts at its address [public: Ryujinx
+/// `Translation/Translator.cs`, which decodes compute programs from their
+/// address and others from address + 0x50 after the `ShaderHeader`]. The
+/// end of the code is found as for [`Program`].
+#[derive(Debug, Clone)]
+pub struct Kernel {
+    code: Vec<Option<exec::Inst>>,
+}
+
+/// The thread blocks of one compute launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Launch {
+    /// Thread blocks per dimension.
+    pub grid: [u32; 3],
+    /// Threads per block per dimension.
+    pub block: [u32; 3],
+    /// Bytes of shared memory per block.
+    pub shared: u32,
+    /// Hardware barriers the kernel may use (barrier `i < barriers`).
+    pub barriers: u32,
+}
+
+impl Kernel {
+    /// Decodes the kernel whose code starts at GPU VA `address`.
+    pub fn decode(memory: &dyn GpuMemory, address: u64) -> Result<Kernel, Unmodeled> {
+        let mut builder = Builder::default();
+        let mut group = [0u8; 32];
+        loop {
+            let group_address = address + (builder.code.len() * 8) as u64;
+            memory.read(group_address, &mut group).ok_or_else(|| {
+                Unmodeled(format!(
+                    "shader: kernel code group at {group_address:#x} is not mapped"
+                ))
+            })?;
+            if builder.push_group(&group, 0)? {
+                return Ok(Kernel { code: builder.code });
+            }
+        }
+    }
+
+    /// Same as [`Kernel::decode`], from bytes starting at the code.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Kernel, Unmodeled> {
+        Ok(Kernel {
+            code: Builder::from_bytes(bytes, 0)?,
+        })
+    }
+
+    /// Size in bytes of the decoded code (the terminating self-branch
+    /// included).
+    pub fn len(&self) -> usize {
+        self.code.len() * 8
+    }
+
+    /// Always false: a kernel has at least its terminating branch.
+    pub fn is_empty(&self) -> bool {
+        self.code.is_empty()
+    }
+
+    /// Host memory the decoded kernel takes.
+    pub fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + std::mem::size_of_val(self.code.as_slice())
+    }
+
+    /// Leading bytes of constant buffer `slot` the kernel may read (see
+    /// [`Program::constant_buffer_extent`]).
+    pub fn constant_buffer_extent(&self, slot: usize) -> Option<usize> {
+        metadata::constant_buffer_extent(&self.code, slot)
+    }
+
+    /// Leading bytes of the texture-handle buffer the kernel reads (see
+    /// [`Program::texture_handle_extent`]).
+    pub fn texture_handle_extent(&self) -> usize {
+        metadata::texture_handle_extent(&self.code)
+    }
+
+    /// Runs every thread of `launch`; global memory, constant buffers and
+    /// textures through `env`. See the interpreter's documentation
+    /// (`exec`, "Compute programs") for the model of warps, barriers and
+    /// shared memory.
+    pub fn run(&self, env: &Env<'_>, launch: &Launch) -> Result<(), Unmodeled> {
+        exec::run_grid(&self.code, env, launch)
+    }
+
+    /// Mnemonics of all decoded instructions, in program order.
+    pub fn mnemonics(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.code.iter().flatten().map(|inst| inst.op.mnemonic())
+    }
+}
+
+#[derive(Default)]
 struct Builder {
-    header: Header,
     code: Vec<Option<exec::Inst>>,
 }
 
 impl Builder {
-    fn new(header: Header) -> Builder {
-        Builder {
-            header,
-            code: Vec::new(),
+    /// Decodes `bytes` (code from its first group on) until the program
+    /// ends; `start` is the code's offset from the program's start, which
+    /// counts against [`MAX_PROGRAM`].
+    fn from_bytes(bytes: &[u8], start: usize) -> Result<Vec<Option<exec::Inst>>, Unmodeled> {
+        let mut builder = Builder::default();
+        loop {
+            let at = builder.code.len() * 8;
+            let group = bytes.get(at..at + 32).ok_or_else(|| {
+                Unmodeled(format!(
+                    "shader: program runs past the end of its {} bytes",
+                    bytes.len() + start
+                ))
+            })?;
+            if builder.push_group(group.try_into().expect("32-byte group"), start)? {
+                return Ok(builder.code);
+            }
         }
     }
 
     /// Decodes one 32-byte group; true when the program ended in it.
-    fn push_group(&mut self, group: &[u8; 32]) -> Result<bool, Unmodeled> {
+    /// `start`: as for [`Builder::from_bytes`].
+    fn push_group(&mut self, group: &[u8; 32], start: usize) -> Result<bool, Unmodeled> {
         if group.iter().all(|&b| b == 0) {
             if self.code.is_empty() {
                 return Err(Unmodeled("shader: program has no code".into()));
             }
             return Ok(true);
         }
-        if SPH_SIZE + self.code.len() * 8 + 32 > MAX_PROGRAM {
+        if start + self.code.len() * 8 + 32 > MAX_PROGRAM {
             return Err(Unmodeled(format!(
                 "shader: no end of program within {MAX_PROGRAM:#x} bytes"
             )));
@@ -280,13 +378,6 @@ impl Builder {
             }
         }
         Ok(false)
-    }
-
-    fn finish(self) -> Program {
-        Program {
-            header: self.header,
-            code: self.code,
-        }
     }
 }
 

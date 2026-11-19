@@ -35,7 +35,7 @@ fn boolean(a: bool, b: bool, op: u32) -> bool {
     }
 }
 impl<const L: usize> Machine<'_, L> {
-    pub(super) fn execute_integer(&mut self, active: u8) -> Result<bool, Unmodeled> {
+    pub(super) fn execute_integer(&mut self, active: Mask) -> Result<bool, Unmodeled> {
         let form = match self.op {
             Op::BfeR
             | Op::BfiR

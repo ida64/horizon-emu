@@ -126,6 +126,18 @@ impl Capture {
             self.failed.store(true, Ordering::Relaxed);
         }
     }
+
+    /// Writes out what is buffered: the reads of a call that was refused,
+    /// which no later call record flushes once the machine stops.
+    fn flush(&self) {
+        let mut out = self.out.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.failed.load(Ordering::Relaxed)
+            && let Err(error) = out.flush()
+        {
+            eprintln!("GPU capture: {error}; capture stopped");
+            self.failed.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Bytes known to a capture or replay, by 4 KiB page.
@@ -241,7 +253,11 @@ impl Engines for Recorder {
             channel: self.channel,
             shadow: &self.shadow,
         };
-        self.inner.call(subchannel, method, argument, &observed)
+        let result = self.inner.call(subchannel, method, argument, &observed);
+        if result.is_err() {
+            self.capture.flush();
+        }
+        result
     }
 
     fn flush(&mut self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
