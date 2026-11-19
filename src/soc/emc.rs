@@ -147,8 +147,23 @@ pub struct Emc {
 }
 
 impl Default for Emc {
+    /// The block as the boot chain leaves it for the kernel.
     fn default() -> Self {
-        let channel: HashMap<u64, u32> = ENTRY_STATE.into_iter().collect();
+        Self::with_registers(ENTRY_STATE.into_iter().collect())
+    }
+}
+
+impl Emc {
+    /// The block as the SoC comes out of reset: no register holds a value
+    /// until written. The NX bootloader programs it during its SDRAM
+    /// bring-up (about 273 registers, `0x40015348`, research §2.5) and
+    /// reads none of them back; whatever of `ENTRY_STATE` it does not
+    /// write refuses when the kernel's clock driver reads it.
+    pub fn power_on() -> Self {
+        Self::with_registers(HashMap::new())
+    }
+
+    fn with_registers(channel: HashMap<u64, u32>) -> Self {
         Self {
             state: Mutex::new(State {
                 channels: [channel.clone(), channel],

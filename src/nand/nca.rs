@@ -1,5 +1,5 @@
 //! Nintendo Content Archives, as far as reading the content meta out of the
-//! meta NCAs of a firmware takes.
+//! meta NCAs of a firmware and the files out of its data NCAs takes.
 //!
 //! An NCA starts with a 0xC00-byte header encrypted with AES-XTS under the
 //! [header key](crypto::nca_header_key) in 0x200-byte sectors numbered from
@@ -50,9 +50,14 @@ pub(crate) const SECTION_HEADER_SIZE: usize = 0x200;
 
 pub const CONTENT_TYPE_PROGRAM: u8 = 0;
 pub const CONTENT_TYPE_META: u8 = 1;
+pub const CONTENT_TYPE_DATA: u8 = 4;
 
+const FS_TYPE_ROMFS: u8 = 0;
 pub(crate) const FS_TYPE_PARTITION: u8 = 1;
 pub(crate) const HASH_TYPE_HIERARCHICAL_SHA256: u8 = 2;
+const HASH_TYPE_HIERARCHICAL_INTEGRITY: u8 = 3;
+/// Levels of an `IVFC` tree in a RomFS section, the data being the last.
+const INTEGRITY_LEVELS: usize = 6;
 const ENCRYPTION_NONE: u8 = 1;
 pub(crate) const ENCRYPTION_CTR: u8 = 3;
 pub(crate) const CTR_KEY_SLOT: usize = 2;
@@ -164,20 +169,20 @@ impl<'a> Nca<'a> {
         &self.header[start..start + SECTION_HEADER_SIZE]
     }
 
-    /// The plain bytes of the data region of partition FS section `section`,
-    /// after checking its header, hash table and data against their hashes.
-    pub fn partition_section(&self, section: usize) -> Result<Vec<u8>, NcaError> {
+    /// The header of section `section`, once it matches the hash the NCA
+    /// header holds for it.
+    fn checked_section_header(&self, section: usize) -> Result<&[u8], NcaError> {
         assert!(section < SECTION_COUNT);
         let header = self.section_header(section);
         let expected = &self.header[0x280 + section * 0x20..0x2A0 + section * 0x20];
         if crypto::sha256(header) != expected {
             return Err(NcaError::SectionHeaderHash { section });
         }
-        if header[0x02] != FS_TYPE_PARTITION || header[0x03] != HASH_TYPE_HIERARCHICAL_SHA256 {
-            return Err(NcaError::Unsupported(
-                "a section other than a partition FS hashed with hierarchical SHA-256",
-            ));
-        }
+        Ok(header)
+    }
+
+    /// The whole of section `section`, decrypted as its `header` says.
+    fn decrypted_section(&self, section: usize, header: &[u8]) -> Result<Vec<u8>, NcaError> {
         let entry = 0x240 + section * 0x10;
         let start = u64::from(u32_at(&self.header[..], entry)) * MEDIA_UNIT;
         let end = u64::from(u32_at(&self.header[..], entry + 4)) * MEDIA_UNIT;
@@ -198,6 +203,19 @@ impl<'a> Nca<'a> {
                 ));
             }
         }
+        Ok(plain)
+    }
+
+    /// The plain bytes of the data region of partition FS section `section`,
+    /// after checking its header, hash table and data against their hashes.
+    pub fn partition_section(&self, section: usize) -> Result<Vec<u8>, NcaError> {
+        let header = self.checked_section_header(section)?;
+        if header[0x02] != FS_TYPE_PARTITION || header[0x03] != HASH_TYPE_HIERARCHICAL_SHA256 {
+            return Err(NcaError::Unsupported(
+                "a section other than a partition FS hashed with hierarchical SHA-256",
+            ));
+        }
+        let plain = self.decrypted_section(section, header)?;
         let region = |index: usize| -> Result<&[u8], NcaError> {
             let offset = u64_at(header, 0x30 + index * 0x10) as usize;
             let size = u64_at(header, 0x38 + index * 0x10) as usize;
@@ -217,6 +235,69 @@ impl<'a> Nca<'a> {
             return Err(NcaError::DataHash { section });
         }
         Ok(data.to_vec())
+    }
+
+    /// The RomFS image in section `section`, after checking its header and
+    /// every level of its integrity tree against their hashes.
+    ///
+    /// The tree (`IVFC`, at 0x08 of the section header): 0x08 master hash
+    /// size, 0x0C level count including the master hash, at 0x10 six levels
+    /// of offset (in the section), size and log2 of the block size (8, 8
+    /// and 4 bytes, 4 reserved), the master hash at 0xC0. Each level holds
+    /// the SHA-256 of the blocks of the next, the master hash those of the
+    /// first, and the last level is the RomFS. A short last block is
+    /// hashed as if filled up with zeros to the block size (switchbrew
+    /// "NCA"; every level of firmware 23.5.0's boot image packages matches
+    /// that way).
+    pub fn romfs_section(&self, section: usize) -> Result<Vec<u8>, NcaError> {
+        let header = self.checked_section_header(section)?;
+        if header[0x02] != FS_TYPE_ROMFS || header[0x03] != HASH_TYPE_HIERARCHICAL_INTEGRITY {
+            return Err(NcaError::Unsupported(
+                "a section other than a RomFS with an integrity tree",
+            ));
+        }
+        let ivfc = &header[0x08..];
+        if &ivfc[..4] != b"IVFC" || u32_at(ivfc, 0x0C) as usize != INTEGRITY_LEVELS + 1 {
+            return Err(NcaError::Unsupported(
+                "an integrity tree other than IVFC with six levels",
+            ));
+        }
+        let master_size = u32_at(ivfc, 0x08) as usize;
+        let master = ivfc
+            .get(0xC0..0xC0 + master_size)
+            .ok_or(NcaError::Unsupported(
+                "a master hash past the section header",
+            ))?;
+        let plain = self.decrypted_section(section, header)?;
+        let mut hashes = master;
+        let mut level = &plain[..0];
+        for index in 0..INTEGRITY_LEVELS {
+            let info = &ivfc[0x10 + index * 0x18..];
+            let (offset, size) = (u64_at(info, 0) as usize, u64_at(info, 8) as usize);
+            let block_order = u32_at(info, 0x10);
+            level = plain
+                .get(offset..offset + size)
+                .ok_or(NcaError::Truncated)?;
+            if !(1..32).contains(&block_order) {
+                return Err(NcaError::Unsupported(
+                    "an integrity block size out of range",
+                ));
+            }
+            let block_size = 1usize << block_order;
+            if hashes.len() < level.len().div_ceil(block_size) * 32 {
+                return Err(NcaError::DataHash { section });
+            }
+            let mut padded = vec![0; block_size];
+            for (block, hash) in level.chunks(block_size).zip(hashes.as_chunks::<32>().0) {
+                padded[..block.len()].copy_from_slice(block);
+                padded[block.len()..].fill(0);
+                if crypto::sha256(&padded) != *hash {
+                    return Err(NcaError::DataHash { section });
+                }
+            }
+            hashes = level;
+        }
+        Ok(level.to_vec())
     }
 
     fn ctr_key(&self) -> Result<[u8; 16], NcaError> {

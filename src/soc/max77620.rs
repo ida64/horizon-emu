@@ -14,6 +14,14 @@
 //! everything masked (`0x0D` to `0x12`). Any other register refuses to be
 //! read.
 //!
+//! On a power-on boot the NX bootloader programs the chip first, in normal
+//! I2C mode (its `0x400007D0`, `0x40000872`, `0x40000806`, `0x40002840`):
+//! `CNFGBBC` (0x04), `ONOFFCNFG1` (0x41), the power sequencers (0x43-0x56),
+//! `SD0`/`SD1` (0x16/0x17), `SD_CFG2` (0x22), `GPIO5` (0x3B, the CPU rail's
+//! enable) and `AME_GPIO` (0x40, read first, bit 5 cleared). Every one is
+//! held as written; `AME_GPIO` reads zero before, as the other
+//! configuration registers do.
+//!
 //! The two blocks share the chip's interrupt output, which is the SoC's
 //! PMU interrupt (pcv binds interrupt 118, level-triggered) and one of its
 //! wake sources: [`Max77620`] is the chip as a whole. Two things happen on

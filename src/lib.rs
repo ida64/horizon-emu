@@ -5,11 +5,14 @@
 //!
 //! * [`boot`] and [`secmon`] define the contract the kernel expects at entry
 //!   and from the secure monitor.
-//! * [`image`] decodes the kernel blob.
+//! * [`image`] decodes the kernel blob, and [`package2`] verifies and
+//!   decrypts it out of package2 as the secure monitor does on cold boot.
 //! * [`gic`], [`timer`] and [`uart`] are the devices the kernel itself
 //!   drives, reached through [`bus`].
 //! * [`hvf`] runs guest code on the host CPU, and [`hvf::debug`] adds
 //!   breakpoints and single-step that the guest cannot see.
+//! * [`bpmp`] interprets the boot and power-management processor, the
+//!   ARM7TDMI the boot chain runs on before the CCPLEX starts.
 //! * [`soc`] holds the rest of the system-on-chip and the board devices
 //!   the initial processes drive; [`keys`] loads the console keys the
 //!   secure monitor derives from; [`nand`] makes the eMMC image of a
@@ -25,6 +28,8 @@ compile_error!("the only CPU backend is Hypervisor.framework on Apple silicon");
 
 pub mod arm64;
 pub mod boot;
+pub mod bootrom;
+pub mod bpmp;
 pub mod bus;
 pub mod clock;
 pub mod gic;
@@ -38,6 +43,7 @@ pub mod maxwell;
 pub mod memory;
 pub mod nand;
 pub mod net;
+pub mod package2;
 pub mod pmu;
 pub mod sdcard;
 pub mod secmon;

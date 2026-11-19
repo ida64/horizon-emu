@@ -23,12 +23,13 @@ use horizon_emu::{
         exception_class::{DATA_ABORT_LOWER, INSTRUCTION_ABORT_LOWER},
     },
     boot::{BootParams, DramSize},
+    bootrom,
     image::KernelImage,
     ipc::{Client, ResultCode, Tracker},
     keys::KeySet,
     machine::{
-        Caller, CodeAddress, ExceptionState, Machine, Module, Place, Poke, Process, RunEnd,
-        RunOptions, SaveReport, TraceEvent,
+        Caller, CodeAddress, ExceptionState, Firmware, Machine, Module, Place, Poke, PowerOn,
+        Process, RunEnd, RunOptions, SaveReport, TraceEvent,
     },
     maxwell, nand, net, sdcard,
     secmon::{self, SmcEffect},
@@ -46,14 +47,27 @@ use crate::{
 const USAGE: &str = "\
 usage: horizon-emu info <kernel.elf>
        horizon-emu boot <kernel.elf> [options]
+       horizon-emu power-on [options]
        horizon-emu restore <snapshot dir> [options]
-       horizon-emu format-emmc <new image file> [--keys FILE [--firmware DIR]]
+       horizon-emu format-emmc <new image file> [--keys FILE [--firmware DIR
+                   [--boot0 <new file> --boot1 <new file>]]]
+       horizon-emu install-boot <image file> --keys FILE --firmware DIR
+                   --boot0 FILE --boot1 FILE
        horizon-emu patch-prodinfo <image file> --keys FILE
        horizon-emu format-sd <new image file> --size SIZE [--add HOST=CARD ...]
 
 <kernel.elf> is the package2 kernel wrapped as an ELF (see pkg2elf.py).
 boot runs until a core needs something that is not emulated, the kernel
-panics, the timeout expires, or its window is closed. format-emmc creates
+panics, the timeout expires, or its window is closed. power-on starts the
+console the way it powers on instead, from its boot ROM (high-level
+emulated): the ROM boots package1 from the BCT in --emmc-boot0 and
+--emmc-boot1 (see format-emmc --boot0), the boot processor (BPMP) runs
+package1's bootloader instruction by instruction, and once it starts the
+CPU the secure monitor's cold boot takes the kernel from package2 in the
+--emmc user area; breakpoints and symbols apply once that kernel is in
+place. It needs --keys with the console's secure_boot_key, and takes the
+options of boot except those that patch the kernel (--homebrew-keys,
+--homebrew: the real package2 runs as it is). format-emmc creates
 an eMMC user area image for --emmc (a sparse file): the 32 GB module's
 partition table; with --keys also the empty, encrypted file systems of a
 console's partitions and the calibration data of this emulator's own
@@ -61,9 +75,15 @@ console (its serial number, addresses and sensor values are made up for
 it; it has no device keys or Nintendo-issued certificates, only a made-up
 TLS client key and self-signed certificate, which Nintendo's servers
 reject); with --firmware also the contents (*.nca) of that directory,
-installed as the system's programs and data. patch-prodinfo gives the
-calibration data of an image formatted before it had one that made-up
-TLS client identity, and changes nothing else. format-sd creates a
+installed as the system's programs and data, and package2 of its boot
+image packages in the BCPKG2 partitions; with --boot0 and --boot1 also the
+images of the two boot partitions for --emmc-boot0/--emmc-boot1 (sparse
+files), holding its BCTs and package1. install-boot puts those boot
+images of the firmware DIR into an existing user area image (its BCPKG2
+partitions, nothing else) and into the boot partition images FILE (made
+if missing). patch-prodinfo gives the calibration data of an image
+formatted before it had one that made-up TLS client identity, and
+changes nothing else. format-sd creates a
 microSD card image for --sd (a sparse file) of SIZE bytes (suffix K, M or
 G for binary multiples; a multiple of 512K above 2088M and up to 32G),
 formatted as the console formats a card, with each --add's host file HOST
@@ -208,6 +228,8 @@ taken as it is, such as one inside a process):
                       material), handles, buffers with the first 32 bytes of
                       each (not for spl and csrng) and the result code
   --trace-devices     print every device register access
+  --trace-bpmp N      with power-on: when the boot processor stops, add its
+                      last N instructions and device accesses to the note
   --trace-times       start every trace line with the seconds since the
                       machine was started
   --verbose           narrate the boot, with times: cores started, each
@@ -261,11 +283,19 @@ fn usage() -> String {
 }
 
 fn run(arguments: &[String]) -> Result<(), String> {
+    if let [command, flags @ ..] = arguments
+        && command == "power-on"
+    {
+        return boot(None, flags, None);
+    }
     let [command, path, flags @ ..] = arguments else {
         return Err(usage());
     };
     if command == "format-emmc" {
         return format_emmc(path, flags).map_err(|error| format!("{path}: {error}"));
+    }
+    if command == "install-boot" {
+        return install_boot(path, flags).map_err(|error| format!("{path}: {error}"));
     }
     if command == "format-sd" {
         return format_sd(path, flags).map_err(|error| format!("{path}: {error}"));
@@ -282,7 +312,7 @@ fn run(arguments: &[String]) -> Result<(), String> {
             info(&image);
             Ok(())
         }
-        "boot" => boot(image, Path::new(path), flags, None),
+        "boot" => boot(Some((image, Path::new(path))), flags, None),
         _ => Err(usage()),
     }
 }
@@ -331,12 +361,17 @@ struct SavedBoot {
     /// Machine flags with their values; images by their names in the
     /// snapshot.
     flags: Vec<String>,
+    /// A machine powered on (`power-on`): no `kernel.elf` beside it, the
+    /// kernel is part of its state.
+    #[serde(default)]
+    power_on: bool,
 }
 
 /// Takes snapshots of a running machine: its state, a copy of the kernel
-/// and of each storage image, and how it was built.
+/// (of a machine started at kernel entry) and of each storage image, and
+/// how it was built.
 struct Snapshotter {
-    kernel: PathBuf,
+    kernel: Option<PathBuf>,
     /// Machine flags as given, with host files as absolute paths.
     flags: Vec<String>,
 }
@@ -344,7 +379,10 @@ struct Snapshotter {
 impl Snapshotter {
     fn save(&self, machine: &Machine, dir: &Path) -> Result<SaveReport, String> {
         let mut beside = |dir: &Path| -> io::Result<()> {
-            let mut saved = SavedBoot { flags: Vec::new() };
+            let mut saved = SavedBoot {
+                flags: Vec::new(),
+                power_on: self.kernel.is_none(),
+            };
             let mut flags = self.flags.iter();
             while let Some(flag) = flags.next() {
                 saved.flags.push(flag.clone());
@@ -358,7 +396,9 @@ impl Snapshotter {
                 clone_file(Path::new(source), &dir.join(name))?;
                 saved.flags.push(name.into());
             }
-            clone_file(&self.kernel, &dir.join("kernel.elf"))?;
+            if let Some(kernel) = &self.kernel {
+                clone_file(kernel, &dir.join("kernel.elf"))?;
+            }
             let json = serde_json::to_vec_pretty(&saved).map_err(io::Error::other)?;
             std::fs::write(dir.join("boot.json"), json)
         };
@@ -427,9 +467,12 @@ fn restore(dir: &Path, flags: &[String]) -> Result<(), String> {
         }
     }
     all.extend(given);
+    if saved.power_on {
+        return boot(None, &all, Some(dir));
+    }
     let kernel = dir.join("kernel.elf");
     let image = KernelImage::load(&kernel).map_err(|error| error.to_string())?;
-    boot(image, &kernel, &all, Some(dir))
+    boot(Some((image, &kernel)), &all, Some(dir))
 }
 
 fn format_sd(path: &str, flags: &[String]) -> Result<(), String> {
@@ -468,7 +511,7 @@ fn parse_size(text: &str) -> Option<u64> {
 }
 
 fn format_emmc(path: &str, flags: &[String]) -> Result<(), String> {
-    let (mut keys, mut firmware) = (None, None);
+    let (mut keys, mut firmware, mut boot) = (None, None, [None, None]);
     let mut flags = flags.iter();
     while let Some(flag) = flags.next() {
         let value = flags.next().ok_or_else(usage)?;
@@ -477,12 +520,38 @@ fn format_emmc(path: &str, flags: &[String]) -> Result<(), String> {
                 keys = Some(KeySet::load(Path::new(value)).map_err(|error| error.to_string())?)
             }
             "--firmware" => firmware = Some(Path::new(value)),
+            "--boot0" => boot[0] = Some(value),
+            "--boot1" => boot[1] = Some(value),
             _ => return Err(usage()),
         }
     }
     if firmware.is_some() && keys.is_none() {
         return Err("--firmware needs --keys".into());
     }
+    let boot = match boot {
+        [None, None] => None,
+        [Some(_), Some(_)] if firmware.is_none() => {
+            return Err("--boot0 and --boot1 need --firmware".into());
+        }
+        [Some(boot0), Some(boot1)] => Some([boot0, boot1]),
+        _ => return Err("--boot0 and --boot1 go together".into()),
+    };
+    // Before any file is made: the firmware has to have them.
+    let boot_images = match (&keys, firmware) {
+        (Some(keys), Some(firmware)) => Some(
+            nand::boot_images::BootImages::load(firmware, keys)
+                .map_err(|error| error.to_string())?,
+        ),
+        _ => None,
+    };
+    let create = |path: &str| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| format!("{path}: {error}"))
+    };
     let image = OpenOptions::new()
         .read(true)
         .write(true)
@@ -504,6 +573,82 @@ fn format_emmc(path: &str, flags: &[String]) -> Result<(), String> {
             installed.contents, installed.bytes
         );
     }
+    if let Some(boot_images) = boot_images {
+        let boot = match boot {
+            Some([boot0, boot1]) => Some([create(boot0)?, create(boot1)?]),
+            None => None,
+        };
+        install_boot_images(&boot_images, &image, boot.as_ref())?;
+    }
+    Ok(())
+}
+
+fn install_boot(path: &str, flags: &[String]) -> Result<(), String> {
+    let (mut keys, mut firmware, mut boot) = (None, None, [None, None]);
+    let mut flags = flags.iter();
+    while let Some(flag) = flags.next() {
+        let value = flags.next().ok_or_else(usage)?;
+        match flag.as_str() {
+            "--keys" => {
+                keys = Some(KeySet::load(Path::new(value)).map_err(|error| error.to_string())?)
+            }
+            "--firmware" => firmware = Some(Path::new(value)),
+            "--boot0" => boot[0] = Some(value),
+            "--boot1" => boot[1] = Some(value),
+            _ => return Err(usage()),
+        }
+    }
+    let (Some(keys), Some(firmware), [Some(boot0), Some(boot1)]) = (keys, firmware, boot) else {
+        return Err("install-boot needs --keys, --firmware, --boot0 and --boot1".into());
+    };
+    let boot_images =
+        nand::boot_images::BootImages::load(firmware, &keys).map_err(|error| error.to_string())?;
+    let image = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    let open = |path: &str| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|error| format!("{path}: {error}"))
+    };
+    let boot = [open(boot0)?, open(boot1)?];
+    install_boot_images(&boot_images, &image, Some(&boot))
+}
+
+/// Writes `boot_images` into the BCPKG2 partitions of the user area
+/// `image` and, given, the boot partition images `boot`.
+fn install_boot_images(
+    boot_images: &nand::boot_images::BootImages,
+    image: &File,
+    boot: Option<&[File; 2]>,
+) -> Result<(), String> {
+    boot_images
+        .write_package2(image)
+        .map_err(|error| error.to_string())?;
+    if let Some([boot0, boot1]) = boot {
+        boot_images
+            .write_boot_partitions([boot0, boot1])
+            .map_err(|error| format!("boot partitions: {error}"))?;
+    }
+    let normal = &boot_images.normal;
+    println!(
+        "boot images: package1 of {}, {} bytes; package2 {} bytes, safe mode {} bytes{}",
+        nand::boot_images::package1_build_date(&normal.package1).unwrap_or("?"),
+        normal.package1.len(),
+        normal.package2.len(),
+        boot_images.safe.package2.len(),
+        if boot.is_some() {
+            "; BCTs and package1 in the boot partitions"
+        } else {
+            "; boot partitions not written (no --boot0/--boot1)"
+        }
+    );
     Ok(())
 }
 
@@ -587,11 +732,38 @@ fn recorded_value(flag: &str, value: &str) -> String {
     }
 }
 
-/// Boots `image` (read from `kernel`) as `flags` say, or with `restore`,
+/// The console's boot ROM run on its eMMC boot partitions, for
+/// `power-on`: what it leaves the boot processor.
+fn boot_rom(keys: &KeySet, boot: [Option<&String>; 2]) -> Result<PowerOn, String> {
+    let secure_boot_key = keys
+        .secure_boot_key()
+        .ok_or("power-on needs --keys with the console's secure_boot_key")?;
+    let read = |path: Option<&String>| {
+        path.map(|path| std::fs::read(path).map_err(|error| format!("{path}: {error}")))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    };
+    let (boot0, boot1) = (read(boot[0])?, read(boot[1])?);
+    if boot0.is_empty() && boot1.is_empty() {
+        return Err("power-on needs --emmc-boot0 or --emmc-boot1 with a BCT and package1".into());
+    }
+    // The device key fuse and the die's identity fuses belong to one chip,
+    // and no key set records them: they are zero here, a choice like the
+    // console's serial number. Only the SSK depends on them, which
+    // package1ldr never uses.
+    let fuses = bootrom::Fuses::retail(*secure_boot_key, 0, bootrom::ChipFuses::default());
+    let mut iram = vec![0; bootrom::IRAM_SIZE];
+    // PMC_SCRATCH0 is clear on a cold boot: no warm boot, no forced recovery.
+    let handoff = bootrom::cold_boot(&boot0, &boot1, &fuses, 0, &mut iram)
+        .map_err(|error| format!("boot ROM: {error}"))?;
+    Ok(PowerOn { handoff, iram })
+}
+
+/// Boots `kernel` (an image and the file it was read from) as `flags` say,
+/// or without one powers the console on from its boot ROM; with `restore`,
 /// goes on from the snapshot in that directory instead.
 fn boot(
-    mut image: KernelImage,
-    kernel: &Path,
+    kernel: Option<(KernelImage, &Path)>,
     flags: &[String],
     restore: Option<&Path>,
 ) -> Result<(), String> {
@@ -604,6 +776,7 @@ fn boot(
     let (mut trace_smc, mut trace_svc, mut trace_devices) = (false, false, false);
     let (mut trace_ipc, mut trace_times, mut verbose) = (false, false, false);
     let mut survey = false;
+    let mut bpmp_trace = 0;
     let mut crash_dump = None::<PathBuf>;
     let mut control = None::<String>;
     let mut cpu_slowdown = None;
@@ -765,6 +938,11 @@ fn boot(
             "--crash-dump" => crash_dump = Some(PathBuf::from(value()?)),
             "--control" => control = Some(value()?.clone()),
             "--trace-devices" => trace_devices = true,
+            "--trace-bpmp" => {
+                bpmp_trace = value()?
+                    .parse()
+                    .map_err(|error| format!("--trace-bpmp: {error}"))?
+            }
             "--survey" => survey = true,
             "--break" => breakpoints.push(value()?),
             "--trace" => tracepoints.push(value()?),
@@ -832,9 +1010,29 @@ fn boot(
         None => homebrew.sd_card()?,
     };
     params.program_verification_disabled |= homebrew.disables_verification();
-    for line in homebrew.install_keys(&mut image)?.iter().chain(&replaced) {
-        println!("{line}");
-    }
+    let (firmware, kernel) = match kernel {
+        Some((mut image, path)) => {
+            let installed = homebrew.install_keys(&mut image)?;
+            for line in installed.iter().chain(&replaced) {
+                println!("{line}");
+            }
+            let path = std::path::absolute(path).map_err(|error| error.to_string())?;
+            (Firmware::Kernel(image), Some(path))
+        }
+        None => {
+            if homebrew.installs_keys() {
+                return Err(
+                    "--homebrew-keys and --homebrew patch the kernel's INI1, and power-on runs \
+                     the real package2 as it is"
+                        .into(),
+                );
+            }
+            for line in &replaced {
+                println!("{line}");
+            }
+            (Firmware::PowerOn(boot_rom(&keys, emmc_boot)?), None)
+        }
+    };
     // A machine somebody is watching, or something drives, runs for as
     // long as they do.
     let timeout = timeout.or((!show_window && control.is_none()).then_some(Duration::from_secs(5)));
@@ -848,10 +1046,18 @@ fn boot(
                 .map_err(|error| format!("--control {path}: {error}"))
         })
         .transpose()?;
-    let machine = Machine::new(image, &params, keys, emmc, sd_card, Box::new(io::stderr()))
-        .map_err(|error| error.to_string())?;
+    let machine = Machine::new(
+        firmware,
+        &params,
+        keys,
+        emmc,
+        sd_card,
+        Box::new(io::stderr()),
+    )
+    .map_err(|error| error.to_string())?;
+    machine.set_bpmp_trace(bpmp_trace);
     let snapshotter = Snapshotter {
-        kernel: std::path::absolute(kernel).map_err(|error| error.to_string())?,
+        kernel,
         flags: machine_flags,
     };
     if let Some(ssid) = &wifi_ssid {

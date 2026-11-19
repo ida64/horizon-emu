@@ -35,7 +35,8 @@ pub const SIZE: u64 = 0xC00;
 const PWRGATE_TOGGLE: u64 = 0x30;
 const TOGGLE_START: u32 = 1 << 8;
 const TOGGLE_PARTITION: u32 = 0x1F;
-const PWRGATE_STATUS: u64 = 0x38;
+/// Which power partitions are on, a bit per partition ID.
+pub const PWRGATE_STATUS: u64 = 0x38;
 
 /// The 64 wake events, 32 to a register: which may wake the console
 /// (`WAKE_MASK`, `WAKE2_MASK`), at which level of their input, high if
@@ -74,6 +75,60 @@ const POWERED_AT_ENTRY: u32 = 1 << 0 | 1 << 14 | 1 << 15;
 const GPU_RG_CNTRL: u64 = 0x2D4;
 const GPU_RAIL_CLAMPED: u32 = 1 << 0;
 
+/// `nxbl_hwcheck.csv`'s PMC rows: `(offset, expected & mask)`; see
+/// [`Pmc::power_on`].
+#[rustfmt::skip]
+const HWCHECK_STATE: [(u64, u32); 143] = [
+    (0x000, 0x00410A00), (0x004, 0x00000000), (0x008, 0x00000000),
+    (0x00C, 0x00000000), (0x010, 0xFF9FFFFF), (0x014, 0x00000000),
+    (0x018, 0x00000000), (0x01C, 0x00200000), (0x020, 0x00000000),
+    (0x024, 0x00000000), (0x028, 0xEDCBA987), (0x030, 0x00000000),
+    (0x034, 0x00000000), (0x03C, 0x003F007F), (0x040, 0xFFFFFFFF),
+    (0x044, 0x00010080), (0x048, 0x00FEB425), (0x04C, 0x00000001),
+    (0x0C8, 0x0000FFFF), (0x0CC, 0x0000FFFF), (0x0D0, 0xFFFFFFFF),
+    (0x0D4, 0xFFFFFFFF), (0x0D8, 0x00000000), (0x0DC, 0x00000000),
+    (0x0E0, 0x00000000), (0x0E4, 0x007C3C2C), (0x0E8, 0x0000000F),
+    (0x0EC, 0x00000000), (0x0F4, 0x00000000), (0x0F8, 0x00018416),
+    (0x154, 0x00000000), (0x158, 0x00000000), (0x15C, 0x00000000),
+    (0x160, 0x00000000), (0x164, 0xF9FFFFE7), (0x168, 0x00000000),
+    (0x16C, 0x00000000), (0x170, 0x00000000), (0x174, 0xFFFFFFFF),
+    (0x178, 0x000000FF), (0x17C, 0x000000FF), (0x180, 0x000000FF),
+    (0x184, 0xEDCBA987), (0x188, 0x00000000), (0x18C, 0x00000000),
+    (0x190, 0x00000000), (0x194, 0x00000000), (0x198, 0x00000000),
+    (0x19C, 0x00000000), (0x1A0, 0x00000000), (0x1A4, 0x0000007E),
+    (0x1A8, 0x00000000), (0x1AC, 0x00000000), (0x1B0, 0x00000000),
+    (0x1B8, 0x00000000), (0x1BC, 0x00000000), (0x1C0, 0x00000000),
+    (0x1C4, 0x02000000), (0x1C8, 0x0000007F), (0x1CC, 0x00000003),
+    (0x1D0, 0x00000000), (0x1D4, 0x00000000), (0x1DC, 0x00002A02),
+    (0x1E0, 0x00000000), (0x1E4, 0x0000001B), (0x1E8, 0x00000000),
+    (0x1F0, 0x0F0F0F0F), (0x1F8, 0x00041041), (0x1FC, 0xC0C0C0C0),
+    (0x200, 0x00000000), (0x204, 0x23232363), (0x208, 0x23232363),
+    (0x20C, 0x23232363), (0x210, 0x16161616), (0x218, 0x01111111),
+    (0x264, 0x80000003), (0x26C, 0x0000001F), (0x270, 0x0000000D),
+    (0x274, 0x00000000), (0x278, 0x0000000F), (0x280, 0x00000F07),
+    (0x284, 0x000000C0), (0x288, 0x00000000), (0x28C, 0x06060606),
+    (0x294, 0x00001101), (0x298, 0x00000001), (0x29C, 0x00000000),
+    (0x2A0, 0x00000000), (0x2A4, 0x000000FF), (0x2A8, 0xFFFFFFFF),
+    (0x2AC, 0xFFFFFFFF), (0x2B0, 0x00000000), (0x2B4, 0x000016E0),
+    (0x2B8, 0x0000001F), (0x2BC, 0x00020000), (0x2C0, 0x00000000),
+    (0x2C4, 0x00000000), (0x2C8, 0x00000000), (0x2CC, 0x00000000),
+    (0x2D0, 0x00000000), (0x2D4, 0x00000001), (0x2D8, 0x00000000),
+    (0x2DC, 0xFFFFFFFF), (0x2E0, 0x000000FF), (0x440, 0x00000001),
+    (0x444, 0x01F00000), (0x448, 0x1DF30000), (0x44C, 0x00000000),
+    (0x450, 0x00020200), (0x45C, 0x0FFF0000), (0x460, 0x0FFF0000),
+    (0x464, 0x00000000), (0x468, 0x00000000), (0x474, 0x00000010),
+    (0x478, 0x0000007F), (0x47C, 0x00000000), (0x480, 0x00000000),
+    (0x484, 0x00000001), (0x488, 0x007F80FA), (0x48C, 0x00000005),
+    (0x490, 0x000000FA), (0x498, 0x00000000), (0x49C, 0x00000001),
+    (0x4A0, 0x00000000), (0x4A4, 0x00000000), (0x4B4, 0x00000000),
+    (0x4B8, 0x00000000), (0x4BC, 0x00000000), (0x4C0, 0x28400000),
+    (0x4C4, 0x28400000), (0x4C8, 0x28400000), (0x4CC, 0x28400000),
+    (0x4D0, 0x000000C0), (0x4D4, 0x00000000), (0x4D8, 0x00000000),
+    (0x4DC, 0x000000FC), (0x4E0, 0x23232363), (0x4E4, 0x0007FF9F),
+    (0x5B0, 0x00000000), (0x5B4, 0x00000000), (0x5B8, 0x00000000),
+    (0x5BC, 0x00000000), (0x5C0, 0x00004000),
+];
+
 pub struct Pmc {
     registers: RegisterFile,
     powered: Mutex<u32>,
@@ -84,6 +139,38 @@ impl Pmc {
         Self {
             registers: RegisterFile::zeroed([(GPU_RG_CNTRL, GPU_RAIL_CLAMPED)]),
             powered: Mutex::new(POWERED_AT_ENTRY),
+        }
+    }
+
+    /// The block as the SoC comes out of reset, for a machine that runs
+    /// the boot chain itself ([`Pmc::new`] is the state at kernel entry).
+    ///
+    /// Every partition is off, the CPU's included: the NX bootloader powers
+    /// CRAIL, C0NC and CE0 before it starts core 0, each only if
+    /// `PWRGATE_STATUS` lacks it (`nxbootloader-research` §2.2; hekate
+    /// `ccplex_boot_cpu0` toggles them unconditionally).
+    ///
+    /// The registers hold what the NX bootloader's hardware-state check
+    /// requires before it writes any (`nxbl_hwcheck.csv`, text
+    /// `0x40002A7C`; 143 registers), the unchecked bits clear
+    /// (\[assumption\]); see `car::Car::power_on` for why that check is the
+    /// evidence. Three registers the boot chain reads are not checked:
+    /// `RST_STATUS` (`0x1b4`) reads 0, the reset reason of a power-on
+    /// (Switchbrew "Fuses" via `pkg1-research` §4; the bootloader takes any
+    /// other value for a warm reset), and the scratch registers `SCRATCH188`
+    /// (`0x810`, changed by read-modify-write) and `SCRATCH200` (`0x840`,
+    /// error codes of an earlier boot) read 0 (\[assumption\]: scratch
+    /// registers lose their contents on a power-on reset, which is why they
+    /// carry state only across warm resets). Every other register refuses to
+    /// be read until written.
+    pub fn power_on() -> Self {
+        Self {
+            registers: RegisterFile::strict(HWCHECK_STATE.into_iter().chain([
+                (0x1B4, 0),
+                (0x810, 0),
+                (0x840, 0),
+            ])),
+            powered: Mutex::new(0),
         }
     }
 
@@ -178,6 +265,26 @@ mod tests {
         // Without the start bit nothing switches.
         pmc.write(0, PWRGATE_TOGGLE, 4, 3).unwrap();
         assert_eq!(status(&pmc), POWERED_AT_ENTRY);
+    }
+
+    #[test]
+    fn power_on_has_every_partition_off_and_the_rest_unestablished() {
+        let pmc = Pmc::power_on();
+        assert_eq!(pmc.read(4, PWRGATE_STATUS, 4), Some(0));
+        // The bootloader powers CRAIL, C0NC and CE0 in turn.
+        for partition in [0, 15, 14] {
+            pmc.write(4, PWRGATE_TOGGLE, 4, u64::from(TOGGLE_START | partition))
+                .unwrap();
+        }
+        assert_eq!(
+            pmc.read(4, PWRGATE_STATUS, 4),
+            Some(u64::from(POWERED_AT_ENTRY))
+        );
+        // As the NX bootloader's check requires; the reset reason power-on.
+        assert_eq!(pmc.read(4, WAKE_MASK[0], 4), Some(0));
+        assert_eq!(pmc.read(4, GPU_RG_CNTRL, 4), Some(1));
+        assert_eq!(pmc.read(4, 0x1B4, 4), Some(0));
+        assert_eq!(pmc.read(4, 0x600, 4), None, "unestablished");
     }
 
     #[test]

@@ -14,8 +14,9 @@
 //! (`PRODINFOF`, FAT12), and `SAFE`, `SYSTEM` and `USER` (FAT32).
 //! [`format_filesystems`] makes them the empty volumes the filesystem
 //! process's own formatter would ([`fat`]). The partitions without a
-//! filesystem stay untouched, so the calibration data and the boot
-//! packages are still missing.
+//! filesystem stay untouched, so the calibration data is still missing;
+//! [`boot_images`] fills the boot partitions and the raw `BCPKG2-*`
+//! partitions from a firmware's boot image packages.
 //!
 //! [`install_firmware`] puts the content archives of a firmware where the
 //! content manager looks for built-in system contents. Its storage for
@@ -50,12 +51,14 @@ use bis::{BisKeys, MissingKey, Xts};
 use fat::{Fat32, FatError, MountedFat32, Sectors};
 
 pub mod bis;
+pub mod boot_images;
 pub mod calibration;
 pub mod cnmt;
 pub mod content_db;
 pub mod crypto;
 pub mod fat;
 pub mod nca;
+pub mod romfs;
 pub mod save;
 pub mod save_indexer;
 
@@ -511,16 +514,22 @@ impl Sectors for EncryptedPartition<'_> {
     }
 }
 
-/// The storage keys of the console `keys` describes, once `image` is known
-/// to have the partitions this module assumes.
-fn storage_keys(image: &File, keys: &KeySet) -> Result<BisKeys, NandError> {
+/// That `image` has the partitions this module assumes.
+fn check_partitioned(image: &File) -> Result<(), NandError> {
     let expected = entries();
     let mut found = vec![0; expected.len()];
     match image.read_exact_at(&mut found, 2 * SECTOR_SIZE) {
-        Ok(()) if found == expected => BisKeys::derive(keys).map_err(NandError::Key),
+        Ok(()) if found == expected => Ok(()),
         Err(error) if error.kind() != io::ErrorKind::UnexpectedEof => Err(NandError::Image(error)),
         _ => Err(NandError::NotPartitioned),
     }
+}
+
+/// The storage keys of the console `keys` describes, once `image` is known
+/// to have the partitions this module assumes.
+fn storage_keys(image: &File, keys: &KeySet) -> Result<BisKeys, NandError> {
+    check_partitioned(image)?;
+    BisKeys::derive(keys).map_err(NandError::Key)
 }
 
 /// Makes the four filesystem partitions of the partitioned `image` empty

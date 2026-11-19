@@ -106,7 +106,8 @@ impl HomebrewOptions {
         self.homebrew.is_some()
     }
 
-    fn installs_keys(&self) -> bool {
+    /// Whether the kernel image's INI1 is patched with the homebrew keys.
+    pub fn installs_keys(&self) -> bool {
         self.keys || self.homebrew.is_some()
     }
 

@@ -442,6 +442,11 @@ impl Crypto {
         }
     }
 
+    /// The console's key material, for the monitor's cold boot (package2).
+    pub fn keys(&self) -> &KeySet {
+        &self.keys
+    }
+
     pub fn save_state(&self) -> SavedCrypto {
         SavedCrypto {
             slots: self.slots,

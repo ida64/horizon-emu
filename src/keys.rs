@@ -16,6 +16,9 @@ pub type KeyPair = [u8; 32];
 const AES_KEK_GENERATION_SOURCE: &str = "aes_kek_generation_source";
 const MASTER_KEY_PREFIX: &str = "master_key_";
 const DEVICE_KEY: &str = "device_key";
+/// The secure boot key (SBK), the console-unique key in the private key
+/// fuses the boot ROM loads into the security engine.
+const SECURE_BOOT_KEY: &str = "secure_boot_key";
 const RETAIL_SPECIFIC_AES_KEY_SOURCE: &str = "retail_specific_aes_key_source";
 /// Lines whose value `ssl` hands the monitor to unwrap the console's TLS
 /// client key: the kek source (`ssl` data `0x2633E0`) and the key source of
@@ -46,6 +49,19 @@ const SAVE_MAC_KEY_SOURCE: &str = "save_mac_key_source_00";
 /// The monitor's source of the title key's ES common key: decrypted with a
 /// master key it gives that generation's `titlekek`.
 const TITLEKEK_SOURCE: &str = "titlekek_source";
+/// The monitor's source of the package2 key: decrypted with the master key
+/// of the generation the package2 header names, it gives `package2_key_XX`.
+const PACKAGE2_KEY_SOURCE: &str = "package2_key_source";
+/// What the TSEC firmware of package1 leaves in the security engine and
+/// decrypts package1 with, as published key sets name the values it
+/// derives from the TSEC's hardware secrets (see [`crate::soc::tsec`]):
+/// the console-unique `tsec_key`, and `tsec_root_key_XX`,
+/// `package1_key_XX` and `package1_mac_key_XX` by TSEC firmware revision
+/// and key generation (the two hex digits).
+const TSEC_KEY: &str = "tsec_key";
+const TSEC_ROOT_KEY_PREFIX: &str = "tsec_root_key_";
+const PACKAGE1_KEY_PREFIX: &str = "package1_key_";
+const PACKAGE1_MAC_KEY_PREFIX: &str = "package1_mac_key_";
 
 #[derive(Debug)]
 pub enum KeyError {
@@ -91,6 +107,13 @@ pub struct KeySet {
     save_mac_kek_source: Option<Key>,
     save_mac_key_source: Option<Key>,
     titlekek_source: Option<Key>,
+    package2_key_source: Option<Key>,
+    tsec_key: Option<Key>,
+    secure_boot_key: Option<Key>,
+    /// By the two hex digits of each name.
+    tsec_root_keys: BTreeMap<u8, Key>,
+    package1_keys: BTreeMap<u8, Key>,
+    package1_mac_keys: BTreeMap<u8, Key>,
 }
 
 /// Key values stay out of logs.
@@ -127,6 +150,15 @@ impl fmt::Debug for KeySet {
             .field("save_mac_kek_source", &self.save_mac_kek_source.is_some())
             .field("save_mac_key_source", &self.save_mac_key_source.is_some())
             .field("titlekek_source", &self.titlekek_source.is_some())
+            .field("package2_key_source", &self.package2_key_source.is_some())
+            .field("tsec_key", &self.tsec_key.is_some())
+            .field("secure_boot_key", &self.secure_boot_key.is_some())
+            .field("tsec_root_key_generations", &self.tsec_root_keys.keys())
+            .field("package1_key_generations", &self.package1_keys.keys())
+            .field(
+                "package1_mac_key_generations",
+                &self.package1_mac_keys.keys(),
+            )
             .finish()
     }
 }
@@ -178,11 +210,24 @@ impl KeySet {
                 keys.save_mac_key_source = Some(key()?);
             } else if name == TITLEKEK_SOURCE {
                 keys.titlekek_source = Some(key()?);
-            } else if let Some(generation) = name
-                .strip_prefix(MASTER_KEY_PREFIX)
-                .and_then(|digits| u8::from_str_radix(digits, 16).ok())
-            {
-                keys.master_keys.insert(generation, key()?);
+            } else if name == PACKAGE2_KEY_SOURCE {
+                keys.package2_key_source = Some(key()?);
+            } else if name == TSEC_KEY {
+                keys.tsec_key = Some(key()?);
+            } else if name == SECURE_BOOT_KEY {
+                keys.secure_boot_key = Some(key()?);
+            } else if let Some((map, generation)) = [
+                (TSEC_ROOT_KEY_PREFIX, &mut keys.tsec_root_keys),
+                (PACKAGE1_KEY_PREFIX, &mut keys.package1_keys),
+                (PACKAGE1_MAC_KEY_PREFIX, &mut keys.package1_mac_keys),
+                (MASTER_KEY_PREFIX, &mut keys.master_keys),
+            ]
+            .into_iter()
+            .find_map(|(prefix, map)| {
+                let digits = name.strip_prefix(prefix)?;
+                Some((map, u8::from_str_radix(digits, 16).ok()?))
+            }) {
+                map.insert(generation, key()?);
             }
         }
         Ok(keys)
@@ -272,6 +317,36 @@ impl KeySet {
     pub fn titlekek_source(&self) -> Option<&Key> {
         self.titlekek_source.as_ref()
     }
+
+    /// `package2_key_source`.
+    pub fn package2_key_source(&self) -> Option<&Key> {
+        self.package2_key_source.as_ref()
+    }
+
+    /// `tsec_key`: the console-unique key the TSEC firmware generates.
+    pub fn tsec_key(&self) -> Option<&Key> {
+        self.tsec_key.as_ref()
+    }
+
+    /// `secure_boot_key`: the SBK of this console's fuses.
+    pub fn secure_boot_key(&self) -> Option<&Key> {
+        self.secure_boot_key.as_ref()
+    }
+
+    /// `tsec_root_key_XX`.
+    pub fn tsec_root_key(&self, revision: u8) -> Option<&Key> {
+        self.tsec_root_keys.get(&revision)
+    }
+
+    /// `package1_key_XX`.
+    pub fn package1_key(&self, generation: u8) -> Option<&Key> {
+        self.package1_keys.get(&generation)
+    }
+
+    /// `package1_mac_key_XX`.
+    pub fn package1_mac_key(&self, generation: u8) -> Option<&Key> {
+        self.package1_mac_keys.get(&generation)
+    }
 }
 
 fn parse_hex<const N: usize>(hex: &str) -> Option<[u8; N]> {
@@ -296,6 +371,7 @@ mod tests {
             "aes_kek_generation_source = 000102030405060708090a0b0c0d0e0f\n\
              master_key_00 = ffeeddccbbaa99887766554433221100\n\
              master_key_1a=0123456789abcdef0123456789ABCDEF\n\
+             package2_key_source = 5566778899aabbccddeeff0011223344\n\
              header_key = 00112233\n\
              ; comment\n",
         )
@@ -304,7 +380,36 @@ mod tests {
         assert_eq!(keys.master_key(0).unwrap()[0], 0xFF);
         assert_eq!(keys.master_key(0x1A).unwrap()[7], 0xEF);
         assert!(keys.master_key(1).is_none());
+        assert_eq!(keys.package2_key_source().unwrap()[0], 0x55);
         assert!(!format!("{keys:?}").contains("ffee"));
+        assert!(!format!("{keys:?}").contains("5566"));
+    }
+
+    #[test]
+    fn keeps_the_tsec_and_package1_keys_by_generation() {
+        let keys = KeySet::parse(
+            "tsec_key = 00112233445566778899aabbccddeeff\n\
+             tsec_root_key_02 = 102132435465768798a9bacbdcedfe0f\n\
+             tsec_root_kek_02 = ffffffffffffffffffffffffffffffff\n\
+             package1_key_08 = 2233445566778899aabbccddeeff0011\n\
+             package1_mac_key_08 = 33445566778899aabbccddeeff001122\n\
+             package1_kek_02 = eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n",
+        )
+        .unwrap();
+        assert_eq!(keys.tsec_key().unwrap()[1], 0x11);
+        assert!(keys.secure_boot_key().is_none());
+        let sbk = KeySet::parse("secure_boot_key = 0f0e0d0c0b0a09080706050403020100\n").unwrap();
+        assert_eq!(sbk.secure_boot_key().unwrap()[0], 0x0F);
+        assert!(!format!("{sbk:?}").contains("0f0e"));
+        assert_eq!(keys.tsec_root_key(2).unwrap()[0], 0x10);
+        assert!(keys.tsec_root_key(0).is_none());
+        assert_eq!(keys.package1_key(8).unwrap()[0], 0x22);
+        assert_eq!(keys.package1_mac_key(8).unwrap()[0], 0x33);
+        assert!(keys.package1_key(2).is_none());
+        let debug = format!("{keys:?}");
+        for value in ["0011", "1021", "2233", "3344"] {
+            assert!(!debug.contains(value));
+        }
     }
 
     #[test]

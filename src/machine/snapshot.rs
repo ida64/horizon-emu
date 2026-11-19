@@ -160,6 +160,11 @@ impl Machine {
         for (core, pmu) in self.pmus.iter().enumerate() {
             parts.push((format!("pmu{core}"), pmu));
         }
+        if let Some(bpmp) = &self.bpmp {
+            parts.push(("bpmp".into(), bpmp));
+            // The kernel the cold boot took from package2, once it has.
+            parts.push(("kernel".into(), &self.image));
+        }
         for (name, device) in self.bus.devices() {
             let Some(part) = device.snapshot() else {
                 return Err(SnapshotError::Unsupported(format!("device {name}")));
@@ -315,9 +320,14 @@ impl Machine {
         let ram = unsafe { std::slice::from_raw_parts_mut(self.ram.host_ptr(), size) };
         // Only the kernel image is in DRAM of a machine just built (zeroing
         // all of DRAM would make every page of it resident); the saved
-        // machine may hold zeros there.
-        let image = (self.image.load_address() - self.ram.base()) as usize;
-        ram[image..image + self.image.bytes().len()].fill(0);
+        // machine may hold zeros there. A machine powered on has nothing
+        // there yet.
+        if self.bpmp.is_none()
+            && let Some(kernel) = self.image.get()
+        {
+            let image = (kernel.load_address() - self.ram.base()) as usize;
+            ram[image..image + kernel.bytes().len()].fill(0);
+        }
         let fd = file.as_raw_fd();
         let mut offset = 0i64;
         while (offset as usize) < size {

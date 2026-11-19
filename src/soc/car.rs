@@ -22,7 +22,13 @@
 //! * writing `CLK_SOURCE_EMC` switches the memory controller's clock, which
 //!   completes its clock change ([`Car::on_emc_clock_change`]);
 //! * modules with state of their own learn when their reset is asserted
-//!   or released ([`Car::on_reset_asserted`], [`Car::on_reset_released`]).
+//!   or released ([`Car::on_reset_asserted`], [`Car::on_reset_released`]);
+//! * the CPU cluster's core 0 starts when its resets are released with the
+//!   cluster clocked ([`Car::on_cpu0_released`]).
+//!
+//! [`Car::new`] is the block as the boot chain leaves it for the kernel;
+//! [`Car::power_on`] as the SoC comes out of reset, for a machine that runs
+//! the boot chain itself.
 //!
 //! # What `pcv` requires at start-up
 //!
@@ -77,7 +83,7 @@ const UTMIP_PLL_CFG0: u64 = 0x480;
 /// * [`ASSUMED_ZERO`], [`GATED_MODULE_SOURCES`] and [`SAVED_FOR_SLEEP`]:
 ///   registers whose entry value nothing public pins down, which read
 ///   zero.
-const ENTRY_STATE: [&[(u64, u32)]; 8] = [
+const ENTRY_STATE: [&[(u64, u32)]; 9] = [
     &OSCILLATOR_AND_BUSES,
     &RUNNING_PLLS,
     &CLOCK_ENABLES,
@@ -86,7 +92,38 @@ const ENTRY_STATE: [&[(u64, u32)]; 8] = [
     &MODULE_SOURCES,
     &ASSUMED_ZERO,
     &PLL_CONTROLS,
+    &[(RST_CPUG_CMPLX, CPUG_RESETS_AT_ENTRY)],
 ];
+
+/// `RST_CPUG_CMPLX_SET` (`0x450`) and `_CLR` (`0x454`): the resets of the
+/// fast CPU cluster (hekate `clock.h`). Core `n`'s `CPURESET` is bit `n`
+/// and its `CORERESET` bit `16 + n` (hekate `ccplex_boot_cpu0`).
+/// \[assumption\] No separate status register: the set register reads the
+/// resets held, and the clear register reads the same; the NX bootloader
+/// reads `0x450` as such in its hardware-state check.
+const RST_CPUG_CMPLX: u64 = 0x450;
+/// Resets that must be released for core 0 to run: exactly what the NX
+/// bootloader of firmware 23.5.0 releases, `RST_CPUG_CMPLX_CLR =
+/// 0x41010001` (`nxbootloader-research` §2.9, text `0x400164A0`): bits 0
+/// and 16 (core 0), 24 and 30 (hekate's comment calls them L2 and debug
+/// resets). Bit 29 (`NONCPU` in hekate) is never cleared by that
+/// bootloader, and the console runs: it is not needed \[inference\].
+const CPU0_RUN_RESETS: u32 = 1 << 0 | 1 << 16 | 1 << 24 | 1 << 30;
+/// The cluster's resets when the NX bootloader starts: its hardware-state
+/// check requires `RST_CPUG_CMPLX & 0x71FFFFFF == 0x61FF000F`
+/// (`nxbl_hwcheck.csv`, text `0x40002A7C`); the bits it does not check
+/// (25 to 27, 31) are \[assumption\] clear. Nothing before it touches
+/// them (package1ldr's inventory has no access), so this is the power-on
+/// value \[inference\].
+pub const CPUG_RESETS_AT_POWER_ON: u32 = 0x61FF_000F;
+/// At kernel entry the bootloader has released core 0
+/// ([`CPU0_RUN_RESETS`]); cores 1 to 3 are the secure monitor's to
+/// start, which this machine does through the power partitions alone.
+const CPUG_RESETS_AT_ENTRY: u32 = CPUG_RESETS_AT_POWER_ON & !CPU0_RUN_RESETS;
+/// `CLK_OUT_ENB_V` bit 0: the fast CPU cluster's clock (`CLK_V_CPUG`,
+/// hekate `clock.h`).
+const CLK_OUT_ENB_V: u64 = 0x360;
+const CLK_V_CPUG: u32 = 1 << 0;
 
 /// Oscillator, CLK_M and the system and CPU clock policies.
 ///
@@ -411,21 +448,22 @@ const SAVED_FOR_SLEEP: [u64; 95] = [
 ];
 /// `(set register, register it sets bits in)`; the matching clear register
 /// follows each set register.
-const SET_CLEAR_PAIRS: [(u64, u64); 14] = [
-    (0x300, 0x004), // RST_DEV_L
-    (0x308, 0x008), // RST_DEV_H
-    (0x310, 0x00C), // RST_DEV_U
-    (0x320, 0x010), // CLK_ENB_L
-    (0x328, 0x014), // CLK_ENB_H
-    (0x330, 0x018), // CLK_ENB_U
-    (0x284, 0x280), // CLK_ENB_X
-    (0x290, 0x28C), // RST_DEV_X
-    (0x29C, 0x298), // CLK_ENB_Y
-    (0x2A8, 0x2A4), // RST_DEV_Y
-    (0x430, 0x358), // RST_DEV_V
-    (0x438, 0x35C), // RST_DEV_W
-    (0x440, 0x360), // CLK_ENB_V
-    (0x448, 0x364), // CLK_ENB_W
+const SET_CLEAR_PAIRS: [(u64, u64); 15] = [
+    (0x300, 0x004),                   // RST_DEV_L
+    (0x308, 0x008),                   // RST_DEV_H
+    (0x310, 0x00C),                   // RST_DEV_U
+    (0x320, 0x010),                   // CLK_ENB_L
+    (0x328, 0x014),                   // CLK_ENB_H
+    (0x330, 0x018),                   // CLK_ENB_U
+    (0x284, 0x280),                   // CLK_ENB_X
+    (0x290, 0x28C),                   // RST_DEV_X
+    (0x29C, 0x298),                   // CLK_ENB_Y
+    (0x2A8, 0x2A4),                   // RST_DEV_Y
+    (0x430, 0x358),                   // RST_DEV_V
+    (0x438, 0x35C),                   // RST_DEV_W
+    (0x440, 0x360),                   // CLK_ENB_V
+    (0x448, 0x364),                   // CLK_ENB_W
+    (RST_CPUG_CMPLX, RST_CPUG_CMPLX), // RST_CPUG_CMPLX, see there
 ];
 
 /// `(alias, register)`: offsets that reach the same register.
@@ -499,7 +537,120 @@ pub struct Car {
     reset_hooks: Vec<(u64, u32, ResetHook)>,
     /// `(reset register, bit, hook)`, see [`Car::on_reset_released`].
     release_hooks: Vec<(u64, u32, ResetHook)>,
+    /// See [`Car::on_cpu0_released`].
+    cpu0_released: Option<ResetHook>,
 }
+
+/// What the block holds at power-on. The NX bootloader checks 253 of its
+/// registers against masked expected values before it writes any
+/// (`nxbl_hwcheck.csv`, the check at text `0x40002A7C`): that is the state
+/// the boot ROM, package1ldr and the TSEC firmware leave it in, read on a
+/// real console, and the best evidence there is of it. The block starts
+/// with each checked register at its expected value under the check's
+/// mask, the unchecked bits clear (\[assumption\]). Package1ldr's own
+/// changes before the check are all idempotent (bits set, cleared, fields
+/// written: `pkg1-research` §3.1), so starting from their result gives the
+/// same result \[inference\]; whether a value is the hardware's reset value
+/// or the boot ROM's doing is not known (the boot ROM here changes
+/// nothing). The check reads the CPU clock policy through `0x368`/`0x36c`
+/// and through their aliases `0x020`/`0x024` with the same values; they
+/// are kept under the canonical offsets.
+///
+/// One register package1ldr changes by read-modify-write is not checked:
+/// `CLK_SOURCE_NVENC` (`0x6a0`, source field set to 4); its other bits are
+/// \[assumption\] clear, as at kernel entry ([`MODULE_SOURCES`]). Every
+/// other register refuses to be read until written.
+const POWER_ON_STATE: [&[(u64, u32)]; 2] = [&HWCHECK_STATE, &[(0x6A0, 0)]];
+
+/// `nxbl_hwcheck.csv`'s CAR rows: `(offset, expected & mask)`.
+#[rustfmt::skip]
+const HWCHECK_STATE: [(u64, u32); 253] = [
+    (0x000, 0x00000000), (0x004, 0x9CD3D2C8), (0x008, 0x87D1F326),
+    (0x00C, 0x828EC5FA), (0x010, 0x80000130), (0x014, 0x020000C1),
+    (0x018, 0x01F00200), (0x028, 0x20000040), (0x02C, 0x00000000),
+    (0x030, 0x00000000), (0x040, 0x00000000), (0x044, 0x00000000),
+    (0x048, 0x10000000), (0x04C, 0x00000000), (0x050, 0x500003F1),
+    (0x058, 0x00000000), (0x060, 0x00000000), (0x068, 0x00005C00),
+    (0x06C, 0x00000010), (0x070, 0x00000000), (0x074, 0x00000000),
+    (0x078, 0x00000000), (0x080, 0x00108002), (0x084, 0x00000002),
+    (0x088, 0x40000000), (0x08C, 0x08000000), (0x090, 0x00002A02),
+    (0x098, 0x00000000), (0x09C, 0x00000010), (0x0A0, 0x40115408),
+    (0x0A4, 0x00000003), (0x0A8, 0x00030003), (0x0AC, 0x00040000),
+    (0x0B0, 0x00803003), (0x0B4, 0x00000002), (0x0B8, 0x00000000),
+    (0x0BC, 0x12000000), (0x0C0, 0x43E11902), (0x0C4, 0x00020002),
+    (0x0C8, 0x00000000), (0x0CC, 0x20000000), (0x0D0, 0x00211001),
+    (0x0D8, 0x00000000), (0x0DC, 0x00040000), (0x0E0, 0x00002401),
+    (0x0E4, 0x00000000), (0x0E8, 0x0E007D02), (0x0EC, 0x00006200),
+    (0x0F0, 0x00000000), (0x0F4, 0x00000000), (0x0F8, 0x00000000),
+    (0x0FC, 0x00000000), (0x110, 0xC0000000), (0x124, 0xC0000000),
+    (0x128, 0xC0000000), (0x138, 0xC0000000), (0x13C, 0xC0000000),
+    (0x148, 0x80000000), (0x150, 0xC0000000), (0x154, 0xC0000000),
+    (0x164, 0x00000010), (0x178, 0xC0000002), (0x17C, 0xC0000002),
+    (0x180, 0x80000003), (0x198, 0xC0000000), (0x19C, 0x40180000),
+    (0x1BC, 0xC0000000), (0x1C0, 0xC0000002), (0x1D4, 0xC0000000),
+    (0x1F4, 0x00000002), (0x200, 0x00000000), (0x280, 0x23004780),
+    (0x28C, 0x01E42049), (0x298, 0x00000300), (0x2A4, 0x0FE9F0DD),
+    (0x2F4, 0x00000001), (0x33C, 0x00000000), (0x340, 0x61FF000F),
+    (0x348, 0x00000000), (0x358, 0x7F818088), (0x35C, 0x190037FF),
+    (0x360, 0x80400808), (0x364, 0x402000FC), (0x368, 0x10000000),
+    (0x36C, 0x00000000), (0x370, 0x10000000), (0x374, 0x00000000),
+    (0x378, 0x00000000), (0x380, 0x00000010), (0x384, 0x00040004),
+    (0x388, 0x07000200), (0x390, 0x00000000), (0x394, 0x00000000),
+    (0x398, 0x00000000), (0x39C, 0x00000000), (0x3A0, 0x00000000),
+    (0x3A4, 0x00080000), (0x3B4, 0xC0000000), (0x3B8, 0xC0000000),
+    (0x3BC, 0xD0000000), (0x3C0, 0xD0000000), (0x3C4, 0xC0000000),
+    (0x3D0, 0xD0000000), (0x3E4, 0xC0000000), (0x3E8, 0xC0000000),
+    (0x3EC, 0x60000000), (0x3F0, 0x60000000), (0x3F4, 0x60000000),
+    (0x3FC, 0xC0000000), (0x400, 0x00000000), (0x410, 0x00000002),
+    (0x414, 0x00000000), (0x420, 0xC0000000), (0x424, 0xC1000000),
+    (0x428, 0xC0000000), (0x42C, 0x00000000), (0x450, CPUG_RESETS_AT_POWER_ON),
+    (0x460, 0x00000000), (0x47C, 0x00000000), (0x480, 0x00190101),
+    (0x484, 0x00018177), (0x488, 0x4260002A), (0x48C, 0x02002070),
+    (0x498, 0x0200000C), (0x49C, 0x00700000), (0x4A0, 0x00000000),
+    (0x4A4, 0x00000000), (0x4A8, 0x00000000), (0x4AC, 0x00000000),
+    (0x4B0, 0x00000000), (0x4B4, 0x00000000), (0x4B8, 0x00041401),
+    (0x4BC, 0x40000000), (0x4C0, 0x00000000), (0x4C4, 0x00004104),
+    (0x4C8, 0x41000000), (0x4CC, 0x00020002), (0x4D0, 0x00000000),
+    (0x4D4, 0x00000000), (0x4D8, 0x00000000), (0x4DC, 0x00000000),
+    (0x4E0, 0x00000000), (0x4E4, 0x00000000), (0x4E8, 0x00108002),
+    (0x4EC, 0x40000000), (0x4F0, 0x08000000), (0x4F4, 0x1F720005),
+    (0x4F8, 0x000000C4), (0x4FC, 0x00108002), (0x500, 0x40000000),
+    (0x504, 0x08000000), (0x508, 0x1F720005), (0x50C, 0x000000C4),
+    (0x510, 0x00000000), (0x514, 0x00000000), (0x518, 0x00000008),
+    (0x51C, 0x0200380D), (0x520, 0x00000014), (0x524, 0x00000105),
+    (0x528, 0x00000053), (0x52C, 0x0200000D), (0x530, 0x0200008D),
+    (0x534, 0x8002A80F), (0x53C, 0x00000002), (0x540, 0x00000002),
+    (0x548, 0x00000001), (0x54C, 0x00000000), (0x554, 0x00000000),
+    (0x55C, 0x00000000), (0x560, 0x00000000), (0x564, 0x00000000),
+    (0x570, 0x10000000), (0x574, 0x00000000), (0x578, 0x00000000),
+    (0x590, 0x00041401), (0x594, 0x40000000), (0x598, 0x10000000),
+    (0x59C, 0x00000000), (0x5A0, 0x00000000), (0x5A4, 0x000C2302),
+    (0x5A8, 0x40000000), (0x5C4, 0x00000000), (0x5C8, 0x00000000),
+    (0x5CC, 0x00000000), (0x5D0, 0x1F720005), (0x5D4, 0x000000C4),
+    (0x5D8, 0x00000000), (0x5E4, 0x00000002), (0x5E8, 0x00002A02),
+    (0x5EC, 0x00010000), (0x5F0, 0x00000000), (0x5F4, 0x00000000),
+    (0x614, 0xC0000000), (0x618, 0xC0000000), (0x61C, 0xC0000000),
+    (0x620, 0xC0000000), (0x624, 0xC0000000), (0x628, 0x40000000),
+    (0x62C, 0xD0000000), (0x630, 0xD0000000), (0x640, 0x60000000),
+    (0x644, 0x40000000), (0x64C, 0x00000000), (0x650, 0x00000000),
+    (0x658, 0x80000000), (0x664, 0x60000000), (0x66C, 0x00000000),
+    (0x67C, 0x00030000), (0x680, 0x30000000), (0x68C, 0x00000C00),
+    (0x690, 0x00000C00), (0x694, 0x00000000), (0x6A4, 0x00108002),
+    (0x6A8, 0x40000000), (0x6AC, 0x08000000), (0x6B0, 0x1F720005),
+    (0x6B4, 0x000000C4), (0x6B8, 0x00000000), (0x6BC, 0x00000000),
+    (0x6C0, 0xC0000000), (0x6C4, 0xC0000000), (0x6C8, 0xC0000000),
+    (0x6CC, 0x00000006), (0x6D0, 0x00000000), (0x6D4, 0x40000000),
+    (0x6D8, 0xC0000000), (0x6DC, 0x00000002), (0x6E0, 0x10006666),
+    (0x6E4, 0x00000000), (0x6E8, 0x80000000), (0x6EC, 0x80000000),
+    (0x704, 0x80000000), (0x708, 0x80000000), (0x710, 0xC0000002),
+    (0x714, 0x00000000), (0x718, 0xC0000000), (0x71C, 0x001FFFFF),
+    (0x720, 0x00000400), (0x724, 0x60000000), (0x728, 0x00000C00),
+    (0x72C, 0x00000C00), (0x730, 0x00000C00), (0x734, 0x00000C00),
+    (0x738, 0x00000C00), (0x73C, 0x00000C00), (0x740, 0x00000C00),
+    (0x744, 0x00000C00), (0x748, 0x00000000), (0x74C, 0x00000000),
+    (0x750, 0x00000000), (0x754, 0x00000000), (0x758, 0x00000000),
+    (0x75C, 0x00000000),
+];
 
 type ResetHook = Box<dyn Fn() + Send + Sync>;
 
@@ -536,7 +687,38 @@ impl Car {
             emc_clock_change: None,
             reset_hooks: Vec::new(),
             release_hooks: Vec::new(),
+            cpu0_released: None,
         }
+    }
+
+    /// The block as the SoC comes out of reset, before the boot ROM: see
+    /// `POWER_ON_STATE`. [`Car::new`] is the state at kernel entry.
+    pub fn power_on() -> Self {
+        Self {
+            registers: RegisterFile::strict(POWER_ON_STATE.into_iter().flatten().copied()),
+            emc_clock_change: None,
+            reset_hooks: Vec::new(),
+            release_hooks: Vec::new(),
+            cpu0_released: None,
+        }
+    }
+
+    /// Has `hook` called when CPU-cluster core 0 starts to run: when a
+    /// write leaves all of its resets released (`CPU0_RUN_RESETS`) with
+    /// the cluster's clock running (`CLK_OUT_ENB_V` bit 0), and one of the
+    /// two did not hold before it. Power to the core (the PMC's
+    /// partitions) and where it starts are for the hook to check.
+    pub fn on_cpu0_released(mut self, hook: Box<dyn Fn() + Send + Sync>) -> Self {
+        self.cpu0_released = Some(hook);
+        self
+    }
+
+    /// Whether core 0 is out of reset and clocked.
+    fn cpu0_runs(&self) -> bool {
+        let resets = self.registers.get(RST_CPUG_CMPLX);
+        let clocks = self.registers.get(CLK_OUT_ENB_V);
+        resets.is_some_and(|held| held & CPU0_RUN_RESETS == 0)
+            && clocks.is_some_and(|enabled| enabled & CLK_V_CPUG != 0)
     }
 
     /// Has `clock_change` called whenever the guest writes
@@ -637,6 +819,7 @@ impl MmioDevice for Car {
         let value = value as u32;
         let target = set_clear_target(register).map_or(register, |(target, _)| target);
         let before = self.registers.get(target);
+        let cpu0_ran = self.cpu0_runs();
         match set_clear_target(register) {
             Some((target, true)) => self.registers.update(target, |bits| bits | value)?,
             Some((target, false)) => self.registers.update(target, |bits| bits & !value)?,
@@ -654,6 +837,12 @@ impl MmioDevice for Car {
             if *hook_register == target && fell & 1 << bit != 0 {
                 hook();
             }
+        }
+        if !cpu0_ran
+            && self.cpu0_runs()
+            && let Some(hook) = &self.cpu0_released
+        {
+            hook();
         }
         if register == OSC_FREQ_DET && value & OSC_FREQ_DET_TRIGGER != 0 {
             let windows = u64::from(value & 0xF) + 1;
@@ -693,6 +882,47 @@ mod tests {
         car.write(0, 0x318, 4, 7).unwrap();
         assert_eq!(car.read(0, 0x318, 4), Some(7));
         assert_eq!(car.read(0, 0x00C, 4), Some(0x820E_557A));
+    }
+
+    #[test]
+    fn cpu0_release_as_the_bootloader_does_it() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let released = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&released);
+        let car = Car::power_on().on_cpu0_released(Box::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(
+            car.read(4, 0x454, 4),
+            Some(u64::from(CPUG_RESETS_AT_POWER_ON))
+        );
+        // The NX bootloader's order (`nxbootloader-research` §2.1, §2.9):
+        // the cluster clock through its set register, then core 0's resets
+        // in one write. Bit 29 stays held.
+        assert_eq!(car.read(4, 0x360, 4), Some(0x8040_0808));
+        car.write(4, 0x440, 4, u64::from(CLK_V_CPUG)).unwrap();
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        car.write(4, 0x454, 4, 0x4101_0001).unwrap();
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert_eq!(car.read(4, 0x450, 4), Some(0x20FE_000E));
+        // Registers nothing establishes still refuse.
+        assert_eq!(car.read(4, 0x5F8, 4), None);
+        // Releasing again is no new start; holding and releasing is.
+        car.write(4, 0x454, 4, 1).unwrap();
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        car.write(4, 0x450, 4, 1).unwrap();
+        car.write(4, 0x454, 4, 1).unwrap();
+        assert_eq!(released.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn kernel_entry_has_core0_running() {
+        let car = Car::new();
+        assert!(car.cpu0_runs());
+        assert_eq!(car.read(0, 0x450, 4), Some(u64::from(CPUG_RESETS_AT_ENTRY)));
     }
 
     #[test]
