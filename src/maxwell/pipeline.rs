@@ -962,7 +962,7 @@ pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result
         fetch.fetch(context.memory, index, fetch_instance, &mut inputs)?;
         inputs.0[0x2F8 / 4] = batch.instance;
         inputs.0[0x2FC / 4] = id;
-        let mut outputs = Attributes([0; 256]);
+        let mut outputs = Attributes::vertex_outputs();
         vertex.run_vertex(&vertex_env, &inputs, fetch.inactive, &mut outputs)?;
         let clip = std::array::from_fn(|i| f32::from_bits(outputs.0[0x70 / 4 + i]));
         let done = Shaded {
