@@ -29,7 +29,7 @@ use crate::snapshot::{Snapshot, SnapshotError, decode, encode};
 
 /// Bumped whenever [`SavedMachine`] or any part's saved form changes in a
 /// way an older snapshot would not decode into.
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 4;
 
 /// Granule of the sparse RAM file.
 const RAM_BLOCK: usize = 64 * 1024;

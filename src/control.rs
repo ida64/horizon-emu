@@ -12,8 +12,11 @@
 //! {"op":"pixel","x":640,"y":360}
 //!     the colour at a point of the 1280x720 screen, "rrggbb"
 //! {"op":"status"}
-//!     seconds since the machine started and whether the panel and its
-//!     backlight are on, whether or not a picture can be composed
+//!     seconds since the program started, whether the panel and its
+//!     backlight are on, whether or not a picture can be composed, and
+//!     "state": "running", "restarting" (between the machine a restart
+//!     took down and the one it powers up) or "stopped", with "stopped"
+//!     saying why (a power-off among the reasons)
 //! {"op":"stop"}
 //!     stops the machine, as closing its window does
 //! {"op":"save_state","path":"/tmp/snap"}
@@ -25,7 +28,9 @@
 //!
 //! Every answer has `"ok"`: true, with the request's results, or false
 //! with an `"error"`. Connections are served one at a time; a request runs
-//! until it is answered.
+//! until it is answered. Requests are answered after the machine stopped,
+//! for as long as the program runs (its window open): a status, a
+//! screenshot of the screen as left.
 
 use std::{
     io::{BufRead, BufReader, ErrorKind, Write},
@@ -33,19 +38,22 @@ use std::{
         fd::AsRawFd,
         unix::net::{UnixListener, UnixStream},
     },
-    sync::atomic::{AtomicBool, Ordering},
+    path::Path,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
-use horizon_emu::machine::Machine;
-use std::path::Path;
-
-use crate::Snapshotter;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::script::{Event, Script};
+use crate::{
+    Console, Snapshotter,
+    script::{Event, Script},
+};
 
 /// How often a waiting server looks at whether the machine has stopped.
 const POLL: Duration = Duration::from_millis(20);
@@ -74,27 +82,35 @@ enum Request {
     },
 }
 
-/// What a request reaches: the machine, its stop switch, when it started,
-/// whether it has ended and what takes its snapshots.
+/// What a request reaches: the console, its stop switch, when the program
+/// started, why the machine stopped once it has, whether the program is
+/// closing and what takes snapshots.
 pub struct Controlled<'a> {
-    pub machine: &'a Machine,
+    pub console: &'a Console,
     pub stop: &'a AtomicBool,
     pub started: Instant,
-    pub ended: &'a AtomicBool,
+    pub stopped: &'a Mutex<Option<String>>,
+    pub closing: &'a AtomicBool,
     pub snapshot: &'a Snapshotter,
 }
 
-/// Serves `listener` until the machine has ended.
+impl Controlled<'_> {
+    fn has_stopped(&self) -> bool {
+        self.stopped.lock().unwrap().is_some()
+    }
+}
+
+/// Serves `listener` until the program closes.
 pub fn serve(listener: UnixListener, controlled: &Controlled) {
     if listener.set_nonblocking(true).is_err() {
         return;
     }
-    while !controlled.ended.load(Ordering::SeqCst) {
+    while !controlled.closing.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => connection(stream, controlled),
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
                 // Until someone connects, or for a look at whether the
-                // machine has ended.
+                // program is closing.
                 let mut waiting = libc::pollfd {
                     fd: listener.as_raw_fd(),
                     events: libc::POLLIN,
@@ -118,7 +134,7 @@ fn connection(stream: UnixStream, controlled: &Controlled) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     loop {
-        if controlled.ended.load(Ordering::SeqCst) {
+        if controlled.closing.load(Ordering::SeqCst) {
             return;
         }
         match reader.read_line(&mut line) {
@@ -148,8 +164,11 @@ fn connection(stream: UnixStream, controlled: &Controlled) {
     }
 }
 
+/// What a request for the machine gets while a restart has none in place.
+const RESTARTING: &str = "the console is restarting";
+
 fn answer(request: Request, controlled: &Controlled) -> Result<Value, String> {
-    let machine = controlled.machine;
+    let console = controlled.console;
     match request {
         Request::Script { text, timeout } => {
             let mut script = Script::parse(&text)?;
@@ -161,18 +180,21 @@ fn answer(request: Request, controlled: &Controlled) -> Result<Value, String> {
             let deadline = Instant::now() + timeout;
             let mut done = Vec::new();
             loop {
-                script.advance(machine, |event| match event {
-                    Event::Done { text, .. } => done.push(text.to_string()),
-                    Event::Screenshot(path) => done.push(crate::save_screen(
-                        machine,
-                        path,
-                        controlled.started.elapsed(),
-                    )),
+                // Across a restart the steps wait for the next machine.
+                console.with(|machine| {
+                    script.advance(machine, |event| match event {
+                        Event::Done { text, .. } => done.push(text.to_string()),
+                        Event::Screenshot(path) => done.push(crate::save_screen(
+                            machine,
+                            path,
+                            controlled.started.elapsed(),
+                        )),
+                    })
                 });
                 let Some((line, text)) = script.waiting_at() else {
                     return Ok(json!({"done": done}));
                 };
-                let stuck = if controlled.ended.load(Ordering::SeqCst) {
+                let stuck = if controlled.has_stopped() {
                     "the machine stopped"
                 } else if Instant::now() >= deadline {
                     "timed out"
@@ -184,8 +206,9 @@ fn answer(request: Request, controlled: &Controlled) -> Result<Value, String> {
             }
         }
         Request::Screenshot { path } => {
-            let screen = machine
-                .screen()
+            let screen = console
+                .with(|machine| machine.screen())
+                .ok_or(RESTARTING)?
                 .map_err(|reason| format!("no picture: {reason}"))?;
             let file = std::fs::File::create(&path).map_err(|error| format!("{path}: {error}"))?;
             crate::write_png(file, &screen.frame).map_err(|error| format!("{path}: {error}"))?;
@@ -196,25 +219,33 @@ fn answer(request: Request, controlled: &Controlled) -> Result<Value, String> {
             }))
         }
         Request::Pixel { x, y } => {
-            let screen = machine
-                .screen()
+            let pixel = console
+                .with(|machine| machine.screen_pixel(x, y))
+                .ok_or(RESTARTING)?
                 .map_err(|reason| format!("no picture: {reason}"))?;
-            let frame = &screen.frame;
-            if x >= frame.width || y >= frame.height {
+            let Some(value) = pixel.value else {
                 return Err(format!(
                     "{x},{y} is outside the {}x{} screen",
-                    frame.width, frame.height
+                    pixel.width, pixel.height
                 ));
-            }
-            let [_, red, green, blue] = frame.pixels[(y * frame.width + x) as usize].to_be_bytes();
+            };
+            let [_, red, green, blue] = value.to_be_bytes();
             Ok(json!({"rgb": format!("{red:02x}{green:02x}{blue:02x}")}))
         }
         Request::Status => {
-            let panel = machine.panel();
+            let stopped = controlled.stopped.lock().unwrap().clone();
+            let panel = console.with(|machine| machine.panel());
+            let state = match (&stopped, panel) {
+                (Some(_), _) => "stopped",
+                (None, Some(_)) => "running",
+                (None, None) => "restarting",
+            };
             Ok(json!({
                 "seconds": controlled.started.elapsed().as_secs_f64(),
-                "panel_on": panel.panel_on,
-                "backlight_on": panel.backlight_on,
+                "panel_on": panel.is_some_and(|panel| panel.panel_on),
+                "backlight_on": panel.is_some_and(|panel| panel.backlight_on),
+                "state": state,
+                "stopped": stopped,
             }))
         }
         Request::Stop => {
@@ -222,7 +253,12 @@ fn answer(request: Request, controlled: &Controlled) -> Result<Value, String> {
             Ok(json!({}))
         }
         Request::SaveState { path } => {
-            let report = controlled.snapshot.save(machine, Path::new(&path))?;
+            if controlled.has_stopped() {
+                return Err("the machine has stopped".into());
+            }
+            let report = console
+                .with(|machine| controlled.snapshot.save(machine, Path::new(&path)))
+                .ok_or(RESTARTING)??;
             Ok(json!({
                 "path": path,
                 "guest_seconds": report.guest_time.as_secs_f64(),

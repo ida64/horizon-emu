@@ -305,6 +305,29 @@ impl Frame {
     }
 }
 
+/// One point of [`Dc::frame_turned_clockwise`]'s picture, and the
+/// picture's size; see [`Dc::pixel_turned_clockwise`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pixel {
+    pub width: u32,
+    pub height: u32,
+    /// `0x00RRGGBB`, as in [`Frame`]; `None` for a point outside the
+    /// picture.
+    pub value: Option<u32>,
+}
+
+impl Pixel {
+    /// Point `(x, y)` of `frame`.
+    fn of(frame: &Frame, x: u32, y: u32) -> Self {
+        Self {
+            width: frame.width,
+            height: frame.height,
+            value: (x < frame.width && y < frame.height)
+                .then(|| frame.pixels[(y * frame.width + x) as usize]),
+        }
+    }
+}
+
 /// Why there is no picture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoFrame {
@@ -624,14 +647,7 @@ impl Dc {
     /// (and host1x's syncpoint reads, which count its frames) do not wait
     /// for the frame buffers to be read.
     fn render(&self, memory: &DeviceMemory, turned: bool) -> Result<Arc<Frame>, NoFrame> {
-        let (frame, active) = {
-            let mut registers = self.registers.lock().unwrap();
-            self.settle(&mut registers);
-            let Some(running) = &registers.running else {
-                return Err(NoFrame::NotRunning);
-            };
-            ((running.since, running.frames), registers.active.clone())
-        };
+        let (frame, active) = self.looked_at()?;
         let mut shown = self.shown.lock().unwrap();
         if let Some(last) = &*shown
             && last.frame == frame
@@ -656,6 +672,68 @@ impl Dc {
         picture
     }
 
+    /// The frame under way (when the controller started sending and how
+    /// many frames it has sent) and a copy of the active registers, the
+    /// controller brought up to date first.
+    fn looked_at(&self) -> Result<((Duration, u128), Copy), NoFrame> {
+        let mut registers = self.registers.lock().unwrap();
+        self.settle(&mut registers);
+        let Some(running) = &registers.running else {
+            return Err(NoFrame::NotRunning);
+        };
+        Ok(((running.since, running.frames), registers.active.clone()))
+    }
+
+    /// Point `(x, y)` of [`Dc::frame_turned_clockwise`]'s picture, worked
+    /// out alone: the picture of this frame if it has been put together
+    /// already, otherwise only the window pixels the point is made of are
+    /// read, the windows refused where the picture refuses them. A buffer
+    /// is found unmapped only where the point reads from it. What a wait
+    /// for a color looks at a few hundred times a second.
+    pub fn pixel_turned_clockwise(
+        &self,
+        memory: &DeviceMemory,
+        x: u32,
+        y: u32,
+    ) -> Result<Pixel, NoFrame> {
+        let (frame, active) = self.looked_at()?;
+        if let Some(last) = &*self.shown.lock().unwrap()
+            && last.frame == frame
+            && last.turned
+            && last.active == active
+        {
+            return match &last.picture {
+                Ok(picture) => Ok(Pixel::of(picture, x, y)),
+                Err(reason) => Err(reason.clone()),
+            };
+        }
+        Self::compose_pixel(memory, &active, x, y)
+    }
+
+    /// [`Dc::pixel_turned_clockwise`] from `active`, the picture not put
+    /// together.
+    fn compose_pixel(
+        memory: &DeviceMemory,
+        active: &Copy,
+        x: u32,
+        y: u32,
+    ) -> Result<Pixel, NoFrame> {
+        let ([width, height], windows) = layers(active)?;
+        // Point (x, y) of the turned picture is (y, height - 1 - x) of the
+        // active area.
+        let at = (x < height && y < width).then(|| [y, height - 1 - x]);
+        // The background is black, and opaque.
+        let mut value = 0;
+        for window in windows {
+            value = window.pixel(memory, [width, height], at, value)?;
+        }
+        Ok(Pixel {
+            width: height,
+            height: width,
+            value: at.map(|_| value),
+        })
+    }
+
     /// Puts the picture together from `active` into `pixels`, whatever
     /// they held before.
     fn compose(
@@ -665,37 +743,7 @@ impl Dc {
         turned: bool,
         mut pixels: Vec<u32>,
     ) -> Result<Frame, NoFrame> {
-        let halves = |value: u32| (value & 0xFFFF, value >> 16);
-        let (width, height) = halves(active.general(register::DISP_ACTIVE));
-        if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
-            return Err(NoFrame::Unsupported(format!(
-                "an active area of {width}x{height}"
-            )));
-        }
-        if active.general(register::BLEND_BACKGROUND_COLOR) != 0 {
-            return Err(NoFrame::Unsupported("a background color".into()));
-        }
-        // Back to front.
-        let mut windows: Vec<Window> = active
-            .windows
-            .iter()
-            .filter(|window| {
-                window
-                    .get(&register::WIN_OPTIONS)
-                    .is_some_and(|options| options & WIN_ENABLE != 0)
-            })
-            .map(|registers| Window { registers })
-            .collect();
-        if windows.len() > 1 {
-            if windows.iter().any(|window| window.blending().is_none()) {
-                return Err(NoFrame::Unsupported(
-                    "several windows without blending set up".into(),
-                ));
-            }
-            windows.sort_by_key(|window| {
-                std::cmp::Reverse(window.blending().map(|control| control & BLEND_DEPTH))
-            });
-        }
+        let ([width, height], windows) = layers(active)?;
         // The background is black, and opaque.
         pixels.clear();
         pixels.resize((width * height) as usize, 0);
@@ -721,6 +769,43 @@ impl Dc {
     }
 }
 
+/// The size of the active area `active` sets up and its enabled windows,
+/// back to front, or why they make no picture.
+fn layers(active: &Copy) -> Result<([u32; 2], Vec<Window<'_>>), NoFrame> {
+    let halves = |value: u32| (value & 0xFFFF, value >> 16);
+    let (width, height) = halves(active.general(register::DISP_ACTIVE));
+    if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(NoFrame::Unsupported(format!(
+            "an active area of {width}x{height}"
+        )));
+    }
+    if active.general(register::BLEND_BACKGROUND_COLOR) != 0 {
+        return Err(NoFrame::Unsupported("a background color".into()));
+    }
+    // Back to front.
+    let mut windows: Vec<Window> = active
+        .windows
+        .iter()
+        .filter(|window| {
+            window
+                .get(&register::WIN_OPTIONS)
+                .is_some_and(|options| options & WIN_ENABLE != 0)
+        })
+        .map(|registers| Window { registers })
+        .collect();
+    if windows.len() > 1 {
+        if windows.iter().any(|window| window.blending().is_none()) {
+            return Err(NoFrame::Unsupported(
+                "several windows without blending set up".into(),
+            ));
+        }
+        windows.sort_by_key(|window| {
+            std::cmp::Reverse(window.blending().map(|control| control & BLEND_DEPTH))
+        });
+    }
+    Ok(([width, height], windows))
+}
+
 /// An enabled window's active registers.
 struct Window<'a> {
     registers: &'a HashMap<u64, u32>,
@@ -740,6 +825,13 @@ impl Window<'_> {
     /// Fetches the window's pixels, red, green, blue and alpha each, into
     /// `scratch.fetched`, and says where each pixel of the window is there.
     fn fetch(&self, memory: &DeviceMemory, scratch: &mut Scratch) -> Result<Layout, NoFrame> {
+        self.source()?.fetch(memory, scratch)
+    }
+
+    /// Where the window's pixels come from and how they are laid out:
+    /// everything [`Window::fetch`] works out from the registers before it
+    /// reads the surface, refused where it refuses.
+    fn source(&self) -> Result<Source, NoFrame> {
         let halves = |value: u32| (value & 0xFFFF, value >> 16);
         // Red first among the 32-bit formats, or the layout of 16 bits.
         let depth = match self.value(register::WIN_COLOR_DEPTH) {
@@ -749,8 +841,7 @@ impl Window<'_> {
             COLOR_DEPTH_R4G4B4A4 => Err(Narrow::R4G4B4A4),
             depth => return Err(NoFrame::Unsupported(format!("color depth {depth}"))),
         };
-        let red_first = depth.ok();
-        let pixel_bytes: u32 = if red_first.is_some() { 4 } else { 2 };
+        let pixel_bytes: u32 = if depth.is_ok() { 4 } else { 2 };
         let byte_swap = self.value(register::WIN_BYTE_SWAP);
         if byte_swap > BYTE_SWAP_SWAP4 || (pixel_bytes == 2 && byte_swap > BYTE_SWAP_SWAP2) {
             return Err(NoFrame::Unsupported(format!(
@@ -812,29 +903,8 @@ impl Window<'_> {
                 .ok_or_else(|| NoFrame::Unsupported("a window above its surface".into()))?;
         }
         let kind = self.value(register::WINBUF_SURFACE_KIND);
-        let Scratch {
-            fetched,
-            block_row,
-            narrow,
-            ..
-        } = &mut *scratch;
-        // Every byte is read over, so what was there stays until it is.
-        fetched.resize((source_width * source_height) as usize, [0; 4]);
-        let bytes: &mut [u8] = if red_first.is_some() {
-            fetched.as_flattened_mut()
-        } else {
-            narrow.resize(fetched.len() * 2, 0);
-            &mut narrow[..]
-        };
-        match kind & SURFACE_KIND_MASK {
-            SURFACE_KIND_PITCH => {
-                for (row, line) in bytes.chunks_mut(row_bytes as usize).enumerate() {
-                    let address = start + (top + row as u64) * stride + left;
-                    memory
-                        .read(address, line)
-                        .ok_or(NoFrame::BufferUnmapped { address })?;
-                }
-            }
+        let surface = match kind & SURFACE_KIND_MASK {
+            SURFACE_KIND_PITCH => Surface::Pitch { start, stride },
             SURFACE_KIND_BLOCK => {
                 let block_height =
                     1 << (kind >> SURFACE_KIND_BLOCK_HEIGHT_SHIFT & SURFACE_KIND_BLOCK_HEIGHT);
@@ -843,10 +913,11 @@ impl Window<'_> {
                     stride,
                     block_height,
                 };
-                layout.read(memory, (left, top), row_bytes, bytes, block_row)?;
+                layout.check(left, row_bytes)?;
+                Surface::Block(layout)
             }
             _ => return Err(NoFrame::Unsupported(format!("surface kind {kind:#x}"))),
-        }
+        };
         // Which byte of a pixel as fetched is red, green, blue and alpha.
         let swapped = match byte_swap {
             BYTE_SWAP_SWAP2 => [1, 0, 3, 2],
@@ -856,16 +927,8 @@ impl Window<'_> {
         let order = match depth {
             Ok(true) => swapped,
             Ok(false) => [swapped[2], swapped[1], swapped[0], swapped[3]],
-            Err(format) => {
-                widen(
-                    narrow,
-                    fetched,
-                    format,
-                    byte_swap == BYTE_SWAP_SWAP2,
-                    options & COLOR_EXPAND != 0,
-                );
-                [0, 1, 2, 3]
-            }
+            // Widened into red, green, blue and alpha.
+            Err(_) => [0, 1, 2, 3],
         };
         // Where pixel (x, y) of the source, as the window scans it, is in
         // the surface's rectangle: the directions reverse the surface's
@@ -888,43 +951,76 @@ impl Window<'_> {
         } else {
             0
         };
-        let source = Layout {
-            width: across,
-            height: down,
-            origin: origin as usize,
-            steps: if column {
-                [step_y, step_x]
-            } else {
-                [step_x, step_y]
+        Ok(Source {
+            depth,
+            swapped_halves: byte_swap == BYTE_SWAP_SWAP2,
+            expand: options & COLOR_EXPAND != 0,
+            pixel_bytes,
+            surface,
+            corner: (left, top),
+            row_bytes,
+            rectangle: [source_width, source_height],
+            layout: Layout {
+                width: across,
+                height: down,
+                origin: origin as usize,
+                steps: if column {
+                    [step_y, step_x]
+                } else {
+                    [step_x, step_y]
+                },
+                order,
             },
-            order,
+            scaling: Scaling {
+                increments: self.value(register::WIN_DDA_INC),
+                initial: [
+                    self.value(register::WIN_H_INITIAL_DDA),
+                    self.value(register::WIN_V_INITIAL_DDA),
+                ],
+                filters: [options & H_FILTER != 0, options & V_FILTER != 0],
+            },
+            size: [width, height],
+        })
+    }
+
+    /// What the window makes of point `at` of the active area, which is
+    /// `area` in size, over `below` there: the window refused where
+    /// [`Window::draw`] refuses it, but only what that point takes read
+    /// from its surface, and nothing if the window does not cover it. The
+    /// surface is read where the point takes its pixels from, so a buffer
+    /// unmapped only elsewhere does not keep the point from being worked
+    /// out, as it keeps the whole picture from being put together.
+    fn pixel(
+        &self,
+        memory: &DeviceMemory,
+        area: [u32; 2],
+        at: Option<[u32; 2]>,
+        below: u32,
+    ) -> Result<u32, NoFrame> {
+        let (left, top) = {
+            let position = self.value(register::WIN_POSITION);
+            (position & 0xFFFF, position >> 16)
         };
-        let scaling = Scaling {
-            increments: self.value(register::WIN_DDA_INC),
-            initial: [
-                self.value(register::WIN_H_INITIAL_DDA),
-                self.value(register::WIN_V_INITIAL_DDA),
-            ],
-            filters: [options & H_FILTER != 0, options & V_FILTER != 0],
-        };
-        if scaling.is_identity([across, down], [width, height]) {
-            return Ok(source);
+        let source = self.source()?;
+        let [width, height] = source.size;
+        if left + width > area[0] || top + height > area[1] {
+            return Err(NoFrame::Unsupported(
+                "a window reaching outside the active area".into(),
+            ));
         }
-        scaling.apply(
-            &scratch.fetched,
-            &source,
-            [width, height],
-            &mut scratch.lines,
-            &mut scratch.scaled,
-        );
-        std::mem::swap(&mut scratch.fetched, &mut scratch.scaled);
-        // Scaling works on each byte alike, so the order stays.
-        Ok(Layout {
-            width,
-            height,
-            origin: 0,
-            steps: [1, width as isize],
-            order,
+        let blend = Blend::of(self)?;
+        let Some([x, y]) = at.filter(|&[x, y]| {
+            (left..left + width).contains(&x) && (top..top + height).contains(&y)
+        }) else {
+            return Ok(below);
+        };
+        let pixel = source.pixel(memory, [x - left, y - top])?;
+        let [red, green, blue, alpha] = source.layout.order.map(|byte| pixel[byte]);
+        Ok(match blend {
+            Blend::Opaque => u32::from_be_bytes([0, red, green, blue]),
+            Blend::Factors { select, k1, k2 } => {
+                BlendTable::new(select, k1, k2).apply([red, green, blue, alpha], below)
+            }
         })
     }
 
@@ -1004,6 +1100,169 @@ impl Window<'_> {
             }
         }
         Ok(())
+    }
+}
+
+/// What [`Window::source`] works out: how the window's surface is read
+/// and how its pixels are laid out as read.
+struct Source {
+    /// Red first among the 32-bit formats, or the layout of 16 bits.
+    depth: Result<bool, Narrow>,
+    /// 16-bit pixels with their bytes swapped.
+    swapped_halves: bool,
+    /// The window's `COLOR_EXPAND` option; see [`widen`].
+    expand: bool,
+    pixel_bytes: u32,
+    surface: Surface,
+    /// Where the rectangle the window shows starts on the surface: bytes
+    /// across and lines down.
+    corner: (u64, u64),
+    /// Bytes across the rectangle.
+    row_bytes: u64,
+    /// The rectangle's pixels across and lines down, in the surface's own
+    /// orientation: how the pixels are laid out as read.
+    rectangle: [u32; 2],
+    /// Where each pixel of the source, as the window scans it, is among
+    /// the pixels read.
+    layout: Layout,
+    scaling: Scaling,
+    /// The window's size on the screen.
+    size: [u32; 2],
+}
+
+enum Surface {
+    Pitch { start: u64, stride: u64 },
+    Block(BlockLinear),
+}
+
+impl Source {
+    /// [`Window::fetch`] once the registers are checked.
+    fn fetch(&self, memory: &DeviceMemory, scratch: &mut Scratch) -> Result<Layout, NoFrame> {
+        let Scratch {
+            fetched,
+            block_row,
+            narrow,
+            ..
+        } = &mut *scratch;
+        let [source_width, source_height] = self.rectangle;
+        // Every byte is read over, so what was there stays until it is.
+        fetched.resize((source_width * source_height) as usize, [0; 4]);
+        let bytes: &mut [u8] = if self.depth.is_ok() {
+            fetched.as_flattened_mut()
+        } else {
+            narrow.resize(fetched.len() * 2, 0);
+            &mut narrow[..]
+        };
+        let (left, top) = self.corner;
+        match &self.surface {
+            Surface::Pitch { start, stride } => {
+                for (row, line) in bytes.chunks_mut(self.row_bytes as usize).enumerate() {
+                    let address = start + (top + row as u64) * stride + left;
+                    memory
+                        .read(address, line)
+                        .ok_or(NoFrame::BufferUnmapped { address })?;
+                }
+            }
+            Surface::Block(layout) => {
+                layout.read(memory, (left, top), self.row_bytes, bytes, block_row)?
+            }
+        }
+        if let Err(format) = self.depth {
+            widen(narrow, fetched, format, self.swapped_halves, self.expand);
+        }
+        let source = self.layout;
+        let [width, height] = self.size;
+        if self
+            .scaling
+            .is_identity([source.width, source.height], self.size)
+        {
+            return Ok(source);
+        }
+        self.scaling.apply(
+            &scratch.fetched,
+            &source,
+            self.size,
+            &mut scratch.lines,
+            &mut scratch.scaled,
+        );
+        std::mem::swap(&mut scratch.fetched, &mut scratch.scaled);
+        // Scaling works on each byte alike, so the order stays.
+        Ok(Layout {
+            width,
+            height,
+            origin: 0,
+            steps: [1, width as isize],
+            order: source.order,
+        })
+    }
+
+    /// Pixel `(x, y)` of the window, as [`Source::fetch`] leaves it at
+    /// `(x, y)` of the layout it says, from only the source pixels it is
+    /// made of.
+    fn pixel(&self, memory: &DeviceMemory, [x, y]: [u32; 2]) -> Result<[u8; 4], NoFrame> {
+        const ONE: u32 = 1 << 12;
+        let source = &self.layout;
+        let read = |x: usize, y: usize| self.read(memory, source.at(x, y) as usize);
+        if self
+            .scaling
+            .is_identity([source.width, source.height], self.size)
+        {
+            return read(x as usize, y as usize);
+        }
+        // [`Scaling::apply`] for one destination pixel.
+        let size = [source.width, source.height];
+        let (left, right, across) = self.scaling.tap(0, size, x.into());
+        let (top, bottom, down) = self.scaling.tap(1, size, y.into());
+        let line = |y: usize| -> Result<[u32; 4], NoFrame> {
+            let (a, b) = (read(left, y)?, read(right, y)?);
+            Ok(std::array::from_fn(|channel| {
+                u32::from(a[channel]) * (ONE - across) + u32::from(b[channel]) * across
+            }))
+        };
+        let (upper, lower) = (line(top)?, line(bottom)?);
+        Ok(std::array::from_fn(|channel| {
+            ((upper[channel] * (ONE - down) + lower[channel] * down + (1 << 23)) >> 24) as u8
+        }))
+    }
+
+    /// Pixel `index` of those read, read alone, widened if 16-bit. An
+    /// unmapped buffer is reported at the address [`Source::fetch`] would
+    /// have failed to read: the line's (pitch) or its block row's.
+    fn read(&self, memory: &DeviceMemory, index: usize) -> Result<[u8; 4], NoFrame> {
+        let source_width = self.rectangle[0] as usize;
+        let (row, column) = (index / source_width, index % source_width);
+        let pixel_bytes = self.pixel_bytes as usize;
+        let (left, top) = self.corner;
+        let y = top + row as u64;
+        let mut bytes = [0; 4];
+        for (offset, byte) in bytes[..pixel_bytes].iter_mut().enumerate() {
+            // The byte's place in the line as fetched.
+            let across = (column * pixel_bytes + offset) as u64;
+            let (unmapped, address) = match &self.surface {
+                Surface::Pitch { start, stride } => {
+                    let line = start + y * stride + left;
+                    (line, line + across)
+                }
+                Surface::Block(layout) => layout.byte(left, y, across),
+            };
+            memory
+                .read(address, std::slice::from_mut(byte))
+                .ok_or(NoFrame::BufferUnmapped { address: unmapped })?;
+        }
+        Ok(match self.depth {
+            Ok(_) => bytes,
+            Err(format) => {
+                let mut pixel = [[0; 4]];
+                widen(
+                    &bytes[..2],
+                    &mut pixel,
+                    format,
+                    self.swapped_halves,
+                    self.expand,
+                );
+                pixel[0]
+            }
+        })
     }
 }
 
@@ -1156,6 +1415,21 @@ impl Scaling {
         source == destination && self.steps() == [DDA_ONE; 2] && self.initial == [0; 2]
     }
 
+    /// Per direction (`axis`) and destination position: the two pixels of
+    /// a source `size` across and down it takes, and the weight of the
+    /// second.
+    fn tap(&self, axis: usize, size: [u32; 2], position: u64) -> (usize, usize, u32) {
+        let last = size[axis].saturating_sub(1) as usize;
+        let at = u64::from(self.initial[axis]) + position * u64::from(self.steps()[axis]);
+        let whole = ((at >> 12) as usize).min(last);
+        let weight = if self.filters[axis] && whole < last {
+            (at & 0xFFF) as u32
+        } else {
+            0
+        };
+        (whole, (whole + 1).min(last), weight)
+    }
+
     /// Scales the window's source, laid out in `pixels` as `source` says,
     /// to `destination` in `out`, a line after the other. `lines` holds the
     /// source's lines scaled across on the way. Weights have the
@@ -1169,23 +1443,10 @@ impl Scaling {
         out: &mut Vec<[u8; 4]>,
     ) {
         const ONE: u32 = 1 << 12;
-        let steps = self.steps();
         let size = [source.width, source.height];
-        // Per direction and destination position: the two source pixels
-        // and the weight of the second.
         let taps = |axis: usize| -> Vec<(usize, usize, u32)> {
-            let last = size[axis].saturating_sub(1) as usize;
             (0..u64::from(destination[axis]))
-                .map(|position| {
-                    let at = u64::from(self.initial[axis]) + position * u64::from(steps[axis]);
-                    let whole = ((at >> 12) as usize).min(last);
-                    let weight = if self.filters[axis] && whole < last {
-                        (at & 0xFFF) as u32
-                    } else {
-                        0
-                    };
-                    (whole, (whole + 1).min(last), weight)
-                })
+                .map(|position| self.tap(axis, size, position))
                 .collect()
         };
         let (columns, rows) = (taps(0), taps(1));
@@ -1362,6 +1623,42 @@ impl BlockLinear {
             + in_gob
     }
 
+    /// Refuses a surface [`Self::read`] cannot read `row_bytes` of from
+    /// byte `left` on.
+    fn check(&self, left: u64, row_bytes: u64) -> Result<(), NoFrame> {
+        if !self.stride.is_multiple_of(GOB_WIDTH) || left + row_bytes > self.stride {
+            return Err(NoFrame::Unsupported(format!(
+                "a block-linear surface {} bytes across",
+                self.stride
+            )));
+        }
+        Ok(())
+    }
+
+    fn block_lines(&self) -> u64 {
+        GOB_HEIGHT * self.block_height
+    }
+
+    fn block_row_size(&self) -> u64 {
+        (self.stride / GOB_WIDTH) * GOB_SIZE * self.block_height
+    }
+
+    /// Where in its block row [`Self::read`] finds the sixteen bytes of a
+    /// line from `x` on, `in_line` being what depends on the line.
+    fn piece(&self, x: u64, in_line: u64) -> usize {
+        (x / GOB_WIDTH * GOB_SIZE * self.block_height
+            + (x % 64 / 32) * 256
+            + (x % 32 / 16) * 32
+            + x % 16
+            + in_line) as usize
+    }
+
+    /// The part of [`Self::offset`] in its block row that depends on the
+    /// line.
+    fn in_line(&self, y: u64) -> u64 {
+        (y % self.block_lines() / GOB_HEIGHT) * GOB_SIZE + (y % 8 / 2) * 64 + (y % 2) * 16
+    }
+
     /// Reads `row_bytes` across of each line from (`left`, `top`) on into
     /// `bytes`, a block row at a time through `block_row`.
     fn read(
@@ -1372,15 +1669,9 @@ impl BlockLinear {
         bytes: &mut [u8],
         block_row: &mut Vec<u8>,
     ) -> Result<(), NoFrame> {
-        if !self.stride.is_multiple_of(GOB_WIDTH) || left + row_bytes > self.stride {
-            return Err(NoFrame::Unsupported(format!(
-                "a block-linear surface {} bytes across",
-                self.stride
-            )));
-        }
-        let block_lines = GOB_HEIGHT * self.block_height;
-        let block_size = GOB_SIZE * self.block_height;
-        let block_row_size = (self.stride / GOB_WIDTH) * block_size;
+        self.check(left, row_bytes)?;
+        let block_lines = self.block_lines();
+        let block_row_size = self.block_row_size();
         let lines = bytes.len() as u64 / row_bytes;
         block_row.resize(block_row_size as usize, 0);
         let mut loaded = None;
@@ -1394,23 +1685,24 @@ impl BlockLinear {
                     .ok_or(NoFrame::BufferUnmapped { address })?;
                 loaded = Some(block);
             }
-            // [`Self::offset`] less the block row's start, with the part
-            // that depends on the line worked out once.
-            let in_line =
-                (y % block_lines / GOB_HEIGHT) * GOB_SIZE + (y % 8 / 2) * 64 + (y % 2) * 16;
+            let in_line = self.in_line(y);
             let out = &mut bytes[(line * row_bytes) as usize..][..row_bytes as usize];
             // Sixteen bytes at a time stay together.
             for (piece, chunk) in out.chunks_mut(16).enumerate() {
-                let x = left + piece as u64 * 16;
-                let at = (x / GOB_WIDTH * block_size
-                    + (x % 64 / 32) * 256
-                    + (x % 32 / 16) * 32
-                    + x % 16
-                    + in_line) as usize;
+                let at = self.piece(left + piece as u64 * 16, in_line);
                 chunk.copy_from_slice(&block_row[at..at + chunk.len()]);
             }
         }
         Ok(())
+    }
+
+    /// Where [`Self::read`] takes byte `across` of line `y` from, reading
+    /// from byte `left` of each line on: the address of the line's block
+    /// row, and of the byte.
+    fn byte(&self, left: u64, y: u64, across: u64) -> (u64, u64) {
+        let block_row = self.start + y / self.block_lines() * self.block_row_size();
+        let at = self.piece(left + across / 16 * 16, self.in_line(y)) as u64 + across % 16;
+        (block_row, block_row + at)
     }
 }
 
@@ -1901,9 +2193,19 @@ mod tests {
                 })
                 .collect();
             times.sort();
+            // A point looked at alone, as a wait for a color does: the
+            // picture not put together in the frame.
+            let (_, active) = dc.looked_at().unwrap();
+            let start = std::time::Instant::now();
+            for point in 0..1000 {
+                let pixel = Dc::compose_pixel(&memory, &active, point % 1280, point % 720);
+                assert!(pixel.unwrap().value.is_some());
+            }
             println!(
-                "{name}: best {:?}, median {:?} per picture",
-                times[0], times[25]
+                "{name}: best {:?}, median {:?} per picture, {:?} per point alone",
+                times[0],
+                times[25],
+                start.elapsed() / 1000
             );
         }
     }
@@ -2390,6 +2692,219 @@ mod tests {
             );
             bench.advance(100);
             assert_eq!(bench.count(9), 2, "the committed stop took effect");
+        }
+    }
+
+    /// Points of the turned picture worked out alone are the picture's:
+    /// every `step`th across and down and the last of each, and points
+    /// just outside it are none. A controller that makes no picture
+    /// refuses a point for the same reason.
+    fn assert_points_are_the_picture(dc: &Dc, memory: &DeviceMemory, step: usize) {
+        let (_, active) = dc.looked_at().unwrap();
+        let picture = dc.frame_turned_clockwise(memory);
+        let frame = match &picture {
+            Ok(frame) => frame,
+            Err(reason) => {
+                assert_eq!(
+                    Dc::compose_pixel(memory, &active, 0, 0).as_ref(),
+                    Err(reason)
+                );
+                return;
+            }
+        };
+        let points = |size: u32| (0..size).step_by(step).chain([size - 1, size, size + 9]);
+        for y in points(frame.height) {
+            for x in points(frame.width) {
+                assert_eq!(
+                    Dc::compose_pixel(memory, &active, x, y),
+                    Ok(Pixel::of(frame, x, y)),
+                    "{x},{y}"
+                );
+            }
+        }
+        // Within the frame, the picture put together is looked at instead.
+        let (x, y) = (frame.width / 2, frame.height / 3);
+        assert_eq!(
+            dc.pixel_turned_clockwise(memory, x, y),
+            Ok(Pixel::of(frame, x, y))
+        );
+    }
+
+    #[test]
+    fn points_of_full_screen_and_home_windows_are_the_pictures() {
+        let (ram, memory) = screen_memory();
+        let pattern: Vec<u8> = (0..0x80_0000u32)
+            .map(|byte| (byte.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        ram.write(BUFFER_PHYSICAL - 0x4000 + 0x40_0000, &pattern)
+            .unwrap();
+        let set_ups: [&dyn Fn(&Dc); 4] = [
+            &|dc| full_screen_window(dc, 1, (720, 1280), (0x42, 0x1400)),
+            &|dc| full_screen_window(dc, 1, (5, 7), (0, 0x40)),
+            &|dc| full_screen_window(dc, 1, (360, 640), (0, 0x1400)),
+            &home_windows,
+        ];
+        for set_up in set_ups {
+            let dc = controller();
+            write(&dc, register::DISP_ACTIVE, 1280 << 16 | 720);
+            set_up(&dc);
+            write(&dc, register::DISPLAY_COMMAND, DISPLAY_MODE_CONTINUOUS);
+            write(&dc, register::STATE_CONTROL, 0x0F);
+            assert!(dc.frame_turned_clockwise(&memory).is_ok());
+            assert_points_are_the_picture(&dc, &memory, 3);
+        }
+    }
+
+    /// Windows of every kind the compositor renders, made up at random:
+    /// each color depth and byte swap, both directions, scanned by rows
+    /// and columns, pitch and block-linear surfaces at odd offsets, scaled
+    /// with and without filters, layered and blended.
+    #[test]
+    fn points_of_made_up_windows_are_the_pictures() {
+        let (ram, memory) = screen_memory();
+        let pattern: Vec<u8> = (0..0x40_0000u32)
+            .map(|byte| (byte.wrapping_mul(2_246_822_519) >> 23) as u8)
+            .collect();
+        ram.write(BUFFER_PHYSICAL - 0x4000 + 0x40_0000, &pattern)
+            .unwrap();
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut random = |below: u32| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % u64::from(below)) as u32
+        };
+        let mut pictured = 0;
+        for _ in 0..400 {
+            let dc = controller();
+            let (area_width, area_height) = (8 + random(41), 8 + random(41));
+            write(&dc, register::DISP_ACTIVE, area_height << 16 | area_width);
+            let windows = 1 + random(3);
+            for window in 0..windows {
+                write(&dc, register::DISPLAY_WINDOW_HEADER, 0x10 << window);
+                let (depth, pixel_bytes) = [
+                    (COLOR_DEPTH_B8G8R8A8, 4),
+                    (COLOR_DEPTH_R8G8B8A8, 4),
+                    (COLOR_DEPTH_B5G6R5, 2),
+                    (COLOR_DEPTH_R4G4B4A4, 2),
+                ][random(4) as usize];
+                let byte_swap = random(if pixel_bytes == 4 { 3 } else { 2 });
+                let options = [
+                    H_DIRECTION,
+                    V_DIRECTION,
+                    SCAN_COLUMN,
+                    COLOR_EXPAND,
+                    H_FILTER,
+                    V_FILTER,
+                ]
+                .into_iter()
+                .filter(|_| random(2) == 1)
+                .fold(WIN_ENABLE, |options, option| options | option);
+                let (width, height) = (1 + random(area_width), 1 + random(area_height));
+                let position =
+                    random(area_height - height + 1) << 16 | random(area_width - width + 1);
+                let (across, down) = (1 + random(40), 1 + random(40));
+                let (rectangle_width, rectangle_height) = if options & SCAN_COLUMN != 0 {
+                    (down, across)
+                } else {
+                    (across, down)
+                };
+                let row_bytes = rectangle_width * pixel_bytes;
+                let (mut left, mut top) = (random(70), random(9));
+                let block = random(2) == 1;
+                let stride = if block {
+                    (left + row_bytes).div_ceil(64) * 64 + 64 * random(3)
+                } else {
+                    left + row_bytes + random(50)
+                };
+                if options & H_DIRECTION != 0 {
+                    left += row_bytes - 1;
+                }
+                if options & V_DIRECTION != 0 {
+                    top += rectangle_height - 1;
+                }
+                let scaled = random(3) != 0;
+                let increment =
+                    |source: u32, shown: u32, random: &mut dyn FnMut(u32) -> u32| match scaled {
+                        true => (((source << 12) / shown).max(1) + random(0x200)).min(0xFFFF),
+                        false => DDA_ONE,
+                    };
+                let increments = increment(down, height, &mut random) << 16
+                    | increment(across, width, &mut random);
+                let (initial_across, initial_down) = match scaled {
+                    true => (random(0x1000), random(0x1000)),
+                    false => (0, 0),
+                };
+                let kind = if block {
+                    SURFACE_KIND_BLOCK | random(6) << SURFACE_KIND_BLOCK_HEIGHT_SHIFT
+                } else {
+                    SURFACE_KIND_PITCH
+                };
+                for (number, value) in [
+                    (register::WIN_COLOR_DEPTH, depth),
+                    (register::WIN_BYTE_SWAP, byte_swap),
+                    (register::WIN_OPTIONS, options),
+                    (register::WIN_POSITION, position),
+                    (register::WIN_SIZE, height << 16 | width),
+                    (
+                        register::WIN_PRESCALED_SIZE,
+                        (down << 16) | (across * pixel_bytes),
+                    ),
+                    (register::WIN_DDA_INC, increments),
+                    (register::WIN_H_INITIAL_DDA, initial_across),
+                    (register::WIN_V_INITIAL_DDA, initial_down),
+                    (register::WIN_LINE_STRIDE, stride),
+                    (register::WINBUF_SURFACE_KIND, kind),
+                    (
+                        register::WINBUF_START_ADDR,
+                        BUFFER as u32 + random(0x1_0000),
+                    ),
+                    (register::WINBUF_ADDR_H_OFFSET, left),
+                    (register::WINBUF_ADDR_V_OFFSET, top),
+                ] {
+                    write(&dc, number, value);
+                }
+                if windows > 1 || random(2) == 1 {
+                    let bypass = if random(4) == 0 { BLEND_BYPASS } else { 0 };
+                    let control = bypass | random(1 << 16) << 8 | random(256);
+                    write(&dc, register::WIN_BLEND_LAYER_CONTROL, control);
+                    let select = random(8) << 4 | random(6);
+                    write(&dc, register::WIN_BLEND_MATCH_SELECT, select);
+                }
+            }
+            write(&dc, register::DISPLAY_COMMAND, DISPLAY_MODE_CONTINUOUS);
+            write(&dc, register::STATE_CONTROL, 0x0F);
+            if dc.frame_turned_clockwise(&memory).is_ok() {
+                pictured += 1;
+            }
+            assert_points_are_the_picture(&dc, &memory, 1);
+        }
+        assert!(pictured > 350, "only {pictured} of 400 made a picture");
+    }
+
+    /// A controller that makes no picture refuses every point for the
+    /// reason it refuses the picture.
+    #[test]
+    fn points_are_refused_as_the_picture_is() {
+        let (_ram, memory) = memory();
+        let stopped = configured();
+        assert_eq!(
+            stopped.pixel_turned_clockwise(&memory, 0, 0),
+            Err(NoFrame::NotRunning)
+        );
+        let refusals: [(u64, u32); 4] = [
+            (register::BLEND_BACKGROUND_COLOR, 1),
+            (register::WIN_COLOR_DEPTH, 3),
+            (register::WIN_POSITION, 3),
+            (register::WIN_OPTIONS, WIN_ENABLE | 1 << 12),
+        ];
+        for (number, value) in refusals {
+            let dc = configured();
+            write(&dc, number, value);
+            write(&dc, register::DISPLAY_COMMAND, DISPLAY_MODE_CONTINUOUS);
+            write(&dc, register::STATE_CONTROL, 0x0F);
+            assert!(dc.frame_turned_clockwise(&memory).is_err(), "{number:#x}");
+            assert_points_are_the_picture(&dc, &memory, 1);
         }
     }
 }

@@ -1656,9 +1656,16 @@ fn setup_triangles(
         0x901 => true,
         other => return Err(refuse("front face", OGL_SET_FRONT_FACE, other)),
     };
-    // SET_WINDOW_ORIGIN FLIP_Y flips the triangle orientation [public:
-    // Ryujinx `StateUpdater.UpdateFrontFace`: front face inverted unless
-    // `TriangleRastFlip`].
+    // SET_WINDOW_ORIGIN FLIP_Y says which way the rows count when the
+    // orientation is taken: with it they count up, as OpenGL window
+    // coordinates do, without it down [public: Ryujinx
+    // `StateUpdater.UpdateFrontFace` keeps the front face on a host with
+    // rows up (OpenGL's lower-left clip origin) only with
+    // `TriangleRastFlip` and inverts it otherwise] [inference, from the
+    // firmware: under the opposite rule every triangle drawn with culling
+    // on was culled, in Settings (FLIP_Y clear) as in the Mii editor's
+    // full-screen composition strip (FLIP_Y set), which left the editor's
+    // frame buffers unwritten].
     let flip = r.get(SET_WINDOW_ORIGIN) & 0x10 != 0;
     let provoking_last = r.get(SET_PROVOKING_VERTEX) & 1 != 0;
 
@@ -1684,8 +1691,9 @@ fn setup_triangles(
             continue;
         }
         let window: Vec<[f32; 4]> = polygon.iter().map(|v| clip.window(v)).collect();
-        // Facing from the signed area of the whole polygon, in window
-        // coordinates with y down.
+        // Facing from the signed area of the whole polygon in window
+        // coordinates: positive is counter-clockwise with rows counted up
+        // and clockwise with rows counted down.
         let area: f32 = (0..window.len())
             .map(|i| {
                 let a = window[i];
@@ -1693,11 +1701,8 @@ fn setup_triangles(
                 a[0] * b[1] - b[0] * a[1]
             })
             .sum();
-        // With y down, a positive area is clockwise on screen. OpenGL
-        // window coordinates have y up, where the same triangle is
-        // counter-clockwise; the orientation flag inverts that.
-        let ccw_in_gl = (area > 0.0) != flip;
-        let front_facing = ccw_in_gl == front_ccw;
+        let counter_clockwise = (area > 0.0) == flip;
+        let front_facing = counter_clockwise == front_ccw;
         if cull {
             let culled = match cull_face {
                 0x404 => front_facing,

@@ -161,7 +161,10 @@ pub fn snap_to_grid(value: f32) -> f32 {
 /// as here; NVK selects these lines with `SET_LINE_MULTISAMPLE_OVERRIDE`
 /// (see `pipeline::line_rule`). \[assumption: the hardware implements
 /// this exact rule. Both APIs allow rules within one pixel of it, and
-/// NVIDIA's is not public.\]
+/// NVIDIA's is not public. Whether `SET_WINDOW_ORIGIN` FLIP_Y, which
+/// makes facing count rows up, also turns the -ε² towards +y is not
+/// established either; it decides only lines and endpoints exactly on a
+/// pixel edge or diamond boundary in y.\]
 ///
 /// For a segment with |slope| <= 1 in the major axis, a diamond the line
 /// enters is crossed on its minor-axis diagonal, so each column (or row)

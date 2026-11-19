@@ -327,12 +327,17 @@ fn power_on() -> Outcome {
         .as_ref()
         .expect("a SoC powered on has the boot blocks");
     bpmp.set_trace(TRACE);
+    // As `Machine::new` powered on: the interrupt controller out of reset,
+    // for the monitor to set up.
+    gic.reset();
     let monitor = SecureMonitor::new(&params, keys);
+    monitor.attach_gic(Arc::clone(&gic));
     let wake = WakesAtOnce {
         soc: &soc,
         bus: &bus,
         ram: &ram,
         bpmp: &bpmp,
+        gic: &gic,
     };
     let env = Env {
         blocks,
@@ -567,11 +572,16 @@ struct WakesAtOnce<'a> {
     bus: &'a Bus,
     ram: &'a GuestRam,
     bpmp: &'a Bpmp,
+    gic: &'a Gic,
 }
 
 impl PowerDomain for WakesAtOnce<'_> {
     fn wake_pending(&self) -> bool {
         true
+    }
+
+    fn power_lost(&self) {
+        self.gic.reset();
     }
 
     fn warm_boot(&self) -> Result<WarmStart, String> {

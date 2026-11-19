@@ -26,6 +26,21 @@
 //! PMU interrupt (pcv binds interrupt 118, level-triggered) and one of its
 //! wake sources: [`Max77620`] is the chip as a whole. Two things happen on
 //! it: the power key and the clock's alarms.
+//!
+//! The firmware ends a run of the console through the chip: Power Options
+//! → Restart and → Turn Off both write `ONOFFCNFG2` (0x42) and then
+//! `ONOFFCNFG1` (0x41), read-modify-write, from pcv: `0x42 = 0x81`,
+//! `0x41 = 0xB8` to restart, `0x42 = 0x01`, `0x41 = 0xB8` to turn off
+//! (traced through this model). `ONOFFCNFG1` bit 7 is the software reset
+//! (`SFT_RST`, Linux `max77620.h`), which switches every regulator off
+//! through the power sequencers; `ONOFFCNFG2` bit 7 (`SFT_RST_WK`) says
+//! whether the chip then powers the console up again, a restart, or stays
+//! off ([`PowerDown`]). \[inference\] That `SFT_RST_WK` decides between the
+//! two is read off its name and these two writes, which differ in it
+//! alone. The chip powers down at once here: [`Max77620::power_down`] says
+//! so to the machine, which stops. `ONOFFCNFG1` bit 1 (`PWR_OFF`) is not
+//! modeled and refuses to be set. What runs on through the power cycle is
+//! the clock, on its own backup battery ([`BatteryBacked`]).
 
 use std::{
     collections::BTreeMap,
@@ -124,10 +139,44 @@ const FPS_LDO0: u8 = 0x46;
 const FPS_SOURCE: u8 = 0b11 << 6;
 const FPS_SOURCE_NONE: u8 = 0b11 << 6;
 
+/// Power-key behavior and the chip's own power-down (Linux `max77620.h`,
+/// `MAX77620_REG_ONOFFCNFG1`): [`ONOFFCNFG1_SFT_RST`] and
+/// [`ONOFFCNFG1_PWR_OFF`] act, the rest (the manual-reset time, the sleep
+/// enable) holds what is written.
+const ONOFFCNFG1: u8 = 0x41;
+/// The software reset (`MAX77620_ONOFFCNFG1_SFT_RST`): every regulator
+/// off, then what [`ONOFFCNFG2_SFT_RST_WK`] says.
+const ONOFFCNFG1_SFT_RST: u8 = 1 << 7;
+/// `MAX77620_ONOFFCNFG1_PWR_OFF`: not modeled, refused.
+const ONOFFCNFG1_PWR_OFF: u8 = 1 << 1;
+/// The chip's wake sources (`MAX77620_REG_ONOFFCNFG2`), held as written.
+const ONOFFCNFG2: u8 = 0x42;
+/// `MAX77620_ONOFFCNFG2_SFT_RST_WK`: after a software reset the chip powers
+/// the console up again ([`PowerDown::Restart`]) instead of staying off.
+const ONOFFCNFG2_SFT_RST_WK: u8 = 1 << 7;
+
+/// How a software reset of the chip (`ONOFFCNFG1` `SFT_RST`) ends the run
+/// of the console: every regulator goes off, and the SoC and DRAM lose
+/// power as when the battery is cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerDown {
+    /// With `ONOFFCNFG2` `SFT_RST_WK` set: the chip starts its power-up
+    /// sequence again, and the console boots as from the power key.
+    Restart,
+    /// With it clear: the chip stays off. \[assumption\] The wake events
+    /// that would power it up again (the power key, an alarm) are not
+    /// modeled: nothing runs after this.
+    Off,
+}
+
 /// The power block of the PMIC.
 #[derive(Serialize, Deserialize)]
 struct Pmic {
     registers: BTreeMap<u8, u8>,
+    /// The software reset, once it is written. Not saved: a snapshot
+    /// refuses to be taken once it is ([`Snapshot for Max77620`](Max77620)).
+    #[serde(skip)]
+    power_down: Option<PowerDown>,
 }
 
 impl Pmic {
@@ -146,7 +195,10 @@ impl Pmic {
             (CID4, CID4_ORIGINAL_CONSOLE),
             (STATSD, 0),
         ]);
-        Self { registers }
+        Self {
+            registers,
+            power_down: None,
+        }
     }
 
     /// The power key going down or coming up.
@@ -273,6 +325,38 @@ impl Max77620 {
         self.update(|_| ()).1
     }
 
+    /// The software reset, once the firmware has written it: the console
+    /// has lost power, and what follows is [`PowerDown`].
+    pub fn power_down(&self) -> Option<PowerDown> {
+        self.shared.chip.lock().unwrap().pmic.power_down
+    }
+
+    /// What of the chip runs on through a power cycle, as it is now.
+    pub fn battery_backed(&self) -> BatteryBacked {
+        let chip = self.shared.chip.lock().unwrap();
+        BatteryBacked {
+            shows: chip.rtc.now(),
+            rtc: chip.rtc.clone(),
+        }
+    }
+
+    /// Makes this chip, of a machine built and not run yet, the one a
+    /// software reset with `SFT_RST_WK` powers up again: the clock goes on
+    /// from where `kept` left it, with its registers and alarms, and no
+    /// power-key event is pending, since no key started this power-up.
+    /// \[assumption\] The software reset clears `ONOFFIRQ` as power-on does
+    /// and leaves the clock alone, which runs on its backup battery.
+    pub fn power_up_from_reset(&self, kept: BatteryBacked) {
+        self.update(|chip| {
+            let BatteryBacked { mut rtc, shows } = kept;
+            rtc.clock = Arc::clone(&chip.rtc.clock);
+            rtc.base = chip.rtc.base;
+            rtc.offset = shows - rtc.unset_time();
+            chip.rtc = rtc;
+            chip.pmic.registers.insert(ONOFFIRQ, 0);
+        });
+    }
+
     /// Does `action` on the chip and brings the interrupt output up to
     /// date; returns the output's level along with the action's result.
     fn update<T>(&self, action: impl FnOnce(&mut Chip) -> T) -> (T, bool) {
@@ -286,6 +370,15 @@ impl Max77620 {
     }
 }
 
+/// The part of the chip that a power cycle leaves running: the real-time
+/// clock with its registers and alarms, and the time it showed when
+/// [`Max77620::battery_backed`] took it.
+pub struct BatteryBacked {
+    rtc: Rtc,
+    /// Seconds since the Unix epoch.
+    shows: i64,
+}
+
 /// Both blocks' registers, the power key's state and the clock: its time
 /// as a base and the guest's offset from it, and its alarms, which go off
 /// at the same guest time in the restored machine. Saved by the SoC
@@ -294,9 +387,16 @@ impl Max77620 {
 /// saved its level.
 impl Snapshot for Max77620 {
     /// Sets off the alarms due by the paused guest time, which the alarm
-    /// watcher might otherwise do in the middle of the save.
+    /// watcher might otherwise do in the middle of the save. A chip that
+    /// has had its software reset written is powering the console down,
+    /// which is not saved: it refuses.
     fn quiesce(&self) -> Result<(), SnapshotError> {
         let mut chip = self.shared.chip.lock().unwrap();
+        if let Some(down) = chip.pmic.power_down {
+            return Err(SnapshotError::Unsupported(format!(
+                "the MAX77620 while it powers the console down ({down:?})"
+            )));
+        }
         if chip.rtc.ring() {
             (self.interrupt)(chip.interrupt());
         }
@@ -403,6 +503,19 @@ impl Pmic {
         match register {
             // Event and status registers follow the inputs, not the bus.
             IRQTOP | ONOFFIRQ | NVERC | ONOFFSTAT => {}
+            ONOFFCNFG1 if value & ONOFFCNFG1_PWR_OFF != 0 => return None,
+            ONOFFCNFG1 => {
+                if value & ONOFFCNFG1_SFT_RST != 0 {
+                    let wakes = self.registers[&ONOFFCNFG2] & ONOFFCNFG2_SFT_RST_WK != 0;
+                    self.power_down = Some(if wakes {
+                        PowerDown::Restart
+                    } else {
+                        PowerDown::Off
+                    });
+                }
+                // [assumption] The reset bit acts and reads back clear.
+                self.registers.insert(register, value & !ONOFFCNFG1_SFT_RST);
+            }
             _ if register <= PMIC_LAST_REGISTER => {
                 self.registers.insert(register, value);
             }
@@ -474,7 +587,7 @@ const RTC_EPOCH_YEAR: i64 = 2000;
 /// with them is the evidence. An alarm set for a date and time goes off
 /// then: the event shows in [`RTCINT`], and [`Rtc::alarm_due`] is how what
 /// the alarm is wired to learns of it.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Rtc {
     /// Guest time, which the clock runs on. Wiring: the restoring machine
     /// has its own.
@@ -948,5 +1061,62 @@ mod tests {
         wait_for(&restored_level);
         assert_eq!(restored_rtc.read(RTCINT), Some(RTCINT_ALARM[0]));
         assert_eq!(read_time(&mut restored_rtc), read_time(&mut rtc));
+    }
+
+    #[test]
+    fn the_software_reset_restarts_or_powers_off_as_onoffcnfg2_says() {
+        let chip = Max77620::new(Arc::default(), |_| {});
+        let mut power = chip.power_block();
+        // What the NX bootloader leaves, and pcv's Restart: 0x42 = 0x81,
+        // then 0x41 = 0xB8.
+        power.write(ONOFFCNFG1, 0x78).unwrap();
+        assert_eq!(chip.power_down(), None);
+        power.write(ONOFFCNFG2, 0x81).unwrap();
+        power.write(ONOFFCNFG1, 0xB8).unwrap();
+        assert_eq!(chip.power_down(), Some(PowerDown::Restart));
+        assert_eq!(power.read(ONOFFCNFG1), Some(0x38));
+        assert!(matches!(chip.quiesce(), Err(SnapshotError::Unsupported(_))));
+
+        // Turn Off: 0x42 = 0x01, then 0x41 = 0xB8.
+        let chip = Max77620::new(Arc::default(), |_| {});
+        let mut power = chip.power_block();
+        power.write(ONOFFCNFG2, 0x01).unwrap();
+        power.write(ONOFFCNFG1, 0xB8).unwrap();
+        assert_eq!(chip.power_down(), Some(PowerDown::Off));
+
+        // PWR_OFF is not modeled.
+        let chip = Max77620::new(Arc::default(), |_| {});
+        assert_eq!(chip.power_block().write(ONOFFCNFG1, 0x3A), None);
+        assert_eq!(chip.power_down(), None);
+    }
+
+    #[test]
+    fn a_restarted_chip_keeps_the_clock_and_has_no_key_event() {
+        let old_clock = guest_clock(Duration::from_secs(100));
+        let old = Max77620::starting_at(1_000, Arc::clone(&old_clock), |_| {});
+        let mut rtc = old.clock_block();
+        // Set to 2031-12-31 23:59:58, then 100 s of guest time.
+        for (index, value) in [58, 59, 23, 1 << 3, 12, 31, 31].into_iter().enumerate() {
+            rtc.write(RTCSEC + index as u8, value).unwrap();
+        }
+        rtc.write(RTCUPDATE0, RTCUPDATE0_WRITE).unwrap();
+        old_clock.set(Duration::from_secs(200));
+        let shown = read_time(&mut rtc);
+        let kept = old.battery_backed();
+
+        // Built later, from another host time, at guest time zero.
+        let new_clock = guest_clock(Duration::ZERO);
+        let new = Max77620::starting_at(2_000_000_000, Arc::clone(&new_clock), |_| {});
+        assert_eq!(
+            new.power_block().read(ONOFFIRQ),
+            Some(ONOFFIRQ_POWER_KEY_PRESSED)
+        );
+        new.power_up_from_reset(kept);
+        assert_eq!(new.power_block().read(ONOFFIRQ), Some(0));
+        let mut new_rtc = new.clock_block();
+        assert_eq!(read_time(&mut new_rtc), shown);
+        new_clock.set(Duration::from_secs(3));
+        // 2032-01-01 00:01:41.
+        assert_eq!(read_time(&mut new_rtc), [41, 1, 0, 1 << 4, 1, 32, 1]);
     }
 }

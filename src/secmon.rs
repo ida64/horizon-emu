@@ -55,17 +55,22 @@
 //! stays within; anything not modeled stops the machine instead of handing the
 //! guest a made-up answer.
 
-use std::{fmt, sync::Mutex};
+use std::{
+    fmt,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 pub mod cold_boot;
 pub mod crypto;
 pub mod sc7;
+pub mod setup;
 
 pub use cold_boot::{ColdBoot, ColdBootContext, ColdBootError, Released};
 
 use crate::{
     boot::{BootParams, CORE_COUNT, DRAM_BASE, DramSize},
     bus::{Access, Bus},
+    gic::Gic,
     keys::{Key, KeySet},
     memory::GuestRam,
     soc::mc::DeviceMemory,
@@ -640,6 +645,9 @@ pub struct SecureMonitor {
     params: BootParams,
     device_id: u64,
     state: Mutex<State>,
+    /// The interrupt controller, which the monitor sets up with Secure
+    /// accesses on the boot chain ([`setup`]): wiring, attached once.
+    gic: OnceLock<Arc<Gic>>,
 }
 
 struct State {
@@ -761,7 +769,31 @@ impl SecureMonitor {
                 boot_chain: false,
                 suspended: None,
             }),
+            gic: OnceLock::new(),
         }
+    }
+
+    /// Has the monitor set `gic` up on the boot chain ([`setup`]). Done once
+    /// by the machine; later calls change nothing.
+    pub fn attach_gic(&self, gic: Arc<Gic>) {
+        let _ = self.gic.set(gic);
+    }
+
+    /// The attached interrupt controller, for the boot chain's set-up.
+    fn gic(&self) -> Result<&Gic, sc7::Sc7Fail> {
+        self.gic
+            .get()
+            .map(|gic| &**gic)
+            .ok_or(sc7::Sc7Fail::Panic("no interrupt controller attached"))
+    }
+
+    /// The kernel's carveouts as the monitor programs them, `(base, size)`.
+    fn kernel_carveouts(&self) -> [(u64, u64); CARVEOUT_COUNT] {
+        self.state
+            .lock()
+            .unwrap()
+            .carveouts
+            .map(|carveout| (carveout.address, carveout.size))
     }
 
     /// Serves one SMC of `core`. `x` is `X0`-`X7` at the instruction and is
@@ -917,6 +949,7 @@ impl SecureMonitor {
             }
             function::CPU_ON => {
                 let (entry, context) = (x[2], x[3]);
+                let boot_chain = state.boot_chain;
                 let Some((core, on)) = usize::try_from(x[1])
                     .ok()
                     .and_then(|core| Some((core, state.cores_on.get_mut(core)?)))
@@ -930,6 +963,13 @@ impl SecureMonitor {
                 }
                 if !switch_core(bus, core, true) {
                     return unimplemented;
+                }
+                // The core starts in the monitor, which sets up its part of
+                // the interrupt controller (`0x1F0146F40`).
+                if boot_chain
+                    && let Err(fail) = self.gic().and_then(|gic| setup::core_interrupts(gic, core))
+                {
+                    return sc7_effect(fail);
                 }
                 *on = true;
                 x[0] = PSCI_SUCCESS;
@@ -963,6 +1003,7 @@ impl SecureMonitor {
                 let port = sc7::Port {
                     bus,
                     ram: engine.ram(),
+                    stack: sc7::STACK,
                 };
                 if state.boot_chain {
                     if state.charger_hi_z_mode {

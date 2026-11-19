@@ -11,12 +11,23 @@
 //! # What the kernel sees of the Security Extensions
 //!
 //! The kernel runs Non-secure, and the secure monitor hands it a controller in
-//! which every interrupt the kernel may own is Group 1. This model is that
-//! Non-secure view with all implemented interrupts in Group 1:
+//! which every interrupt the kernel may own is Group 1. Register accesses
+//! through the bus are the Non-secure view:
 //!
 //! - `GICD_IGROUPRn` is RAZ/WI. The kernel writes zero to it
 //!   (`Gic_InitializeCoreInterface`, `0x800d4f94`), which on this hardware
 //!   changes nothing.
+//! - A Group 0 interrupt's bits and fields read as zero and ignore writes,
+//!   an SGI request does not reach a CPU that has the SGI in Group 0
+//!   (specification 4.3), and a Group 0 interrupt is never signaled as an
+//!   IRQ: it would be the secure monitor's FIQ, which is not modelled. In
+//!   a machine started at the kernel no interrupt is in Group 0
+//!   ([`Gic::new`]); in one powered on, the controller starts from reset
+//!   and the high-level emulated secure monitor makes the Secure writes
+//!   of its set-up ([`Gic::secure_distributor_write`],
+//!   [`Gic::secure_cpu_interface_write`]), which leave interrupts 28
+//!   (per CPU), 77 (the activity monitor) and 90 (the security engine) in
+//!   Group 0. No device here drives those three.
 //! - `GICD_CTLR` and `GICC_CTLR` are the Non-secure copies: bit 0 enables
 //!   Group 1, and `GICC_CTLR` further holds only the two bypass disables and
 //!   `EOImodeNS`.
@@ -38,10 +49,9 @@
 //!   are Secure registers, RAZ/WI here (TRM table 3-6 note d, TRM 3.2.1).
 //!
 //! Writes to `GICC_PMR` are only honored by the hardware while the Secure view
-//! of the mask is `0x80` or above, and interrupts left in Group 0 are RAZ/WI.
-//! Both depend on state only the secure world can set; the model assumes the
-//! secure world left the mask in the Non-secure range and kept no interrupt in
-//! Group 0.
+//! of the mask is `0x80` or above; the model assumes the secure world left
+//! the mask in the Non-secure range (its Secure write of a lower mask is not
+//! modelled).
 //!
 //! # GIC-400 implementation choices (TRM)
 //!
@@ -109,6 +119,24 @@ const CONTROL_BITS: u32 = CONTROL_ENABLE_GROUP1
     | CONTROL_FIQ_BYPASS_DISABLE_GROUP1
     | CONTROL_IRQ_BYPASS_DISABLE_GROUP1
     | CONTROL_EOI_MODE_NS;
+
+/// The Secure `GICC_BPR` after reset and its minimum (TRM table 3-6).
+const SECURE_MIN_BINARY_POINT: u8 = 2;
+/// Secure `GICC_CTLR` bits (specification table 4-31): `EnableGrp1`,
+/// which the Non-secure copy shows as bit 0; `CBPR`; the Group 1 bypass
+/// disables and `EOImodeNS`, which it shows as bits 5, 6 and 9. The other
+/// bits are Secure only.
+const SECURE_CONTROL_ENABLE_GROUP1: u32 = 1 << 1;
+const SECURE_CONTROL_CBPR: u32 = 1 << 4;
+const SECURE_CONTROL_ALIASED: [(u32, u32); 4] = [
+    (SECURE_CONTROL_ENABLE_GROUP1, CONTROL_ENABLE_GROUP1),
+    (1 << 7, CONTROL_FIQ_BYPASS_DISABLE_GROUP1),
+    (1 << 8, CONTROL_IRQ_BYPASS_DISABLE_GROUP1),
+    (1 << 10, CONTROL_EOI_MODE_NS),
+];
+const SECURE_CONTROL_ONLY: u32 = 0x27D;
+/// Implemented bits of a priority value in the Secure view: five.
+const SECURE_PRIORITY_BITS: u8 = 0xf8;
 
 /// Interrupt ID field of `GICC_IAR`, `GICC_EOIR`, `GICC_DIR` and `GICC_HPPIR`.
 const INTID_FIELD: u32 = 0x3ff;
@@ -191,6 +219,12 @@ struct Interrupt {
     priority: u8,
     /// CPU interfaces an SPI is forwarded to.
     targets: u8,
+    /// In Group 0, the secure world's: Non-secure accesses read its fields
+    /// as zero and cannot change them, and it is never signaled as an IRQ
+    /// (it would be the secure monitor's FIQ). Every implemented interrupt
+    /// is in Group 0 after reset; the secure monitor moves the ones the
+    /// kernel owns to Group 1 ([`Gic::secure_distributor_write`]).
+    group0: bool,
 }
 
 impl Interrupt {
@@ -201,10 +235,10 @@ impl Interrupt {
     }
 }
 
-/// Whether a shared interrupt can be forwarded: enabled, pending and not
-/// active.
+/// Whether a shared interrupt can be forwarded: in Group 1, enabled,
+/// pending and not active.
 fn forwardable(spi: &Interrupt) -> bool {
-    spi.enabled && !spi.active && spi.pending()
+    !spi.group0 && spi.enabled && !spi.active && spi.pending()
 }
 
 /// One CPU interface and the distributor state banked for its processor.
@@ -221,6 +255,13 @@ struct Cpu {
     private: [Interrupt; PRIVATE_COUNT],
     /// Per SGI, the CPUs whose request for it is pending here.
     sgi_sources: [u8; SGI_COUNT],
+    /// The bits of the Secure `GICC_CTLR` that have no Non-secure alias
+    /// (`EnableGrp0`, `AckCtl`, `FIQEn`, `CBPR`, the Group 0 bypass
+    /// disables, `EOImodeS`): stored for the secure monitor, acting only
+    /// through `CBPR` on [`Self::binary_point`].
+    secure_control: u32,
+    /// The Secure `GICC_BPR`.
+    secure_binary_point: u8,
 }
 
 impl Cpu {
@@ -236,7 +277,26 @@ impl Cpu {
             active_priorities: 0,
             private,
             sgi_sources: [0; SGI_COUNT],
+            secure_control: 0,
+            secure_binary_point: SECURE_MIN_BINARY_POINT,
         }
+    }
+
+    /// The CPU interface and its processor's banked distributor state as
+    /// the controller comes out of reset: [`Self::new`] with every
+    /// interrupt in Group 0, the input lines kept.
+    fn reset(&mut self) {
+        let lines = self.private.map(|interrupt| interrupt.line);
+        *self = Self::new();
+        for (interrupt, line) in self.private.iter_mut().zip(lines) {
+            interrupt.line = line;
+            interrupt.group0 = true;
+        }
+    }
+
+    /// Whether `CBPR` has the Secure binary point stand for Group 1 too.
+    fn common_binary_point(&self) -> bool {
+        self.secure_control & SECURE_CONTROL_CBPR != 0
     }
 
     /// The part of `priority` that decides preemption.
@@ -299,6 +359,9 @@ fn bitmap_first_intid(offset: usize) -> usize {
 struct State {
     /// Non-secure `GICD_CTLR.EnableGrp1`.
     forwarding: bool,
+    /// Secure `GICD_CTLR.EnableGrp0`: stored for the secure monitor; no
+    /// Group 0 interrupt is signaled here.
+    group0_forwarding: bool,
     cpus: Box<[Cpu]>,
     #[serde(with = "crate::snapshot::array")]
     spis: [Interrupt; SPI_COUNT],
@@ -308,8 +371,27 @@ impl State {
     fn new(core_count: usize) -> Self {
         Self {
             forwarding: false,
+            group0_forwarding: false,
             cpus: (0..core_count).map(|_| Cpu::new()).collect(),
             spis: [Interrupt::default(); SPI_COUNT],
+        }
+    }
+
+    /// The controller as it comes out of reset (specification 4.3, TRM
+    /// 3.2): both groups' forwarding off, every interrupt in Group 0,
+    /// disabled, inactive, not pending, at priority 0, targeting no CPU
+    /// and level-sensitive; every CPU interface as [`Cpu::reset`] leaves
+    /// it. The input lines are the devices' and stay as they are.
+    fn reset(&mut self) {
+        self.forwarding = false;
+        self.group0_forwarding = false;
+        self.cpus.iter_mut().for_each(Cpu::reset);
+        for spi in &mut self.spis {
+            *spi = Interrupt {
+                line: spi.line,
+                group0: true,
+                ..Interrupt::default()
+            };
         }
     }
 
@@ -339,9 +421,24 @@ impl State {
         self.spis.get_mut(intid.checked_sub(PRIVATE_COUNT)?)
     }
 
+    /// [`Self::interrupt`] as a Non-secure access sees it: `None` for a
+    /// Group 0 interrupt, whose fields read as zero and ignore writes.
+    fn visible(&self, core: usize, intid: usize) -> Option<&Interrupt> {
+        self.interrupt(core, intid)
+            .filter(|interrupt| !interrupt.group0)
+    }
+
+    fn visible_mut(&mut self, core: usize, intid: usize) -> Option<&mut Interrupt> {
+        self.interrupt_mut(core, intid)
+            .filter(|interrupt| !interrupt.group0)
+    }
+
     /// Pending status as the pending registers report it, which includes
     /// interrupts that are also active.
     fn includes_pending(&self, core: usize, intid: usize) -> bool {
+        if self.visible(core, intid).is_none() {
+            return false;
+        }
         match self.cpus[core].sgi_sources.get(intid) {
             Some(&sources) => sources != 0,
             // TRM 2.8: a disabled distributor hides level-sensitive inputs here.
@@ -382,7 +479,7 @@ impl State {
                     Some(&sources) => sources != 0,
                     None => interrupt.pending(),
                 };
-                pending && interrupt.enabled && !interrupt.active
+                !interrupt.group0 && pending && interrupt.enabled && !interrupt.active
             })
             .map(|(intid, interrupt)| (interrupt.priority, intid))
             .min()
@@ -474,7 +571,7 @@ impl State {
     /// completes. `None` is a write the specification makes UNPREDICTABLE:
     /// the interrupt does not exist or is not active.
     fn completed_interrupt(&mut self, core: usize, intid: usize) -> Option<&mut Interrupt> {
-        self.interrupt_mut(core, intid)
+        self.visible_mut(core, intid)
             .filter(|interrupt| interrupt.active)
     }
 
@@ -520,11 +617,13 @@ impl State {
             0b10 => requester,
             _ => return None,
         };
-        // TRM 2.8: SGIs cannot be made pending while the distributor is disabled.
+        // TRM 2.8: SGIs cannot be made pending while the distributor is
+        // disabled; a Non-secure request reaches only targets that have
+        // the SGI in Group 1 (specification 4.3.15).
         if self.forwarding {
             let sgi = (value & 0xf) as usize;
             for (index, cpu) in self.cpus.iter_mut().enumerate() {
-                if targets & (1 << index) != 0 {
+                if targets & (1 << index) != 0 && !cpu.private[sgi].group0 {
                     cpu.sgi_sources[sgi] |= requester;
                 }
             }
@@ -555,16 +654,21 @@ impl State {
     fn read_byte_field(&self, core: usize, field: ByteField) -> u8 {
         match field {
             ByteField::Priority(intid) => self
-                .interrupt(core, intid)
+                .visible(core, intid)
                 .map_or(0, |interrupt| interrupt.priority),
-            ByteField::Targets(intid) => match self.interrupt(core, intid) {
+            ByteField::Targets(intid) => match self.visible(core, intid) {
                 Some(spi) if intid >= PRIVATE_COUNT => spi.targets,
                 // A private interrupt targets exactly the processor reading it.
                 Some(_) => 1 << core,
                 None => 0,
             },
             ByteField::ClearSgiPending(sgi) | ByteField::SetSgiPending(sgi) => {
-                self.cpus[core].sgi_sources[sgi]
+                let cpu = &self.cpus[core];
+                if cpu.private[sgi].group0 {
+                    0
+                } else {
+                    cpu.sgi_sources[sgi]
+                }
             }
         }
     }
@@ -573,29 +677,33 @@ impl State {
         let cpu_mask = self.cpu_mask();
         match field {
             ByteField::Priority(intid) => {
-                if let Some(interrupt) = self.interrupt_mut(core, intid) {
+                if let Some(interrupt) = self.visible_mut(core, intid) {
                     interrupt.priority = value & PRIORITY_BITS;
                 }
             }
             // The targets of private interrupts are read-only.
             ByteField::Targets(intid) => {
-                if let Some(spi) = self.spi_mut(intid) {
+                if let Some(spi) = self.spi_mut(intid).filter(|spi| !spi.group0) {
                     spi.targets = value & cpu_mask;
                 }
             }
+            ByteField::ClearSgiPending(sgi) | ByteField::SetSgiPending(sgi)
+                if self.cpus[core].private[sgi].group0 => {}
             ByteField::ClearSgiPending(sgi) => self.cpus[core].sgi_sources[sgi] &= !value,
             ByteField::SetSgiPending(sgi) => self.cpus[core].sgi_sources[sgi] |= value & cpu_mask,
         }
     }
 
     /// Applies `update` to every implemented interrupt from `first_writable`
-    /// up that `value` selects in the bitmap register word at `offset`.
+    /// up that `value` selects in the bitmap register word at `offset`;
+    /// a Non-secure access (`secure` false) only to those in Group 1.
     fn update_selected(
         &mut self,
         core: usize,
         offset: usize,
         value: u32,
         first_writable: usize,
+        secure: bool,
         update: impl Fn(&mut Interrupt),
     ) {
         let first = bitmap_first_intid(offset);
@@ -605,6 +713,7 @@ impl State {
         {
             if intid >= first_writable
                 && let Some(interrupt) = self.interrupt_mut(core, intid)
+                && (secure || !interrupt.group0)
             {
                 update(interrupt);
             }
@@ -613,10 +722,15 @@ impl State {
 
     /// `GICD_ICFGRn`, two bits per interrupt: bit 1 selects edge-triggered,
     /// bit 0 is the read-only legacy bit that reads as one for peripherals.
-    fn read_configuration(&self, core: usize, register: usize) -> u32 {
+    /// A Non-secure read (`secure` false) sees Group 0 interrupts' fields
+    /// as zero.
+    fn read_configuration(&self, core: usize, register: usize, secure: bool) -> u32 {
         (0..16).fold(0, |value, field| {
             let intid = register * 16 + field;
-            let config = match self.interrupt(core, intid) {
+            let interrupt = self
+                .interrupt(core, intid)
+                .filter(|interrupt| secure || !interrupt.group0);
+            let config = match interrupt {
                 Some(_) if intid < SGI_COUNT => 0b10,
                 Some(interrupt) => 0b01 | u32::from(interrupt.edge_triggered) << 1,
                 None => 0b00,
@@ -625,9 +739,13 @@ impl State {
         })
     }
 
-    fn write_configuration(&mut self, register: usize, value: u32) {
+    /// A write of `GICD_ICFGRn`; a Non-secure one (`secure` false) leaves
+    /// Group 0 interrupts alone.
+    fn write_configuration(&mut self, register: usize, value: u32, secure: bool) {
         for field in 0..16 {
-            if let Some(spi) = self.spi_mut(register * 16 + field) {
+            if let Some(spi) = self.spi_mut(register * 16 + field)
+                && (secure || !spi.group0)
+            {
                 spi.edge_triggered = value & (0b10 << (2 * field)) != 0;
             }
         }
@@ -663,15 +781,17 @@ impl State {
             gicd::IIDR => DISTRIBUTOR_IIDR,
             gicd::IGROUPR..gicd::ISENABLER => 0,
             gicd::ISENABLER..gicd::ISPENDR => bitmap(&|intid| {
-                self.interrupt(core, intid)
+                self.visible(core, intid)
                     .is_some_and(|interrupt| interrupt.enabled)
             }),
             gicd::ISPENDR..gicd::ISACTIVER => bitmap(&|intid| self.includes_pending(core, intid)),
             gicd::ISACTIVER..gicd::IPRIORITYR => bitmap(&|intid| {
-                self.interrupt(core, intid)
+                self.visible(core, intid)
                     .is_some_and(|interrupt| interrupt.active)
             }),
-            gicd::ICFGR..gicd::PPISR => self.read_configuration(core, (offset - gicd::ICFGR) / 4),
+            gicd::ICFGR..gicd::PPISR => {
+                self.read_configuration(core, (offset - gicd::ICFGR) / 4, false)
+            }
             gicd::PPISR => {
                 let private = &self.cpus[core].private;
                 pack_bits(SGI_COUNT, |bit| private[SGI_COUNT + bit].line)
@@ -718,36 +838,184 @@ impl State {
             // The enable and pending bits of SGIs ignore writes; SGIs have
             // their own pending registers.
             gicd::ISENABLER..gicd::ICENABLER => {
-                self.update_selected(core, offset, value, SGI_COUNT, |interrupt| {
+                self.update_selected(core, offset, value, SGI_COUNT, false, |interrupt| {
                     interrupt.enabled = true;
                 });
             }
             gicd::ICENABLER..gicd::ISPENDR => {
-                self.update_selected(core, offset, value, SGI_COUNT, |interrupt| {
+                self.update_selected(core, offset, value, SGI_COUNT, false, |interrupt| {
                     interrupt.enabled = false;
                 });
             }
             gicd::ISPENDR..gicd::ICPENDR => {
-                self.update_selected(core, offset, value, SGI_COUNT, |interrupt| {
+                self.update_selected(core, offset, value, SGI_COUNT, false, |interrupt| {
                     interrupt.latched = true;
                 });
             }
             gicd::ICPENDR..gicd::ISACTIVER => {
-                self.update_selected(core, offset, value, SGI_COUNT, |interrupt| {
+                self.update_selected(core, offset, value, SGI_COUNT, false, |interrupt| {
                     interrupt.latched = false;
                 });
             }
             gicd::ISACTIVER..gicd::ICACTIVER => {
-                self.update_selected(core, offset, value, 0, |interrupt| interrupt.active = true);
+                self.update_selected(core, offset, value, 0, false, |interrupt| {
+                    interrupt.active = true;
+                });
             }
             gicd::ICACTIVER..gicd::IPRIORITYR => {
-                self.update_selected(core, offset, value, 0, |interrupt| interrupt.active = false);
+                self.update_selected(core, offset, value, 0, false, |interrupt| {
+                    interrupt.active = false;
+                });
             }
             gicd::ICFGR..gicd::PPISR => {
-                self.write_configuration((offset - gicd::ICFGR) / 4, value);
+                self.write_configuration((offset - gicd::ICFGR) / 4, value, false);
             }
             gicd::SGIR => self.generate_sgi(core, value)?,
             _ => return None,
+        }
+        Some(())
+    }
+
+    /// A Secure word read by `core` of the distributor register at
+    /// `offset`, for the read-modify-writes of
+    /// [`Self::secure_distributor_write`]'s registers: those registers as
+    /// the Secure view shows them, Group 1 priorities as the Secure value
+    /// (the Non-secure view shifted right by one, bit 7 set). Others: `None`.
+    fn secure_distributor_read(&self, core: usize, offset: usize) -> Option<u32> {
+        if !offset.is_multiple_of(4) {
+            return None;
+        }
+        let bitmap = |bit: &dyn Fn(&Interrupt) -> bool| {
+            let first = bitmap_first_intid(offset);
+            pack_bits(32, |index| {
+                self.interrupt(core, first + index).is_some_and(bit)
+            })
+        };
+        let bytes = |byte: &dyn Fn(usize) -> u8| {
+            (0..4).fold(0, |value, index| {
+                value | u32::from(byte(index)) << (8 * index)
+            })
+        };
+        Some(match offset {
+            gicd::CTLR => u32::from(self.group0_forwarding) | u32::from(self.forwarding) << 1,
+            gicd::IGROUPR..gicd::ISENABLER => bitmap(&|interrupt| !interrupt.group0),
+            gicd::ISENABLER..gicd::ISPENDR => bitmap(&|interrupt| interrupt.enabled),
+            gicd::IPRIORITYR..gicd::IPRIORITYR_END => bytes(&|index| {
+                let intid = offset - gicd::IPRIORITYR + index;
+                self.interrupt(core, intid).map_or(0, |interrupt| {
+                    if interrupt.group0 {
+                        interrupt.priority
+                    } else {
+                        interrupt.priority >> 1 | 0x80
+                    }
+                })
+            }),
+            gicd::ITARGETSR..gicd::ITARGETSR_END => bytes(&|index| {
+                let intid = offset - gicd::ITARGETSR + index;
+                match self.interrupt(core, intid) {
+                    Some(spi) if intid >= PRIVATE_COUNT => spi.targets,
+                    Some(_) => 1 << core,
+                    None => 0,
+                }
+            }),
+            gicd::ICFGR..gicd::PPISR => {
+                self.read_configuration(core, (offset - gicd::ICFGR) / 4, true)
+            }
+            _ => return None,
+        })
+    }
+
+    /// A Secure word write by `core` to the distributor, as the secure
+    /// monitor makes them: `GICD_CTLR` (bit 0 `EnableGrp0`, bit 1 the
+    /// Non-secure `EnableGrp1`), `GICD_IGROUPRn` (a bit per interrupt,
+    /// set for Group 1), the enable registers and `GICD_ICFGRn` of either
+    /// group, and the priority and target bytes. A priority byte of a Group
+    /// 1 interrupt is kept as the Non-secure view shows it, the Secure value
+    /// shifted left by one (specification 3.5.1); one of a Group 0
+    /// interrupt as the Secure value. Other registers: `None`, not modelled.
+    fn secure_distributor_write(&mut self, core: usize, offset: usize, value: u32) -> Option<()> {
+        if !offset.is_multiple_of(4) {
+            return None;
+        }
+        match offset {
+            gicd::CTLR => {
+                self.group0_forwarding = value & 1 != 0;
+                self.forwarding = value & 2 != 0;
+            }
+            gicd::IGROUPR..gicd::ISENABLER => {
+                let first = bitmap_first_intid(offset);
+                for index in 0..32 {
+                    if let Some(interrupt) = self.interrupt_mut(core, first + index) {
+                        interrupt.group0 = value & 1 << index == 0;
+                    }
+                }
+            }
+            gicd::ISENABLER..gicd::ICENABLER => {
+                self.update_selected(core, offset, value, SGI_COUNT, true, |interrupt| {
+                    interrupt.enabled = true;
+                });
+            }
+            gicd::ICENABLER..gicd::ISPENDR => {
+                self.update_selected(core, offset, value, SGI_COUNT, true, |interrupt| {
+                    interrupt.enabled = false;
+                });
+            }
+            gicd::IPRIORITYR..gicd::IPRIORITYR_END => {
+                for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
+                    let intid = offset - gicd::IPRIORITYR + index;
+                    if let Some(interrupt) = self.interrupt_mut(core, intid) {
+                        interrupt.priority = if interrupt.group0 {
+                            byte & SECURE_PRIORITY_BITS
+                        } else {
+                            byte << 1 & PRIORITY_BITS
+                        };
+                    }
+                }
+            }
+            gicd::ITARGETSR..gicd::ITARGETSR_END => {
+                let cpu_mask = self.cpu_mask();
+                for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
+                    if let Some(spi) = self.spi_mut(offset - gicd::ITARGETSR + index) {
+                        spi.targets = byte & cpu_mask;
+                    }
+                }
+            }
+            gicd::ICFGR..gicd::PPISR => {
+                self.write_configuration((offset - gicd::ICFGR) / 4, value, true);
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    /// A Secure write to `core`'s CPU interface, as the secure monitor
+    /// makes them: `GICC_CTLR`, whose Group 1 bits the Non-secure copy
+    /// shows ([`SECURE_CONTROL_ALIASED`]); `GICC_PMR` at `0x80` or above,
+    /// which the Non-secure view shows shifted left by one (a lower mask
+    /// would leave Non-secure writes ignored, which is not modelled);
+    /// `GICC_BPR`. With `CBPR` set the Non-secure `GICC_BPR` reads the
+    /// Secure one plus one, at most 7, and ignores writes (specification
+    /// 4.4.3). Other registers: `None`, not modelled.
+    fn secure_cpu_interface_write(&mut self, core: usize, offset: usize, value: u32) -> Option<()> {
+        let cpu = &mut self.cpus[core];
+        match offset {
+            gicc::CTLR => {
+                cpu.secure_control = value & SECURE_CONTROL_ONLY;
+                cpu.control = SECURE_CONTROL_ALIASED
+                    .iter()
+                    .filter(|&&(secure, _)| value & secure != 0)
+                    .fold(0, |control, &(_, alias)| control | alias);
+            }
+            gicc::PMR if value & 0xFF >= 0x80 => {
+                cpu.priority_mask = (value as u8) << 1 & PRIORITY_BITS;
+            }
+            gicc::BPR => {
+                cpu.secure_binary_point = (value as u8 & 0b111).max(SECURE_MIN_BINARY_POINT);
+            }
+            _ => return None,
+        }
+        if cpu.common_binary_point() {
+            cpu.binary_point = (cpu.secure_binary_point + 1).clamp(MIN_BINARY_POINT, 7);
         }
         Some(())
     }
@@ -788,6 +1056,7 @@ impl State {
         match offset {
             gicc::CTLR => cpu.control = value & CONTROL_BITS,
             gicc::PMR => cpu.priority_mask = value as u8 & PRIORITY_BITS,
+            gicc::BPR if cpu.common_binary_point() => {}
             gicc::BPR => cpu.binary_point = (value as u8 & 0b111).max(MIN_BINARY_POINT),
             gicc::EOIR => self.end_of_interrupt(core, value)?,
             // Read-only registers, and the aliases that only Secure accesses reach.
@@ -822,8 +1091,10 @@ pub struct Gic {
 }
 
 impl Gic {
-    /// Creates the controller as it is before the kernel programs it: nothing
-    /// enabled, pending or active, and every interrupt in Group 1.
+    /// Creates the controller as the secure monitor hands it to the kernel
+    /// in a machine started at the kernel, which runs no monitor set-up:
+    /// nothing enabled, pending or active, and every interrupt in Group 1.
+    /// A machine powered on from the boot ROM [`Self::reset`]s it first.
     ///
     /// `irq_raised(core)` is invoked, with no internal lock held, every time
     /// the IRQ output to `core` has gone from deasserted to asserted.
@@ -908,6 +1179,43 @@ impl Gic {
     ) -> Option<()> {
         let offset = usize::try_from(offset).ok()?;
         self.update(|state| state.cpu_interface_write(core, offset, usize::from(size), value))
+    }
+
+    /// The controller as it comes out of reset: every interrupt in Group
+    /// 0, disabled, inactive and not pending, every register at its reset
+    /// value; the devices' input lines as they are. Reset happens at power
+    /// on and when the SoC loses power in SC7; the secure monitor sets the
+    /// Secure side up again ([`Self::secure_distributor_write`],
+    /// [`Self::secure_cpu_interface_write`]) and the kernel its own.
+    pub fn reset(&self) {
+        self.update(State::reset);
+    }
+
+    /// A Secure 32-bit read by `core` of the distributor register at
+    /// `offset`, of the registers [`Self::secure_distributor_write`]
+    /// writes. `None`: a register whose Secure read is not modelled.
+    pub fn secure_distributor_read(&self, core: usize, offset: u64) -> Option<u32> {
+        let offset = usize::try_from(offset).ok()?;
+        self.state
+            .lock()
+            .unwrap()
+            .secure_distributor_read(core, offset)
+    }
+
+    /// A Secure 32-bit write by `core` to the distributor register at
+    /// `offset`: the secure monitor's, which reaches what Non-secure
+    /// accesses cannot (Group 0, the group registers). `None`: a register
+    /// whose Secure write is not modelled.
+    pub fn secure_distributor_write(&self, core: usize, offset: u64, value: u32) -> Option<()> {
+        let offset = usize::try_from(offset).ok()?;
+        self.update(|state| state.secure_distributor_write(core, offset, value))
+    }
+
+    /// A Secure 32-bit write to `core`'s CPU interface register at
+    /// `offset`; see [`Self::secure_distributor_write`].
+    pub fn secure_cpu_interface_write(&self, core: usize, offset: u64, value: u32) -> Option<()> {
+        let offset = usize::try_from(offset).ok()?;
+        self.update(|state| state.secure_cpu_interface_write(core, offset, value))
     }
 
     /// Drives the input line of interrupt `intid` from a device model. PPIs
@@ -1732,9 +2040,81 @@ mod tests {
             .map(|(index, spi)| (PRIVATE_COUNT + index, spi));
         private
             .chain(shared)
-            .filter(|(_, interrupt)| interrupt.enabled && !interrupt.active)
+            .filter(|(_, interrupt)| !interrupt.group0 && interrupt.enabled && !interrupt.active)
             .map(|(intid, interrupt)| (interrupt.priority, intid))
             .min()
+    }
+
+    /// After reset every interrupt is Group 0, which the Non-secure view
+    /// cannot see or signal; the secure monitor's Secure writes move the
+    /// kernel's interrupts to Group 1 and keep its own.
+    #[test]
+    fn reset_hides_everything_until_the_secure_side_moves_it_to_group_1() {
+        let bench = Bench::enabled();
+        bench.route_spi(40, 0x10, 0b1);
+        bench.gic.set_line(0, 40, true);
+        assert!(bench.gic.irq_asserted(0));
+        bench.gic.reset();
+        assert!(!bench.gic.irq_asserted(0));
+        // The line is the device's and stays; nothing else does.
+        assert_eq!(bench.d_read(0, GICD_SPISR), 1 << 8);
+        assert_eq!(bench.d_read(0, GICD_CTLR), 0);
+        bench.d_write(0, GICD_CTLR, 1);
+        bench.c_write(0, GICC_CTLR, 1);
+        bench.c_write(0, GICC_PMR, 0xff);
+        bench.route_spi(40, 0x10, 0b1);
+        assert_eq!(bench.d_read(0, GICD_ISENABLER + 4), 0, "Group 0: RAZ/WI");
+        assert!(!bench.gic.irq_asserted(0));
+
+        let secure = |offset: u64, value: u32| {
+            bench
+                .gic
+                .secure_distributor_write(0, offset, value)
+                .unwrap();
+        };
+        secure(GICD_IGROUPR + 4, ALL);
+        secure(GICD_IPRIORITYR + 40, 0x8080_8080);
+        assert_eq!(
+            bench.gic.secure_distributor_read(0, GICD_IPRIORITYR + 40),
+            Some(0x8080_8080)
+        );
+        // Secure 0x80 is Non-secure 0x00.
+        assert_eq!(bench.d_read(0, GICD_IPRIORITYR + 40), 0);
+        // Group 1 forwarding stays the kernel's: the Secure write of 1
+        // enables Group 0 only.
+        secure(GICD_CTLR, 1);
+        assert_eq!(bench.d_read(0, GICD_CTLR), 0);
+        assert_eq!(bench.gic.secure_distributor_read(0, GICD_CTLR), Some(1));
+        bench.d_write(0, GICD_CTLR, 1);
+        bench.route_spi(40, 0x10, 0b1);
+        assert!(bench.gic.irq_asserted(0));
+        assert_eq!(bench.c_read(0, GICC_IAR), 40);
+        bench.c_write(0, GICC_EOIR, 40);
+
+        // Back to Group 0: gone from the Non-secure view, never signaled.
+        secure(GICD_IGROUPR + 4, !(1 << 8));
+        assert!(!bench.gic.irq_asserted(0));
+        assert_eq!(bench.d_read(0, GICD_ISENABLER + 4), 0);
+        assert_eq!(bench.c_read(0, GICC_HPPIR), SPURIOUS_INTID);
+
+        // CBPR: the Non-secure binary point follows the Secure one.
+        bench
+            .gic
+            .secure_cpu_interface_write(0, GICC_CTLR, 0x1D9)
+            .unwrap();
+        bench
+            .gic
+            .secure_cpu_interface_write(0, GICC_BPR, 2)
+            .unwrap();
+        assert_eq!(bench.c_read(0, GICC_BPR), 3);
+        bench.c_write(0, GICC_BPR, 7);
+        assert_eq!(bench.c_read(0, GICC_BPR), 3, "ignored under CBPR");
+        // EnableGrp1 is Secure bit 1; bits 7 and 8 show as 5 and 6.
+        assert_eq!(bench.c_read(0, GICC_CTLR), 0x60);
+        assert_eq!(
+            bench.gic.secure_cpu_interface_write(0, GICC_PMR, 0x40),
+            None
+        );
     }
 
     /// [`State::signaling`] looks at the shared interrupts once for all
@@ -1764,6 +2144,7 @@ mod tests {
                     edge_triggered: random(2) == 0,
                     priority: (random(4) as u8) << 6,
                     targets: random(16) as u8,
+                    group0: random(8) == 0,
                 };
             };
             for spi in &mut state.spis {

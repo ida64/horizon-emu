@@ -109,17 +109,21 @@
 //!   not public, so nothing is cleared.
 //!
 //! Reset values: `SE_SECURITY` reads `0x0001_0005` (everything open), the
-//! access registers all ones (`0xFF` for AES slots, `0x7` for RSA slots,
-//! all bits of the per-key registers), key slots zero, `SE_TZRAM_SECURITY`
-//! 1, every other register zero \[assumption: none of these is public; the
-//! drivers only ever clear permission bits. The NX bootloader's check of
-//! the state it starts in (text `0x4000C4D8..0x4000C6CC`) agrees with
-//! every one of them it reads but what runs before it changes: slots 14 and
-//! 15 read-protected (boot ROM), slot 13's per-key bit clear (\[inference\]:
-//! the TSEC step, which installs slot 13)\]. The AES access
-//! registers hold 8 bits (Trusted
-//! Firmware-A's context layout saves bits 7:0); bit 7's meaning is not
-//! public, so it is kept and gates nothing.
+//! access registers every permission (`0x7F` for AES slots, `0x7` for RSA
+//! slots, all bits of the per-key registers), key slots zero,
+//! `SE_TZRAM_SECURITY` 1, every other register zero \[assumption: none of
+//! these is public; the drivers only ever clear permission bits. The NX
+//! bootloader's check of the state it starts in (text
+//! `0x4000C4D8..0x4000C6CC`) agrees with every one of them it reads but
+//! what runs before it changes: slots 14 and 15 read-protected (boot ROM),
+//! slot 13's per-key bit clear (\[inference\]: the TSEC step, which installs
+//! slot 13)\]. The AES access registers hold 8 bits (Trusted Firmware-A's
+//! context layout saves bits 7:0); bit 7's meaning is not public, it gates
+//! nothing and reads 0 from reset \[inference: the secure monitor's check
+//! of the engine's settings, `0x1F01423EC` with its table at
+//! `0x1F01480A8`, compares each access register's low half with a value
+//! whose bit 7 is clear, after writes of its own that keep bit 7 as they
+//! find it (`0x1F0141544`); a set bit 7 would be its panic at every boot\].
 //!
 //! # Refusals
 //!
@@ -128,10 +132,17 @@
 //! IV word whose update permission is gone (an RSA key word by register,
 //! any word by an operation into the key table, or through
 //! [`Se::load_key`] which returns an error instead; AES key and IV words
-//! written through `_DATA` are ignored, see above), using a slot whose key
-//! use permission is gone, input or
+//! written through `_DATA` are ignored, see above), using an RSA slot
+//! whose key use permission is gone, input or
 //! output lists too short for the operation, restarts, and any field
-//! combination not listed above, the context save's included.
+//! combination not listed above, the context save's included. An AES
+//! slot's key use permission gates nothing \[inference: the secure monitor
+//! takes it from slots 8 to 15 (`0x1F01E1368`, flags `0x140`) and then
+//! decrypts with slot 13's key into slot 12 there and runs every key of
+//! slots 10 to 15 through the engine for its digest (`0x1F0143DD8`),
+//! which a refusal would end in its panic; what the permission keeps from
+//! a non-secure requester is not public, and every requester that reaches
+//! this device is taken as secure\].
 //!
 //! # Context save
 //!
@@ -386,7 +397,7 @@ const ACCESS_OIV_UPDATE: u32 = 1 << 3;
 const ACCESS_UIV_READ: u32 = 1 << 4;
 const ACCESS_UIV_UPDATE: u32 = 1 << 5;
 const ACCESS_KEY_USE: u32 = 1 << 6;
-const ACCESS_RESET: u32 = 0xFF;
+const ACCESS_RESET: u32 = 0x7F;
 /// RSA slot access register bits.
 const RSA_ACCESS_KEY_READ: u32 = 1 << 0;
 const RSA_ACCESS_KEY_UPDATE: u32 = 1 << 1;
@@ -402,9 +413,8 @@ const LIST_ENTRY_SIZE_MAX: u32 = 0xFF_FFFF;
 /// [`Se::load_key`] flags, in the encoding the public drivers pass to
 /// their key slot lock functions: bits 0 to 6 revoke the access register
 /// bits of the same number (if any of them is given, the register is
-/// written with the complement of the flags, so bit 7 of the register goes
-/// with flag bit 7), and [`LOCK_PER_KEY`] clears the slot's bit of
-/// `SE_CRYPTO_SECURITY_PERKEY`.
+/// written with the complement of the flags), and [`LOCK_PER_KEY`] clears
+/// the slot's bit of `SE_CRYPTO_SECURITY_PERKEY`.
 pub const LOCK_KEY_READ: u32 = ACCESS_KEY_READ;
 pub const LOCK_KEY_UPDATE: u32 = ACCESS_KEY_UPDATE;
 pub const LOCK_OIV_READ: u32 = ACCESS_OIV_READ;
@@ -1340,11 +1350,6 @@ impl State {
             2 => 32,
             _ => return Err(format!("AES key mode {mode} is not one")),
         };
-        if self.slots[slot].access & ACCESS_KEY_USE == 0 {
-            return Err(format!(
-                "AES with key slot {slot}, whose access register forbids its use"
-            ));
-        }
         let xors = xor != XOR_BYPASS;
         let reads_memory = input == INPUT_MEMORY
             || xors && matches!(vector_select, VECTOR_MEMORY | VECTOR_PREVIOUS_MEMORY);
@@ -2216,7 +2221,7 @@ mod tests {
             u32::from_le_bytes(key[4..8].try_into().unwrap())
         );
         bench.write(CRYPTO_KEYTABLE_ACCESS + 14 * 4, !LOCK_KEY_READ);
-        assert_eq!(bench.read(CRYPTO_KEYTABLE_ACCESS + 14 * 4), 0xFE);
+        assert_eq!(bench.read(CRYPTO_KEYTABLE_ACCESS + 14 * 4), 0x7E);
         assert_eq!(bench.read(CRYPTO_KEYTABLE_DATA), 0);
         bench.write(CRYPTO_SECURITY_PERKEY, !(1 << 14));
         assert_eq!(bench.read(CRYPTO_KEYTABLE_DATA), 0xFFFF_FFFF);
@@ -2245,7 +2250,7 @@ mod tests {
             .se
             .load_key(15, &key, LOCK_KEY_READ | LOCK_KEY_UPDATE | LOCK_PER_KEY)
             .unwrap();
-        // Bit 7 goes with the per-key flag, as in the drivers' encoding.
+        // Bit 7 reads 0 from reset.
         assert_eq!(bench.read(CRYPTO_KEYTABLE_ACCESS + 15 * 4), 0x7C);
         assert_eq!(bench.read(CRYPTO_SECURITY_PERKEY), 0x7FFF);
         // Permissions only go.
@@ -2263,12 +2268,14 @@ mod tests {
             bench.aes(15, 0, ECB_ENCRYPT, &[0xA5; 16]),
             bench.aes(0, 0, ECB_ENCRYPT, &[0xA5; 16])
         );
-        // Without key use the slot does nothing.
+        // Without key use the slot still serves: every requester is secure.
         bench.se.load_key(1, &key, LOCK_KEY_USE).unwrap();
-        bench.write(CONFIG, config(ALG_AES, ALG_NOP, 0, DST_MEMORY));
-        bench.write(CRYPTO_CONFIG, ECB_ENCRYPT | 1 << 24);
-        assert_eq!(bench.se.write(0, OPERATION, 4, OP_START.into()), None);
-        assert!(bench.notes.take()[0].contains("forbids its use"));
+        assert_eq!(bench.read(CRYPTO_KEYTABLE_ACCESS + 4), 0x3F);
+        assert_eq!(
+            bench.aes(1, 0, ECB_ENCRYPT, &[0xA5; 16]),
+            bench.aes(15, 0, ECB_ENCRYPT, &[0xA5; 16])
+        );
+        assert!(bench.notes.take().is_empty());
     }
 
     #[test]
@@ -2410,7 +2417,7 @@ mod tests {
         let restored = Bench::new();
         restored.se.restore(&saved).unwrap();
         assert_eq!(random(&restored), random(&first));
-        assert_eq!(restored.read(CRYPTO_KEYTABLE_ACCESS + 9 * 4), 0xFE);
+        assert_eq!(restored.read(CRYPTO_KEYTABLE_ACCESS + 9 * 4), 0x7E);
         assert_eq!(
             restored.aes(9, 0, ECB_ENCRYPT, &[1; 16]),
             first.aes(9, 0, ECB_ENCRYPT, &[1; 16])
