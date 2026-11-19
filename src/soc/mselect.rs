@@ -20,7 +20,7 @@
 //! bits 25:24 cleared (coreboot's names: `ERR_RESP_EN_SLAVE1/2`) and
 //! 29:27 set (`WRAP_TO_INCR_SLAVE0..2`). Out of reset, the registers'
 //! reset values are not public. `MSELECT_CONFIG` reads
-//! [`CONFIG_OUT_OF_RESET`]: \[inference\] the error-response bits set,
+//! `0x0300_0000`: \[inference\] the error-response bits set,
 //! since every public sequence (coreboot `mselect_enable_wrap`, TF-A's
 //! Tegra210 platform code, hekate, the monitor and the warmboot here)
 //! clears them, and \[assumption\] every other bit clear; nothing here
