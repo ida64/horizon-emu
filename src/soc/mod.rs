@@ -136,6 +136,9 @@ const SDMMC4_INTID: u32 = 32 + 31;
 const SDMMC2_BASE: u64 = 0x700B_0200;
 const SDMMC2_INTID: u32 = 32 + 15;
 
+/// The BPMP's cache controller (hekate `bpmp.c` `BPMP_CACHE_BASE`).
+const BPMP_CACHE_BASE: u64 = 0x5004_0000;
+
 /// Explanations devices leave when they refuse an access, for whoever reads
 /// the machine's stop report.
 #[derive(Default)]
@@ -896,6 +899,22 @@ impl Soc {
                     iram::RESERVED_BASE,
                     iram::RESERVED_SIZE,
                     Box::new(iram::AfterIram::new(Arc::clone(&soc.notes))),
+                );
+                // The BPMP's cache controller (hekate `bpmp.c`
+                // `BPMP_CACHE_CONFIG`; Atmosphère `tegra_avp_cache.hpp`):
+                // only its configuration register, which the monitor's SC7
+                // stub changes by read-modify-write (it sets DISABLE_WB and
+                // DISABLE_RB, bits 10 and 11, text `0x40003464`). No cache
+                // is emulated, so its bits only store. \[assumption\] It
+                // reads 0 (cache disabled) until written: no stage of the
+                // boot chain writes it before the stub, and its power-on
+                // value is not public. Its other registers keep what is
+                // written and refuse reads until then.
+                bus.map(
+                    "BPMP cache controller",
+                    BPMP_CACHE_BASE,
+                    0x1000,
+                    Box::new(RegisterFile::strict([(0x000, 0)])),
                 );
                 bus.map(
                     "TZRAM",

@@ -11,7 +11,7 @@
 //! | `0x0000_0000`..`0x0000_0020` | the architected vectors | never taken: exceptions go where `EVP_COP_*_VECTOR` say ([`crate::soc::evp`]); an exception whose register is unwritten stops the BPMP with that said |
 //! | `0x0010_0000`..`0x0012_0000` | IROM, the boot ROM | refused: no dump is available and the ROM is high-level emulated ([`crate::bootrom`]); it has also locked itself out before the bootloader runs (Fusée Gelée write-up) |
 //! | `0x4000_0000`..`0x4004_0000` | IRAM ([`crate::soc::iram`]) | read and written directly; bytes no master has written since the ROM's hand-off (or since SC7) refuse reads ([`Iram::bpmp_read`]) |
-//! | `0x5004_0000`..`0x5004_1000` | the BPMP's cache controller (hekate `BPMP_CACHE_BASE`) | refused: not modelled, and package1ldr does not use it |
+//! | `0x5004_0000`..`0x5004_1000` | the BPMP's cache controller (hekate `BPMP_CACHE_BASE`) | on the [`Bus`]: its configuration register alone, as storage; no cache is emulated |
 //! | `0x5004_1000`..`0x5004_3000` | the CPU cluster's GIC | refused: the BPMP takes its interrupts from the legacy interrupt controller ([`crate::soc::ictlr`]) \[inference: the GIC is the CPU complex's private peripheral, and Linux routes the BPMP's interrupts through the LIC\] |
 //! | DRAM (`0x8000_0000` up to 4 GiB) | [`GuestRam`] | read and written directly; the memory controller's carveouts are not applied to the BPMP (its client, AVPC, is not modelled) |
 //! | anything else | [`Bus`] with core index [`BPMP_CORE`] | as the device says; unmapped or unmodelled accesses stop the BPMP |
@@ -148,7 +148,6 @@ const WAKE_POLL: Duration = Duration::from_millis(5);
 
 const IROM: Range<u32> = 0x0010_0000..0x0012_0000;
 const VECTORS: Range<u32> = 0..0x20;
-const BPMP_CACHE: Range<u32> = 0x5004_0000..0x5004_1000;
 const GIC: Range<u32> = 0x5004_1000..0x5004_3000;
 const IRAM: Range<u32> = iram::BASE as u32..(iram::BASE + iram::SIZE) as u32;
 
@@ -623,9 +622,6 @@ impl BpmpView<'_> {
         if IROM.contains(&address) {
             return refuse("the boot ROM (IROM) is not available: it is high-level emulated");
         }
-        if BPMP_CACHE.contains(&address) {
-            return refuse("the BPMP cache controller is not modelled");
-        }
         if GIC.contains(&address) {
             return refuse(
                 "the CPU cluster's GIC: the BPMP's interrupts come from the legacy \
@@ -1067,19 +1063,32 @@ impl<'env> Session<'env> {
             self.start_cold_boot(scope, entry);
             Ok(())
         });
+        let trace = || {
+            let trace = bpmp.trace();
+            if trace.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; last of what it did, oldest first:\n  {}",
+                    trace.join("\n  ")
+                )
+            }
+        };
         let stop = match exit {
-            BpmpExit::Stopped => CoreStop::Requested,
-            BpmpExit::Fault(fault) => {
-                let trace = bpmp.trace();
-                let trace = if trace.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "; last of what it did, oldest first:\n  {}",
-                        trace.join("\n  ")
-                    )
+            BpmpExit::Stopped => {
+                let power = match bpmp.power() {
+                    Power::On => "powered",
+                    Power::Sc7 => "in SC7",
                 };
-                env.notes.add(format!("BPMP: {fault}{trace}"));
+                env.notes.add(format!(
+                    "BPMP when the machine stopped: {power}, pc {:#010x}{}",
+                    bpmp.core().pc(),
+                    trace()
+                ));
+                CoreStop::Requested
+            }
+            BpmpExit::Fault(fault) => {
+                env.notes.add(format!("BPMP: {fault}{}", trace()));
                 CoreStop::Bpmp {
                     pc: bpmp.core().pc(),
                 }
@@ -1564,7 +1573,7 @@ mod tests {
         assert_eq!(view.read(0x8000_0010, 4), Ok(0x1234_5678));
         view.write(0x8000_0014, 2, 0xBEEF).unwrap();
         assert_eq!(view.read(0x8000_0014, 2), Ok(0xBEEF));
-        for address in [0x5004_1000, 0x0010_0000, 0x5004_0000, 0x0000_0008] {
+        for address in [0x5004_1000, 0x0010_0000, 0x0000_0008] {
             assert!(
                 matches!(view.read(address, 4), Err(BusError::Unmodelled(_))),
                 "{address:#x}"

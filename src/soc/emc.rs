@@ -31,6 +31,10 @@
 //!   FIFO and sets `CLKCHANGE_COMPLETE` in `INTSTATUS` (write one to clear);
 //! * self refresh: `EMC_STATUS` shows both devices in self refresh while
 //!   `SELF_REF` requests it;
+//! * requests: none is ever in flight, so `EMC_STATUS` always shows no
+//!   outstanding transactions (the monitor's SC7 stub stalls requests and
+//!   waits for that on both channels before self refresh, text
+//!   `0x400033FE`);
 //! * DLL: once enabled the digital DLL reports lock and an updated private
 //!   setting (`DIG_DLL_STATUS` bits 15 and 17) and keeps reporting them: the
 //!   firmware waits for lock again after disabling the DLL during training,
@@ -69,6 +73,10 @@ const EMC_STATUS: u64 = 0x2B4;
 const MRR_DIVLD: u32 = 1 << 20;
 /// Both devices (ranks) in self refresh.
 const IN_SELF_REFRESH: u32 = 3 << 8;
+/// No request in flight: what stalling requests (`REQ_CTRL`, `0x2b0`)
+/// waits for (Tegra K1 TRM `EMC_REQ_CTRL_0`, public; Linux
+/// `sleep-tegra20.S` polls bit 2 after stalling).
+const NO_OUTSTANDING_TRANSACTIONS: u32 = 1 << 2;
 const CFG_DIG_DLL: u64 = 0x2BC;
 const DIG_DLL_STATUS: u64 = 0x2C4;
 const DLL_LOCK: u32 = 1 << 15;
@@ -242,7 +250,7 @@ fn read_channel(state: &mut State, channel: usize, register: u64) -> Option<u32>
     Some(match register {
         INTSTATUS => state.interrupts,
         EMC_STATUS => {
-            let mut value = 0;
+            let mut value = NO_OUTSTANDING_TRANSACTIONS;
             if state.mrr[channel].is_some() {
                 value |= MRR_DIVLD;
             }
@@ -338,7 +346,7 @@ mod tests {
         assert_eq!(channel1.read(0, SELF_REF, 4), Some(1));
         assert_eq!(
             channel1.read(0, EMC_STATUS, 4),
-            Some(u64::from(IN_SELF_REFRESH))
+            Some(u64::from(IN_SELF_REFRESH | NO_OUTSTANDING_TRANSACTIONS))
         );
         assert_eq!(
             broadcast.read(0, INTSTATUS, 4),
@@ -354,9 +362,13 @@ mod tests {
     fn mode_register_reads_go_through_the_valid_bit() {
         let (_, broadcast, channel1) = ports();
         broadcast.write(0, MRR, 4, 0x8013_0000).unwrap();
-        assert_eq!(channel1.read(0, EMC_STATUS, 4), Some(u64::from(MRR_DIVLD)));
+        let idle = NO_OUTSTANDING_TRANSACTIONS;
+        assert_eq!(
+            channel1.read(0, EMC_STATUS, 4),
+            Some(u64::from(MRR_DIVLD | idle))
+        );
         assert_eq!(channel1.read(0, MRR, 4), Some(0x8013_0505));
-        assert_eq!(channel1.read(0, EMC_STATUS, 4), Some(0));
+        assert_eq!(channel1.read(0, EMC_STATUS, 4), Some(u64::from(idle)));
         // Channel 0's result is still waiting.
         assert_eq!(broadcast.read(0, MRR, 4), Some(0x8013_0505));
         broadcast.write(0, MRR, 4, 0x8005_0000).unwrap();

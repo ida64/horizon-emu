@@ -39,8 +39,8 @@
 //!   them out, Linux `tegra_io_pad_prepare`), and `IO_DPD3_STATUS` /
 //!   `IO_DPD4_STATUS` (`0x460`, `0x468`) follow at once. Pads that do not
 //!   exist never read set: \[inference\] masks `0x0FFFFFFF` and
-//!   `0x0FFFDFFF`, the status the stub waits for after requesting all
-//!   ones.
+//!   `0x0FFF1FFF`, the status the monitor's SC7 stub waits for after
+//!   requesting all ones (its literals at text `0x400033A0`/`0x400033A4`).
 //! * `DPD_ENABLE` (`0x024`) bit 0 puts the SoC into SC7: storage here; the
 //!   machine's BPMP loop looks at it ([`dpd_entered`]) and powers the SoC
 //!   down.
@@ -79,7 +79,7 @@ const SET_SW_CLAMP: u64 = 0x47C;
 /// (CRAIL, partition 0).
 const CLAMP_CRAIL: u32 = 1 << 0;
 /// `IO_DPD3`/`IO_DPD4`: request, status, and the pads that exist.
-const IO_DPD: [(u64, u64, u32); 2] = [(0x45C, 0x460, 0x0FFF_FFFF), (0x464, 0x468, 0x0FFF_DFFF)];
+const IO_DPD: [(u64, u64, u32); 2] = [(0x45C, 0x460, 0x0FFF_FFFF), (0x464, 0x468, 0x0FFF_1FFF)];
 const IO_DPD_CODE_SHIFT: u32 = 30;
 const IO_DPD_ON: u32 = 2;
 const IO_DPD_OFF: u32 = 1;
@@ -459,9 +459,9 @@ mod tests {
         pmc.write(4, 0x45C, 4, 0x8FFF_FFFF).unwrap();
         assert_eq!(read(0x460), 0x0FFF_FFFF);
         pmc.write(4, 0x464, 4, 0x8FFF_FFFF).unwrap();
-        assert_eq!(read(0x468), 0x0FFF_DFFF);
+        assert_eq!(read(0x468), 0x0FFF_1FFF);
         pmc.write(4, 0x464, 4, 0x4000_00FF).unwrap();
-        assert_eq!(read(0x468), 0x0FFF_DF00);
+        assert_eq!(read(0x468), 0x0FFF_1F00);
         // SC7 entry is storage the machine looks at; a SoC reset refused.
         pmc.write(4, DPD_ENABLE, 4, 3).unwrap();
         assert!(dpd_entered(read(DPD_ENABLE)));
