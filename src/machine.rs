@@ -1738,14 +1738,28 @@ struct Probes {
     /// Breakpoint being stepped from and steps still to take.
     stepping: Option<(Place, u32)>,
     /// Time the core still has to stand still for the guest code it ran,
-    /// with [`RunOptions::cpu_slowdown`].
+    /// with [`RunOptions::cpu_slowdown`], less what the host already held
+    /// it up by.
     pacing_debt: Duration,
     /// [`Vcpu::exec_time`] when the debt was last added to.
     paced_to: Duration,
+    /// Time the host held the core up beyond what it owed, at most
+    /// [`HOLD_UP_KEPT`]: set against the debt still to come.
+    held_up: Duration,
 }
 
 /// How long a core runs guest code at most before it pays its pacing debt.
 const PACING_SLICE: Duration = Duration::from_micros(100);
+
+/// The most of the time a busy host held a slowed core up beyond its debt
+/// that is set against the debt it runs up next, so that the core makes
+/// up for the host's sleeps waking it late (by about 150 µs each on a
+/// loaded host, against the 100 µs to 1 ms it owes at a time) without
+/// running faster than the console's processor for longer than
+/// `1 / (factor - 1)` of this. \[assumption\]: 1 ms, tens of times shorter
+/// than the margin the boot's ordering has at host speed (about 30 ms,
+/// see [`CONSOLE_SLOWDOWN`]).
+const HOLD_UP_KEPT: Duration = Duration::from_millis(1);
 
 /// How often a sleeping console looks for what would wake it.
 const WAKE_POLL: Duration = Duration::from_millis(5);
@@ -1889,6 +1903,7 @@ impl<'env> Session<'env> {
                 stepping: None,
                 pacing_debt: Duration::ZERO,
                 paced_to: Duration::ZERO,
+                held_up: Duration::ZERO,
             },
             Err(error) => return failed(error),
         };
@@ -1958,6 +1973,7 @@ impl<'env> Session<'env> {
         let interrupt =
             self.machine.gic.irq_asserted(core) && !probes.debug.wants_interrupts_deferred(vcpu)?;
         vcpu.set_pending_irq(interrupt)?;
+        let entered = Instant::now();
         let exit = probes.debug.run(vcpu)?;
         if self.paced() {
             // Standing still after running is running slowly, as far as
@@ -1968,11 +1984,34 @@ impl<'env> Session<'env> {
             // stretching that too makes whatever the console does to its
             // devices many times a second (its touch panel, its sensors)
             // more than one slowed core can do.
-            let ran = vcpu.exec_time()?;
-            probes.pacing_debt += (ran - probes.paced_to) * (self.options.cpu_slowdown - 1);
-            probes.paced_to = ran;
+            //
+            // A busy host already holds the core up, and that counts
+            // towards the slowdown: the wall time of the run beyond the
+            // guest code it ran (the host kernel's count of guest time
+            // leaves out the time the core's thread was not scheduled
+            // \[inference\]: `hv_vcpu_get_exec_time` is documented as the
+            // vCPU's cumulative execution time), and the time a payment's
+            // sleep overran. The debt never drops below zero; what the host
+            // held the core up by beyond it is set against the next debt,
+            // up to [`HOLD_UP_KEPT`]. Without this a loaded host slows the
+            // guest by the factor on top of its own slowing: on one with
+            // a load average near 20, the sleeps alone, waking about
+            // 150 µs late every 100 µs to 1 ms owed, ran core 3 (where
+            // the boot's system programs run) at a 22nd of its speed, and
+            // boot2 ended after 60 to 120 s instead of about 20.
+            let wall = entered.elapsed();
+            let total = vcpu.exec_time()?;
+            let ran = total - probes.paced_to;
+            probes.paced_to = total;
+            let held_up = wall.saturating_sub(ran) + probes.held_up;
+            let owed = probes.pacing_debt + ran * (self.options.cpu_slowdown - 1);
+            probes.pacing_debt = owed.saturating_sub(held_up);
+            probes.held_up = held_up.saturating_sub(owed).min(HOLD_UP_KEPT);
             if probes.pacing_debt >= PACING_SLICE {
+                let sleeping = Instant::now();
                 thread::sleep(probes.pacing_debt);
+                probes.held_up =
+                    (sleeping.elapsed().saturating_sub(probes.pacing_debt)).min(HOLD_UP_KEPT);
                 probes.pacing_debt = Duration::ZERO;
             }
         }

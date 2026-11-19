@@ -42,6 +42,41 @@
 //! press zl 300 until 820,330 2d2d2d 4   # the lock screen's home icon
 //! press power 3500                      # the power menu
 //! ```
+//!
+//! Every sleep is followed by a wake the firmware asks for itself. As the
+//! console goes to sleep it sets the PMIC clock's first alarm 4 s ahead
+//! and unmasks it; the alarm wakes the console about 8 s after the POWER
+//! press, with the panel powered and the backlight off, and 17 to 19 s
+//! later it sleeps again with the alarm 1200 s, later about an hour,
+//! ahead (seen in kernel-entry runs) \[inference: a background ("half
+//! awake") wake, which the firmware tells from a POWER wake by the PMIC's
+//! interrupt sources\]. `hid` opens the Joy-Con's wired session again
+//! then. Nothing can be seen during that wake, so `wait` and `until` do
+//! not match it, but a POWER press a fixed time after the one that put
+//! the console to sleep can land on its return to sleep, and the script
+//! then runs out of step with the console. Wait it out, and press POWER
+//! until the lock screen shows:
+//!
+//! ```text
+//! press power 300                           # to sleep
+//! sleep 40                                  # past the firmware's own wake
+//! press power 300 until 820,330 2d2d2d 10   # the lock screen, lit
+//! ```
+//!
+//! The lock screen's "Press the same button three times" counts only
+//! presses that follow one another quickly: 150 ms presses 0.6 s apart
+//! unlock it, 300 ms presses 0.8 s apart did not (once, on a busy host).
+//! On a busy host a press can also fall between two of its frames and be
+//! lost, with the Joy-Con's reports carrying it. Press each until its dot
+//! fills; the first press brings up the prompt, whose B icon is at
+//! 52,651:
+//!
+//! ```text
+//! press a 300 until 52,651 2d2d2d 3
+//! press a 150 until 600,652 2d2d2d 0.6
+//! press a 150 until 640,652 2d2d2d 0.6
+//! press a 150 until 260,545 e60012 0.6      # HOME
+//! ```
 
 use std::time::{Duration, Instant};
 
