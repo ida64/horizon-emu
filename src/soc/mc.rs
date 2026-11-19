@@ -76,6 +76,8 @@ pub const SMMU_DC_ASID: u64 = 0x240;
 pub const SMMU_VIC_ASID: u64 = 0x284;
 /// Host1x CDMA client ASID, from the same public swgroup table.
 pub const SMMU_HOST1X_ASID: u64 = 0x250;
+/// NVDEC client ASID (`nvdec` swgroup), from the same public swgroup table.
+pub const SMMU_NVDEC_ASID: u64 = 0xAB4;
 /// Address space register of the eMMC port's host controller.
 pub const SMMU_SDMMC4A_ASID: u64 = 0xAA0;
 /// Address space register of the game card port's host controller (two

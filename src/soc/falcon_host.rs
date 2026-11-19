@@ -1,19 +1,18 @@
 //! Host-engine Falcon boot interface, not a Falcon instruction emulator.
 //!
-//! nvservices 23.5.0 `0x809e0` loads 256-byte DMEM/IMEM blocks through
-//! 0x1110..0x111c, starts CPUCTL, and requires IDLESTATE == 0 (spec §5.2).
-//! Firmware bytes are fetched through the engine SMMU and retained; completing
-//! boot means the modeled service is ready, not that firmware was executed.
-//! pcv `0x39450`, partition table `0xb1b18`, workaround table `0xab40c`,
-//! sets then clears VIC SLCG override 0x8c mask 0x010000dd for MBIST.
+//! nvservices 23.5.0 `0x809e0` (VIC) and `0x835e0` (NVDEC) load 256-byte
+//! DMEM/IMEM blocks through 0x1110..0x111c, start CPUCTL, and require
+//! IDLESTATE == 0 (spec §5.2). Firmware bytes are fetched through the
+//! engine SMMU and retained; the [`Engine`] is shown them when CPUCTL
+//! starts the processor and may refuse firmware it does not know.
+//! Completing boot means the modeled service is ready, not that firmware
+//! was executed. pcv `0x39450`, partition table `0xb1b18`, workaround table
+//! `0xab40c`, sets then clears VIC SLCG override 0x8c mask 0x010000dd for
+//! MBIST.
 //!
 //! The THI method port at +0x40/+0x44 is THI words 0x10/0x11, the registers
-//! host1x channels reach as class methods; both go to the [`Vic`] engine.
-use super::{
-    Notes,
-    mc::DeviceMemory,
-    vic::{self, Vic},
-};
+//! host1x channels reach as class methods; both go to the [`Engine`].
+use super::{Notes, mc::DeviceMemory};
 use crate::{
     bus::MmioDevice,
     snapshot::{Snapshot, SnapshotError, decode, encode},
@@ -22,7 +21,44 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
 pub const VIC_BASE: u64 = 0x5434_0000;
+pub const NVDEC_BASE: u64 = 0x5448_0000;
 pub const SIZE: u64 = 0x40000;
+
+/// The engine a host falcon runs: what its THI registers and class methods
+/// reach.
+pub trait Engine: Snapshot {
+    /// Its name in notes and snapshot errors.
+    const NAME: &'static str;
+    /// Its host1x class.
+    const CLASS: u32;
+    /// A write of THI register `offset` (in words), from a host1x channel
+    /// or from the MMIO window (byte offset `4 * offset`).
+    fn thi_write(&self, offset: u32, value: u32) -> Option<()>;
+    /// Value of the THI method offset register (MMIO +0x40).
+    fn method_offset(&self) -> u32;
+    /// CPUCTL starts the processor with these memories; an error refuses
+    /// the start.
+    fn start(&self, imem: &[u8], dmem: &[u8]) -> Result<(), String>;
+}
+
+/// The VIC's firmware is not checked: any firmware starts it (the
+/// compositor is modeled whatever runs on its Falcon).
+impl Engine for super::vic::Vic {
+    const NAME: &'static str = "VIC";
+    const CLASS: u32 = super::vic::CLASS;
+
+    fn thi_write(&self, offset: u32, value: u32) -> Option<()> {
+        super::vic::Vic::thi_write(self, offset, value)
+    }
+
+    fn method_offset(&self) -> u32 {
+        super::vic::Vic::method_offset(self)
+    }
+
+    fn start(&self, _imem: &[u8], _dmem: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct State {
@@ -43,15 +79,15 @@ impl Default for State {
     }
 }
 
-pub struct HostFalcon {
+pub struct HostFalcon<E> {
     state: Mutex<State>,
     memory: DeviceMemory,
-    engine: Vic,
+    engine: E,
     notes: Arc<Notes>,
 }
-impl HostFalcon {
-    /// `memory` is memory as the VIC's SMMU client reaches it.
-    pub fn new(memory: DeviceMemory, engine: Vic, notes: Arc<Notes>) -> Self {
+impl<E: Engine> HostFalcon<E> {
+    /// `memory` is memory as the engine's SMMU client reaches it.
+    pub fn new(memory: DeviceMemory, engine: E, notes: Arc<Notes>) -> Self {
         Self {
             state: Mutex::new(State::default()),
             memory,
@@ -61,7 +97,7 @@ impl HostFalcon {
     }
     /// A host1x channel method: THI register `offset` (in words) of `class`.
     pub fn method(&self, class: u32, offset: u32, value: u32) -> Option<()> {
-        if class != vic::CLASS {
+        if class != E::CLASS {
             return self.refuse(format!("class {class:#x} method {offset:#x}={value:#x}"));
         }
         self.engine.thi_write(offset, value)
@@ -84,11 +120,11 @@ impl HostFalcon {
         )
     }
     fn refuse(&self, reason: String) -> Option<()> {
-        self.notes.add(format!("VIC: {reason}"));
+        self.notes.add(format!("{}: {reason}", E::NAME));
         None
     }
 }
-impl MmioDevice for HostFalcon {
+impl<E: Engine> MmioDevice for HostFalcon<E> {
     fn read(&self, _core: usize, offset: u64, size: u8) -> Option<u64> {
         if size == 4 && offset == 0x40 {
             return Some(self.engine.method_offset().into());
@@ -136,6 +172,11 @@ impl MmioDevice for HostFalcon {
                 return Some(());
             }
             0x1100 if v != 2 => return self.refuse(format!("CPUCTL {v:#x}")),
+            0x1100 => {
+                if let Err(reason) = self.engine.start(&s.imem, &s.dmem) {
+                    return self.refuse(reason);
+                }
+            }
             _ => {}
         }
         s.regs[offset as usize / 4] = v;
@@ -148,16 +189,16 @@ impl MmioDevice for HostFalcon {
 }
 
 /// Saves the boot interface registers and the firmware loaded into IMEM
-/// and DMEM, and with them the [`Vic`] engine's own state.
-impl Snapshot for HostFalcon {
+/// and DMEM, and with them the [`Engine`]'s own state.
+impl<E: Engine> Snapshot for HostFalcon<E> {
     fn save(&self) -> Result<Vec<u8>, SnapshotError> {
         let host = encode(&*self.state.lock().unwrap())?;
         encode(&(host, self.engine.save()?))
     }
 
     fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
-        let (host, engine): (Vec<u8>, Vec<u8>) = decode("VIC host", state)?;
-        let host: State = decode("VIC host", &host)?;
+        let (host, engine): (Vec<u8>, Vec<u8>) = decode(E::NAME, state)?;
+        let host: State = decode(E::NAME, &host)?;
         self.engine.restore(&engine)?;
         *self.state.lock().unwrap() = host;
         Ok(())
@@ -170,7 +211,10 @@ mod tests {
     use crate::{
         boot::DramSize,
         memory::GuestRam,
-        soc::mc::{Mc, SMMU_VIC_ASID},
+        soc::{
+            mc::{Mc, SMMU_VIC_ASID},
+            vic::Vic,
+        },
     };
 
     #[test]
