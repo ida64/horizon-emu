@@ -762,7 +762,11 @@ fn boot_rom(keys: &KeySet, boot: [Option<&String>; 2]) -> Result<PowerOn, String
     // PMC_SCRATCH0 is clear on a cold boot: no warm boot, no forced recovery.
     let handoff = bootrom::cold_boot(&boot0, &boot1, &fuses, 0, &mut iram)
         .map_err(|error| format!("boot ROM: {error}"))?;
-    Ok(PowerOn { handoff, iram })
+    Ok(PowerOn {
+        handoff,
+        iram,
+        fuses,
+    })
 }
 
 /// Boots `kernel` (an image and the file it was read from) as `flags` say,

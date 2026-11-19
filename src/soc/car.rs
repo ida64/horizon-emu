@@ -116,6 +116,14 @@ const CPU0_RUN_RESETS: u32 = 1 << 0 | 1 << 16 | 1 << 24 | 1 << 30;
 /// them (package1ldr's inventory has no access), so this is the power-on
 /// value \[inference\].
 pub const CPUG_RESETS_AT_POWER_ON: u32 = 0x61FF_000F;
+/// The cluster's resets as the SoC powers up after SC7: the power-on value
+/// without bits 24 and 30. \[inference\] The warmboot firmware releases
+/// core 0 with `RST_CPUG_CMPLX_CLR = 0x20000000`, then `0x10001` (bits 29,
+/// 0 and 16 only, `warmboot-research` §7 steps 10 and 12) and the console
+/// resumes, so the L2 and debug resets cannot be asserted after SC7 the way
+/// they are at a cold power-on; which reset domain they belong to is not
+/// public.
+pub const CPUG_RESETS_AFTER_SC7: u32 = CPUG_RESETS_AT_POWER_ON & !(1 << 24 | 1 << 30);
 /// At kernel entry the bootloader has released core 0
 /// ([`CPU0_RUN_RESETS`]); cores 1 to 3 are the secure monitor's to
 /// start, which this machine does through the power partitions alone.
@@ -558,9 +566,26 @@ pub struct Car {
 ///
 /// One register package1ldr changes by read-modify-write is not checked:
 /// `CLK_SOURCE_NVENC` (`0x6a0`, source field set to 4); its other bits are
-/// \[assumption\] clear, as at kernel entry ([`MODULE_SOURCES`]). Every
-/// other register refuses to be read until written.
+/// \[assumption\] clear, as at kernel entry ([`MODULE_SOURCES`]).
+///
+/// Registers the kernel's clock driver (`pcv`) reads that no stage of the
+/// boot chain writes and the check does not cover start as at kernel entry,
+/// with the same assumption as there: [`GATED_MODULE_SOURCES`],
+/// [`SAVED_FOR_SLEEP`] and [`ASSUMED_ZERO`] read 0 (81 of them read by
+/// `pcv` on a powered-on run, surveyed by ChainAhead). Where the check has
+/// a row, its value wins. Every other register refuses to be read until
+/// written.
 const POWER_ON_STATE: [&[(u64, u32)]; 2] = [&HWCHECK_STATE, &[(0x6A0, 0)]];
+
+/// What `pcv` reads that the boot chain leaves as reset made it, as at
+/// kernel entry: see `POWER_ON_STATE`.
+fn untouched_at_power_on() -> impl Iterator<Item = (u64, u32)> {
+    GATED_MODULE_SOURCES
+        .into_iter()
+        .chain(SAVED_FOR_SLEEP)
+        .map(|register| (register, 0))
+        .chain(ASSUMED_ZERO)
+}
 
 /// `nxbl_hwcheck.csv`'s CAR rows: `(offset, expected & mask)`.
 #[rustfmt::skip]
@@ -695,7 +720,9 @@ impl Car {
     /// `POWER_ON_STATE`. [`Car::new`] is the state at kernel entry.
     pub fn power_on() -> Self {
         Self {
-            registers: RegisterFile::strict(POWER_ON_STATE.into_iter().flatten().copied()),
+            registers: RegisterFile::strict(
+                untouched_at_power_on().chain(POWER_ON_STATE.into_iter().flatten().copied()),
+            ),
             emc_clock_change: None,
             reset_hooks: Vec::new(),
             release_hooks: Vec::new(),
@@ -882,6 +909,20 @@ mod tests {
         car.write(0, 0x318, 4, 7).unwrap();
         assert_eq!(car.read(0, 0x318, 4), Some(7));
         assert_eq!(car.read(0, 0x00C, 4), Some(0x820E_557A));
+    }
+
+    #[test]
+    fn power_on_answers_what_pcv_reads() {
+        let car = Car::power_on();
+        // pcv's first unmodelled read on a powered-on run, and others it
+        // reads that no boot stage writes.
+        for register in [0x10C, 0x100, 0x114, 0x600, 0x70C] {
+            assert_eq!(car.read(4, register, 4), Some(0), "{register:#x}");
+        }
+        assert_eq!(
+            car.read(4, RST_CPUG_CMPLX, 4),
+            Some(u64::from(CPUG_RESETS_AT_POWER_ON))
+        );
     }
 
     #[test]

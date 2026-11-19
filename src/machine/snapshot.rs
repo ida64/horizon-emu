@@ -188,7 +188,9 @@ impl Machine {
                 "a snapshot is being taken already".into(),
             ));
         }
-        if state.threads == [false; CORE_COUNT] {
+        // A machine powered on may have only its BPMP running (before core
+        // 0 is released, or in SC7), whose state its part saves.
+        if state.threads == [false; CORE_COUNT] && self.bpmp.is_none() {
             return Err(SnapshotError::Unsupported(
                 "a machine that is not running".into(),
             ));
