@@ -5,10 +5,18 @@
 //! and the microSD port once a card is detected in the slot. With a card
 //! fitted, commands reach it ([`Card`]) and data moves by SDMA: the
 //! controller masters the bus and copies blocks between the card and the
-//! buffer the driver names, through the SMMU, pausing at every buffer
-//! boundary for the driver to confirm the next address. Without a card
-//! the controller is still fully there, but no card ever answers, and every
-//! command that expects a response ends in a command timeout.
+//! buffer the driver names, through the memory controller
+//! ([`DeviceMemory`]: the SMMU once the kernel attaches the port, physical
+//! DRAM and, through the redirect aperture, IRAM before), pausing at every
+//! buffer boundary for the driver to confirm the next address. Without a
+//! card the controller is still fully there, but no card ever answers, and
+//! every command that expects a response ends in a command timeout.
+//!
+//! On a power-on boot the NX bootloader drives the eMMC port first, with
+//! the same family of driver and the controller's interrupt unused: it
+//! polls the status registers, gates the SD clock between commands, and
+//! reads the extended CSD, the GPT and the head of BCPKG2 into IRAM and
+//! package2 into DRAM by 64-bit SDMA with 512 KiB buffer boundaries.
 //!
 //! The present state register shows the levels of the CMD and DAT lines.
 //! They idle high, pulled up; a microSD card drives them low while it
@@ -35,7 +43,9 @@
 //!
 //! Programmed I/O through the buffer data port and ADMA descriptor tables
 //! are not modeled; a transfer that asks for either stops the machine with
-//! a note. The capabilities report only what the driver insists on.
+//! a note. So does a card whose image file the host fails to read or
+//! write ([`BlockError::Host`]). The capabilities report only what the
+//! driver insists on.
 //!
 //! A machine snapshot saves the registers, the transfer paused at a buffer
 //! boundary, what the driver is yet to be told and the guest time it is
@@ -68,19 +78,28 @@ pub enum Response {
     Long([u8; 15]),
 }
 
+/// Why a card moved no block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockError {
+    /// The card is not sending or receiving, the block is not the size it
+    /// moves, or it is beyond the end: the controller sees a data timeout.
+    Timeout,
+    /// The host failed to read or write the card's image file; the machine
+    /// stops with this note.
+    Host(String),
+}
+
 /// A card on the controller's command and data lines.
 pub trait Card: Send {
     /// Executes one command. `None` is no response: the command expects
     /// none, or the card ignored it.
     fn command(&mut self, index: u8, argument: u32) -> Option<Response>;
 
-    /// The next block the card sends. `None` when it is not sending, or
-    /// `block` is not the size of what it sends.
-    fn send_block(&mut self, block: &mut [u8]) -> Option<()>;
+    /// The next block the card sends.
+    fn send_block(&mut self, block: &mut [u8]) -> Result<(), BlockError>;
 
-    /// Takes the next block the host sends. `None` when the card is not
-    /// receiving or cannot store the block.
-    fn receive_block(&mut self, block: &[u8]) -> Option<()>;
+    /// Takes the next block the host sends.
+    fn receive_block(&mut self, block: &[u8]) -> Result<(), BlockError>;
 
     /// Consumes the tuning block if that is what the card is sending.
     fn take_tuning_block(&mut self) -> bool;
@@ -671,9 +690,18 @@ impl Sdmmc {
                 if transfer.blocks_left == 0 {
                     break;
                 }
-                if transfer.to_host && card.send_block(&mut transfer.block).is_none() {
-                    host.raise_error(ERROR_DATA_TIMEOUT);
-                    return Some(());
+                if transfer.to_host {
+                    match card.send_block(&mut transfer.block) {
+                        Ok(()) => {}
+                        Err(BlockError::Timeout) => {
+                            host.raise_error(ERROR_DATA_TIMEOUT);
+                            return Some(());
+                        }
+                        Err(BlockError::Host(note)) => {
+                            self.notes.add(note);
+                            return None;
+                        }
+                    }
                 }
                 transfer.moved = 0;
             }
@@ -695,9 +723,18 @@ impl Sdmmc {
             transfer.moved += count;
             transfer.address += count as u64;
             if transfer.moved == transfer.block.len() {
-                if !transfer.to_host && card.receive_block(&transfer.block).is_none() {
-                    host.raise_error(ERROR_DATA_TIMEOUT);
-                    return Some(());
+                if !transfer.to_host {
+                    match card.receive_block(&transfer.block) {
+                        Ok(()) => {}
+                        Err(BlockError::Timeout) => {
+                            host.raise_error(ERROR_DATA_TIMEOUT);
+                            return Some(());
+                        }
+                        Err(BlockError::Host(note)) => {
+                            self.notes.add(note);
+                            return None;
+                        }
+                    }
                 }
                 transfer.blocks_left -= 1;
                 host.busy += match transfer.to_host {
@@ -1304,6 +1341,45 @@ mod tests {
     }
 
     #[test]
+    fn an_image_the_host_fails_to_read_stops_the_machine_with_a_note_naming_it() {
+        use super::super::medium::{ImageFile, Medium};
+        let path =
+            std::env::temp_dir().join(format!("horizon-emu-sdmmc-failing-{}", std::process::id()));
+        std::fs::write(&path, [0; 16 * 512]).unwrap();
+        // Open only for writing: every read of it fails on the host.
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        let image = ImageFile {
+            file,
+            path: path.clone(),
+        };
+        let card = emmc::tests::selected_over(Medium::new("eMMC", 16, Some(image), false));
+        let bench = Bench::with_card(Some(Box::new(card)), Timing::INSTANT);
+        bench.write(
+            HOST_CONTROL_2,
+            2,
+            (CONTROL_2_VERSION_4 | CONTROL_2_64_BIT_ADDRESSING).into(),
+        );
+        bench.write(ADMA_ADDRESS, 4, BUFFER);
+        bench.write(BLOCK_SIZE, 2, 0x200);
+        bench.write(ARGUMENT, 4, 3);
+        bench.write(TRANSFER_MODE, 2, (TRANSFER_DMA | TRANSFER_TO_HOST).into());
+        assert_eq!(
+            bench.sdmmc.write(0, COMMAND as u64, 2, 17 << 8 | 0x3A),
+            None,
+            "the access is refused, not answered with a data timeout"
+        );
+        assert_eq!(bench.read(ERROR_INTERRUPT_STATUS, 2), 0);
+        let notes = bench.sdmmc.notes.take();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].starts_with("eMMC: cannot read sector 3 of the image ")
+                && notes[0].contains(&path.display().to_string()),
+            "{notes:?}"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn present_state_shows_the_lines_low_through_a_voltage_switch() {
         use super::super::sdcard::{SdCard, SdCardImage};
         let image = SdCardImage::memory(vec![0; (0x1010 + 1) << 19]).unwrap();
@@ -1354,6 +1430,272 @@ mod tests {
         assert_eq!(
             bench.read(HOST_CONTROL_2, 2),
             u64::from(CONTROL_2_SAMPLING_CLOCK_SELECT)
+        );
+    }
+
+    /// The NX bootloader's SDMMC4 driver, register for register, polling
+    /// as it does with interrupts off: host setup `0x400170A0`, a command
+    /// `0x4000196C` (`0x40017200` inhibit wait, `0x40016F98` SDMA setup,
+    /// `0x4000192C` status enables, `0x400016F8` issue, `0x4001712C` and
+    /// `0x4001717C` completion, `0x40017024` DAT0 wait).
+    struct Bootloader {
+        sdmmc: Sdmmc,
+    }
+
+    /// What a command moves: SDMA buffer, blocks, direction, auto-CMD12.
+    struct Data {
+        address: u32,
+        blocks: u16,
+        read: bool,
+        auto_stop: bool,
+    }
+
+    impl Bootloader {
+        fn write(&self, offset: usize, size: u8, value: u64) {
+            self.sdmmc.write(0, offset as u64, size, value).unwrap();
+        }
+
+        fn read(&self, offset: usize, size: u8) -> u64 {
+            self.sdmmc.read(0, offset as u64, size).unwrap()
+        }
+
+        fn set_bits(&self, offset: usize, size: u8, bits: u64) {
+            let value = self.read(offset, size);
+            self.write(offset, size, value | bits);
+        }
+
+        fn clear_bits(&self, offset: usize, size: u8, bits: u64) {
+            let value = self.read(offset, size);
+            self.write(offset, size, value & !bits);
+        }
+
+        fn set_up_host(&self) {
+            self.set_bits(0x1F0, 4, 1 << 19);
+            self.clear_bits(0x1AC, 4, 4);
+            // Auto-calibration (`0x40001088`).
+            self.set_bits(0x1E0, 4, 1 << 31);
+            self.set_bits(0x1E4, 4, 0xA000_0000);
+            assert_eq!(self.read(0x1EC, 4) >> 31, 0, "calibration over");
+            self.clear_bits(0x1E0, 4, 1 << 31);
+            self.set_bits(CLOCK_CONTROL, 2, 1);
+            assert_ne!(self.read(CLOCK_CONTROL, 2) & 2, 0, "internal clock stable");
+            self.clear_bits(HOST_CONTROL_2, 2, 0x8000);
+            self.clear_bits(CLOCK_CONTROL, 2, 0x20);
+            self.set_bits(HOST_CONTROL_2, 2, 0x1000);
+            assert_ne!(self.read(CAPABILITIES, 4) & 1 << 28, 0, "64-bit capable");
+            self.set_bits(HOST_CONTROL_2, 2, 0x2000);
+            self.clear_bits(HOST_CONTROL, 1, 0x18);
+            let timeout = self.read(0x2E, 1);
+            self.write(0x2E, 1, timeout & 0xF0 | 0xE);
+            // SD clock on.
+            self.set_bits(CLOCK_CONTROL, 2, 4);
+        }
+
+        /// Polls normal status for `bits`, clearing what it found; panics
+        /// on an error.
+        fn wait(&self, bits: u16) -> u16 {
+            loop {
+                let normal = self.read(NORMAL_INTERRUPT_STATUS, 2) as u16;
+                assert_eq!(normal & 0x8000, 0, "error {:#x}", self.read(0x32, 2));
+                if normal & bits != 0 {
+                    self.write(NORMAL_INTERRUPT_STATUS, 2, (normal & bits).into());
+                    return normal & bits;
+                }
+            }
+        }
+
+        /// Issues command `index` with response field `response` (the
+        /// driver's 0, 0x02, 0x09, 0x1A, 0x1B): the response's first word.
+        fn command(&self, index: u16, argument: u32, response: u16, data: Option<Data>) -> u32 {
+            let busy = response == 0x1B;
+            while self.read(PRESENT_STATE, 4) & 1 != 0 {}
+            if busy || data.is_some() {
+                while self.read(PRESENT_STATE, 4) & 2 != 0 {}
+            }
+            let mut next_boundary = 0;
+            if let Some(data) = &data {
+                assert_eq!(data.address % 8, 0);
+                self.write(ADMA_ADDRESS, 4, data.address.into());
+                self.write(ADMA_ADDRESS + 4, 4, 0);
+                next_boundary = (u64::from(data.address) + 0x8_0000) >> 19 << 19;
+                self.write(BLOCK_SIZE, 2, 0x200 | 0x7000);
+                self.write(BLOCK_COUNT, 2, data.blocks.into());
+                let mut mode = if data.blocks > 1 { 0x23 } else { 1 };
+                if data.read {
+                    mode |= 0x10;
+                }
+                if data.auto_stop {
+                    mode = (mode & 0xFFF3) + 4;
+                }
+                self.write(TRANSFER_MODE, 2, mode);
+            }
+            self.set_bits(NORMAL_STATUS_ENABLE, 2, 0xB);
+            self.set_bits(ERROR_STATUS_ENABLE, 2, 0x17F);
+            for status in [NORMAL_INTERRUPT_STATUS, ERROR_INTERRUPT_STATUS] {
+                self.write(status, 2, self.read(status, 2));
+            }
+            self.write(ARGUMENT, 4, argument.into());
+            let present = if data.is_some() { 0x20 } else { 0 };
+            self.write(COMMAND, 2, (index << 8 | response | present).into());
+            self.wait(NORMAL_COMMAND_COMPLETE);
+            let first = self.read(RESPONSE, 4) as u32;
+            if data.is_some() {
+                while self.wait(NORMAL_TRANSFER_COMPLETE | NORMAL_DMA) == NORMAL_DMA {
+                    self.write(ADMA_ADDRESS, 4, next_boundary & 0xFFFF_FFFF);
+                    self.write(ADMA_ADDRESS + 4, 4, next_boundary >> 32);
+                    next_boundary += 0x8_0000;
+                }
+            }
+            self.clear_bits(ERROR_STATUS_ENABLE, 2, 0x17F);
+            self.clear_bits(NORMAL_STATUS_ENABLE, 2, 0xB);
+            if busy || data.is_some() {
+                while self.read(PRESENT_STATE, 4) & 1 << 20 == 0 {}
+            }
+            first
+        }
+
+        /// CMD13: the card's current state.
+        fn state(&self) -> u32 {
+            let status = self.command(13, 2 << 16, 0x1A, None);
+            assert_eq!(status & 0xFDF9_0000, 0, "status errors {status:#x}");
+            status >> 9 & 0xF
+        }
+
+        fn switch(&self, argument: u32) {
+            self.command(6, argument, 0x1B, None);
+            assert_eq!(self.state(), 4);
+        }
+
+        fn read_sectors(&self, sector: u32, blocks: u16, address: u32) {
+            let data = Data {
+                address,
+                blocks,
+                read: true,
+                auto_stop: true,
+            };
+            self.command(18, sector, 0x1A, Some(data));
+            assert_eq!(self.state(), 4, "auto-CMD12 ended the read");
+        }
+    }
+
+    #[test]
+    fn the_bootloader_reads_ext_csd_gpt_and_bcpkg2_into_iram_and_package2_into_dram() {
+        use super::super::iram::{self, Iram};
+        const BCPKG2: u32 = 0x8000;
+        // The user area: a GPT whose entry 2 is BCPKG2-1-Normal-Main,
+        // BootConfig at the partition's start, package2 at +0x4000 with
+        // its size in the words the bootloader XORs.
+        let mut gpt = vec![0u8; 33 * 512];
+        gpt[..8].copy_from_slice(b"EFI PART");
+        gpt[8..12].copy_from_slice(&0x1_0000u32.to_le_bytes());
+        gpt[12..16].copy_from_slice(&92u32.to_le_bytes());
+        gpt[24..32].copy_from_slice(&1u64.to_le_bytes());
+        gpt[72..80].copy_from_slice(&2u64.to_le_bytes());
+        let entry = 512 + 2 * 128;
+        gpt[entry + 32..entry + 40].copy_from_slice(&u64::from(BCPKG2).to_le_bytes());
+        for (index, unit) in "BCPKG2-1-Normal-Main".encode_utf16().enumerate() {
+            gpt[entry + 56 + 2 * index..][..2].copy_from_slice(&unit.to_le_bytes());
+        }
+        let mut bcpkg2: Vec<u8> = (0..0x4000 + 0x90 * 512)
+            .map(|index: usize| (index * 7 + index / 509) as u8)
+            .collect();
+        let size: u32 = 0x90 * 512;
+        let (key_a, key_b) = (0x1234_5678u32, 0x9ABC_DEF0u32);
+        for (at, word) in [
+            (0x100, size ^ key_a ^ key_b),
+            (0x108, key_a),
+            (0x10C, key_b),
+        ] {
+            bcpkg2[0x4000 + at..][..4].copy_from_slice(&word.to_le_bytes());
+        }
+        let mut card = emmc::tests::selected(0x80_0000);
+        for (sector, bytes) in [(1, &gpt), (BCPKG2, &bcpkg2)] {
+            let blocks = bytes.len() / 512;
+            card.command(23, blocks as u32).unwrap();
+            card.command(25, sector).unwrap();
+            for block in bytes.chunks(512) {
+                card.receive_block(block).unwrap();
+            }
+        }
+
+        // As package1ldr leaves the memory controller: the eMMC port's
+        // ASID register zero (no translation), the redirect aperture open
+        // from 0x4000_0000 to 0x8000_0000.
+        let ram = Arc::new(GuestRam::new(RAM_BASE, 0x10_0000).unwrap());
+        let memory_controller = Arc::new(mc::Mc::new(DramSize::Gb4));
+        let iram = Arc::new(Iram::new());
+        memory_controller.attach_iram(Arc::clone(&iram));
+        for (register, value) in [(0x65C, 0x4000_0000u32), (0x660, 0x8000_0000)] {
+            memory_controller
+                .write(0, register, 4, value.into())
+                .unwrap();
+        }
+        let bootloader = Bootloader {
+            sdmmc: Sdmmc::new(
+                Box::new(|_| {}),
+                DeviceMemory::new(&memory_controller, &ram, mc::SMMU_SDMMC4A_ASID),
+                Some(Box::new(card)),
+                Timing::INSTANT,
+                Arc::default(),
+                Arc::new(GuestClock::new()),
+            ),
+        };
+        let in_iram = |address: u32, len: usize| {
+            let mut bytes = vec![0; len];
+            iram.copy_out(address - iram::BASE as u32, &mut bytes)
+                .unwrap();
+            bytes
+        };
+
+        // Card initialisation (`0x40001454`), from power-on.
+        bootloader.set_up_host();
+        bootloader.command(0, 0, 0, None);
+        while bootloader.command(1, 0x4000_0080, 0x02, None) >> 31 == 0 {}
+        bootloader.command(2, 0, 0x09, None);
+        bootloader.command(3, 2 << 16, 0x1A, None);
+        bootloader.command(9, 2 << 16, 0x09, None);
+        bootloader.command(7, 2 << 16, 0x1B, None);
+        let ext_csd = Data {
+            address: 0x4001_F200,
+            blocks: 1,
+            read: true,
+            auto_stop: false,
+        };
+        bootloader.command(8, 0, 0x1A, Some(ext_csd));
+        let ext_csd = in_iram(0x4001_F200, 512);
+        assert_eq!(ext_csd[212..216], 0x80_0000u32.to_le_bytes(), "SEC_COUNT");
+        assert_eq!(ext_csd[196], 0x57, "DEVICE_TYPE");
+        bootloader.command(16, 512, 0x1A, None);
+        // 8-bit, high speed at 52 MHz; then the user area (`0x40001614`).
+        bootloader.switch(0x03B7_0200);
+        bootloader.switch(0x03B9_0100);
+        bootloader.switch(0x03B3_0000);
+
+        // The GPT (`0x4000CF6C`), then BCPKG2's first 64 sectors
+        // (`0x4000D8D0`), both into IRAM at 0x4003_0000.
+        bootloader.read_sectors(1, 33, 0x4003_0000);
+        assert_eq!(in_iram(0x4003_0000, gpt.len()), gpt);
+        let entries = in_iram(0x4003_0000 + 512 + 2 * 128, 128);
+        assert_eq!(entries[32..40], u64::from(BCPKG2).to_le_bytes());
+        bootloader.read_sectors(BCPKG2, 64, 0x4003_0000);
+        assert_eq!(in_iram(0x4003_0000, 0x8000), bcpkg2[..0x8000]);
+        let word = |address| u32::from_le_bytes(in_iram(address, 4).try_into().unwrap());
+        assert_eq!(
+            word(0x4003_4100) ^ word(0x4003_4108) ^ word(0x4003_410C),
+            size
+        );
+
+        // Package2 (`0x40000B7A`) into DRAM, across a 512 KiB DMA boundary
+        // the driver moves the buffer address over.
+        let dram = RAM_BASE as u32 + 0x7_F000;
+        bootloader.read_sectors(BCPKG2 + 32, (size / 512) as u16, dram);
+        let mut package2 = vec![0; size as usize];
+        ram.read(dram.into(), &mut package2).unwrap();
+        assert_eq!(package2, bcpkg2[0x4000..]);
+        assert_eq!(
+            in_iram(0x4003_0000, 0x8000),
+            bcpkg2[..0x8000],
+            "IRAM untouched"
         );
     }
 }

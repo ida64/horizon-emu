@@ -9,6 +9,10 @@
 //! open-source bootloaders. The processor's regulator is on, or nothing
 //! would be running; the GPU's is taken to be off, which is how those
 //! bootloaders hand the console over.
+//!
+//! On a power-on boot the NX bootloader writes the processor's regulator
+//! before anything reads it, too (its `0x40000806`): `CONTROL1` 0xB0,
+//! `CONTROL2` 0xC1, then both output registers 0xB7 (on, 950 mV).
 
 use super::i2c::RegisterMap;
 use crate::snapshot::{SnapshotError, decode, encode};

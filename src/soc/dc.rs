@@ -41,8 +41,9 @@
 //! restored from a snapshot ([`Dc`]'s [`Snapshot`]) with guest time set to
 //! the saved time reaches its next boundary when the saved one would have.
 //!
-//! Nothing is scanned out continuously. [`Dc::frame`] produces the picture
-//! the controller would be sending at that moment from the active copy:
+//! Nothing is scanned out continuously. [`Dc::frame_turned_clockwise`]
+//! produces the picture the controller would be sending at that moment, as
+//! the screen shows it, from the active copy:
 //! the enabled windows' frame buffers, fetched through the SMMU like the
 //! hardware fetches them, layered on the active area.
 
@@ -96,6 +97,12 @@ mod register {
     pub const DISPLAY_WINDOW_HEADER: u64 = 0x042;
     /// The command registers end here; double-buffered ones follow.
     pub const COMMAND_END: u64 = 0x044;
+    /// `DC_COM_DSC_TOP_CTL`. package1ldr's memory built-in self-test
+    /// workaround sets bit 2 by read-modify-write while the head is fresh
+    /// out of reset (its text `0x910`) and never reads it again; nothing
+    /// else touches it. \[assumption\] It reads zero until written: its
+    /// reset value is not public, and nothing ever looks at the other bits.
+    pub const DSC_TOP_CTL: u64 = 0x33E;
     /// Every read nvservices makes of it discards the value: in its clock
     /// change sequence while the head's clock is reported on (text
     /// `0x22d20`, `0x22c4c`, `0x3b580` and others) and before it
@@ -301,7 +308,7 @@ impl Frame {
 pub enum NoFrame {
     /// The controller has not been set up to send frames.
     NotRunning,
-    /// It is set up in a way [`Dc::frame`] does not render.
+    /// It is set up in a way [`Dc::frame_turned_clockwise`] does not render.
     Unsupported(String),
     /// The window's frame buffer is not memory the controller can reach.
     BufferUnmapped { address: u64 },
@@ -563,7 +570,9 @@ impl Dc {
     }
 
     /// The picture being sent to the panel, with the frame buffers read
-    /// through `memory`.
+    /// through `memory`, unturned: what the tests compare against the
+    /// controller's own coordinates.
+    #[cfg(test)]
     pub fn frame(&self, memory: &DeviceMemory) -> Result<Frame, NoFrame> {
         self.render(memory, false)
     }
@@ -1274,8 +1283,12 @@ impl MmioDevice for Dc {
             copy.windows[window].get(&number)
         } else {
             copy.general.get(&number).or_else(|| {
-                // Not known before it is written; nobody can tell.
-                (number == register::DISP_TIMING_OPTIONS).then_some(&0)
+                // Not known before they are written; nobody can tell.
+                matches!(
+                    number,
+                    register::DISP_TIMING_OPTIONS | register::DSC_TOP_CTL
+                )
+                .then_some(&0)
             })
         };
         value.map(|&value| value.into())

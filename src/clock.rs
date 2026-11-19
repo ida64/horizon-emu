@@ -7,13 +7,12 @@
 //! it to where the saved one was, so every deadline saved as guest time
 //! means what it meant.
 //!
-//! Device threads that wait for a moment of guest time do so through
-//! [`GuestClock::sleep_until`], or, when they wait on a condition variable
-//! of their own, with [`GuestClock::until`] as the timeout; either way
+//! Device threads that wait for a moment of guest time wait on a condition
+//! variable of their own, with [`GuestClock::until`] as the timeout, so
 //! they do not see time pass while the machine is paused.
 
 use std::{
-    sync::{Condvar, Mutex},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -23,7 +22,6 @@ const PAUSED_POLL: Duration = Duration::from_millis(20);
 
 pub struct GuestClock {
     state: Mutex<State>,
-    changed: Condvar,
 }
 
 #[derive(Clone, Copy)]
@@ -57,7 +55,6 @@ impl GuestClock {
                 at: Duration::ZERO,
                 since: Some(Instant::now()),
             }),
-            changed: Condvar::new(),
         }
     }
 
@@ -71,7 +68,6 @@ impl GuestClock {
         let mut state = self.state.lock().unwrap();
         state.at = state.now();
         state.since = None;
-        self.changed.notify_all();
     }
 
     /// Lets guest time run on from where it stands.
@@ -80,7 +76,6 @@ impl GuestClock {
         if state.since.is_none() {
             state.since = Some(Instant::now());
         }
-        self.changed.notify_all();
     }
 
     pub fn is_paused(&self) -> bool {
@@ -94,7 +89,6 @@ impl GuestClock {
         if state.since.is_some() {
             state.since = Some(Instant::now());
         }
-        self.changed.notify_all();
     }
 
     /// How long the host should wait for guest time to reach `deadline`:
@@ -107,28 +101,6 @@ impl GuestClock {
             None if state.at >= deadline => Duration::ZERO,
             None => PAUSED_POLL,
         }
-    }
-
-    /// Blocks until guest time has reached `deadline`, however long the
-    /// clock stands still on the way.
-    pub fn sleep_until(&self, deadline: Duration) {
-        let mut state = self.state.lock().unwrap();
-        loop {
-            let now = state.now();
-            if now >= deadline {
-                return;
-            }
-            let wait = match state.since {
-                Some(_) => deadline - now,
-                None => PAUSED_POLL,
-            };
-            state = self.changed.wait_timeout(state, wait).unwrap().0;
-        }
-    }
-
-    /// Blocks for `span` of guest time.
-    pub fn sleep(&self, span: Duration) {
-        self.sleep_until(self.now() + span);
     }
 }
 
