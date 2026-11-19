@@ -80,7 +80,9 @@ image packages in the BCPKG2 partitions; with --boot0 and --boot1 also the
 images of the two boot partitions for --emmc-boot0/--emmc-boot1 (sparse
 files), holding its BCTs and package1. install-boot puts those boot
 images of the firmware DIR into an existing user area image (its BCPKG2
-partitions, nothing else) and into the boot partition images FILE (made
+partitions, nothing else, after rewriting a partition table of 128
+entries in the eleven-entry form the NX bootloader accepts; partition
+contents untouched) and into the boot partition images FILE (made
 if missing). patch-prodinfo gives the calibration data of an image
 formatted before it had one that made-up TLS client identity, and
 changes nothing else. format-sd creates a
@@ -618,6 +620,10 @@ fn install_boot(path: &str, flags: &[String]) -> Result<(), String> {
             .map_err(|error| format!("{path}: {error}"))
     };
     let boot = [open(boot0)?, open(boot1)?];
+    let rewritten = nand::rewrite_partition_table(&image).map_err(|error| error.to_string())?;
+    if rewritten {
+        println!("partition table rewritten: eleven entries, the partitions untouched");
+    }
     install_boot_images(&boot_images, &image, Some(&boot))
 }
 
