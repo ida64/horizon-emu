@@ -383,21 +383,25 @@ impl Soc {
             falcon_host::SIZE,
             Box::new(Arc::clone(&vic)),
         );
-        for channel in 0..7 {
-            let vic = Arc::clone(&vic);
-            bus.map(
-                "host1x channel",
-                0x5000_0000 + channel * 0x4000,
-                0x100,
-                Box::new(host1x_channel::Channel::new(
+        let channels: Vec<Arc<host1x_channel::Channel>> = (0..7)
+            .map(|index| {
+                let vic = Arc::clone(&vic);
+                let channel = Arc::new(host1x_channel::Channel::new(
                     DeviceMemory::new(&mc, ram, mc::SMMU_HOST1X_ASID),
                     Arc::clone(&syncpoints),
                     Arc::clone(clock),
                     Arc::new(move |class, offset, value| vic.method(class, offset, value)),
                     Arc::clone(&notes),
-                )),
-            );
-        }
+                ));
+                bus.map(
+                    "host1x channel",
+                    0x5000_0000 + index * 0x4000,
+                    0x100,
+                    Box::new(Arc::clone(&channel)),
+                );
+                channel
+            })
+            .collect();
         let gpio = Arc::new(Gpio::with_interrupts(
             GPIO_INPUTS,
             gpio::INTIDS.map(|intid| line(gic, intid)),
@@ -462,7 +466,11 @@ impl Soc {
             Box::new(Arc::clone(&soc.dcb)),
         );
         bus.map("DSI", dsi::BASE, dsi::SIZE, Box::new(Arc::clone(&soc.dsi)));
-        let host1x = Host1xSync::new(syncpoints, vec![Arc::clone(&soc.dc), Arc::clone(&soc.dcb)]);
+        let host1x = Host1xSync::new(
+            syncpoints,
+            vec![Arc::clone(&soc.dc), Arc::clone(&soc.dcb)],
+            channels,
+        );
         bus.map(
             "host1x",
             host1x::SYNC_BASE,

@@ -23,6 +23,11 @@
 //! moment it is enabled, and the interrupt is a level that lasts while any
 //! status bit is set (the kernel event is created for a level interrupt,
 //! nvservices `0x10f5c`).
+//!
+//! Its CDMA timeout thread (`0x828A0`) reads a channel's `CBSTAT` and
+//! `CBREAD` to tell a channel standing at a wait for one of its job's
+//! syncpoints, which it lets run on, from one that is stuck; the channels
+//! answer them ([`Channel::command_status`]).
 
 use std::sync::{Arc, Mutex};
 
@@ -30,6 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     dc::Dc,
+    host1x_channel::Channel,
     regs::{RegisterFile, word},
 };
 use crate::{
@@ -74,6 +80,10 @@ mod register {
     pub const SYNCPT: u64 = 0xF80;
     /// Thresholds, a word each.
     pub const SYNCPT_INT_THRESH: u64 = 0x1380;
+    /// Per channel, read-only: the data of the method its command
+    /// processor stands at, and that method's class and offset.
+    pub const CBREAD: u64 = 0xC80;
+    pub const CBSTAT: u64 = 0xCC0;
 }
 
 /// Which bitmap register, and which of its words, `offset` is.
@@ -203,14 +213,21 @@ pub struct Host1xSync {
     /// The display controllers, which count frames and window updates on
     /// syncpoints.
     displays: Vec<Arc<Dc>>,
+    /// The channels, by number.
+    channels: Vec<Arc<Channel>>,
     configuration: RegisterFile,
 }
 
 impl Host1xSync {
-    pub fn new(syncpoints: Arc<Syncpoints>, displays: Vec<Arc<Dc>>) -> Self {
+    pub fn new(
+        syncpoints: Arc<Syncpoints>,
+        displays: Vec<Arc<Dc>>,
+        channels: Vec<Arc<Channel>>,
+    ) -> Self {
         Self {
             syncpoints,
             displays,
+            channels,
             configuration: RegisterFile::strict([]),
         }
     }
@@ -221,6 +238,24 @@ impl Host1xSync {
             .iter()
             .for_each(|display| display.count_frames());
     }
+
+    /// `CBREAD`/`CBSTAT` of a channel, if `offset` is one.
+    fn command_status(&self, offset: u64) -> Option<Option<u32>> {
+        use register::{CBREAD, CBSTAT};
+        let (array, status) = if (CBSTAT..CBSTAT + 0x40).contains(&offset) {
+            (CBSTAT, true)
+        } else if (CBREAD..CBREAD + 0x40).contains(&offset) {
+            (CBREAD, false)
+        } else {
+            return None;
+        };
+        let channel = self.channels.get(((offset - array) / 4) as usize)?;
+        Some(
+            channel
+                .command_status()
+                .map(|(stat, read)| if status { stat } else { read }),
+        )
+    }
 }
 
 impl MmioDevice for Host1xSync {
@@ -229,6 +264,9 @@ impl MmioDevice for Host1xSync {
         let offset = word(offset, size)?;
         if CONFIGURATION.contains(&offset) {
             return self.configuration.get(offset).map(u64::from);
+        }
+        if let Some(value) = self.command_status(offset) {
+            return value.map(u64::from);
         }
         let value = match offset {
             // Their sources are host1x's own errors, of channels and
@@ -343,7 +381,7 @@ mod tests {
             Box::new(Duration::default),
             Box::new(|_| {}),
         ));
-        let host1x = Host1xSync::new(Arc::clone(&syncpoints), vec![dc]);
+        let host1x = Host1xSync::new(Arc::clone(&syncpoints), vec![dc], Vec::new());
         (syncpoints, host1x)
     }
 
@@ -378,7 +416,7 @@ mod tests {
         let syncpoints = Arc::new(Syncpoints::new(Box::new(move |asserted| {
             line.store(asserted, std::sync::atomic::Ordering::SeqCst)
         })));
-        let host1x = Host1xSync::new(Arc::clone(&syncpoints), Vec::new());
+        let host1x = Host1xSync::new(Arc::clone(&syncpoints), Vec::new(), Vec::new());
         (syncpoints, host1x, level)
     }
 
