@@ -64,6 +64,7 @@ use horizon_emu::{
         BootBlocks, Soc,
         emmc::EmmcImages,
         flow::CopStatus,
+        irom::RomImage,
         mc::{self, DeviceMemory},
         medium::ImageFile,
     },
@@ -88,6 +89,10 @@ const TRACE: usize = 128;
 const BOOTLOADER_STATE: u32 = 0xF8;
 const MONITOR_STATE: u32 = 0xFC;
 
+/// Where the boot ROM starts package1ldr (the BCT's entry point), and the
+/// IRAM package1 is loaded into, up to the PK11 blob.
+const PACKAGE1LDR_ENTRY: u32 = 0x4001_0040;
+const PACKAGE1LDR: std::ops::Range<u32> = 0x4001_0000..0x4001_7000;
 /// Where the PK11 plaintext's header lands once the TSEC has decrypted the
 /// blob in place (package1ldr's PK11 parser, text 0xA10/0xA80).
 const PK11_HEADER: u32 = 0x1_7000;
@@ -277,14 +282,16 @@ impl Outcome {
     }
 }
 
-fn power_on() -> Outcome {
+/// The chain with the boot ROM high-level emulated, or with `rom`, a dump
+/// of it, run on the BPMP from its reset.
+fn power_on(rom: Option<RomImage>) -> Outcome {
     let keys =
         KeySet::load(Path::new(&format!("{ROOT}prod_newer.keys"))).expect("required key file");
     let kernel = KernelImage::load(Path::new(&format!("{ROOT}fw_kernel/kernel_normal.elf")))
         .expect("required kernel ELF of 23.5.0's package2 in ../fw_kernel");
     let (emmc, boot_bytes) = media(&keys);
 
-    // The boot ROM, as `boot --power-on` runs it (src/main.rs `boot_rom`).
+    // The boot ROM, as `power-on` runs it (src/main.rs `boot_rom`).
     let fuses = bootrom::Fuses::retail(
         *keys
             .secure_boot_key()
@@ -292,14 +299,19 @@ fn power_on() -> Outcome {
         0,
         bootrom::ChipFuses::default(),
     );
-    let mut iram = vec![0; bootrom::IRAM_SIZE];
-    let handoff = bootrom::cold_boot(&boot_bytes[0], &boot_bytes[1], &fuses, 0, &mut iram)
-        .expect("the boot ROM boots package1 from BOOT0");
-    let entry = handoff.entry;
-    let power_on = PowerOn {
-        handoff,
-        iram,
-        fuses,
+    let power_on = match rom {
+        Some(rom) => PowerOn::Rom { rom, fuses },
+        None => {
+            let mut iram = vec![0; bootrom::IRAM_SIZE];
+            let handoff = bootrom::cold_boot(&boot_bytes[0], &boot_bytes[1], &fuses, 0, &mut iram)
+                .expect("the boot ROM boots package1 from BOOT0");
+            assert_eq!(handoff.entry, PACKAGE1LDR_ENTRY);
+            PowerOn::Emulated {
+                handoff,
+                iram,
+                fuses,
+            }
+        }
     };
 
     // The machine of `Machine::new` with `power_on`, without the VM and the
@@ -316,7 +328,7 @@ fn power_on() -> Outcome {
         &clock,
         Some(emmc),
         None,
-        true,
+        power_on.soc_start(),
         &mut bus,
     )
     .expect("the SoC builds on these images");
@@ -349,7 +361,7 @@ fn power_on() -> Outcome {
     };
 
     let progress = Arc::new(Progress::default());
-    if entry == 0x4001_0040 && bpmp.core().pc() == entry {
+    if bpmp.core().pc() == PACKAGE1LDR_ENTRY {
         progress.reach(Stage::BootRomHandoff, &clock);
     }
     let stop = AtomicBool::new(false);
@@ -390,6 +402,15 @@ fn power_on() -> Outcome {
             }
             let slice = bpmp.slice(&env, SLICE);
             let pc = bpmp.core().pc();
+            // With a dump of the ROM: it has hidden itself and the BPMP
+            // runs what it loaded, package1 at power-on and the warmboot
+            // firmware (to the same place) after SC7.
+            if blocks.sb.irom_hidden_from().is_some() && PACKAGE1LDR.contains(&pc) {
+                progress.reach(Stage::BootRomHandoff, &clock);
+                if progress.has(Stage::Sc7) {
+                    progress.reach(Stage::Warmboot, &clock);
+                }
+            }
             if NX_BOOTLOADER_STUB.contains(&pc)
                 && iram_word(blocks, PK11_HEADER).to_le_bytes() == *b"PK11"
             {
@@ -421,6 +442,7 @@ fn power_on() -> Outcome {
                 Slice::PoweredDown | Slice::Asleep => {
                     stopped = Some("the SoC entered SC7 before the kernel asked to sleep".into());
                 }
+                // Without a dump of the ROM the BPMP wakes at the warmboot.
                 Slice::Woke => {
                     if bpmp.core().pc() == WARMBOOT_ENTRY {
                         progress.reach(Stage::Warmboot, &clock);
@@ -566,7 +588,8 @@ fn suspend(
 
 /// The harness's SC7: the wake comes at once (the console's would be the
 /// power key at the PMC; no kernel ran here to arm it), and the boot ROM's
-/// warm path is the machine's.
+/// warm path is the machine's (the high-level one; with a dump of the ROM
+/// the BPMP runs the ROM instead and this is not asked).
 struct WakesAtOnce<'a> {
     soc: &'a Soc,
     bus: &'a Bus,
@@ -596,11 +619,9 @@ impl PowerDomain for WakesAtOnce<'_> {
 /// stop the test prints.
 const REACHED: Stage = Stage::KernelResumed;
 
-/// The chain on the BPMP, to the kernel's entry, then a sleep and a wake
-/// through the monitor's SC7 stub and the warmboot firmware.
-#[test]
-fn power_on_runs_the_boot_chain_on_the_bpmp_alone() {
-    let outcome = power_on();
+/// Fails unless `outcome` reached every stage up to `floor`, or all of
+/// them if it got past it.
+fn check(outcome: &Outcome, floor: Stage) {
     let explained = outcome.explain();
     let reached: Vec<Stage> = outcome
         .progress
@@ -614,7 +635,7 @@ fn power_on_runs_the_boot_chain_on_the_bpmp_alone() {
     let floor = if complete {
         Stage::KernelResumed
     } else {
-        REACHED
+        floor
     };
     // Every stage up to the floor (the monitor's own state may come before
     // or after the bootloader's first).
@@ -641,4 +662,28 @@ fn power_on_runs_the_boot_chain_on_the_bpmp_alone() {
         );
     }
     println!("{explained}");
+}
+
+/// The chain on the BPMP, to the kernel's entry, then a sleep and a wake
+/// through the monitor's SC7 stub and the warmboot firmware.
+#[test]
+fn power_on_runs_the_boot_chain_on_the_bpmp_alone() {
+    check(&power_on(None), REACHED);
+}
+
+/// A dump of the T210 boot ROM, for the run that executes it. NVIDIA's
+/// code is not part of this repository: the test runs where the file is.
+const BOOT_ROM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../t210_bootrom.bin");
+
+/// The same chain with the boot ROM itself run on the BPMP from its reset
+/// vector: at power-on (BCT, package1) and again at the wake (the saved
+/// security engine context, the warmboot firmware).
+#[test]
+fn power_on_runs_the_boot_rom_itself() {
+    let Ok(bytes) = std::fs::read(BOOT_ROM) else {
+        eprintln!("{BOOT_ROM} absent: skipped");
+        return;
+    };
+    let rom = RomImage::new(bytes).expect("a dump of the T210 boot ROM");
+    check(&power_on(Some(rom)), REACHED);
 }

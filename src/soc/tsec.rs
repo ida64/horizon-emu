@@ -72,7 +72,18 @@
 //!    left spinning, is not modeled\]. The other anti-tamper tests (random
 //!    CAR toggles, memory-transfer and TZRAM tests, the SMMU/fuse
 //!    virtualization probe) are not made.
-//! 2. PK11 at IRAM 0x4001_6FE0 (size word, IV at +0x10, ciphertext at
+//! 2. `car_init` ("Initialize CAR registers", Switchbrew) puts the boot
+//!    ROM's two devices back into reset: SDMMC4, which the ROM read the
+//!    BCT and package1 from, and USBD, whose PHY it always brings up
+//!    \[inference: the ROM takes both out of reset and never puts them
+//!    back (ROM `0x111B78`, `0x106CD0`; the driver's shut-down, `0x112946`,
+//!    has no caller), neither package1ldr nor the NX bootloader touches
+//!    them before the bootloader's hardware-state check, which requires
+//!    both resets asserted (`RST_DEVICES_L` bits 15 and 22), and this is
+//!    the only step in between that writes the clock and reset
+//!    controller. What else it writes is not public; every other register
+//!    the check reads already has its value without it\].
+//! 3. PK11 at IRAM 0x4001_6FE0 (size word, IV at +0x10, ciphertext at
 //!    +0x20, CMAC trailer after it) is checked with AES-CMAC under
 //!    `package1_mac_key_08` and decrypted in place with AES-128-CBC under
 //!    `package1_key_08`; its header is checked and its NX-bootloader entry
@@ -81,7 +92,7 @@
 //!    this package1 with the key set). A size above 0x287F0, a CMAC mismatch or a
 //!    bad header is refused \[inference: the firmware checks; what it does
 //!    then is not public\].
-//! 3. Security engine keyslot 0x0D gets `tsec_root_key_02` and keyslot
+//! 4. Security engine keyslot 0x0D gets `tsec_root_key_02` and keyslot
 //!    0x0C `tsec_key`, in that order, and slot 0x0D is made secure-only
 //!    (its bit of `SE_CRYPTO_SECURITY_PERKEY` cleared) while both keep
 //!    every access permission \[inference: the NX bootloader's
@@ -90,13 +101,13 @@
 //!    clear) and the access registers of slots 0..13 (SE+0x284..0x2B8) to
 //!    read 0x7F; neither the boot ROM nor package1ldr writes them, and no
 //!    public source describes SecureBoot's keyslot locks\].
-//! 4. `EVP_COP_RESET_VECTOR` (0x6000_F200) gets the entry (`set_excp_vec`)
+//! 5. `EVP_COP_RESET_VECTOR` (0x6000_F200) gets the entry (`set_excp_vec`)
 //!    \[assumption: only the reset vector; Switchbrew names the call
 //!    without saying which vectors\].
-//! 5. MAILBOX1 reads 0xB0B0B0B0 (SecureBootLdr's success write), DMEM is
+//! 6. MAILBOX1 reads 0xB0B0B0B0 (SecureBootLdr's success write), DMEM is
 //!    cleared, the processor is halted (`CPUCTL` `HALTED`, `IRQSTAT`
 //!    `HALT` pending).
-//! 6. The machine restarts the BPMP in ARM state at the entry
+//! 7. The machine restarts the BPMP in ARM state at the entry
 //!    ([`TsecSoc::restart_bpmp`]). Switchbrew has SecureBoot halt the BPMP
 //!    through the flow controller, set its vectors and resume it; a BPMP
 //!    spinning with interrupts masked leaves its loop only through a reset,
@@ -133,8 +144,9 @@
 //!   signature at IMEM 0x2F00); the keks never leave the TSEC.
 //!
 //! Not modeled, refused where it would be read: the SOR1 HDCP registers
-//! Keygen writes the TSEC key into, the SCP's state, `car_init` and
-//! `ccplex_init`'s side effects, any lock of keyslots 0x0C/0x0D beyond
+//! Keygen writes the TSEC key into, the SCP's state, what `car_init`
+//! writes beyond those two resets, `ccplex_init`'s side effects, any lock
+//! of keyslots 0x0C/0x0D beyond
 //! slot 0x0D's per-key bit, the PK11 header, IV and CMAC bytes around the plaintext
 //! (left as they were).
 
@@ -258,6 +270,10 @@ const TSEC_ROOT_KEY_SLOT: usize = 0x0D;
 const EVP_COP_RESET_VECTOR: u32 = 0x6000_F200;
 /// SecureBootLdr's success value in MAILBOX1 (Switchbrew "SCRATCH1").
 const BOOT_SUCCESS: u32 = 0xB0B0_B0B0;
+/// `CLK_RST_CONTROLLER_RST_DEV_L_SET` and the resets `car_init` asserts
+/// there: USBD (bit 22) and SDMMC4 (bit 15); see the module.
+const RST_DEV_L_SET: u32 = 0x6000_6300;
+const CAR_INIT_RESETS: u32 = 1 << 22 | 1 << 15;
 
 /// The rest of the SoC as the TSEC reaches it and acts on it.
 ///
@@ -694,6 +710,9 @@ impl Tsec {
                 ));
             }
         }
+        // `car_init`, as far as its effect is established (see the module).
+        soc.ahb_write(RST_DEV_L_SET, &CAR_INIT_RESETS.to_le_bytes())
+            .ok_or("car_init: asserting the SDMMC4 and USBD resets failed")?;
         let size = word(PK11_BLOB)? as usize;
         if size > PK11_MAX_SIZE || !size.is_multiple_of(16) {
             return Err(format!("PK11 size {size:#x}"));

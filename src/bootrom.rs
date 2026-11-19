@@ -1,14 +1,15 @@
 //! The T210 boot ROM's cold boot from the eMMC, high-level emulated: the
 //! state it leaves when it starts the bootloader (package1ldr) on the BPMP.
 //!
-//! No dump of the ROM exists here and none may be fetched, so this is built
-//! from public descriptions only: switchbrew ("BCT", "Package1", "Fuses",
-//! "Cryptosystem", "Flash Filesystem"), the Fusée Gelée disclosure
+//! The ROM is NVIDIA's code and is not part of this program, so this is
+//! built from public descriptions only: switchbrew ("BCT", "Package1",
+//! "Fuses", "Cryptosystem", "Flash Filesystem"), the Fusée Gelée disclosure
 //! (ReSwitched, 2018), NVIDIA's T210 BCT header as published with
 //! cbootimage (layout facts), U-Boot's and coreboot's Tegra210 headers, and
 //! what package1ldr of firmware 23.5.0 reads (its code at `0x400100FA`,
-//! called from `0x40010CEE`). A dump, should one be supplied, runs on the
-//! BPMP instead; the boundary is [`BootRomHandoff`].
+//! called from `0x40010CEE`). A machine given a dump of the ROM runs it on
+//! the BPMP instead ([`crate::soc::irom`], [`crate::machine::PowerOn::Rom`])
+//! and takes from here only the console's fuses ([`Fuses::at_reset`]).
 //!
 //! [`cold_boot`], in the ROM's order:
 //!
@@ -75,11 +76,11 @@
 //!    permissions but key read). The private key fuses then read as all
 //!    ones (switchbrew "Fuses"); [`fuses_after_boot`] is what the fuse
 //!    block shows from then on.
-//! 8. The lock-outs (Fusée Gelée: applied before the bootloader starts):
-//!    the IROM is hidden, `SB_CSR` bit 4 (`PIROM_DISABLE`) set with
-//!    `SB_PIROM_START` 0x1000 ([`ROM_LOCKOUTS`]). \[inference\] These are
-//!    the ROM's: the NX bootloader's check requires those values, and
-//!    package1ldr does not write the SB registers.
+//! 8. The lock-out (Fusée Gelée: applied before the bootloader starts):
+//!    the IROM is hidden, `SB_CSR` bit 4 (`PIROM_DISABLE`) set
+//!    ([`ROM_LOCKOUT`]) from `SB_PIROM_START` on, which is 0x1000 from
+//!    reset ([`crate::soc::sb`]). The ROM's last store before the
+//!    bootloader (ROM `0x100FDC`).
 //! 9. The BPMP starts at the entry point in ARM state (package1ldr's first
 //!    instruction, at 0x40010040, is the ARM `ldr sp, =0x40008000`).
 //!
@@ -165,8 +166,9 @@ const RSA_SIZE: usize = 0x100;
 /// The SHA-256 of the modulus in the Erista BCTs of firmware 23.5.0 (normal
 /// and safe mode alike): what `FUSE_PUBLIC_KEY0-7` hold on a retail Erista,
 /// derived, not read from one. `FUSE_PUBLIC_KEY0` holds bytes 0-3 as a
-/// little-endian word, and so on \[assumption\]: only reads of the fuse
-/// registers depend on that order.
+/// little-endian word, and so on: the ROM copies the fuse words out that
+/// way and compares the bytes with the SHA-256 the security engine writes
+/// to memory (`0x102248`, `0x102896`).
 pub const ERISTA_PUBLIC_KEY_HASH: [u8; 32] = [
     0x4F, 0xBD, 0xB8, 0x60, 0x7C, 0x0B, 0xCC, 0x95, 0x20, 0xD7, 0x86, 0x34, 0xCB, 0x1E, 0xD2, 0xEE,
     0x96, 0x64, 0xE6, 0x66, 0x5D, 0xFE, 0xED, 0xCE, 0x18, 0x59, 0x13, 0xD1, 0x00, 0xE1, 0x39, 0x7E,
@@ -183,6 +185,18 @@ const FUSE_SKU_INFO: u64 = 0x110;
 const FUSE_SECURITY_MODE: u64 = 0x1A0;
 const FUSE_PUBLIC_KEY0: u64 = 0x164;
 const FUSE_PRIVATE_KEY0: u64 = 0x1A4;
+/// `FUSE_PRODUCTION_MODE` (0x7000F900): burnt on every chip NVIDIA ships
+/// \[inference: it marks a chip as past NVIDIA's own production; the ROM
+/// treats one without it as a pre-production part, `0x100294`\].
+/// `FUSE_FA` (0x7000F948): failure analysis mode, not burnt on a unit in
+/// the field.
+const FUSE_PRODUCTION_MODE: u64 = 0x100;
+const FUSE_FA: u64 = 0x148;
+/// `FUSE_RESERVED_SW` (0x7000F9C0) and `FUSE_OPT_VENDOR_CODE` (0x7000FA00),
+/// the first of the die's identity fuses ([`ChipFuses`], in its order,
+/// with the unnamed one at 0x7000FA20).
+const FUSE_RESERVED_SW: u64 = 0x1C0;
+const FUSE_OPT_VENDOR_CODE: u64 = 0x200;
 /// "Must be 0x83"; package1ldr compares it (`0x400100D8`).
 const SKU_ID: u32 = 0x83;
 
@@ -190,9 +204,33 @@ const SKU_ID: u32 = 0x83;
 /// straps.
 const RESERVED_SW_BOOT_DEVICE: u32 = 0b111;
 const RESERVED_SW_SKIP_STRAPS: u32 = 1 << 3;
-/// \[assumption\] The SDMMC is boot device 0, as `NvBootFuseBootDevice`
-/// is recalled to begin; nothing else reads the value.
+/// Recovery mode asks for two buttons (VOLUME_UP and HOME): set on
+/// production units (switchbrew "Fuses"). Bit 7, recovery over XUSB, is
+/// clear on the original Erista units.
+const RESERVED_SW_TWO_BUTTON_RCM: u32 = 1 << 6;
+/// The SDMMC is boot device 0: the real ROM, given 0, reads its BCT from
+/// the eMMC (`0x101EFE`).
 const FUSE_BOOT_DEVICE_SDMMC: u32 = 0;
+/// Fuses only the real ROM reads (switchbrew "Fuses" for the names).
+/// `FUSE_BOOT_DEVICE_INFO`: the boot device's configuration index, of
+/// which the ROM takes bits 13:0 (`0x102156`). \[assumption\] 0, the eMMC's
+/// default configuration: a retail unit's word is not public.
+const FUSE_BOOT_DEVICE_INFO: u64 = 0x1BC;
+/// `FUSE_PKC_DISABLE`: 0, since a retail unit's ROM checks the BCT's RSA
+/// signature (Fusée Gelée; the ROM takes its public-key scheme only on 0,
+/// `0x102020`).
+const FUSE_PKC_DISABLE: u64 = 0x268;
+/// `FUSE_ODM_INFO`: `0x1F00` on production units, every debug signal
+/// disabled (switchbrew "Fuses").
+const FUSE_ODM_INFO: u64 = 0x29C;
+const ODM_INFO_PRODUCTION: u32 = 0x1F00;
+/// `FUSE_SECURE_PROVISION_INDEX` and `_INFO`: NVIDIA's factory
+/// provisioning, which picks a provisioning key by the index and, by bit
+/// 1 of the info word, keeps the ROM out of its ODM production mode
+/// (`0x100286`, `0x10033A`). 0 on a unit in the field \[inference: its ROM
+/// is in that mode, which is why it insists on the BCT's signature\].
+const FUSE_SECURE_PROVISION_INDEX: u64 = 0x2E8;
+const FUSE_SECURE_PROVISION_INFO: u64 = 0x2EC;
 
 /// `PMC_SCRATCH0` bits the ROM tests first.
 const SCRATCH0_WARM_BOOT: u32 = 1;
@@ -222,18 +260,66 @@ pub struct Fuses {
 
 impl Fuses {
     /// A retail Erista with this console's private key fuses and chip
-    /// identity. `reserved_sw` is \[assumption\] "skip the straps, boot the
-    /// SDMMC": a retail unit boots its eMMC, but its actual fuse word is not
-    /// public; only this module reads it.
+    /// identity. `reserved_sw` is the production units' two-button recovery
+    /// mode and \[assumption\] "skip the straps, boot the SDMMC": a retail
+    /// unit boots its eMMC, but the rest of its fuse word is not public.
     pub fn retail(secure_boot_key: Key, device_key: u32, chip: ChipFuses) -> Self {
         Self {
             odm_production: true,
             public_key_hash: ERISTA_PUBLIC_KEY_HASH,
             secure_boot_key,
             device_key,
-            reserved_sw: RESERVED_SW_SKIP_STRAPS | FUSE_BOOT_DEVICE_SDMMC,
+            reserved_sw: RESERVED_SW_TWO_BUTTON_RCM
+                | RESERVED_SW_SKIP_STRAPS
+                | FUSE_BOOT_DEVICE_SDMMC,
             chip,
         }
+    }
+
+    /// The fuse cache words these fuses give at reset, before the ROM has
+    /// run, as `(offset, value)` in the block at 0x7000F800: what
+    /// [`fuses_after_boot`] gives with the private key fuses readable
+    /// (`FUSE_PRIVATE_KEY0-3` the secure boot key as the key file has it,
+    /// each word little-endian, the way open-source tools copy the fuse
+    /// words out; `FUSE_PRIVATE_KEY4` the device key) and
+    /// `FUSE_PRIVATEKEYDISABLE` clear, and the fuses only the ROM reads:
+    /// `FUSE_RESERVED_SW`, the die's identity, and those of its boot
+    /// device and mode (see their constants).
+    pub fn at_reset(&self) -> Vec<(u64, u32)> {
+        let hash = self.public_key_hash.as_chunks::<4>().0.iter();
+        let key = self.secure_boot_key.as_chunks::<4>().0.iter();
+        let chip = &self.chip;
+        let mut words = vec![
+            (FUSE_PRODUCTION_MODE, 1),
+            (FUSE_FA, 0),
+            (FUSE_SKU_INFO, SKU_ID),
+            (FUSE_SECURITY_MODE, u32::from(self.odm_production)),
+            (FUSE_PRIVATEKEYDISABLE, 0),
+            (FUSE_PRIVATE_KEY0 + 16, self.device_key),
+            (FUSE_RESERVED_SW, self.reserved_sw),
+            (FUSE_BOOT_DEVICE_INFO, 0),
+            (FUSE_PKC_DISABLE, 0),
+            (FUSE_ODM_INFO, ODM_INFO_PRODUCTION),
+            (FUSE_SECURE_PROVISION_INDEX, 0),
+            (FUSE_SECURE_PROVISION_INFO, 0),
+            (FUSE_OPT_VENDOR_CODE, chip.vendor_code),
+            (FUSE_OPT_VENDOR_CODE + 0x04, chip.fab_code),
+            (FUSE_OPT_VENDOR_CODE + 0x08, chip.lot_code_0),
+            (FUSE_OPT_VENDOR_CODE + 0x0C, chip.lot_code_1),
+            (FUSE_OPT_VENDOR_CODE + 0x10, chip.wafer_id),
+            (FUSE_OPT_VENDOR_CODE + 0x14, chip.x_coordinate),
+            (FUSE_OPT_VENDOR_CODE + 0x18, chip.y_coordinate),
+            (FUSE_OPT_VENDOR_CODE + 0x20, chip.unknown_0x220),
+        ];
+        for (index, word) in hash.enumerate() {
+            let value = u32::from_le_bytes(*word);
+            words.push((FUSE_PUBLIC_KEY0 + 4 * index as u64, value));
+        }
+        for (index, word) in key.enumerate() {
+            let value = u32::from_le_bytes(*word);
+            words.push((FUSE_PRIVATE_KEY0 + 4 * index as u64, value));
+        }
+        words
     }
 }
 
@@ -366,20 +452,13 @@ pub struct RegisterBits {
     pub value: u32,
 }
 
-/// The ROM's lock-outs: `SB_CSR` (0x6000C200, the NX bootloader checks bits
-/// 15:4 and 1:0) with `PIROM_DISABLE`, and `SB_PIROM_START` (0x6000C204).
-pub const ROM_LOCKOUTS: [RegisterBits; 2] = [
-    RegisterBits {
-        address: 0x6000_C200,
-        mask: 0xFFF3,
-        value: 1 << 4,
-    },
-    RegisterBits {
-        address: 0x6000_C204,
-        mask: u32::MAX,
-        value: 0x1000,
-    },
-];
+/// The ROM's lock-out: `SB_CSR` (0x6000C200, the NX bootloader checks bits
+/// 15:4 and 1:0) with `PIROM_DISABLE`.
+pub const ROM_LOCKOUT: RegisterBits = RegisterBits {
+    address: 0x6000_C200,
+    mask: 0xFFF3,
+    value: 1 << 4,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootRomError {
@@ -913,7 +992,7 @@ pub struct WarmBootHandoff {
     /// the guest has written the bytes itself.
     pub iram_undefined: Vec<(Range<u32>, &'static str)>,
     /// Register bits to apply, in order: [`SELF_REFRESH_EXIT`], then
-    /// [`ROM_LOCKOUTS`] (Fusée Gelée's pseudo-code applies the lock-outs
+    /// [`ROM_LOCKOUT`] (Fusée Gelée's pseudo-code applies the lock-out
     /// after either path).
     pub registers: Vec<RegisterBits>,
     /// The security engine's state as it was saved before SC7, for
@@ -1115,10 +1194,7 @@ pub fn warm_boot(
         cpsr: ENTRY_CPSR,
         iram_written: written,
         iram_undefined,
-        registers: [SELF_REFRESH_EXIT]
-            .into_iter()
-            .chain(ROM_LOCKOUTS)
-            .collect(),
+        registers: vec![SELF_REFRESH_EXIT, ROM_LOCKOUT],
         se_context,
     })
 }
@@ -1570,7 +1646,7 @@ mod tests {
             ]
         );
         assert_eq!(handoff.registers[0], SELF_REFRESH_EXIT);
-        assert_eq!(handoff.registers[1..], ROM_LOCKOUTS);
+        assert_eq!(handoff.registers[1], ROM_LOCKOUT);
         // The entry holds the first word of the code: the warmboot's branch
         // to 0x40010444.
         assert_eq!(iram_word(&iram, handoff.entry), u32_at(&warmboot, 0x240));

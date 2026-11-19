@@ -24,11 +24,15 @@
 //! Power-on values: what the NX bootloader's hardware-state check requires
 //! before it writes the block (`nxbl_hwcheck.csv`, text `0x40002A7C`):
 //! `SB_PFCFG`, the spare registers and both reset vector halves zero, and
-//! `SB_CSR` with only `PIROM_DISABLE` set and `SB_PIROM_START` 0x1000 —
-//! those two the boot ROM's lock-outs ([`crate::bootrom::ROM_LOCKOUTS`],
-//! applied with [`Sb::apply_rom`]); before them `SB_CSR` is
-//! \[assumption\] zero and `SB_PIROM_START` refuses to be read. Bits the
-//! check does not look at are \[assumption\] zero.
+//! `SB_CSR` with only `PIROM_DISABLE` set and `SB_PIROM_START` 0x1000.
+//! `PIROM_DISABLE` is the boot ROM's lock-out, its last store before it
+//! starts the bootloader (ROM `0x100FDC`; [`crate::bootrom::ROM_LOCKOUT`]
+//! when the ROM is high-level emulated, applied with [`Sb::apply_rom`]);
+//! before it `SB_CSR` is \[assumption\] zero. `SB_PIROM_START` is 0x1000
+//! from reset \[inference: the ROM never writes it, and goes on running at
+//! `0x100FE0` once it has set `PIROM_DISABLE`, which only a hidden part
+//! starting above that allows\]; writes of it are refused. Bits the check
+//! does not look at are \[assumption\] zero.
 //!
 //! \[assumption\] Once `NS_RST_VEC_WR_DIS` is set, writes of the reset
 //! vector by non-secure masters are dropped, as the name says; the BPMP
@@ -39,7 +43,10 @@
 //! writing zero does not clear them. Writes that set other `SB_CSR` bits,
 //! and writes of the read-only registers above, are refused.
 
-use std::sync::Mutex;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +62,7 @@ pub const SIZE: u64 = 0x100;
 
 const CSR: u64 = 0x00;
 const PIROM_START: u64 = 0x04;
+const PIROM_START_AT_RESET: u32 = 0x1000;
 const PFCFG: u64 = 0x08;
 const SPARE: u64 = 0x0C;
 const SPARE_COUNT: usize = 8;
@@ -65,14 +73,27 @@ pub const CSR_NS_RST_VEC_WR_DIS: u32 = 1 << 1;
 pub const CSR_PIROM_DISABLE: u32 = 1 << 4;
 const AARCH64_MODE_EN: u32 = 1 << 0;
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct State {
     csr: u32,
-    pirom_start: Option<u32>,
+    pirom_start: u32,
     pfcfg: u32,
     spare: [u32; SPARE_COUNT],
     reset_low: u32,
     reset_high: u32,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            csr: 0,
+            pirom_start: PIROM_START_AT_RESET,
+            pfcfg: 0,
+            spare: [0; SPARE_COUNT],
+            reset_low: 0,
+            reset_high: 0,
+        }
+    }
 }
 
 /// Where a CPU-cluster core starts.
@@ -87,6 +108,9 @@ pub struct ResetVector {
 #[derive(Default)]
 pub struct Sb {
     state: Mutex<State>,
+    /// Counts changes of the boot ROM's lock-out (and of the patch unit,
+    /// which shares it): see [`Sb::irom_generation`].
+    irom_generation: Arc<AtomicU64>,
 }
 
 impl Sb {
@@ -99,6 +123,25 @@ impl Sb {
     /// lock-outs again, and the warmboot firmware writes the vector).
     pub fn reset(&self) {
         *self.state.lock().unwrap() = State::default();
+        self.irom_changed();
+    }
+
+    /// A counter that moves whenever what the boot ROM's memory reads as
+    /// may have changed: the lock-out here, and the patch unit's entries
+    /// ([`super::irom::Irom`] increments the same counter).
+    pub fn irom_generation(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.irom_generation)
+    }
+
+    fn irom_changed(&self) {
+        self.irom_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The offset in the boot ROM from which it is hidden: `SB_PIROM_START`
+    /// once `PIROM_DISABLE` is set; `None` while all of it can be read.
+    pub fn irom_hidden_from(&self) -> Option<u32> {
+        let state = *self.state.lock().unwrap();
+        (state.csr & CSR_PIROM_DISABLE != 0).then_some(state.pirom_start)
     }
 
     /// The AArch64 reset vector.
@@ -110,17 +153,16 @@ impl Sb {
         }
     }
 
-    /// What the boot ROM leaves in the register at `offset`: the bits in
-    /// `mask` are `value`. `None` for a register the ROM's lock-outs do not
-    /// name (`SB_CSR`, `SB_PIROM_START`).
+    /// What the boot ROM leaves in `SB_CSR`: the bits in `mask` are
+    /// `value`. `None` for any other register.
     pub fn apply_rom(&self, offset: u64, mask: u32, value: u32) -> Option<()> {
+        if offset != CSR {
+            return None;
+        }
         let mut state = self.state.lock().unwrap();
-        let register = match offset {
-            CSR => &mut state.csr,
-            PIROM_START => state.pirom_start.get_or_insert(0),
-            _ => return None,
-        };
-        *register = *register & !mask | value & mask;
+        state.csr = state.csr & !mask | value & mask;
+        drop(state);
+        self.irom_changed();
         Some(())
     }
 }
@@ -131,7 +173,7 @@ impl MmioDevice for Sb {
         let offset = word(offset, size)?;
         let value = match offset {
             CSR => state.csr,
-            PIROM_START => state.pirom_start?,
+            PIROM_START => state.pirom_start,
             PFCFG => state.pfcfg,
             AA64_RESET_LOW => state.reset_low,
             AA64_RESET_HIGH => state.reset_high,
@@ -156,6 +198,10 @@ impl MmioDevice for Sb {
             PFCFG => state.pfcfg = value,
             _ => return None,
         }
+        drop(state);
+        if offset == CSR {
+            self.irom_changed();
+        }
         Some(())
     }
 
@@ -171,6 +217,7 @@ impl Snapshot for Sb {
 
     fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
         *self.state.lock().unwrap() = decode("secure boot registers", state)?;
+        self.irom_changed();
         Ok(())
     }
 }
@@ -183,23 +230,24 @@ mod tests {
 
     fn after_rom() -> Sb {
         let sb = Sb::new();
-        for lockout in crate::bootrom::ROM_LOCKOUTS {
-            sb.apply_rom(
-                u64::from(lockout.address) - BASE,
-                lockout.mask,
-                lockout.value,
-            )
-            .unwrap();
-        }
+        let lockout = crate::bootrom::ROM_LOCKOUT;
+        sb.apply_rom(
+            u64::from(lockout.address) - BASE,
+            lockout.mask,
+            lockout.value,
+        )
+        .unwrap();
         sb
     }
 
     #[test]
     fn reads_what_the_bootloader_checks() {
-        assert_eq!(Sb::new().read(BPMP, PIROM_START, 4), None);
+        assert_eq!(Sb::new().read(BPMP, PIROM_START, 4), Some(0x1000));
+        assert_eq!(Sb::new().irom_hidden_from(), None);
         let sb = after_rom();
         assert_eq!(sb.read(BPMP, CSR, 4), Some(0x10));
         assert_eq!(sb.read(BPMP, PIROM_START, 4), Some(0x1000));
+        assert_eq!(sb.irom_hidden_from(), Some(0x1000));
         for offset in [PFCFG, 0x0C, 0x28, AA64_RESET_LOW, AA64_RESET_HIGH] {
             assert_eq!(sb.read(BPMP, offset, 4), Some(0), "{offset:#x}");
         }

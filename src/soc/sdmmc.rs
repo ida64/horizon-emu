@@ -221,10 +221,15 @@ const TUNING_TRIES_SHIFT: u32 = 13;
 /// Specification version 3.0, vendor version 3.
 const HOST_VERSION_VALUE: u16 = 0x0303;
 
-/// 64-bit system addressing, the one capability the filesystem process
-/// insists on before it goes further (it aborts without it). Nothing
+/// 64-bit system addressing (bit 28), the one capability the filesystem
+/// process insists on before it goes further (it aborts without it), and
+/// High Speed Support (bit 21) \[inference: the boot ROM keeps the clock
+/// divider the BCT asks of the eMMC, 9, only on a host that reports it
+/// (`0x111B78`, `0x111F2A`), and otherwise falls back to the card's
+/// 26 MHz; the NX bootloader's hardware-state check requires
+/// `CLK_SOURCE_SDMMC4` as the first leaves it, `0x10`\]. Nothing
 /// establishes the other capability fields, so they read as absent.
-const CAPABILITIES_VALUE: u32 = 1 << 28;
+const CAPABILITIES_VALUE: u32 = 1 << 28 | 1 << 21;
 
 /// Called with the level of the controller's interrupt output.
 pub type InterruptLine = Box<dyn Fn(bool) + Send + Sync>;

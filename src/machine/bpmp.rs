@@ -9,7 +9,7 @@
 //! | range | what | here |
 //! |---|---|---|
 //! | `0x0000_0000`..`0x0000_0020` | the architected vectors | never taken: exceptions go where `EVP_COP_*_VECTOR` say ([`crate::soc::evp`]); an exception whose register is unwritten stops the BPMP with that said |
-//! | `0x0010_0000`..`0x0012_0000` | IROM, the boot ROM | refused: no dump is available and the ROM is high-level emulated ([`crate::bootrom`]); it has also locked itself out before the bootloader runs (Fusée Gelée write-up) |
+//! | `0x0010_0000`..`0x0012_0000` | IROM, the boot ROM | with a dump of the ROM ([`PowerOn::Rom`]): its first 96 KiB read through the patch unit, until the ROM's lock-out hides them ([`crate::soc::irom`]); writes and the rest refused. Without a dump refused: the ROM is high-level emulated ([`crate::bootrom`]) |
 //! | `0x4000_0000`..`0x4004_0000` | IRAM ([`crate::soc::iram`]) | read and written directly; bytes no master has written since the ROM's hand-off (or since SC7) refuse reads ([`Iram::bpmp_read`]) |
 //! | `0x5004_0000`..`0x5004_1000` | the BPMP's cache controller (hekate `BPMP_CACHE_BASE`) | on the [`Bus`]: its configuration register alone, as storage; no cache is emulated |
 //! | `0x5004_1000`..`0x5004_3000` | the CPU cluster's GIC | refused: the BPMP takes its interrupts from the legacy interrupt controller ([`crate::soc::ictlr`]) \[inference: the GIC is the CPU complex's private peripheral, and Linux routes the BPMP's interrupts through the LIC\] |
@@ -82,11 +82,17 @@
 //!   controller ([`PowerDomain::power_lost`]; the monitor's resume sets
 //!   its Secure side up again and the kernel restores its own,
 //!   [`crate::secmon::setup`]);
+//! * in a machine that runs the ROM itself, also what only the ROM sets
+//!   up again: the fuse block's driver and key hiding, the patch unit,
+//!   USB1 and the security engine ([`crate::soc::Soc::enter_sc7`]);
 //! * kept, though lost on the console \[assumption\]: every other block,
 //!   among them the rest of the clock and reset controller, the memory and
-//!   EMC controllers (the boot ROM's restore from PMC scratch would write
-//!   back what they hold, `bootrom::warm_boot`) and the security engine
-//!   (its context comes back from the monitor's save on the warm path);
+//!   EMC controllers (the boot ROM's restore from PMC scratch writes back
+//!   what they hold: `bootrom::warm_boot` leaves it out, the ROM itself
+//!   does it) and, without a dump of the ROM, the security engine (its
+//!   context comes back from the monitor's save on the warm path). So a
+//!   ROM run after SC7 starts from the clocks the kernel left, not from
+//!   the SoC's reset values, and writes its own over them;
 //! * kept, as on the console: DRAM, the PMC (bar what the wake changes),
 //!   the PMIC and its clock.
 //!
@@ -94,11 +100,16 @@
 //! until the machine has a wake event ([`PowerDomain::wake_pending`]: the
 //! PMIC's interrupt at the PMC, the power key or an alarm). At the wake
 //! (`wake`) the PMC leaves deep power down and its secure-scratch locks
-//! reset ([`pmc::SECURE_LOCKS`]), the boot ROM's warm path runs
-//! ([`PowerDomain::warm_boot`]: `bootrom::warm_boot`, its register writes
-//! and the security engine's context), its IRAM image is loaded with what
-//! it leaves undefined unestablished, and the BPMP starts at the
-//! warmboot's entry.
+//! reset ([`pmc::SECURE_LOCKS`]). Without a dump of the ROM, the boot
+//! ROM's warm path runs high-level emulated ([`PowerDomain::warm_boot`]:
+//! `bootrom::warm_boot`, its register writes and the security engine's
+//! context), its IRAM image is loaded with what it leaves undefined
+//! unestablished, and the BPMP starts at the warmboot's entry. With one,
+//! the BPMP comes out of reset at the ROM's vector as at power-on (IRAM
+//! zero, the fuse block, the patch unit and USB1 as at power-on,
+//! [`crate::soc::Soc::enter_sc7`]) with `PMC_RST_STATUS` saying LP0, and
+//! the ROM takes its warm path by `PMC_SCRATCH0` bit 0, which the monitor
+//! set before the sleep.
 
 use std::{
     ops::Range,
@@ -129,6 +140,7 @@ use crate::{
         BootBlocks, BootSignals, Notes, Soc, car,
         flow::CopStatus,
         iram::{self, Iram, Refusal},
+        irom::{self, RomImage},
         mc, pmc, sb,
         se::Se,
         tsec::TsecSoc,
@@ -150,6 +162,8 @@ const IDLE_POLL: Duration = Duration::from_millis(1);
 const WAKE_POLL: Duration = Duration::from_millis(5);
 
 const IROM: Range<u32> = 0x0010_0000..0x0012_0000;
+/// The part of [`IROM`] a dump of the ROM fills.
+const IROM_IMAGE: Range<u32> = irom::BASE..irom::BASE + irom::SIZE as u32;
 const VECTORS: Range<u32> = 0..0x20;
 const GIC: Range<u32> = 0x5004_1000..0x5004_3000;
 const IRAM: Range<u32> = iram::BASE as u32..(iram::BASE + iram::SIZE) as u32;
@@ -167,6 +181,10 @@ pub(super) const MONITOR_SCTLR_EL1: u64 = 0x00C5_0838;
 
 /// Why IRAM holds nothing established after SC7.
 const IRAM_LOST: &str = "IRAM lost power in SC7";
+
+/// The CPSR of a core at reset: Supervisor mode, ARM state, IRQ and FIQ
+/// masked (ARM ARM A2, "Reset").
+const RESET_CPSR: u32 = 0xD3;
 
 /// A [`PowerDomain`] with no wake source, for a harness that runs the BPMP
 /// without a machine: a SoC that enters SC7 stays there.
@@ -199,14 +217,39 @@ const SC7_RESETS: [(u64, u32); 3] = [
     (mc::BASE + 0x9BC, 0),
 ];
 
-/// What a machine powered on starts from: the boot ROM's hand-off and the
-/// IRAM it wrote ([`crate::bootrom::cold_boot`]), and the fuses the ROM
-/// read, which its warm path after SC7 reads again.
-pub struct PowerOn {
-    pub handoff: BootRomHandoff,
-    /// [`crate::bootrom::IRAM_SIZE`] bytes.
-    pub iram: Vec<u8>,
-    pub fuses: Fuses,
+/// What a machine powered on starts from.
+pub enum PowerOn {
+    /// The high-level emulated boot ROM's hand-off and the IRAM it wrote
+    /// ([`crate::bootrom::cold_boot`], [`crate::bootrom::IRAM_SIZE`]
+    /// bytes), and the fuses the ROM read, which its warm path after SC7
+    /// reads again.
+    Emulated {
+        handoff: BootRomHandoff,
+        iram: Vec<u8>,
+        fuses: Fuses,
+    },
+    /// A dump of the boot ROM, which the BPMP runs from its reset vector,
+    /// and the console's fuses, which the ROM reads from the fuse block.
+    Rom { rom: RomImage, fuses: Fuses },
+}
+
+impl PowerOn {
+    pub fn fuses(&self) -> &Fuses {
+        match self {
+            Self::Emulated { fuses, .. } | Self::Rom { fuses, .. } => fuses,
+        }
+    }
+
+    /// The state the SoC is built in for this start.
+    pub fn soc_start(&self) -> crate::soc::Start<'_> {
+        match self {
+            Self::Emulated { .. } => crate::soc::Start::AfterRom,
+            Self::Rom { rom, fuses } => crate::soc::Start::Reset {
+                rom: rom.clone(),
+                fuses,
+            },
+        }
+    }
 }
 
 /// The BPMP: the core, what runs with it, whether the SoC is in SC7.
@@ -246,6 +289,18 @@ struct SavedBpmp {
 /// Which data accesses the trace keeps: device accesses, not memory.
 fn traced_access(address: u32) -> bool {
     !IRAM.contains(&address) && u64::from(address) < DRAM_BASE
+}
+
+/// IRAM as the boot ROM finds it when the SoC powers up: all zero.
+///
+/// \[assumption\] What static RAM holds after power is applied is not
+/// defined, and the ROM reads it before writing it: the first thing its
+/// main routine does (`0x102296`) is look for a debugger's table of
+/// messages by a marker at `0x4003_8000`. Any contents but that marker and
+/// a matching checksum take the ROM the same way; zeros are that.
+fn blank_iram(iram: &Iram) {
+    iram.load(0, &vec![0; iram::SIZE as usize])
+        .expect("all of IRAM");
 }
 
 /// A core at `entry` in ARM state with `cpsr` (its T bit clear).
@@ -294,6 +349,24 @@ impl Bpmp {
             fuses: None,
             starting_core0: AtomicBool::new(false),
         })
+    }
+
+    /// The BPMP at its reset in a SoC whose IROM holds a dump of the boot
+    /// ROM: at the ROM's reset vector in the state the architecture gives a
+    /// core at reset ([`Arm7::reset`]), the ROM's instructions cached like
+    /// IRAM's; `fuses` are the console's, kept for reports.
+    ///
+    /// IRAM reads zero (`blank_iram`).
+    pub fn at_reset(blocks: &BootBlocks, fuses: Fuses) -> Result<Self, String> {
+        let irom = blocks.irom().ok_or("the SoC has no boot ROM")?;
+        blank_iram(&blocks.iram);
+        let mut bpmp = Self::new(irom::BASE, RESET_CPSR, &blocks.iram)?;
+        let running = bpmp.running.get_mut().unwrap();
+        running
+            .assist
+            .add_code_cache(IROM_IMAGE, irom.code_generation());
+        bpmp.fuses = Some(fuses);
+        Ok(bpmp)
     }
 
     /// Keeps the last `depth` instructions the core starts and the last
@@ -393,8 +466,15 @@ impl Bpmp {
         let mut view = BpmpView {
             env,
             missing_vector: None,
+            software_interrupt: false,
         };
-        match core.run_assisted(&mut view, assist, budget) {
+        let run = core.run_assisted(&mut view, assist, budget);
+        if view.software_interrupt
+            && let Some(fault) = foreign_patch(env, core)
+        {
+            return Slice::Fault(fault);
+        }
+        match run {
             Ok(_) => Slice::Ran,
             Err(fault) => Slice::Fault(fault.to_string()),
         }
@@ -494,6 +574,15 @@ fn wake(running: &mut Running, env: &Env<'_>) -> Result<(), String> {
     for register in pmc::SECURE_LOCKS {
         let value = pmc::power_on_value(register).unwrap_or(0);
         write_register(bus, pmc::BASE + register, value)?;
+    }
+    if env.blocks.irom().is_some() {
+        // The ROM itself: the BPMP comes out of reset at its vector, with
+        // the reset reason of a wake from deep power down for it to read.
+        write_register(bus, pmc::BASE + pmc::RST_STATUS, pmc::RST_STATUS_LP0)?;
+        blank_iram(&env.blocks.iram);
+        reset_core(&mut running.core, irom::BASE, RESET_CPSR)?;
+        running.power = Power::On;
+        return Ok(());
     }
     let start = env.power.warm_boot()?;
     let iram = &env.blocks.iram;
@@ -607,6 +696,28 @@ struct BpmpView<'a> {
     env: &'a Env<'a>,
     /// The exception last taken with its vector register unwritten.
     missing_vector: Option<Exception>,
+    /// A software interrupt was taken in this run: the run ends there, for
+    /// [`foreign_patch`] to look at where it came from.
+    software_interrupt: bool,
+}
+
+/// Why the software interrupt the core has just taken cannot be served,
+/// if it cannot: an `svc` in the boot ROM's dump that the patch unit did
+/// not put there (see [`crate::soc::irom`]).
+fn foreign_patch(env: &Env<'_>, core: &Arm7) -> Option<String> {
+    let irom = env.blocks.irom()?;
+    // Thumb: the link register holds the address after the `svc`.
+    let from_thumb = core.spsr()? & crate::bpmp::PSR_T != 0;
+    let address = core.reg(14).wrapping_sub(2);
+    (from_thumb && IROM_IMAGE.contains(&address) && irom.foreign_svc(address - irom::BASE)).then(
+        || {
+            format!(
+                "svc at {address:#010x} in the boot ROM dump is not one of this console's \
+                 patches: the dump was read through another device's patch unit, and what \
+                 the ROM itself has there is not in it"
+            )
+        },
+    )
 }
 
 fn refuse<T>(reason: impl Into<String>) -> Result<T, BusError> {
@@ -635,7 +746,7 @@ impl BpmpView<'_> {
                 None => refuse("low vectors: the BPMP's vectors are the EVP registers"),
             };
         }
-        if IROM.contains(&address) {
+        if IROM.contains(&address) && self.env.blocks.irom().is_none() {
             return refuse("the boot ROM (IROM) is not available: it is high-level emulated");
         }
         if GIC.contains(&address) {
@@ -659,10 +770,35 @@ impl BpmpView<'_> {
         let end = u64::from(address) + len as u64;
         (IRAM.contains(&address) && end <= u64::from(IRAM.end)).then(|| address - IRAM.start)
     }
+
+    /// A device access nothing models: refused, unless a survey is being
+    /// run ([`Notes::survey`]), which notes it and goes on (a read then
+    /// gives 0).
+    fn surveyed(&self, access: String, why: String) -> Result<(), BusError> {
+        if !self.env.notes.survey() {
+            return refuse(why);
+        }
+        self.env
+            .notes
+            .add(format!("BPMP {access}: {why} (answered by the survey)"));
+        Ok(())
+    }
 }
 
 impl BpmpBus for BpmpView<'_> {
     fn read(&mut self, address: u32, size: u8) -> Result<u32, BusError> {
+        if IROM.contains(&address)
+            && let Some(irom) = self.env.blocks.irom()
+        {
+            return match irom.read(address - IROM.start, size) {
+                Ok(value) => Ok(value),
+                Err(irom::Refusal::Outside) => refuse("IROM past the boot ROM's 96 KiB"),
+                Err(irom::Refusal::Hidden) => refuse(
+                    "the boot ROM hid itself (SB_CSR PIROM_DISABLE): what a read there gives \
+                     is not established",
+                ),
+            };
+        }
         if IRAM.contains(&address) {
             let offset = address - IRAM.start;
             return self
@@ -681,13 +817,15 @@ impl BpmpBus for BpmpView<'_> {
                 .expect("checked to be DRAM");
             return Ok(u32::from_le_bytes(bytes));
         }
-        match self.env.bus.read(BPMP_CORE, u64::from(address), size) {
-            Access::Done(value) => Ok(value as u32),
-            Access::Unmapped => refuse("nothing is mapped there"),
-            Access::Unimplemented(device) => refuse(format!(
-                "the {device} does not model this register or width"
-            )),
-        }
+        let why = match self.env.bus.read(BPMP_CORE, u64::from(address), size) {
+            Access::Done(value) => return Ok(value as u32),
+            Access::Unmapped => "nothing is mapped there".to_string(),
+            Access::Unimplemented(device) => {
+                format!("the {device} does not model this register or width")
+            }
+        };
+        self.surveyed(format!("{size}-byte read at {address:#010x}"), why)
+            .map(|()| 0)
     }
 
     fn write(&mut self, address: u32, size: u8, value: u32) -> Result<(), BusError> {
@@ -700,6 +838,9 @@ impl BpmpBus for BpmpView<'_> {
                 .bpmp_write(offset, size, value)
                 .map_or_else(|| refuse("access across the end of IRAM"), Ok);
         }
+        if IROM.contains(&address) && self.env.blocks.irom().is_some() {
+            return refuse("a write to the boot ROM");
+        }
         self.unmodelled(address)?;
         if let Some(address) = self.dram(address, size) {
             self.env
@@ -708,17 +849,21 @@ impl BpmpBus for BpmpView<'_> {
                 .expect("checked to be DRAM");
             return Ok(());
         }
-        match self
+        let why = match self
             .env
             .bus
             .write(BPMP_CORE, u64::from(address), size, u64::from(value))
         {
-            Access::Done(()) => Ok(()),
-            Access::Unmapped => refuse("nothing is mapped there"),
-            Access::Unimplemented(device) => refuse(format!(
-                "the {device} does not model this register or width"
-            )),
-        }
+            Access::Done(()) => return Ok(()),
+            Access::Unmapped => "nothing is mapped there".to_string(),
+            Access::Unimplemented(device) => {
+                format!("the {device} does not model this register or width")
+            }
+        };
+        self.surveyed(
+            format!("{size}-byte write of {value:#x} at {address:#010x}"),
+            why,
+        )
     }
 
     /// IRAM in one go when all of it is established; word by word
@@ -757,7 +902,10 @@ impl BpmpBus for BpmpView<'_> {
 
     fn exception_vector(&mut self, exception: Exception) -> u32 {
         match self.env.blocks.evp.cop_vector(exception.offset()) {
-            Some(vector) => vector,
+            Some(vector) => {
+                self.software_interrupt |= exception == Exception::SoftwareInterrupt;
+                vector
+            }
             None => {
                 self.missing_vector = Some(exception);
                 exception.offset()
@@ -767,7 +915,8 @@ impl BpmpBus for BpmpView<'_> {
 
     fn should_pause(&mut self) -> bool {
         let signals = &self.env.blocks.signals;
-        self.env.blocks.flow.take_halt_change()
+        self.software_interrupt
+            || self.env.blocks.flow.take_halt_change()
             || signals.cpu0_released.load(Ordering::Acquire)
             || signals.cop_held.load(Ordering::Acquire)
             || signals.cop_restarted.load(Ordering::Acquire)
@@ -903,12 +1052,16 @@ impl TsecSoc for TsecPort {
 }
 
 impl Bpmp {
-    /// Applies the boot ROM's hand-off to `soc`, a SoC powered on whose
-    /// devices are on `bus`, and gives the BPMP it starts: IRAM as the ROM
-    /// wrote it, the ROM's keyslots in the security engine with the
-    /// permissions it leaves them, its lock-outs in the secure boot
-    /// registers ([`crate::bootrom::ROM_LOCKOUTS`]), and the TSEC connected
-    /// to the machine ([`TsecPort`]) with what `keys` hold for it.
+    /// The BPMP of `soc`, a SoC powered on whose devices are on `bus`, as
+    /// `power_on` starts it, with the TSEC connected to the machine
+    /// ([`TsecPort`]) and what `keys` hold for it.
+    ///
+    /// With the high-level emulated ROM its hand-off is applied: IRAM as
+    /// the ROM wrote it, the ROM's keyslots in the security engine with
+    /// the permissions it leaves them, its lock-out in the secure boot
+    /// registers ([`crate::bootrom::ROM_LOCKOUT`]). With a dump of the
+    /// ROM nothing is applied: the BPMP starts at its reset
+    /// ([`Bpmp::at_reset`]) and the ROM does all of that itself.
     pub fn power_on(
         power_on: &PowerOn,
         soc: &Soc,
@@ -916,7 +1069,16 @@ impl Bpmp {
         keys: &KeySet,
     ) -> Result<Self, String> {
         let boot = soc.boot.as_ref().ok_or("the SoC was not powered on")?;
-        for slot in &power_on.handoff.keyslots {
+        TsecPort::connect(soc, bus, keys).ok_or("the SoC has no boot blocks")?;
+        let (handoff, iram, fuses) = match power_on {
+            PowerOn::Rom { fuses, .. } => return Self::at_reset(boot, fuses.clone()),
+            PowerOn::Emulated {
+                handoff,
+                iram,
+                fuses,
+            } => (handoff, iram, fuses),
+        };
+        for slot in &handoff.keyslots {
             let access = &slot.access;
             let flags = [
                 (access.readable, crate::soc::se::LOCK_KEY_READ),
@@ -930,16 +1092,8 @@ impl Bpmp {
                 .load_key(usize::from(slot.slot), &slot.key, flags)
                 .map_err(|error| error.to_string())?;
         }
-        for lockout in &bootrom::ROM_LOCKOUTS {
-            apply_rom_bits(boot, bus, lockout)?;
-        }
-        TsecPort::connect(soc, bus, keys).ok_or("the SoC has no boot blocks")?;
-        Self::from_handoff(
-            &power_on.handoff,
-            &power_on.iram,
-            &boot.iram,
-            power_on.fuses.clone(),
-        )
+        apply_rom_bits(boot, bus, &bootrom::ROM_LOCKOUT)?;
+        Self::from_handoff(handoff, iram, &boot.iram, fuses.clone())
     }
 }
 
@@ -1309,6 +1463,7 @@ mod tests {
                 ictlr: Arc::new(Ictlr::new()),
                 tzram: Arc::new(Tzram::new()),
                 signals: Arc::new(BootSignals::default()),
+                rom: None,
             };
             let mut bus = Bus::default();
             let signal = |set: fn(&BootSignals)| {
@@ -1604,6 +1759,7 @@ mod tests {
         let mut view = BpmpView {
             env: &env,
             missing_vector: None,
+            software_interrupt: false,
         };
         assert_eq!(view.read(0x8000_0010, 4), Ok(0x1234_5678));
         view.write(0x8000_0014, 2, 0xBEEF).unwrap();
@@ -1618,7 +1774,7 @@ mod tests {
         view.write(0x6000_C230, 4, 0x4003_0001).unwrap();
         assert_eq!(bench.blocks.sb.read(0, 0x30, 4), Some(0x4003_0001));
         assert!(matches!(
-            view.read(0x6000_C204, 4),
+            view.read(0x6000_C238, 4),
             Err(BusError::Unmodelled(_))
         ));
     }

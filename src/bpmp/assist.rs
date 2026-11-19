@@ -44,6 +44,16 @@ impl Assist {
         self.cache = Some(CodeCache::new(region, generation));
     }
 
+    /// Caches the instructions fetched from `region` as well, another
+    /// plain memory with its own `generation` (see
+    /// [`Assist::set_code_cache`]); the regions must not overlap.
+    pub fn add_code_cache(&mut self, region: Range<u32>, generation: Arc<AtomicU64>) {
+        match &mut self.cache {
+            Some(cache) => cache.regions.push(Region::new(region, generation)),
+            None => self.set_code_cache(region, generation),
+        }
+    }
+
     /// Stops caching instructions.
     pub fn clear_code_cache(&mut self) {
         self.cache = None;
@@ -118,12 +128,16 @@ impl Arm7 {
 
 /// Instructions by address, valid while nothing has written them.
 ///
-/// One entry per halfword of the region holds the instruction fetched
+/// One entry per halfword of each region holds the instruction fetched
 /// there and a tag: the state it was fetched in and the epoch it was
-/// fetched in. A write from elsewhere (the generation moved) starts a new
-/// epoch, which invalidates every entry at once; the core's own stores
-/// clear the entries they overlap.
+/// fetched in. A write from elsewhere (the region's generation moved)
+/// starts a new epoch, which invalidates every entry of the region at
+/// once; the core's own stores clear the entries they overlap.
 pub(super) struct CodeCache {
+    regions: Vec<Region>,
+}
+
+struct Region {
     base: u32,
     entries: Vec<Entry>,
     generation: Arc<AtomicU64>,
@@ -139,7 +153,7 @@ struct Entry {
     tag: u32,
 }
 
-impl CodeCache {
+impl Region {
     fn new(region: Range<u32>, generation: Arc<AtomicU64>) -> Self {
         let base = region.start & !3;
         let end = region.end.max(base).wrapping_add(3) & !3;
@@ -151,33 +165,6 @@ impl CodeCache {
             seen,
             epoch: 1,
         }
-    }
-
-    /// The instruction at `pc` (an aligned address of `width` bytes),
-    /// from the cache or the bus.
-    #[inline]
-    pub(super) fn fetch(
-        &mut self,
-        bus: &mut dyn BpmpBus,
-        pc: u32,
-        width: u8,
-    ) -> Result<u32, BusError> {
-        let generation = self.generation.load(Ordering::Acquire);
-        if generation != self.seen {
-            self.seen = generation;
-            self.new_epoch();
-        }
-        let slot = (pc.wrapping_sub(self.base) / 2) as usize;
-        let tag = self.epoch << 1 | u32::from(width == 2);
-        let Some(entry) = self.entries.get_mut(slot) else {
-            return bus.read(pc, width);
-        };
-        if entry.tag == tag {
-            return Ok(entry.instruction);
-        }
-        let instruction = bus.read(pc, width)?;
-        *entry = Entry { instruction, tag };
-        Ok(instruction)
     }
 
     fn new_epoch(&mut self) {
@@ -207,6 +194,52 @@ impl CodeCache {
         if end > 1 << 32 {
             // The write wraps past the top of the address space.
             self.invalidate(0, (end - (1 << 32)) as u32);
+        }
+    }
+}
+
+impl CodeCache {
+    fn new(region: Range<u32>, generation: Arc<AtomicU64>) -> Self {
+        Self {
+            regions: vec![Region::new(region, generation)],
+        }
+    }
+
+    /// The instruction at `pc` (an aligned address of `width` bytes),
+    /// from the cache or the bus.
+    #[inline]
+    pub(super) fn fetch(
+        &mut self,
+        bus: &mut dyn BpmpBus,
+        pc: u32,
+        width: u8,
+    ) -> Result<u32, BusError> {
+        for region in &mut self.regions {
+            let slot = (pc.wrapping_sub(region.base) / 2) as usize;
+            if slot >= region.entries.len() {
+                continue;
+            }
+            let generation = region.generation.load(Ordering::Acquire);
+            if generation != region.seen {
+                region.seen = generation;
+                region.new_epoch();
+            }
+            let tag = region.epoch << 1 | u32::from(width == 2);
+            let entry = &mut region.entries[slot];
+            if entry.tag == tag {
+                return Ok(entry.instruction);
+            }
+            let instruction = bus.read(pc, width)?;
+            *entry = Entry { instruction, tag };
+            return Ok(instruction);
+        }
+        bus.read(pc, width)
+    }
+
+    /// Drops the entries a write of `len` bytes at `address` overlaps.
+    fn invalidate(&mut self, address: u32, len: u32) {
+        for region in &mut self.regions {
+            region.invalidate(address, len);
         }
     }
 }

@@ -37,7 +37,7 @@ use horizon_emu::{
     maxwell, nand, net, sdcard,
     secmon::{self, SmcEffect},
     soc::{
-        Panel, bcm4356::Bcm4356Wifi, dc::Frame, emmc::EmmcImages, joycon::Button,
+        Panel, bcm4356::Bcm4356Wifi, dc::Frame, emmc::EmmcImages, irom::RomImage, joycon::Button,
         max77620::PowerDown, medium::ImageFile, sdcard::SdCardImage, wifi_ap::AccessPoint,
     },
     svc,
@@ -72,15 +72,22 @@ PMIC's clock and the Joy-Con kept, DRAM lost; the window and --control
 socket stay. A restart with media whose writes host memory alone keeps
 (no --emmc-writable, --sd-writable, --amiibo-writable, or --homebrew's
 card) stops the machine instead. power-on starts the
-console the way it powers on instead, from its boot ROM (high-level
-emulated): the ROM boots package1 from the BCT in --emmc-boot0 and
---emmc-boot1 (see format-emmc --boot0), the boot processor (BPMP) runs
-package1's bootloader instruction by instruction, and once it starts the
-CPU the secure monitor's cold boot takes the kernel from package2 in the
---emmc user area; breakpoints and symbols apply once that kernel is in
-place. It needs --keys with the console's secure_boot_key, and takes the
-options of boot except those that patch the kernel (--homebrew-keys,
---homebrew: the real package2 runs as it is). format-emmc creates
+console the way it powers on instead, from its boot ROM: the ROM boots
+package1 from the BCT in --emmc-boot0 and --emmc-boot1 (see format-emmc
+--boot0), the boot processor (BPMP) runs package1's bootloader instruction
+by instruction, and once it starts the CPU the secure monitor's cold boot
+takes the kernel from package2 in the --emmc user area; breakpoints and
+symbols apply once that kernel is in place. The ROM is high-level
+emulated unless --bootrom gives a dump of it (NVIDIA's code, not part of
+this program), which the BPMP then runs itself: the ROM patches itself
+from the fuses, reads the BCT and package1 from the eMMC and checks their
+signature with the security engine, and after a sleep restores the
+engine's saved state and starts the warmboot firmware. The console's fuses
+are this emulator's, not a dump's: the key file's secure_boot_key and the
+retail unit's published settings and ROM patches. power-on needs --keys
+with the console's secure_boot_key, and takes the options of boot except
+those that patch the kernel (--homebrew-keys, --homebrew: the real package2
+runs as it is). format-emmc creates
 an eMMC user area image for --emmc (a sparse file): the 32 GB module's
 partition table; with --keys also the empty, encrypted file systems of a
 console's partitions and the calibration data of this emulator's own
@@ -147,6 +154,11 @@ options:
                       module is absent. Writes stay in memory.
   --emmc-boot0 FILE   raw images of the eMMC boot partitions (default:
   --emmc-boot1 FILE   erased)
+  --bootrom FILE      with power-on: a dump of the Tegra X1's boot ROM
+                      (96 KiB, as read from 0x100000), which the boot
+                      processor then runs from its reset vector instead of
+                      the high-level emulation, at power-on and again at
+                      every wake from sleep
   --emmc-writable     write to the eMMC images instead: what the guest
                       stores is there on the next run
   --sd FILE           raw image of a microSD card, in the slot from power
@@ -404,6 +416,7 @@ const MACHINE_FLAGS: &[(&str, bool)] = &[
     ("--emmc", true),
     ("--emmc-boot0", true),
     ("--emmc-boot1", true),
+    ("--bootrom", true),
     ("--emmc-writable", false),
     ("--sd", true),
     ("--sd-writable", false),
@@ -424,6 +437,7 @@ const MACHINE_FLAGS: &[(&str, bool)] = &[
 /// built, recorded as absolute paths.
 const FILE_FLAGS: &[&str] = &[
     "--keys",
+    "--bootrom",
     "--homebrew",
     "--hbl",
     "--homebrew-app",
@@ -834,9 +848,15 @@ fn recorded_value(flag: &str, value: &str) -> String {
     }
 }
 
-/// The console's boot ROM run on its eMMC boot partitions, for
-/// `power-on`: what it leaves the boot processor.
-fn boot_rom(keys: &KeySet, boot: [Option<&String>; 2]) -> Result<PowerOn, String> {
+/// What the console is powered on from, for `power-on`: with `rom`, a
+/// dump of the boot ROM, which the boot processor then runs; without, the
+/// ROM high-level emulated on the eMMC boot partitions, and what it leaves
+/// the boot processor.
+fn boot_rom(
+    keys: &KeySet,
+    boot: [Option<&String>; 2],
+    rom: Option<&String>,
+) -> Result<PowerOn, String> {
     let secure_boot_key = keys
         .secure_boot_key()
         .ok_or("power-on needs --keys with the console's secure_boot_key")?;
@@ -854,11 +874,25 @@ fn boot_rom(keys: &KeySet, boot: [Option<&String>; 2]) -> Result<PowerOn, String
     // console's serial number. Only the SSK depends on them, which
     // package1ldr never uses.
     let fuses = bootrom::Fuses::retail(*secure_boot_key, 0, bootrom::ChipFuses::default());
+    if let Some(path) = rom {
+        let rom = std::fs::read(path)
+            .map_err(|error| error.to_string())
+            .and_then(RomImage::new)
+            .map_err(|error| format!("--bootrom {path}: {error}"))?;
+        for halfword in rom.restored() {
+            eprintln!(
+                "horizon-emu: --bootrom {path}: the dump shows another device's patch at \
+                 {:#x} ({:#06x}); the ROM's own instruction {:#06x} runs there",
+                halfword.offset, halfword.dumped, halfword.original
+            );
+        }
+        return Ok(PowerOn::Rom { rom, fuses });
+    }
     let mut iram = vec![0; bootrom::IRAM_SIZE];
     // PMC_SCRATCH0 is clear on a cold boot: no warm boot, no forced recovery.
     let handoff = bootrom::cold_boot(&boot0, &boot1, &fuses, 0, &mut iram)
         .map_err(|error| format!("boot ROM: {error}"))?;
-    Ok(PowerOn {
+    Ok(PowerOn::Emulated {
         handoff,
         iram,
         fuses,
@@ -891,6 +925,7 @@ fn boot(
     let mut pokes = Vec::new();
     let mut steps_after_breakpoint = 0;
     let (mut emmc_user, mut emmc_boot) = (None, [None, None]);
+    let mut rom = None;
     let mut emmc_writable = false;
     let (mut sd_card, mut sd_writable) = (None, false);
     let mut screenshot = None;
@@ -1021,6 +1056,7 @@ fn boot(
             "--emmc" => emmc_user = Some(value()?),
             "--emmc-boot0" => emmc_boot[0] = Some(value()?),
             "--emmc-boot1" => emmc_boot[1] = Some(value()?),
+            "--bootrom" => rom = Some(value()?),
             "--emmc-writable" => emmc_writable = true,
             "--sd" => sd_card = Some(value()?),
             "--sd-writable" => sd_writable = true,
@@ -1123,6 +1159,11 @@ fn boot(
             "--homebrew-keys and --homebrew patch the kernel's INI1, and power-on runs \
              the real package2 as it is"
                 .into(),
+        );
+    }
+    if kernel.is_some() && rom.is_some() {
+        return Err(
+            "--bootrom is power-on's: boot starts at the kernel's entry, after the ROM".into(),
         );
     }
     if wifi_ssid.is_none() {
@@ -1262,7 +1303,7 @@ fn boot(
                 changed = installed;
                 Firmware::Kernel(image)
             }
-            None => Firmware::PowerOn(boot_rom(&keys, emmc_boot)?),
+            None => Firmware::PowerOn(boot_rom(&keys, emmc_boot, rom)?),
         };
         if first {
             for line in &changed {

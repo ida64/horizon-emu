@@ -41,7 +41,9 @@
 //!   ECB, CBC encryption and decryption, OFB and CTR as the drivers set
 //!   them. With the hash bit set and the hash registers as destination, the
 //!   last block goes to `SE_HASH_RESULT_0..3`: CBC-MAC, from which the
-//!   drivers build CMAC (they compute the subkeys themselves).
+//!   drivers build CMAC (they compute the subkeys themselves). With the
+//!   hash bit set and memory as destination only one block is modelled,
+//!   which goes to the output list (the boot ROM's CMAC, `0x103D52`).
 //!   Chaining operations leave their next vector in the slot's UIV, and a
 //!   counter operation leaves the advanced counter in
 //!   `SE_CRYPTO_LINEAR_CTR` \[inference: hekate's CTR and CBC code finish a
@@ -59,7 +61,14 @@
 //!   reads as 32-bit words, `H0` first (hekate byte-swaps the SHA-256
 //!   words to get the digest). For SHA-384/512 each 64-bit word is two
 //!   registers, high half first \[assumption: no public driver reads
-//!   them\].
+//!   them\]. With memory as destination, the operation that ends the
+//!   message writes the digest to the output list, in the algorithm's
+//!   byte order (the boot ROM, `0x103360`, gives it a buffer of the
+//!   digest's size, and its RSA-PSS check, `0x103698`, XORs and compares
+//!   those bytes with the encoded message's as they are, which only the
+//!   standard order lets a real signature pass). \[assumption\] The hash
+//!   registers keep what they held: nothing reads them after such an
+//!   operation.
 //! * Two RSA key slots of 2048-bit exponent and modulus, written and read
 //!   word by word through `SE_RSA_KEYTABLE_ADDR`/`_DATA` (least significant
 //!   word first, as the public drivers write them), with access registers
@@ -70,7 +79,21 @@
 //!   Modular exponentiation of 512 to 2048 bits (`SE_RSA_KEY_SIZE` 0 to 3,
 //!   exponent `SE_RSA_EXP_SIZE` words) of the input list read as a
 //!   little-endian number; the result in `SE_RSA_OUTPUT_0..63`, least
-//!   significant word first.
+//!   significant word first, or with memory as destination the same
+//!   number's bytes, least significant first, in the output list (the
+//!   boot ROM, `0x103620`, reverses them before it reads the encoded
+//!   message's last byte off the end, `0x103698`; \[assumption\] the
+//!   output registers then keep what they held). A whole key can also
+//!   come from memory:
+//!   writing `SE_RSA_KEYTABLE_ADDR` with bit 8 set and a slot (bit 7)
+//!   loads that slot from the input list, the modulus and then the
+//!   exponent, least significant word first, the way the boot ROM loads
+//!   the BCT's key and restores the saved ones (`0x10359A`: `SE_CONFIG`
+//!   `0x4000`, the list, `SE_RSA_KEY_SIZE` 3, `SE_RSA_EXP_SIZE` 64, the
+//!   address register, then it waits for `SE_STATUS` to read idle; its
+//!   callers put the BCT's modulus first and 65537 in the first word
+//!   after it, and the saved context has the same order). Only that
+//!   whole 2048-bit form is modelled.
 //! * The random number generator (`SE_CONFIG.ENC_ALG = RNG`) to memory, into
 //!   a key slot, or into the secure random key (SRK). Its numbers are
 //!   ChaCha20 from the machine's seed (`--rng-seed`'s
@@ -106,7 +129,8 @@
 //!   access registers. Nintendo's warmboot firmware pulses that reset and
 //!   then uses slots 2, 10-13 and 15 without loading them again (BPMP
 //!   `0x40011038`, `warmboot-research` §7); what else the reset clears is
-//!   not public, so nothing is cleared.
+//!   not public, so nothing is cleared. Losing power is another matter:
+//!   [`Se::power_off`].
 //!
 //! Reset values: `SE_SECURITY` reads `0x0001_0005` (everything open), the
 //! access registers every permission (`0x7F` for AES slots, `0x7` for RSA
@@ -186,13 +210,15 @@
 //! Trusted Firmware-A's T210 code saves the same parts in a different
 //! order (key, OIV and UIV per slot); the monitor's order is the one the
 //! console's boot ROM accepts, so it is the one [`SeContext::open`] reads.
-//! The sticky bits are packed as TF-A's `tegra_se_lp_sticky_bits_context_save`
-//! lists them, bit `n` in word `n / 32` of the 256 (little-endian):
+//! The sticky bits are packed as the boot ROM's parser takes them apart
+//! (`0x103A3C`), bit `n` in word `n / 32` of the 256 (little-endian):
 //! `SE_SECURITY` bits 2:0 at 2:0 and bit 16 at 3, `SE_TZRAM_SECURITY` 1:0
 //! at 5:4, `SE_CRYPTO_SECURITY_PERKEY` 15:0 at 21:6, the AES access
-//! registers 7:0 at `22 + 8·slot`, `SE_RSA_SECURITY_PERKEY` 1:0 at
-//! 151:150, the RSA access registers 2:0 at 154:152 and 157:155, and
-//! `SE_SECURITY` bit 4 at 158.
+//! registers 6:0 at `22 + 7·slot`, `SE_RSA_SECURITY_PERKEY` 1:0 at
+//! 135:134, and the RSA access registers 2:0 at 138:136 and 141:139. The
+//! ROM writes each back to its register after loading the keys
+//! (`0x103B86`). (Trusted Firmware-A's list for its own chip gives the AES
+//! registers eight bits each and puts the rest higher.)
 //!
 //! What the boot ROM checks of the blob beyond its known pattern, and what
 //! it does with a blob that fails, is not public: [`SeContext::open`]
@@ -374,9 +400,14 @@ const KEYTABLE_ADDR_FIELDS: u32 = 0xFF;
 const KEYTABLE_DST_FIELDS: u32 = 0x3 | 0xF << 8;
 /// `SE_RSA_KEYTABLE_ADDR`: word (5:0), modulus rather than exponent (6),
 /// slot (7), and the read/write bit (10) hekate's header names, which the
-/// data register's direction makes redundant here. Bit 8 selects input by
-/// DMA, which is not modelled.
+/// data register's direction makes redundant here.
 const RSA_KEYTABLE_ADDR_FIELDS: u32 = 0xFF | 1 << 10;
+/// Bit 8: the key comes from memory instead (`State::rsa_key_from_memory`).
+const RSA_KEYTABLE_ADDR_BY_MEMORY: u32 = 1 << 8;
+const RSA_KEYTABLE_ADDR_SLOT: u32 = 1 << 7;
+/// `SE_CONFIG` for a key by memory, as the boot ROM sets it: the RSA
+/// algorithm, nothing else.
+const CONFIG_RSA_KEY_BY_MEMORY: u32 = ALG_RSA << 12;
 /// `SE_RSA_CONFIG`: the key slot (bit 24).
 const RSA_CONFIG_FIELDS: u32 = 1 << 24;
 
@@ -673,6 +704,24 @@ impl Se {
             slot.exponent = *exponent;
         }
         state.set_sticky_bits(&context.sticky);
+    }
+
+    /// The engine as at power-on again, for a SoC that lost power in SC7
+    /// and whose boot ROM runs at the wake: every register and key slot at
+    /// its reset value and no SRK (which is why the monitor saves the
+    /// context and the ROM restores it). The random number generator goes
+    /// on in its stream: it stands in for an entropy source, which does
+    /// not start over.
+    pub fn power_off(&self) {
+        let mut state = self.state.lock().unwrap();
+        let drbg = Drbg {
+            seed: state.drbg.seed,
+            drawn: state.drbg.drawn,
+        };
+        *state = State {
+            drbg,
+            ..State::new(0)
+        };
     }
 
     /// Writes `key` (16, 24 or 32 bytes) into the key words of `slot`, as
@@ -1115,7 +1164,9 @@ impl State {
                 self.rsa_slots[index(offset, RSA_KEYTABLE_ACCESS)].access &= value;
             }
             RSA_KEYTABLE_ADDR => {
-                if value & !RSA_KEYTABLE_ADDR_FIELDS != 0 {
+                if value & RSA_KEYTABLE_ADDR_BY_MEMORY != 0 {
+                    self.rsa_key_from_memory(memory, value)?;
+                } else if value & !RSA_KEYTABLE_ADDR_FIELDS != 0 {
                     return Err(format!("SE_RSA_KEYTABLE_ADDR {value:#x}: unmodelled bits"));
                 }
                 self.rsa_keytable_addr = value;
@@ -1258,12 +1309,11 @@ impl State {
         put(4, 2, self.tzram_security);
         put(6, 16, self.crypto_perkey);
         for (index, slot) in self.slots.iter().enumerate() {
-            put(22 + 8 * index, 8, slot.access);
+            put(22 + 7 * index, 7, slot.access);
         }
-        put(150, 2, self.rsa_perkey);
-        put(152, 3, self.rsa_slots[0].access);
-        put(155, 3, self.rsa_slots[1].access);
-        put(158, 1, self.security >> 4);
+        put(134, 2, self.rsa_perkey);
+        put(136, 3, self.rsa_slots[0].access);
+        put(139, 3, self.rsa_slots[1].access);
         let mut bytes = [0; 32];
         for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(bits) {
             *chunk = word.to_le_bytes();
@@ -1280,16 +1330,16 @@ impl State {
                 value | u32::from(bytes[at / 8] >> (at % 8) & 1) << bit
             })
         };
-        let held = 0x7 | 1 << 4 | SECURITY_SOFT;
-        self.security = self.security & !held | get(0, 3) | get(3, 1) << 16 | get(158, 1) << 4;
+        let held = 0x7 | SECURITY_SOFT;
+        self.security = self.security & !held | get(0, 3) | get(3, 1) << 16;
         self.tzram_security = get(4, 2);
         self.crypto_perkey = get(6, 16);
         for index in 0..AES_SLOTS {
-            self.slots[index].access = get(22 + 8 * index, 8);
+            self.slots[index].access = get(22 + 7 * index, 7);
         }
-        self.rsa_perkey = get(150, 2);
-        self.rsa_slots[0].access = get(152, 3);
-        self.rsa_slots[1].access = get(155, 3);
+        self.rsa_perkey = get(134, 2);
+        self.rsa_slots[0].access = get(136, 3);
+        self.rsa_slots[1].access = get(139, 3);
     }
 
     fn start(&mut self, memory: &dyn EngineMemory) -> Result<(), Refusal> {
@@ -1396,6 +1446,11 @@ impl State {
         }
         match (destination, hash) {
             (DST_MEMORY, false) => scatter(memory, self.out_list, &output)?,
+            // One block: whether the engine would write every block or
+            // only the last, as it does to the hash registers, is the same
+            // thing. The boot ROM computes its CMAC subkeys and the last
+            // block of a CMAC this way (`0x103D52`, `0x103E2C`).
+            (DST_MEMORY, true) if blocks == 1 => scatter(memory, self.out_list, &output)?,
             (DST_HASHREG, true) => {
                 let last = &output[output.len() - 16..];
                 for (word, bytes) in self.hash.iter_mut().zip(last.as_chunks::<4>().0) {
@@ -1450,6 +1505,43 @@ impl State {
         Ok(())
     }
 
+    /// Loads an RSA slot from the input list: see the module ("A whole
+    /// key can also come from memory").
+    fn rsa_key_from_memory(
+        &mut self,
+        memory: &dyn EngineMemory,
+        address: u32,
+    ) -> Result<(), Refusal> {
+        let refuse = |what: &str| {
+            Err(format!(
+                "RSA key by memory (SE_RSA_KEYTABLE_ADDR {address:#x}): {what}"
+            ))
+        };
+        if address & !(RSA_KEYTABLE_ADDR_BY_MEMORY | RSA_KEYTABLE_ADDR_SLOT) != 0 {
+            return refuse("unmodelled bits");
+        }
+        if self.config != CONFIG_RSA_KEY_BY_MEMORY {
+            return refuse("SE_CONFIG is not the RSA algorithm alone");
+        }
+        if self.rsa_key_size != 3 || self.rsa_exp_size as usize != RSA_WORDS {
+            return refuse("only a 2048-bit modulus and exponent are modelled");
+        }
+        let slot = usize::from(address & RSA_KEYTABLE_ADDR_SLOT != 0);
+        if self.rsa_slots[slot].access & RSA_ACCESS_KEY_UPDATE == 0 {
+            return refuse("the slot's access register forbids the update");
+        }
+        let key = gather(memory, self.in_list, Some(RSA_WORDS * 8))?;
+        let (modulus, exponent) = key.split_at(RSA_WORDS * 4);
+        let words = |bytes: &[u8]| -> [u32; RSA_WORDS] {
+            let words = bytes.as_chunks::<4>().0;
+            std::array::from_fn(|index| u32::from_le_bytes(words[index]))
+        };
+        let target = &mut self.rsa_slots[slot];
+        target.modulus = words(modulus);
+        target.exponent = words(exponent);
+        Ok(())
+    }
+
     fn random(&mut self, memory: &dyn EngineMemory, destination: u32) -> Result<(), Refusal> {
         if destination == DST_SRK {
             let mut srk = [0; 16];
@@ -1494,7 +1586,7 @@ impl State {
         let Some(sha) = Sha::from_mode(mode) else {
             return Err(format!("SHA mode {mode} is not one"));
         };
-        if destination != DST_HASHREG {
+        if !matches!(destination, DST_HASHREG | DST_MEMORY) {
             return Err(format!("SHA to destination {destination}: not modelled"));
         }
         if self.sha_config & !1 != 0 {
@@ -1528,17 +1620,28 @@ impl State {
                 data.len()
             ));
         }
-        sha.run(
-            &mut self.hash,
-            self.sha_config & 1 != 0,
-            &data,
-            last.then_some(total),
-        );
-        Ok(())
+        let init = self.sha_config & 1 != 0;
+        if destination == DST_HASHREG {
+            sha.run(&mut self.hash, init, &data, last.then_some(total));
+            return Ok(());
+        }
+        // To memory: the digest itself, as the boot ROM takes it
+        // (`0x103360`; see the module).
+        if !last {
+            return Err("SHA to memory before the end of the message: not modelled".into());
+        }
+        let mut state = self.hash;
+        sha.run(&mut state, init, &data, Some(total));
+        let digest: Vec<u8> = state
+            .iter()
+            .flat_map(|word| word.to_be_bytes())
+            .take(sha.digest_size())
+            .collect();
+        scatter(memory, self.out_list, &digest)
     }
 
     fn rsa(&mut self, memory: &dyn EngineMemory, destination: u32) -> Result<(), Refusal> {
-        if destination != DST_RSAREG {
+        if !matches!(destination, DST_RSAREG | DST_MEMORY) {
             return Err(format!("RSA to destination {destination}: not modelled"));
         }
         if self.rsa_config & !RSA_CONFIG_FIELDS != 0 {
@@ -1569,15 +1672,16 @@ impl State {
         let exponent = BigUint::from_slice(&key.exponent[..exponent_words]);
         let input = gather(memory, self.in_list, Some(width * 4))?;
         let result = BigUint::from_bytes_le(&input).modpow(&exponent, &modulus);
+        let mut bytes = result.to_bytes_le();
+        bytes.resize(width * 4, 0);
+        if destination == DST_MEMORY {
+            // The number as the registers would give it, least significant
+            // byte first (see the module).
+            return scatter(memory, self.out_list, &bytes);
+        }
         self.rsa_output = [0; RSA_WORDS];
-        for (word, bytes) in self
-            .rsa_output
-            .iter_mut()
-            .zip(result.to_bytes_le().chunks(4))
-        {
-            let mut le = [0; 4];
-            le[..bytes.len()].copy_from_slice(bytes);
-            *word = u32::from_le_bytes(le);
+        for (word, bytes) in self.rsa_output.iter_mut().zip(bytes.as_chunks::<4>().0) {
+            *word = u32::from_le_bytes(*bytes);
         }
         Ok(())
     }
@@ -1801,6 +1905,16 @@ impl Sha {
         match self {
             Self::Sha384 | Self::Sha512 => 128,
             _ => 64,
+        }
+    }
+
+    fn digest_size(self) -> usize {
+        match self {
+            Self::Sha1 => 20,
+            Self::Sha224 => 28,
+            Self::Sha256 => 32,
+            Self::Sha384 => 48,
+            Self::Sha512 => 64,
         }
     }
 
@@ -2393,6 +2507,58 @@ mod tests {
         assert_eq!(bench.read(RSA_KEYTABLE_ACCESS + 4), RSA_ACCESS_KEY_UPDATE);
         assert_eq!(bench.se.write(0, OPERATION, 4, OP_START.into()), None);
         assert!(bench.notes.take()[0].contains("RSA with key slot 1"));
+    }
+
+    /// The forms the boot ROM uses for its signature check, and the
+    /// engine's power-off between its two runs.
+    #[test]
+    fn a_key_from_memory_and_results_to_memory_as_the_boot_rom_takes_them() {
+        use rand_chacha::ChaCha8Rng;
+        use rsa::traits::PublicKeyParts;
+        let key = rsa::RsaPrivateKey::new(&mut ChaCha8Rng::seed_from_u64(1), 2048).unwrap();
+        let bench = Bench::new();
+        // The key: the modulus, then the exponent, each 256 bytes.
+        let mut loaded = key.n().to_bytes_le();
+        loaded.resize(RSA_WORDS * 4, 0);
+        loaded.extend(key.e().to_bytes_le());
+        loaded.resize(RSA_WORDS * 8, 0);
+        bench.poke(INPUT, &loaded);
+        bench.list(IN_LIST, &[(INPUT, loaded.len() as u32)]);
+        bench.write(CONFIG, CONFIG_RSA_KEY_BY_MEMORY);
+        bench.write(IN_LL_ADDR, IN_LIST);
+        bench.write(RSA_KEY_SIZE, 3);
+        bench.write(RSA_EXP_SIZE, RSA_WORDS as u32);
+        bench.write(
+            RSA_KEYTABLE_ADDR,
+            RSA_KEYTABLE_ADDR_BY_MEMORY | RSA_KEYTABLE_ADDR_SLOT,
+        );
+        // Slot 1 holds it: the result, to memory, least significant byte
+        // first.
+        let message = BigUint::from_bytes_be(&[0x42; 200]);
+        let mut input = message.to_bytes_le();
+        input.resize(RSA_WORDS * 4, 0);
+        bench.write(CONFIG, config(ALG_RSA, ALG_NOP, 0, DST_MEMORY));
+        bench.write(RSA_CONFIG, 1 << 24);
+        let mut expected = message.modpow(key.e(), key.n()).to_bytes_le();
+        expected.resize(RSA_WORDS * 4, 0);
+        assert_eq!(bench.run(&input, RSA_WORDS * 4), expected);
+
+        // A digest to memory, in the algorithm's byte order.
+        bench.write(CONFIG, config(ALG_SHA, ALG_NOP, 5, DST_MEMORY));
+        bench.write(SHA_MSG_LENGTH, 3 * 8);
+        bench.write(SHA_MSG_LEFT, 3 * 8);
+        bench.write(SHA_CONFIG, 1);
+        use sha2::Digest;
+        assert_eq!(bench.run(b"abc", 32), sha2::Sha256::digest(b"abc")[..]);
+
+        // Without power the engine forgets the key.
+        bench.se.power_off();
+        bench.write(CONFIG, config(ALG_RSA, ALG_NOP, 0, DST_MEMORY));
+        bench.write(RSA_CONFIG, 1 << 24);
+        bench.write(RSA_KEY_SIZE, 3);
+        bench.write(RSA_EXP_SIZE, RSA_WORDS as u32);
+        assert_eq!(bench.se.write(0, OPERATION, 4, OP_START.into()), None);
+        assert!(bench.notes.take()[0].contains("modulus is zero"));
     }
 
     fn random(bench: &Bench) -> Vec<u8> {

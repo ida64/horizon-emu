@@ -885,7 +885,9 @@ impl Machine {
             &clock,
             emmc,
             sd_card,
-            power_on.is_some(),
+            power_on
+                .as_ref()
+                .map_or(crate::soc::Start::Kernel, PowerOn::soc_start),
             &mut bus,
         )
         .map_err(MachineError::Emmc)?;

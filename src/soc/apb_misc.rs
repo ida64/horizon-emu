@@ -32,6 +32,10 @@ use crate::{
 pub const BASE: u64 = 0x7000_0000;
 pub const SIZE: u64 = 0x1000;
 
+/// `PP_STRAPPING_OPT_A` bits 12:10: the recovery mode straps, set while
+/// their buttons are not held (see `POWER_ON_STATE`).
+const RECOVERY_STRAPS: u32 = 0x1C00;
+
 /// `APB_MISC_GP_HIDREV`: which chip this is. The firmware's clock driver
 /// tells the original console's SoC from its successor by the major
 /// revision in bits 7:4, where 2 is the successor (pcv text `0x50cc0`).
@@ -53,8 +57,16 @@ pub const PAD_GROUPS: std::ops::Range<u64> = 0x8E4..0xB70;
 /// values (offset from [`BASE`]): `PP_STRAPPING_OPT_A` (`0x008`, bits 9:8
 /// and 0), `PP_PINMUX_GLOBAL` (`0x040`), and others the check names only
 /// by offset.
+///
+/// `PP_STRAPPING_OPT_A` also has the recovery mode straps in bits 12:10,
+/// which the check leaves out: the volume and HOME buttons, each reading 1
+/// while its button is not held. \[inference\] The boot ROM enters
+/// recovery mode on clear bits there (`0x104170`: bit 10 clear, with bit 12
+/// when the fuses ask for two buttons), and the Switch's own ROM patch
+/// keeps a copy for the warm boot with all three set (`| 0x1C00`,
+/// switchbrew "Fuses", IROM patch 4). Nobody is holding them.
 const POWER_ON_STATE: [(u64, u32); 24] = [
-    (0x008, 0x0000_0000),
+    (0x008, RECOVERY_STRAPS),
     (0x024, 0x0000_0000),
     (0x040, 0x0000_0000),
     (0x07C, 0x0000_0000),

@@ -24,6 +24,7 @@ pub mod emmc;
 pub mod evp;
 pub mod falcon_host;
 pub mod flow;
+pub mod fuse;
 pub mod gm20b;
 pub mod gmix;
 pub mod gpio;
@@ -35,6 +36,7 @@ mod hwcheck;
 pub mod i2c;
 pub mod ictlr;
 pub mod iram;
+pub mod irom;
 pub mod joycon;
 pub mod lsm6ds3;
 pub mod m92t36;
@@ -67,6 +69,7 @@ pub mod tmr;
 pub mod touch;
 pub mod tsec;
 pub mod tzram;
+pub mod usb2;
 pub mod vic;
 pub mod wifi_ap;
 pub mod xusb_device;
@@ -397,6 +400,47 @@ pub struct BootBlocks {
     /// What the clock and reset controller tells the BPMP's machine: see
     /// [`BootSignals`].
     pub signals: Arc<BootSignals>,
+    /// What only a machine that runs the boot ROM itself has
+    /// ([`Start::Reset`]); without, the ROM is high-level emulated.
+    pub rom: Option<RomBlocks>,
+}
+
+/// The blocks of a machine given a dump of the boot ROM: its memory, and
+/// the USB port it sets up on every cold boot.
+pub struct RomBlocks {
+    pub irom: Arc<irom::Irom>,
+    pub usb2: Arc<usb2::Usb2>,
+}
+
+impl BootBlocks {
+    /// The boot ROM's memory, in a machine that runs the ROM.
+    pub fn irom(&self) -> Option<&Arc<irom::Irom>> {
+        self.rom.as_ref().map(|rom| &rom.irom)
+    }
+}
+
+/// The state a SoC is built in.
+pub enum Start<'a> {
+    /// As the boot chain leaves it for the kernel.
+    Kernel,
+    /// Out of reset, as far as the high-level emulated boot ROM
+    /// ([`crate::bootrom`]) leaves it for package1ldr: the boot chain runs
+    /// from there ([`BootBlocks`], [`car::Car::power_on`],
+    /// [`pmc::Pmc::power_on`]).
+    AfterRom,
+    /// At reset, with a dump of the boot ROM in IROM and the fuses the ROM
+    /// reads: the BPMP runs the ROM itself.
+    Reset {
+        rom: irom::RomImage,
+        fuses: &'a crate::bootrom::Fuses,
+    },
+}
+
+impl Start<'_> {
+    /// Whether the boot chain runs in this machine.
+    fn powers_on(&self) -> bool {
+        !matches!(self, Start::Kernel)
+    }
 }
 
 /// Reset events of the clock and reset controller that start or stop a
@@ -444,6 +488,8 @@ pub struct Soc {
     pub pmic: max77620::Max77620,
     /// The power management controller, where wake events arrive.
     pmc: Arc<Pmc>,
+    /// The fuse block; set once it is built.
+    pub fuse: std::sync::OnceLock<Arc<fuse::Fuse>>,
     /// The boot chain's blocks, in a machine that runs it.
     pub boot: Option<BootBlocks>,
     /// The security engine, for the boot ROM's and the TSEC's key slots.
@@ -474,10 +520,9 @@ pub struct Soc {
 impl Soc {
     /// Builds every block and places it at its address on `bus`. `emmc`
     /// holds the contents of the eMMC module and `sd_card` those of the
-    /// microSD card; without them their slots are empty. With `power_on`
-    /// the SoC is as it comes out of reset, for the boot chain to run on
-    /// ([`BootBlocks`], [`car::Car::power_on`], [`pmc::Pmc::power_on`]);
-    /// without, as the boot chain leaves it for the kernel.
+    /// microSD card; without them their slots are empty. `start` is the
+    /// state the SoC is in: as the boot chain leaves it for the kernel, or
+    /// out of reset for the boot chain to run on ([`Start`]).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         params: &BootParams,
@@ -486,9 +531,10 @@ impl Soc {
         clock: &Arc<GuestClock>,
         emmc: Option<EmmcImages>,
         sd_card: Option<SdCardImage>,
-        power_on: bool,
+        start: Start<'_>,
         bus: &mut Bus,
     ) -> Result<Self, ImageError> {
+        let power_on = start.powers_on();
         let mc = Arc::new(if power_on {
             Mc::power_on()
         } else {
@@ -633,6 +679,22 @@ impl Soc {
                     .expect("the rails' CTS ports have their inputs listed");
             }
         }));
+        let sb: Arc<sb::Sb> = Arc::default();
+        let rom = match &start {
+            Start::Reset { rom, .. } => {
+                let irom = Arc::new(irom::Irom::new(rom.clone(), Arc::clone(&sb)));
+                bus.map(
+                    "IPATCH",
+                    irom::IPATCH_BASE,
+                    irom::IPATCH_SIZE,
+                    Box::new(irom::Ipatch(Arc::clone(&irom))),
+                );
+                let usb2 = Arc::new(usb2::Usb2::new());
+                bus.map("USB1", usb2::BASE, usb2::SIZE, Box::new(Arc::clone(&usb2)));
+                Some(RomBlocks { irom, usb2 })
+            }
+            _ => None,
+        };
         let soc = Self {
             gpio,
             touch_input,
@@ -643,6 +705,7 @@ impl Soc {
             } else {
                 Pmc::new()
             }),
+            fuse: std::sync::OnceLock::new(),
             boot: iram.map(|iram| BootBlocks {
                 iram,
                 tzram: tzram.clone().expect("TZRAM is made with IRAM"),
@@ -651,9 +714,10 @@ impl Soc {
                     Arc::clone(&notes),
                 )),
                 evp: Arc::default(),
-                sb: Arc::default(),
+                sb,
                 ictlr: Arc::default(),
                 signals: Arc::default(),
+                rom,
             }),
             se,
             tsec,
@@ -1115,20 +1179,29 @@ impl Soc {
             (FUSE_RESERVED_ODM7, ANTI_DOWNGRADE_FUSES),
             (FUSE_SPARE_BIT_5, 1),
         ];
-        bus.map(
-            "fuses",
-            FUSE_BASE,
-            FUSE_SIZE,
-            Box::new(RegisterFile::strict(
-                measurements
-                    .map(|fuse| (fuse, 0))
-                    .into_iter()
-                    .chain(console)
-                    .chain(FUSES_THE_BOOTLOADER_CHECKS)
-                    .chain(configuration)
-                    .chain(crate::bootrom::fuses_after_boot()),
-            )),
-        );
+        let registers = measurements
+            .map(|fuse| (fuse, 0))
+            .into_iter()
+            .chain(console)
+            .chain(FUSES_THE_BOOTLOADER_CHECKS)
+            .chain(configuration);
+        let fuse = Arc::new(match &start {
+            Start::Reset { fuses, .. } => {
+                let (array, size) = fuse::patch_records();
+                fuse::Fuse::new(
+                    registers
+                        .chain(fuses.at_reset())
+                        .chain([(fuse::FIRST_BOOTROM_PATCH_SIZE, size)]),
+                    array,
+                )
+            }
+            _ => fuse::Fuse::new(registers.chain(crate::bootrom::fuses_after_boot()), []),
+        });
+        bus.map("fuses", FUSE_BASE, FUSE_SIZE, Box::new(Arc::clone(&fuse)));
+        soc.fuse
+            .set(fuse)
+            .ok()
+            .expect("the fuse block is built once");
         let gauge: Box<dyn I2cDevice> =
             Box::new(Max17050::new(Battery::FULL, Arc::clone(&soc.notes)));
         let i2c1 = [
@@ -1248,8 +1321,23 @@ impl Soc {
 
     /// The SoC enters deep power down (SC7): the PMC takes the wake level
     /// of its "auto" events from their pads ([`Pmc::sample_wake_levels`]).
+    ///
+    /// In a machine that runs the boot ROM itself, the blocks the ROM
+    /// sets up lose their state with the SoC's power, for the ROM to find
+    /// them as at power-on when it runs again at the wake: the fuse block
+    /// (the private key fuses readable again), the patch unit, USB1 and
+    /// the security engine, whose context the ROM restores from the
+    /// monitor's save.
     pub fn enter_sc7(&self) {
         self.pmc.sample_wake_levels(|event| self.wake_pad(event));
+        if let Some(rom) = self.boot.as_ref().and_then(|boot| boot.rom.as_ref()) {
+            rom.irom.power_off();
+            rom.usb2.power_off();
+            self.se.power_off();
+            if let Some(fuse) = self.fuse.get() {
+                fuse.power_off();
+            }
+        }
     }
 
     /// Whether something wakes the sleeping console, which the power
@@ -1399,7 +1487,7 @@ mod tests {
             &clock,
             None,
             None,
-            false,
+            Start::Kernel,
             &mut Bus::default(),
         )
         .unwrap();
@@ -1451,7 +1539,7 @@ mod tests {
             &clock,
             None,
             None,
-            false,
+            Start::Kernel,
             &mut Bus::default(),
         )
         .unwrap();

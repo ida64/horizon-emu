@@ -13,7 +13,9 @@
 //! bit 30, count 28:0) and a `PCR` (present count; write bit 30 to clear
 //! the interrupt); the counter's `USEC_CFG` (`0x014`) and
 //! `CNTR_FREEZE` (`0x03C`); watchdogs `WDT0`..`WDT4` at `0x100` + 0x20·n,
-//! `CONFIG` (+0), `COMMAND` (+8), `UNLOCK_PATTERN` (+0xC).
+//! `CONFIG` (+0), `STATUS` (+4; bit 0 says the watchdog runs, and the boot
+//! ROM asks it of `WDT4`, `0x104758`; none ever runs here, so it reads 0),
+//! `COMMAND` (+8), `UNLOCK_PATTERN` (+0xC).
 //!
 //! Power-on values: the NX bootloader's hardware-state check reads all of
 //! those as zero in the bits it looks at (`nxbl_hwcheck.csv`, the check
@@ -23,11 +25,15 @@
 //! entry, since the boot chain starts none of them.
 //!
 //! `USEC_CFG` (dividend + 1 in bits 15:8, divisor + 1 in 7:0, applied to the
-//! oscillator) holds `0x45F` at kernel entry, what the NX bootloader writes
-//! (`0x40015250`, research §2.1): 19.2 MHz · 5 / 96, one tick per
-//! microsecond. Its reset value is not public: at power-on it refuses to be
-//! read until written. Only that setting is accepted; any other would make
-//! the counter count something other than microseconds, which it does not.
+//! timers' clock, CLK_M) holds `0x45F` at kernel entry, what the NX
+//! bootloader writes (`0x40015250`, research §2.1): 19.2 MHz · 5 / 96, one
+//! tick per microsecond, CLK_M being half the 38.4 MHz oscillator by then.
+//! The boot ROM writes `0x4BF` (`0x10023A`, by the oscillator it measured):
+//! 38.4 MHz · 5 / 192, CLK_M still being the oscillator itself. Its reset
+//! value is not public: at power-on it refuses to be read until written.
+//! Only those two settings are accepted, each taken to go with the CLK_M of
+//! its writer; any other would make the counter count something other than
+//! microseconds, which it does not.
 //!
 //! Refused, because they are not modelled: starting a timer (a `PTV` write
 //! with bit 31 set), anything written to a watchdog (package1ldr and the
@@ -47,8 +53,9 @@ pub const SIZE: u64 = 0x400;
 const TIMERUS_CNTR_1US: u64 = 0x10;
 const TIMERUS_USEC_CFG: u64 = 0x14;
 const TIMERUS_CNTR_FREEZE: u64 = 0x3C;
-/// One tick per microsecond from the 19.2 MHz oscillator.
+/// One tick per microsecond from a CLK_M of 19.2 MHz, and of 38.4 MHz.
 const USEC_CFG_19_2_MHZ: u32 = 0x045F;
+const USEC_CFG_38_4_MHZ: u32 = 0x04BF;
 
 /// Each timer's `PTV`; its `PCR` follows.
 const TIMERS: [u64; 14] = [
@@ -59,7 +66,9 @@ const PTV_ENABLE: u32 = 1 << 31;
 const PCR: u64 = 0x4;
 /// Each watchdog's registers start here.
 const WATCHDOGS: [u64; 5] = [0x100, 0x120, 0x140, 0x160, 0x180];
-const WDT_REGISTERS: [u64; 3] = [0x0, 0x8, 0xC];
+/// `CONFIG`, `STATUS` (bit 0: the watchdog is running, which the boot
+/// ROM asks of `WDT4`, `0x104758`), `COMMAND`, `UNLOCK_PATTERN`.
+const WDT_REGISTERS: [u64; 4] = [0x0, 0x4, 0x8, 0xC];
 
 pub struct Timers {
     /// Time since the machine was powered on.
@@ -106,7 +115,9 @@ impl MmioDevice for Timers {
         let register = word(offset, size)?;
         let value = value as u32;
         match register {
-            TIMERUS_USEC_CFG if value == USEC_CFG_19_2_MHZ => self.registers.set(register, value),
+            TIMERUS_USEC_CFG if matches!(value, USEC_CFG_19_2_MHZ | USEC_CFG_38_4_MHZ) => {
+                self.registers.set(register, value)
+            }
             ptv if TIMERS.contains(&ptv) && value & PTV_ENABLE == 0 => {
                 self.registers.set(ptv, value)
             }

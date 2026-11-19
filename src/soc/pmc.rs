@@ -98,6 +98,16 @@ const TOGGLE_START: u32 = 1 << 8;
 const TOGGLE_PARTITION: u32 = 0x1F;
 /// Which power partitions are on, a bit per partition ID.
 pub const PWRGATE_STATUS: u64 = 0x38;
+/// `RST_STATUS`: why the SoC last came out of reset, bits 2:0. 0 is a
+/// power-on. \[inference\] 4 is a wake from deep power down (LP0): the
+/// boot ROM takes 1, 2, 3 and 5 for the watchdog, thermal and software
+/// resets it handles apart (`0x102FA6`) and does its LP0 step on 4, and
+/// the Switch's fourth ROM patch restores the straps from scratch
+/// whenever the register is not 0 (switchbrew "Fuses", "IROM patch 4":
+/// "backing up and restoring strapping options for warmboot"). The
+/// machine's SC7 cycle writes it when it wakes a SoC that runs the ROM.
+pub const RST_STATUS: u64 = 0x1B4;
+pub const RST_STATUS_LP0: u32 = 4;
 
 /// Whether `DPD_ENABLE` (as read) puts the SoC into SC7.
 pub fn dpd_entered(dpd_enable: u32) -> bool {
@@ -222,14 +232,34 @@ const HWCHECK_STATE: [(u64, u32); 143] = [
 
 /// Registers the boot chain reads that the check does not: see
 /// [`Pmc::power_on`].
-const POWER_ON_UNCHECKED: [(u64, u32); 6] = [
-    (0x1B4, 0),
+const POWER_ON_UNCHECKED: [(u64, u32); 9] = [
+    (SCRATCH0, 0),
+    (USB_AO, 0),
+    (RST_STATUS, 0),
+    (SCRATCH49, 0),
     (0x810, 0),
     (0x840, 0),
     (CLAMP_STATUS, 0),
     (SECURE_SCRATCH21, 0),
     (SECURE_SCRATCH35, 0),
 ];
+
+/// `USB_AO`: the boot ROM's USB set-up clears bits 2 and 3 (the wake
+/// detectors' power-downs of port 0, as hekate's same step names them) by
+/// read-modify-write (`0x10706A`); nothing else in the boot chain reads
+/// it. \[assumption\] It reads 0 at power-on: its reset value is not in
+/// the public sources, and the only use made of it leaves the bits the
+/// ROM clears clear either way.
+const USB_AO: u64 = 0x0F0;
+/// `SCRATCH49`: the boot ROM clears bits 1:0 by read-modify-write as it
+/// leaves a cold boot (`0x101328`). 0 at power-on like the other scratch
+/// registers ([`Pmc::power_on`]).
+const SCRATCH49: u64 = 0x244;
+
+/// `SCRATCH0`: the boot ROM's flags, which it reads first of all
+/// (`0x1023BE`): bit 0 a warm boot (the monitor sets it before SC7), bit 1
+/// recovery mode.
+const SCRATCH0: u64 = 0x050;
 
 /// `SECURE_SCRATCH21`: the secure monitor's cold boot sets bit 4 by
 /// read-modify-write (`warmboot-research` §3, monitor `0x1F0146D14`).
@@ -304,10 +334,11 @@ impl Pmc {
     /// evidence. Other registers the boot chain reads are not checked:
     /// `RST_STATUS` (`0x1b4`) reads 0, the reset reason of a power-on
     /// (Switchbrew "Fuses" via `pkg1-research` §4; the bootloader takes any
-    /// other value for a warm reset); the scratch registers `SCRATCH188`
-    /// (`0x810`, changed by read-modify-write), `SCRATCH200` (`0x840`,
-    /// error codes of an earlier boot), those of `LP0_SCRATCH` and
-    /// `SECURE_SCRATCH21` and `35` (`0x334`, `0x36c`) read 0 (\[assumption\]: scratch
+    /// other value for a warm reset); the scratch registers `SCRATCH49`
+    /// (`0x244`), `SCRATCH188` (`0x810`, changed by read-modify-write),
+    /// `SCRATCH200` (`0x840`, error codes of an earlier boot), those of
+    /// `LP0_SCRATCH` and `SECURE_SCRATCH21` and `35` (`0x334`, `0x36c`)
+    /// read 0 (\[assumption\]: scratch
     /// registers lose their contents on a power-on reset, which is why they
     /// carry state only across warm resets; where the check has a row for
     /// one, its value wins); and `CLAMP_STATUS` reads 0 (no software clamp

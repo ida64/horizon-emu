@@ -689,7 +689,10 @@ const CLK_SOURCE_EMC: u64 = 0x19C;
 /// tens of microseconds on hardware; here it is ready at once. `pcv`
 /// triggers two windows and requires 2338-2348, i.e. a 38.4 MHz crystal
 /// (`NvClockDetectOSCClock`, text `0x47ee0`); the status reads nothing
-/// before the first measurement.
+/// before the first measurement. \[inference\] The trigger bit reads 0
+/// once the measurement is done: the boot ROM writes the register once,
+/// `0x8000_0000` (`0x1001C0`), nothing after it writes it again, and the
+/// NX bootloader's hardware-state check requires bit 31 clear there.
 const OSC_FREQ_DET: u64 = 0x58;
 const OSC_FREQ_DET_STATUS: u64 = 0x5C;
 const OSC_FREQ_DET_TRIGGER: u32 = 1 << 31;
@@ -875,6 +878,8 @@ impl MmioDevice for Car {
             let windows = u64::from(value & 0xF) + 1;
             let count = OSCILLATOR_HZ * windows / CLK_S_HZ;
             self.registers.set(OSC_FREQ_DET_STATUS, count as u32);
+            self.registers
+                .set(OSC_FREQ_DET, value & !OSC_FREQ_DET_TRIGGER);
         }
         if register == CLK_SOURCE_EMC
             && let Some(clock_change) = &self.emc_clock_change

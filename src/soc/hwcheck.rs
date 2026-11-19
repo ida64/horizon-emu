@@ -51,7 +51,8 @@ fn bootloader_hardware_state_check() {
     let ram = Arc::new(GuestRam::new(boot::DRAM_BASE, size).unwrap());
     let clock = Arc::new(GuestClock::new());
     let mut bus = Bus::default();
-    let _soc = Soc::new(&params, &gic, &ram, &clock, None, None, true, &mut bus).unwrap();
+    let start = super::Start::AfterRom;
+    let _soc = Soc::new(&params, &gic, &ram, &clock, None, None, start, &mut bus).unwrap();
 
     // package1ldr's enable_mem_ctl: MC_IRAM_REG_CTRL &= ~1, then the AHB
     // redirect aperture.
