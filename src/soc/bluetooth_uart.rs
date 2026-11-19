@@ -279,7 +279,15 @@ pub fn keep_radio(uart: &Arc<Serial>, clock: Arc<GuestClock>) {
         .spawn(move || {
             let mut next = clock.now() + LOOK;
             loop {
-                clock.sleep_until(next);
+                // Waits until guest time reaches `next`, polling while the
+                // clock stands still.
+                loop {
+                    let wait = clock.until(next);
+                    if wait.is_zero() {
+                        break;
+                    }
+                    std::thread::sleep(wait);
+                }
                 let Some(uart) = uart.upgrade() else {
                     return;
                 };
