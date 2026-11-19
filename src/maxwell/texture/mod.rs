@@ -15,8 +15,8 @@ mod filtering;
 pub mod format;
 pub mod layout;
 
+use super::Unmodeled;
 use super::sampling::Target;
-use super::{GpuMemory, Unmodeled};
 use format::{ComponentType, Encoding, ImageFormat};
 use layout::{BlockLinear, ImageShape};
 
@@ -368,34 +368,68 @@ impl Texture {
         Ok((tic.address, size))
     }
 
-    /// Decodes compressed blocks directly into the final mip buffer. There is no
-    /// per-texel allocation. sRGB conversion precedes component swizzle and filtering
-    /// [public: OpenGL 4.6 §8.24; NVIDIA clb197tex.h S_R_G_B_CONVERSION].
-    pub fn decode(memory: &dyn GpuMemory, tic: &Tic) -> Result<Self, Unmodeled> {
+    /// Decodes the texture `tic` describes from `raw`, the bytes of its
+    /// footprint ([`Texture::footprint`]), directly into the final mip
+    /// buffers. There is no per-texel allocation. sRGB conversion precedes
+    /// component swizzle and filtering [public: OpenGL 4.6 §8.24; NVIDIA
+    /// clb197tex.h S_R_G_B_CONVERSION].
+    ///
+    /// The work per texel is kept small: a block's offset is its row's
+    /// offset plus its column's, both computed once (block-linear
+    /// addressing adds the two, see [`layout::gob_offset`]), and each
+    /// component of a packed format is converted once per code (by
+    /// table).
+    pub fn decode(raw: &[u8], tic: &Tic) -> Result<Self, Unmodeled> {
         let (_, size) = Self::footprint(tic)?;
-        let mut raw = Vec::new();
-        raw.try_reserve_exact(
-            usize::try_from(size).map_err(|_| unsupported("texture extent", size))?,
-        )
-        .map_err(|e| unsupported("texture allocation", e))?;
-        raw.resize(size as usize, 0);
-        memory.read(tic.address, &mut raw).ok_or_else(|| {
-            unsupported(
-                "texture memory read",
-                format_args!("{:#x}+{size:#x}", tic.address),
-            )
-        })?;
+        let raw = usize::try_from(size)
+            .ok()
+            .and_then(|size| raw.get(..size))
+            .ok_or_else(|| {
+                unsupported(
+                    "texture bytes",
+                    format_args!("{:#x} of {size:#x}", raw.len()),
+                )
+            })?;
         let tiled = if tic.pitch.is_none() {
             Some(layout::block_linear_image(&tic.shape, tic.block)?)
         } else {
             None
         };
-        let mut levels = Vec::with_capacity(tic.shape.levels as usize);
         let f = tic.format;
+        let bytes_per_block = f.bytes_per_block as usize;
+        // Bytes of a block straddle 16-byte sectors (and are gathered one
+        // at a time) only in a block-linear layout of a size that is not a
+        // power of two.
+        let gather = tiled.is_some() && !f.bytes_per_block.is_power_of_two();
+        let packed = match f.encoding {
+            Encoding::Packed(fields) => Some(Packed::new(tic, fields)?),
+            _ => None,
+        };
+        // Index of each output component in [R, G, B, A, 0, 1].
+        let swizzle = tic.swizzle.map(|s| match s {
+            0 => 4,
+            2..=5 => usize::from(s - 2),
+            6 | 7 => 5,
+            _ => unreachable!(),
+        });
         let srgb8 = matches!(
             f.encoding,
             Encoding::Bc1 | Encoding::Bc2 | Encoding::Bc3 | Encoding::Bc7
-        ) || matches!(f.encoding, Encoding::Packed(fields) if fields[..3].iter().all(|(_,bits)| matches!(bits,0|8)));
+        );
+        // Fields of up to 16 bits are converted by table too when the
+        // texture has many more texels than a table has entries.
+        let level_0 = u64::from(tic.shape.width)
+            * u64::from(tic.shape.height)
+            * u64::from(tic.shape.depth)
+            * u64::from(tic.shape.layers);
+        let lookups = packed.as_ref().filter(|_| !gather).and_then(|packed| {
+            packed.lookups(
+                f.bytes_per_block,
+                swizzle,
+                if level_0 >= 4 << 16 { 16 } else { 8 },
+            )
+        });
+        let mut levels = Vec::with_capacity(tic.shape.levels as usize);
         for level in 0..tic.shape.levels {
             let width = (tic.shape.width >> level).max(1);
             let height = (tic.shape.height >> level).max(1);
@@ -411,69 +445,80 @@ impl Texture {
                         .map_err(|_| unsupported("texture texel extent", count))?,
                 )
                 .map_err(|e| unsupported("decoded texture allocation", e))?;
-            texels.resize(count as usize, [0.; 4]);
+            if lookups.is_none() {
+                texels.resize(count as usize, [0.; 4]);
+            }
+            let blocks_wide = width.div_ceil(f.block_width);
+            let blocks_high = height.div_ceil(f.block_height);
+            let surface = tiled.as_ref().map(|image| &image.levels[level as usize]);
+            let blocks = Blocks {
+                raw,
+                // Offset of each block of a row from the row's offset.
+                columns: (0..blocks_wide)
+                    .map(|bx| match surface {
+                        Some(m) => m.surface.offset(bx * f.bytes_per_block, 0, 0) as usize,
+                        None => bx as usize * bytes_per_block,
+                    })
+                    .collect(),
+                gather: surface.filter(|_| gather).map(|m| &m.surface),
+                bytes_per_block: f.bytes_per_block,
+            };
+            let mut split = [0u8; 16];
             let mut block = [[0.; 4]; 144];
             for layer in 0..tic.shape.layers {
                 for z in 0..depth {
-                    for by in 0..height.div_ceil(f.block_height) {
-                        for bx in 0..width.div_ceil(f.block_width) {
-                            let offset = if let Some(image) = &tiled {
-                                let m = &image.levels[level as usize];
+                    let plane = (layer as usize * depth as usize + z as usize) * height as usize;
+                    for by in 0..blocks_high {
+                        let row = match (&tiled, surface) {
+                            (Some(image), Some(m)) => {
                                 u64::from(layer) * image.layer_stride
                                     + m.offset
-                                    + m.surface.offset(bx * f.bytes_per_block, by, z)
-                            } else {
+                                    + m.surface.offset(0, by, z)
+                            }
+                            _ => {
                                 u64::from(tic.pitch.unwrap())
-                                    * (u64::from(layer * depth + z)
-                                        * u64::from(height.div_ceil(f.block_height))
+                                    * (u64::from(layer * depth + z) * u64::from(blocks_high)
                                         + u64::from(by))
-                                    + u64::from(bx * f.bytes_per_block)
-                            } as usize;
-                            let mut split = [0u8; 16];
-                            let bytes = if let Some(image) = &tiled
-                                && !f.bytes_per_block.is_power_of_two()
-                            {
-                                let m = &image.levels[level as usize];
-                                for byte in 0..f.bytes_per_block {
-                                    let address = u64::from(layer) * image.layer_stride
-                                        + m.offset
-                                        + m.surface.offset(bx * f.bytes_per_block + byte, by, z);
-                                    split[byte as usize] =
-                                        *raw.get(address as usize).ok_or_else(|| {
-                                            unsupported("texture byte offset", address)
-                                        })?;
-                                }
-                                &split[..f.bytes_per_block as usize]
-                            } else {
-                                raw.get(offset..offset + f.bytes_per_block as usize)
-                                    .ok_or_else(|| unsupported("texture block offset", offset))?
+                            }
+                        } as usize;
+                        if let Some(lookups) = &lookups {
+                            // One texel per block, rows in order.
+                            let row_of = match bytes_per_block {
+                                1 => lookup_row::<1>,
+                                2 => lookup_row::<2>,
+                                4 => lookup_row::<4>,
+                                _ => lookup_row::<8>,
                             };
-                            decode_block(tic, bytes, &mut block)?;
+                            row_of(raw, row, &blocks.columns, lookups, &mut texels)?;
+                            continue;
+                        }
+                        if let Some(packed) = &packed {
+                            // One texel per block.
+                            let start = (plane + by as usize) * width as usize;
+                            for (bx, texel) in
+                                texels[start..start + width as usize].iter_mut().enumerate()
+                            {
+                                let c = packed.texel(blocks.get(row, bx as u32, &mut split)?);
+                                let c = [c[0], c[1], c[2], c[3], 0., 1.];
+                                *texel = swizzle.map(|i| c[i]);
+                            }
+                            continue;
+                        }
+                        for bx in 0..blocks_wide {
+                            decode_block(tic, blocks.get(row, bx, &mut split)?, &mut block)?;
                             for y in 0..f.block_height.min(height - by * f.block_height) {
+                                let start = (plane + (by * f.block_height + y) as usize)
+                                    * width as usize
+                                    + (bx * f.block_width) as usize;
                                 for x in 0..f.block_width.min(width - bx * f.block_width) {
                                     let mut c = block[(y * f.block_width + x) as usize];
                                     if tic.srgb {
                                         for v in &mut c[..3] {
-                                            *v = if srgb8 {
-                                                format::SRGB8_TO_LINEAR
-                                                    [(*v * 255.).round().clamp(0., 255.) as usize]
-                                            } else {
-                                                format::srgb_to_linear(*v)
-                                            };
+                                            *v = srgb_decode(*v, srgb8);
                                         }
                                     }
-                                    let c = tic.swizzle.map(|s| match s {
-                                        0 => 0.,
-                                        2..=5 => c[(s - 2) as usize],
-                                        6 | 7 => 1.,
-                                        _ => unreachable!(),
-                                    });
-                                    let index = (((layer as usize * depth as usize + z as usize)
-                                        * height as usize
-                                        + (by * f.block_height + y) as usize)
-                                        * width as usize)
-                                        + (bx * f.block_width + x) as usize;
-                                    texels[index] = c;
+                                    let c = [c[0], c[1], c[2], c[3], 0., 1.];
+                                    texels[start + x as usize] = swizzle.map(|i| c[i]);
                                 }
                             }
                         }
@@ -491,49 +536,292 @@ impl Texture {
     }
 }
 
+/// The blocks of one level in the footprint's bytes.
+struct Blocks<'a> {
+    raw: &'a [u8],
+    /// Offset of each block of a row from the row's offset.
+    columns: Vec<usize>,
+    /// The surface whose blocks straddle 16-byte sectors, gathered a byte
+    /// at a time.
+    gather: Option<&'a layout::BlockLinearSurface>,
+    bytes_per_block: u32,
+}
+
+impl Blocks<'_> {
+    /// The bytes of block `bx` of the row at offset `row` (in `split` if
+    /// gathered).
+    #[inline]
+    fn get<'s>(
+        &'s self,
+        row: usize,
+        bx: u32,
+        split: &'s mut [u8; 16],
+    ) -> Result<&'s [u8], Unmodeled> {
+        let length = self.bytes_per_block as usize;
+        if let Some(surface) = self.gather {
+            for byte in 0..self.bytes_per_block {
+                let address = row + surface.offset(bx * self.bytes_per_block + byte, 0, 0) as usize;
+                split[byte as usize] = *self
+                    .raw
+                    .get(address)
+                    .ok_or_else(|| unsupported("texture byte offset", address))?;
+            }
+            return Ok(&split[..length]);
+        }
+        let offset = row + self.columns[bx as usize];
+        self.raw
+            .get(offset..offset + length)
+            .ok_or_else(|| unsupported("texture block offset", offset))
+    }
+}
+
+/// An sRGB-encoded component to linear: through the table of the 256
+/// 8-bit codes (rounding to the nearest code) for formats of 8-bit
+/// components, by the curve otherwise.
+fn srgb_decode(value: f32, srgb8: bool) -> f32 {
+    if srgb8 {
+        format::SRGB8_TO_LINEAR[(value * 255.).round().clamp(0., 255.) as usize]
+    } else {
+        format::srgb_to_linear(value)
+    }
+}
+
+/// How a packed component's code becomes a number.
+#[derive(Clone, Copy)]
+enum Conversion {
+    Unorm,
+    Snorm,
+    Uf10,
+    Uf11,
+    F16,
+    F32,
+    /// Integer components: never selected (`Tic::parse`), so their value
+    /// cannot affect the result.
+    Zero,
+}
+
+/// One component of a packed format as sampling sees it: its field of the
+/// texel word, converted by its data type, rounded through binary16 for
+/// the FORCE_FP16 types, then sRGB-decoded for R, G and B of an sRGB
+/// view.
+#[derive(Clone, Copy)]
+struct Component {
+    shift: u32,
+    bits: u32,
+    conversion: Conversion,
+    force_fp16: bool,
+    /// `Some(srgb8)` when sRGB-decoded (see [`srgb_decode`]).
+    srgb: Option<bool>,
+}
+
+impl Component {
+    /// The value of `code`.
+    #[inline]
+    fn value(&self, code: u32) -> f32 {
+        let mut c = match self.conversion {
+            Conversion::Unorm => format::unorm_to_f32(code, self.bits),
+            Conversion::Snorm => format::snorm_to_f32(code, self.bits),
+            Conversion::Uf10 => format::uf10_to_f32(code),
+            Conversion::Uf11 => format::uf11_to_f32(code),
+            Conversion::F16 => format::f16_to_f32(code as u16),
+            Conversion::F32 => f32::from_bits(code),
+            Conversion::Zero => 0.,
+        };
+        if self.force_fp16 {
+            c = format::f16_to_f32(format::f32_to_f16(c));
+        }
+        if let Some(srgb8) = self.srgb {
+            c = srgb_decode(c, srgb8);
+        }
+        c
+    }
+}
+
+/// A component of a packed texel, prepared once per texture.
+enum Channel {
+    /// Absent from the format: 0 for R, G and B (sRGB-decoded if the view
+    /// is sRGB), 1 for A.
+    Constant(f32),
+    /// At most 8 bits: the value of every code, from [`Component::value`].
+    Table {
+        shift: u32,
+        mask: u128,
+        values: Box<[f32]>,
+    },
+    /// Wider: [`Component::value`] per texel.
+    Computed(Component),
+}
+
+/// The components of a packed format.
+struct Packed {
+    channels: [Channel; 4],
+}
+
+impl Packed {
+    fn new(tic: &Tic, fields: [(u8, u8); 4]) -> Result<Self, Unmodeled> {
+        let srgb8 = fields[..3].iter().all(|(_, bits)| matches!(bits, 0 | 8));
+        let mut channels = Vec::with_capacity(4);
+        for (i, (shift, bits)) in fields.into_iter().enumerate() {
+            let srgb = (tic.srgb && i < 3).then_some(srgb8);
+            if bits == 0 {
+                let default = if i == 3 { 1. } else { 0. };
+                channels.push(Channel::Constant(match srgb {
+                    Some(srgb8) => srgb_decode(default, srgb8),
+                    None => default,
+                }));
+                continue;
+            }
+            let conversion = match tic.types[i] {
+                ComponentType::Unorm | ComponentType::UnormForceFp16 => Conversion::Unorm,
+                ComponentType::Snorm | ComponentType::SnormForceFp16 => Conversion::Snorm,
+                ComponentType::Float => match bits {
+                    10 => Conversion::Uf10,
+                    11 => Conversion::Uf11,
+                    16 => Conversion::F16,
+                    32 => Conversion::F32,
+                    _ => return Err(unsupported("TIC FLOAT component bits", bits)),
+                },
+                ComponentType::Uint | ComponentType::Sint => Conversion::Zero,
+            };
+            let component = Component {
+                shift: shift.into(),
+                bits: bits.into(),
+                conversion,
+                force_fp16: matches!(
+                    tic.types[i],
+                    ComponentType::UnormForceFp16 | ComponentType::SnormForceFp16
+                ),
+                srgb,
+            };
+            channels.push(if bits <= 8 {
+                Channel::Table {
+                    shift: shift.into(),
+                    mask: (1 << bits) - 1,
+                    values: (0..1u32 << bits)
+                        .map(|code| component.value(code))
+                        .collect(),
+                }
+            } else {
+                Channel::Computed(component)
+            });
+        }
+        Ok(Packed {
+            channels: channels.try_into().ok().expect("four components"),
+        })
+    }
+
+    /// R, G, B and A of the texel stored in `bytes`, before the swizzle.
+    #[inline]
+    fn texel(&self, bytes: &[u8]) -> [f32; 4] {
+        let word = match *bytes {
+            [a] => u128::from(a),
+            [a, b] => u16::from_le_bytes([a, b]).into(),
+            [a, b, c, d] => u32::from_le_bytes([a, b, c, d]).into(),
+            _ => bytes
+                .iter()
+                .enumerate()
+                .fold(0, |word, (i, &b)| word | u128::from(b) << (i * 8)),
+        };
+        self.channels.each_ref().map(|channel| match channel {
+            Channel::Constant(value) => *value,
+            Channel::Table {
+                shift,
+                mask,
+                values,
+            } => values[((word >> shift) & mask) as usize],
+            Channel::Computed(c) => c.value(((word >> c.shift) & ((1 << c.bits) - 1)) as u32),
+        })
+    }
+
+    /// Per output component (after `swizzle`, indices into [R, G, B, A,
+    /// 0, 1]): the value of every code of the field it selects. Only for
+    /// texels of 1, 2, 4 or 8 bytes whose selected fields have at most
+    /// `most_bits` bits.
+    fn lookups(
+        &self,
+        bytes_per_block: u32,
+        swizzle: [usize; 4],
+        most_bits: u32,
+    ) -> Option<[Lookup; 4]> {
+        if !matches!(bytes_per_block, 1 | 2 | 4 | 8) {
+            return None;
+        }
+        let constant = |value: f32| Lookup {
+            shift: 0,
+            mask: 0,
+            values: Box::new([value]),
+        };
+        let mut lookups = Vec::with_capacity(4);
+        for source in swizzle {
+            lookups.push(match self.channels.get(source) {
+                None => constant(if source == 4 { 0. } else { 1. }),
+                Some(Channel::Constant(value)) => constant(*value),
+                Some(Channel::Table {
+                    shift,
+                    mask,
+                    values,
+                }) => Lookup {
+                    shift: *shift,
+                    mask: *mask as u64,
+                    values: values.clone(),
+                },
+                Some(Channel::Computed(c)) if c.bits <= most_bits => Lookup {
+                    shift: c.shift,
+                    mask: (1 << c.bits) - 1,
+                    values: (0..1u32 << c.bits).map(|code| c.value(code)).collect(),
+                },
+                Some(Channel::Computed(_)) => return None,
+            });
+        }
+        lookups.try_into().ok()
+    }
+}
+
+/// One output component of a packed texel of at most 8 bytes: its value
+/// for every code of the field at `shift` (`mask` wide; a constant has a
+/// field of no bits).
+struct Lookup {
+    shift: u32,
+    mask: u64,
+    values: Box<[f32]>,
+}
+
+/// Appends the texels of the row at offset `row` of a packed format of
+/// `N`-byte texels (each `columns[x]` past the row's offset), through
+/// `lookups`.
+fn lookup_row<const N: usize>(
+    raw: &[u8],
+    row: usize,
+    columns: &[usize],
+    lookups: &[Lookup; 4],
+    texels: &mut Vec<[f32; 4]>,
+) -> Result<(), Unmodeled> {
+    for &column in columns {
+        let offset = row + column;
+        let bytes = raw
+            .get(offset..offset + N)
+            .ok_or_else(|| unsupported("texture block offset", offset))?;
+        let mut word = [0u8; 8];
+        word[..N].copy_from_slice(bytes);
+        let word = u64::from_le_bytes(word);
+        texels.push(
+            lookups
+                .each_ref()
+                .map(|l| l.values[((word >> l.shift) & l.mask) as usize]),
+        );
+    }
+    Ok(())
+}
+
+/// Decodes one block of a compressed or shared-exponent format (packed
+/// formats are decoded per component, [`Packed`]).
 fn decode_block(tic: &Tic, bytes: &[u8], out: &mut [[f32; 4]; 144]) -> Result<(), Unmodeled> {
     let signed = matches!(
         tic.types[0],
         ComponentType::Snorm | ComponentType::SnormForceFp16
     );
     match tic.format.encoding {
-        Encoding::Packed(fields) => {
-            let mut word = 0u128;
-            for (i, &b) in bytes.iter().enumerate() {
-                word |= u128::from(b) << (i * 8);
-            }
-            let mut c = [0., 0., 0., 1.];
-            for (i, (shift, bits)) in fields.into_iter().enumerate() {
-                if bits == 0 {
-                    continue;
-                }
-                let v = ((word >> shift) & ((1u128 << bits) - 1)) as u32;
-                c[i] = match tic.types[i] {
-                    ComponentType::Unorm | ComponentType::UnormForceFp16 => {
-                        format::unorm_to_f32(v, bits.into())
-                    }
-                    ComponentType::Snorm | ComponentType::SnormForceFp16 => {
-                        format::snorm_to_f32(v, bits.into())
-                    }
-                    ComponentType::Float => match bits {
-                        10 => format::uf10_to_f32(v),
-                        11 => format::uf11_to_f32(v),
-                        16 => format::f16_to_f32(v as u16),
-                        32 => f32::from_bits(v),
-                        _ => return Err(unsupported("TIC FLOAT component bits", bits)),
-                    },
-                    // Unselected stencil/integer channels cannot affect the result.
-                    ComponentType::Uint | ComponentType::Sint => 0.,
-                };
-                if matches!(
-                    tic.types[i],
-                    ComponentType::UnormForceFp16 | ComponentType::SnormForceFp16
-                ) {
-                    c[i] = format::f16_to_f32(format::f32_to_f16(c[i]));
-                }
-            }
-            out[0] = c;
-        }
+        Encoding::Packed(_) => unreachable!("packed formats are decoded per component"),
         Encoding::SharedExponent => {
             let v = u32::from_le_bytes(bytes.try_into().unwrap());
             let scale = 2f32.powi((v >> 27) as i32 - 24);
