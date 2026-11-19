@@ -721,6 +721,35 @@ pub fn install_ssl_identity(image: &File, keys: &KeySet) -> Result<u64, NandErro
     Ok(device_id)
 }
 
+/// Gives the console whose calibration data the partitioned `image` holds
+/// the WLAN MAC address `mac` (command 6 of the calibration data), and
+/// leaves everything else as it is but the update count: a second
+/// emulated console with its own address, for several emulators sharing
+/// the air (`wlan` builds the radio's NVRAM from this block and sets the
+/// radio's address from it).
+pub fn set_wlan_mac_address(image: &File, keys: &KeySet, mac: [u8; 6]) -> Result<(), NandError> {
+    let cipher = storage_keys(image, keys)?.cipher(bis::KEY_CALIBRATION);
+    let mut data = vec![0; SIZE];
+    image
+        .read_exact_at(&mut data, partition_start())
+        .map_err(NandError::Image)?;
+    cipher.decrypt(0, &mut data);
+    if data[..4] != MAGIC {
+        return Err(NandError::Calibration(
+            "PRODINFO holds no calibration data under these keys",
+        ));
+    }
+    put(&mut data, WLAN_MAC_ADDRESS, &mac);
+    seal_crc(&mut data, WLAN_MAC_ADDRESS);
+    let updates = u16::from_le_bytes([data[14], data[15]]).saturating_add(1);
+    data[14..16].copy_from_slice(&updates.to_le_bytes());
+    seal_header(&mut data);
+    cipher.encrypt(0, &mut data);
+    image
+        .write_all_at(&data, partition_start())
+        .map_err(NandError::Image)
+}
+
 fn partition_start() -> u64 {
     partition_range(PARTITION)
         .expect("the layout has the partition")

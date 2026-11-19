@@ -18,6 +18,7 @@
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,14 @@ pub trait Peer: Send {
 
     /// Whether the peer holds the console's CTS input asserted.
     fn clear_to_send(&self) -> bool;
+
+    /// What the peer sends of its own accord by guest time `now`, not in
+    /// answer to a byte, and the guest time at which it next will, if it
+    /// knows; `Err` says what it was about to do that is not modeled. A
+    /// peer that only ever answers keeps the default: nothing, ever.
+    fn due(&mut self, _now: Duration) -> Result<(Vec<u8>, Option<Duration>), String> {
+        Ok((Vec::new(), None))
+    }
 
     /// The peer's state, encoded: everything that decides what it answers
     /// from now on ([`Snapshot::save`]).
@@ -110,6 +119,26 @@ impl Serial {
     /// Bytes waiting in the receive FIFO.
     pub(crate) fn receive_len(&self) -> usize {
         self.state.lock().unwrap().receive.len()
+    }
+
+    /// Receives what the peer sends of its own accord by guest time `now`
+    /// ([`Peer::due`]), as if it had just come over the line; returns when
+    /// the peer next sends. What the peer cannot do becomes a note.
+    pub fn deliver(&self, now: Duration) -> Option<Duration> {
+        let mut s = self.state.lock().unwrap();
+        let (bytes, next) = match self.peer.lock().unwrap().due(now) {
+            Ok(due) => due,
+            Err(what) => {
+                self.notes.add(what);
+                return None;
+            }
+        };
+        if !bytes.is_empty() {
+            s.eord = true;
+            s.receive.extend(bytes);
+            self.update(&s);
+        }
+        next
     }
 
     fn update(&self, state: &State) {

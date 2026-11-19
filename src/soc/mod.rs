@@ -14,6 +14,7 @@ pub mod bq24193;
 pub mod car;
 pub mod cldvfs;
 pub mod dc;
+pub mod dot11;
 pub mod dpaux;
 pub mod dsi;
 pub mod emc;
@@ -35,6 +36,7 @@ pub mod max77621;
 pub mod mc;
 mod medium;
 pub mod mipi_cal;
+pub mod ntag;
 pub mod pcie;
 pub mod pcie_endpoint;
 pub mod pmc;
@@ -311,6 +313,8 @@ pub struct Soc {
     /// The WiFi function of the radio, for placing an access point around
     /// it (`--wifi-ssid`); set once the PCIe root complex is built.
     pub wifi: std::sync::OnceLock<Arc<bcm4356::Bcm4356Wifi>>,
+    /// What is in range of the Bluetooth radio (`--pro-controller`).
+    pub bluetooth: Arc<bluetooth_uart::Air>,
     /// Guest time, which the SoC's clocks count.
     pub clock: Arc<GuestClock>,
     gic: Arc<Gic>,
@@ -426,6 +430,7 @@ impl Soc {
             pmic: max77620::Max77620::new(Arc::clone(clock), line(gic, PMU_INTID)),
             pmc: Arc::new(Pmc::new()),
             wifi: std::sync::OnceLock::new(),
+            bluetooth: Arc::new(bluetooth_uart::Air::new(Arc::clone(clock))),
             clock: Arc::clone(clock),
             gic: Arc::clone(gic),
             dc: controller(DC_INTID),
@@ -510,11 +515,15 @@ impl Soc {
                 bluetooth_uart::BASE,
                 "Bluetooth UART",
                 serial(
-                    Box::<bluetooth_uart::Line>::default(),
+                    Box::new(bluetooth_uart::Line::new(
+                        Arc::clone(&soc.clock),
+                        Arc::clone(&soc.bluetooth),
+                    )),
                     bluetooth_uart::INTID,
                 ),
             ),
         ];
+        bluetooth_uart::keep_radio(&uarts[2].2, Arc::clone(&soc.clock));
         for (base, name, uart) in &uarts {
             bus.map(name, *base, serial::SIZE, Box::new(Arc::clone(uart)));
         }

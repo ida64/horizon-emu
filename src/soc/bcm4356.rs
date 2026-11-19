@@ -55,6 +55,9 @@ use crate::{
     snapshot::{Snapshot, SnapshotError, decode, encode},
 };
 
+mod on_air;
+use on_air::{Effect, Radio};
+
 // ---------------------------------------------------------------------------
 // Identity of the function. These are values only real hardware supplies.
 // ---------------------------------------------------------------------------
@@ -298,6 +301,28 @@ const WLC_SET_BAND: u32 = 142;
 /// Default scan type, 0 active / 1 passive (`WLC_SET_PASSIVE_SCAN`).
 const WLC_SET_PASSIVE_SCAN: u32 = 49;
 const WLC_GET_VALID_CHANNELS: u32 = 217;
+/// Beacon and DTIM periods of the BSS the firmware runs as access point,
+/// whether the interface is up, and sending a station of that BSS away
+/// (public `wlioctl_defs.h`).
+const WLC_SET_BCNPRD: u32 = 76;
+const WLC_SET_DTIMPRD: u32 = 78;
+const WLC_GET_UP: u32 = 162;
+const WLC_SCB_DEAUTHENTICATE_FOR_REASON: u32 = 201;
+const WLC_GET_INSTANCE: u32 = 14;
+const WLC_GET_BCNPRD: u32 = 75;
+const WLC_GET_AP: u32 = 117;
+/// An action frame the host asked to be sent went out (public
+/// `bcmevent.h`), and one received, with `wl_event_rx_frame_data_t`
+/// before the frame.
+const WLC_E_ACTION_FRAME_COMPLETE: u32 = 60;
+const WLC_E_ACTION_FRAME_RX: u32 = 75;
+const WLC_SET_WPA_AUTH: u32 = 165;
+const WLC_GET_ASSOCLIST: u32 = 159;
+/// Interference mitigation mode (`WLC_SET_INTERFERENCE_OVERRIDE_MODE`,
+/// public `wlioctl_defs.h`): `wlan` `0x65130` sets it for local
+/// communication next to Bluetooth coexistence; the radio model has no
+/// interference to mitigate, so the firmware only keeps it.
+const WLC_SET_INTERFERENCE_OVERRIDE_MODE: u32 = 311;
 /// Two bands: 5 GHz (1) and 2.4 GHz (2) (`WLC_BAND_5G`/`WLC_BAND_2G`); the
 /// chip is dual-band (the NVRAM calibrates both).
 const BANDLIST: [u32; 3] = [2, 1, 2];
@@ -312,6 +337,25 @@ const CHANNELS: [u8; 17] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 36, 40, 4
 /// `wlan` then sets `bw_cap` itself).
 const NMODE: u32 = 1;
 const MIMO_BW_CAP: u32 = 1;
+/// The EDCA parameters the firmware starts with, per access category in
+/// Broadcom's order (BE, BK, VI, VO; `edcf_acparam_t`: ACI and AIFSN,
+/// ECWmax << 4 | ECWmin, TXOP in 32 us units): the defaults IEEE
+/// 802.11-2016 Table 9-138 gives an access point (for the BSS it runs,
+/// `wme_ac_ap`) and a station (`wme_ac_sta`). Assumed to be the
+/// firmware's: `wlan` `0x65130` reads them, changes BE's ECW and writes
+/// that entry back.
+const WME_AC_AP: [[u8; 4]; 4] = [
+    [0x03, 0x64, 0, 0],
+    [0x27, 0xa4, 0, 0],
+    [0x41, 0x43, 94, 0],
+    [0x61, 0x32, 47, 0],
+];
+const WME_AC_STA: [[u8; 4]; 4] = [
+    [0x03, 0xa4, 0, 0],
+    [0x27, 0xa4, 0, 0],
+    [0x42, 0x43, 94, 0],
+    [0x62, 0x32, 47, 0],
+];
 /// Broadcom error codes (`bcmutils.h`, public).
 const BCME_BADARG: i16 = -2;
 /// A message carrying a firmware event to the host, in a posted event
@@ -361,7 +405,6 @@ const WLC_E_ASSOC: u32 = 7;
 const WLC_E_DISASSOC: u32 = 11;
 const WLC_E_LINK: u32 = 16;
 const WLC_E_STATUS_FAIL: u32 = 1;
-const WLC_E_STATUS_NO_NETWORKS: u32 = 3;
 const WLC_E_STATUS_PARTIAL: u32 = 8;
 const WLC_EVENT_MSG_LINK: u16 = 1;
 /// How long authentication and association take on the air (four
@@ -447,6 +490,8 @@ enum Deferred {
         epoch: u32,
         attempt: u32,
     },
+    /// Work of the radio on the air shared with other emulators.
+    Air(on_air::Work),
 }
 
 /// The station's association with the access point.
@@ -463,6 +508,10 @@ struct Association {
 /// Takes the Ethernet frames the access point forwards from the station.
 pub type Uplink = Box<dyn Fn(&[u8]) + Send + Sync>;
 
+/// Takes the 802.11 frames the radio transmits on the air shared with
+/// other emulators, with the channel it transmits on (`crate::air`).
+pub type AirLink = Box<dyn Fn(u8, &[u8]) + Send + Sync>;
+
 /// The network around the radio: the access point and where the frames
 /// it forwards from the station go (the router behind it).
 struct Network {
@@ -474,6 +523,7 @@ struct Network {
 struct Event<'a> {
     kind: u32,
     status: u32,
+    reason: u32,
     flags: u16,
     addr: [u8; 6],
     data: &'a [u8],
@@ -484,6 +534,7 @@ impl<'a> Event<'a> {
         Self {
             kind,
             status,
+            reason: 0,
             flags: 0,
             addr: [0; 6],
             data,
@@ -595,6 +646,12 @@ struct Dongle {
     association: Option<Association>,
     /// Counts joins, to tell stale association work from current.
     epoch: u32,
+    /// What the firmware does on the air shared with other emulators.
+    radio: Radio,
+    /// What the radio did in the request being served, carried out once
+    /// the request is complete.
+    #[serde(skip)]
+    effects: Vec<Effect>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -626,6 +683,10 @@ struct State {
     /// machine's builder; the access point's state is saved on its own.
     #[serde(skip)]
     network: Option<Network>,
+    /// The air shared with other emulators: wiring, set by the machine's
+    /// builder (and again after a restore).
+    #[serde(skip)]
+    air: Option<AirLink>,
     /// The function is gone: the thread running scheduled work ends.
     #[serde(skip)]
     stopped: bool,
@@ -697,6 +758,7 @@ impl Bcm4356Wifi {
             interrupt: false,
             scheduled: Vec::new(),
             network: None,
+            air: None,
             stopped: false,
         }));
         let due = Arc::new(Condvar::new());
@@ -760,6 +822,31 @@ impl Bcm4356Wifi {
             self.notes.add(format!("BCM4356 WiFi: {note}"));
         }
     }
+
+    /// Puts the radio on the air shared with other emulators: `link` takes
+    /// the frames it transmits.
+    pub fn set_air(&self, link: AirLink) {
+        self.state.lock().unwrap().air = Some(link);
+    }
+
+    /// A frame another emulator's radio transmitted on `channel`: heard if
+    /// the radio listens there. While guest time stands still it is lost,
+    /// as frames from the network are ([`Self::from_network`]).
+    pub fn from_air(&self, channel: u8, frame: &[u8]) {
+        let mut state = self.state.lock().unwrap();
+        if self.clock.is_paused() {
+            return;
+        }
+        let now = self.clock.now();
+        let result = state.air_received(channel, frame, now, self.upstream.as_ref());
+        if state.arm(now) {
+            self.due.notify_one();
+        }
+        drop(state);
+        if let Err(note) = result {
+            self.notes.add(format!("BCM4356 WiFi: {note}"));
+        }
+    }
 }
 
 impl Drop for Bcm4356Wifi {
@@ -797,7 +884,7 @@ fn run_scheduled(
             Some(wait) if !wait.is_zero() => due.wait_timeout(locked, wait).unwrap().0,
             Some(_) => {
                 let (deadline, work) = locked.scheduled.remove(0);
-                let result = locked.deferred(work, upstream);
+                let result = locked.deferred(work, deadline, upstream);
                 locked.arm(deadline);
                 if let Err(note) = result {
                     notes.add(format!("BCM4356 WiFi: {note}"));
@@ -826,7 +913,9 @@ impl Snapshot for Bcm4356Wifi {
 
     /// Takes the saved state back, with the work it had scheduled, which
     /// runs when guest time reaches it. The access point takes back its
-    /// group key; its uplink stays as built.
+    /// group key; its uplink and the air link stay
+    /// as built (the link to the other emulators is made anew, as after a
+    /// dropped link; what was on the air meanwhile is lost).
     fn restore(&self, bytes: &[u8]) -> Result<(), SnapshotError> {
         let Saved {
             state: mut restored,
@@ -852,6 +941,7 @@ impl Snapshot for Bcm4356Wifi {
             }
         }
         restored.network = state.network.take();
+        restored.air = state.air.take();
         restored.stopped = state.stopped;
         *state = restored;
         self.due.notify_all();
@@ -1255,6 +1345,8 @@ impl State {
             epoch: 0,
             scan_in_flight: None,
             event_sequence: 0,
+            radio: Radio::default(),
+            effects: Vec::new(),
         });
     }
 
@@ -1495,7 +1587,7 @@ impl State {
                 upstream,
             )?;
         }
-        Ok(())
+        self.apply_effects(dongle, upstream)
     }
 
     /// Schedules the work the firmware left, after its delays from guest
@@ -1515,12 +1607,17 @@ impl State {
         any
     }
 
-    /// Finishes work the firmware began earlier.
-    fn deferred(&mut self, work: Deferred, upstream: &dyn Upstream) -> Result<(), Refusal> {
+    /// Finishes work the firmware began earlier, due at guest time `at`.
+    fn deferred(
+        &mut self,
+        work: Deferred,
+        at: Duration,
+        upstream: &dyn Upstream,
+    ) -> Result<(), Refusal> {
         let Some(mut dongle) = self.dongle.take() else {
             return Ok(());
         };
-        let result = self.run(&mut dongle, work, upstream);
+        let result = self.run(&mut dongle, work, at, upstream);
         self.dongle = Some(dongle);
         result.and_then(|()| self.update_interrupt(upstream))
     }
@@ -1529,6 +1626,7 @@ impl State {
         &mut self,
         dongle: &mut Dongle,
         work: Deferred,
+        at: Duration,
         upstream: &dyn Upstream,
     ) -> Result<(), Refusal> {
         match work {
@@ -1553,6 +1651,7 @@ impl State {
             Deferred::ScanDone { sync_id, if_id } => {
                 if dongle.scan_in_flight == Some(sync_id) {
                     dongle.scan_in_flight = None;
+                    dongle.radio.end_scan(sync_id);
                     let data = escan_result(sync_id, &[]);
                     self.event(
                         dongle,
@@ -1664,8 +1763,158 @@ impl State {
                     self.deliver(dongle, if_id, &m1, upstream)?;
                 }
             }
+            Deferred::Air(work) => {
+                let config = air_config(dongle);
+                let effects = match work {
+                    on_air::Work::Beacon { epoch } => dongle.radio.beacon(&config, epoch, at),
+                    on_air::Work::ScanChannel { sync_id, channel } => {
+                        dongle.radio.scan_channel(&config, sync_id, channel)
+                    }
+                    on_air::Work::Probe { epoch, index } => {
+                        dongle.radio.probe(&config, epoch, index)
+                    }
+                    on_air::Work::Timeout { epoch, stage } => dongle.radio.timeout(epoch, stage),
+                    on_air::Work::PeriodicActionFrame { setting } => {
+                        periodic_action_frame(dongle, setting)
+                    }
+                };
+                dongle.effects.extend(effects);
+                self.apply_effects(dongle, upstream)?;
+            }
         }
         Ok(())
+    }
+
+    /// Carries out what the radio did: frames onto the air (lost if the
+    /// radio shares no air), events and frames for the host, and work for
+    /// later.
+    fn apply_effects(
+        &mut self,
+        dongle: &mut Dongle,
+        upstream: &dyn Upstream,
+    ) -> Result<(), Refusal> {
+        for effect in std::mem::take(&mut dongle.effects) {
+            match effect {
+                Effect::Transmit { channel, frame } => {
+                    if let Some(air) = self.air.as_ref() {
+                        air(channel, &frame);
+                    }
+                }
+                Effect::Event {
+                    if_id,
+                    kind,
+                    status,
+                    reason,
+                    flags,
+                    addr,
+                    data,
+                } => {
+                    let mut e = Event::new(kind, status, &data).from(addr);
+                    e.reason = reason;
+                    e.flags = flags;
+                    self.event(dongle, if_id, e, upstream)?;
+                }
+                Effect::ScanResult {
+                    if_id,
+                    sync_id,
+                    bss_info,
+                } => {
+                    if dongle.scan_in_flight == Some(sync_id) {
+                        let data = escan_result(sync_id, &[bss_info]);
+                        self.event(
+                            dongle,
+                            if_id,
+                            Event::new(WLC_E_ESCAN_RESULT, WLC_E_STATUS_PARTIAL, &data),
+                            upstream,
+                        )?;
+                    }
+                }
+                Effect::Deliver { if_id, frame } => {
+                    self.deliver(dongle, if_id, &frame, upstream)?
+                }
+                Effect::ActionFrame { channel, frame } => {
+                    self.action_frame_heard(dongle, channel, &frame, upstream)?
+                }
+                Effect::Later { delay, work } => dongle.timers.push((delay, Deferred::Air(work))),
+            }
+        }
+        Ok(())
+    }
+
+    /// An action frame heard on `channel`: a Nintendo vendor-specific one
+    /// (category 127, the OUI the host set with `nsc_subtypeoui`, its type
+    /// byte one of those listed in `nsc_subtypes`) goes to the host as
+    /// `WLC_E_ACTION_FRAME_RX`: `wl_event_rx_frame_data_t` (version 1,
+    /// chanspec, RSSI, MAC time, rate; big-endian like the event header,
+    /// public `bcmevent.h`), then the frame's body from its category on;
+    /// the sender is the event's address. `wlan`'s handler of event 75
+    /// (`0x5f5a0`) rebuilds the MAC header from that address, its own and
+    /// the BSSID (`0x687b0` with the data from offset 16), as brcmfmac
+    /// does (`brcmf_p2p_notify_action_frame_rx`).
+    /// \[inference\] The filter's meaning is taken from what `wlan` sets:
+    /// the OUI 00:22:AA (data `0x130d2d`, `0x69b20`), and `nsc_subtypes` as
+    /// eight type bytes with 0xFF for none (all 0xFF when a mode is set up,
+    /// `0x69d80`; then 04 and 05 added one by one, traced), and from the
+    /// host's event mask, which enables event 75 (and not 59). Other
+    /// action frames are not passed on.
+    fn action_frame_heard(
+        &mut self,
+        dongle: &mut Dongle,
+        channel: u8,
+        frame: &[u8],
+        upstream: &dyn Upstream,
+    ) -> Result<(), Refusal> {
+        let body = frame.get(super::dot11::HEADER_LEN..).unwrap_or(&[]);
+        let oui = dongle.settings.get("nsc_subtypeoui");
+        let types = dongle
+            .settings
+            .get("nsc_subtypes")
+            .cloned()
+            .unwrap_or_default();
+        let wanted = body.first() == Some(&127)
+            && oui.is_some_and(|oui| body.get(1..4) == oui.get(..3))
+            && body
+                .get(4)
+                .is_some_and(|t| *t != 0xff && types.iter().take(8).any(|x| x == t));
+        if !wanted {
+            return Ok(());
+        }
+        let mut data = 1u16.to_be_bytes().to_vec();
+        data.extend(chanspec_20(channel).to_be_bytes());
+        data.extend(i32::from(on_air::RSSI_DBM).to_be_bytes());
+        data.extend(0u32.to_be_bytes());
+        data.extend(0u32.to_be_bytes());
+        data.extend(body);
+        let addr: [u8; 6] = frame[10..16].try_into().unwrap();
+        self.event(
+            dongle,
+            0,
+            Event::new(WLC_E_ACTION_FRAME_RX, WLC_E_STATUS_SUCCESS, &data).from(addr),
+            upstream,
+        )
+    }
+
+    /// A frame from the air on `channel`, at guest time `now`.
+    fn air_received(
+        &mut self,
+        channel: u8,
+        frame: &[u8],
+        now: Duration,
+        upstream: &dyn Upstream,
+    ) -> Result<(), Refusal> {
+        let Some(mut dongle) = self.dongle.take() else {
+            return Ok(());
+        };
+        let result = if dongle.up {
+            let config = air_config(&dongle);
+            let effects = dongle.radio.receive(&config, channel, frame, now);
+            dongle.effects.extend(effects);
+            self.apply_effects(&mut dongle, upstream)
+        } else {
+            Ok(())
+        };
+        self.dongle = Some(dongle);
+        result.and_then(|()| self.update_interrupt(upstream))
     }
 
     /// A frame the host transmits: `msgbuf_tx_msghdr` with the Ethernet
@@ -1696,6 +1945,11 @@ impl State {
         let mut status = header(MSG_TX_STATUS, if_id, le32(item, 4));
         status[10..12].copy_from_slice(&ring.to_le_bytes());
         self.complete(dongle, RING_D2H_TX_COMPLETE, &status, upstream)?;
+        let config = air_config(dongle);
+        if let Some(effects) = dongle.radio.transmit(&config, &frame) {
+            dongle.effects.extend(effects);
+            return self.apply_effects(dongle, upstream);
+        }
         self.station_sent(dongle, &frame, upstream)
     }
 
@@ -1812,7 +2066,7 @@ impl State {
         frame.extend(e.flags.to_be_bytes());
         frame.extend(e.kind.to_be_bytes());
         frame.extend(e.status.to_be_bytes());
-        frame.extend(0u32.to_be_bytes()); // reason
+        frame.extend(e.reason.to_be_bytes());
         frame.extend(0u32.to_be_bytes()); // auth type: open system
         frame.extend((data.len() as u32).to_be_bytes());
         frame.extend(e.addr);
@@ -1993,15 +2247,67 @@ fn dongle_ioctl(
             dongle.up = true;
             return Ok(Ok(Vec::new()));
         }
+        // Down, the radio is off the air: its BSS and its link end.
         WLC_DOWN => {
             dongle.up = false;
+            dongle.radio.down();
             return Ok(Ok(Vec::new()));
         }
+        // Whether the interface is up (`wlan` `0x65130` asks before it
+        // changes coexistence settings).
+        WLC_GET_UP => return Ok(Ok(u32::from(dongle.up).to_le_bytes().to_vec())),
+        // The driver instance: the chip's only radio, unit 0 (Broadcom's
+        // `wlc->pub->unit` of the first interface).
+        WLC_GET_INSTANCE => return Ok(Ok(0u32.to_le_bytes().to_vec())),
+        // Access point mode, as the host set it (off at power-on).
+        WLC_GET_AP => {
+            let mode = setting_word(dongle, &format!("ioctl {WLC_SET_AP}")).unwrap_or(0);
+            return Ok(Ok(mode.to_le_bytes().to_vec()));
+        }
+        WLC_GET_BCNPRD => {
+            let period = setting_word(dongle, &format!("ioctl {WLC_SET_BCNPRD}")).unwrap_or(100);
+            return Ok(Ok(period.to_le_bytes().to_vec()));
+        }
+        // The authenticated key management, as the "wpa_auth" iovar sets it.
+        WLC_SET_WPA_AUTH => {
+            let Some(word) = input.get(..4) else {
+                return Ok(Err(BCME_BADARG));
+            };
+            dongle.settings.insert("wpa_auth".into(), word.to_vec());
+            return Ok(Ok(Vec::new()));
+        }
+        // `maclist`: count, then the addresses of the stations associated
+        // with the BSS the radio runs, or of the access point it joined.
+        WLC_GET_ASSOCLIST => {
+            let peers: Vec<[u8; 6]> = match (&dongle.radio.bss, air_link(dongle)) {
+                (Some(bss), _) => bss
+                    .stations
+                    .iter()
+                    .filter(|s| s.associated)
+                    .map(|s| s.mac)
+                    .collect(),
+                (None, Some(link)) => link.bssid.into_iter().collect(),
+                _ if dongle.association.as_ref().is_some_and(|a| a.linked) => {
+                    vec![wifi_ap::BSSID]
+                }
+                _ => Vec::new(),
+            };
+            let mut list = (peers.len() as u32).to_le_bytes().to_vec();
+            list.extend(peers.concat());
+            return Ok(Ok(list));
+        }
         // Settings taking one word, which the firmware stores: infrastructure
-        // mode, channel, power save mode, access point mode (off), band,
-        // default scan type.
-        WLC_SET_INFRA | WLC_SET_CHANNEL | WLC_SET_PM | WLC_SET_AP | WLC_SET_BAND
-        | WLC_SET_PASSIVE_SCAN => {
+        // mode, channel, power save mode, access point mode, band, default
+        // scan type, beacon and DTIM periods, interference mitigation.
+        WLC_SET_INFRA
+        | WLC_SET_CHANNEL
+        | WLC_SET_PM
+        | WLC_SET_AP
+        | WLC_SET_BAND
+        | WLC_SET_PASSIVE_SCAN
+        | WLC_SET_BCNPRD
+        | WLC_SET_DTIMPRD
+        | WLC_SET_INTERFERENCE_OVERRIDE_MODE => {
             let Some(word) = input.get(..4) else {
                 return Ok(Err(BCME_BADARG));
             };
@@ -2016,46 +2322,125 @@ fn dongle_ioctl(
             list.extend(CHANNELS.iter().map(|&c| u32::from(c)));
             return Ok(Ok(words(&list)));
         }
-        // A join without the "join" iovar: `wl_join_params_t` (SSID, then
-        // BSSID at 36), `wlan`'s fallback at `0x646e0`.
+        // `wl_join_params_t`: SSID, then `wl_assoc_params_t` (BSSID at 36,
+        // chanspec count at 44, chanspecs from 48). In access point mode it
+        // starts the BSS (an empty SSID stops it); otherwise it is a join
+        // without the "join" iovar, `wlan`'s fallback at `0x646e0`.
         WLC_SET_SSID => {
             let (Some(len), Some(bssid)) = (input.get(..4), input.get(36..42)) else {
                 return Ok(Err(BCME_BADARG));
             };
             let len = (u32::from_le_bytes(len.try_into().unwrap()) as usize).min(32);
             let ssid = input[4..4 + len].to_vec();
-            return Ok(join(dongle, ap, if_id, &ssid, bssid.try_into().unwrap()));
+            if access_point_mode(dongle) {
+                return Ok(start_bss(dongle, if_id, &ssid));
+            }
+            let channels = chanspec_list(input, 44);
+            return Ok(join(
+                dongle,
+                ap,
+                if_id,
+                &ssid,
+                bssid.try_into().unwrap(),
+                channels,
+            ));
         }
         WLC_GET_BSSID => {
+            if dongle.radio.bss.is_some() {
+                return Ok(Ok(dongle.mac.to_vec()));
+            }
+            if let Some(bssid) = air_link(dongle).and_then(|l| l.bssid) {
+                return Ok(Ok(bssid.to_vec()));
+            }
             return Ok(match dongle.association.as_ref().filter(|a| a.linked) {
                 Some(_) => Ok(wifi_ap::BSSID.to_vec()),
                 None => Err(BCME_NOTASSOCIATED),
             });
         }
-        // `wlc_ssid_t` of the network joined: length, 32 bytes.
+        // `wlc_ssid_t` of the network joined or run: length, 32 bytes.
         WLC_GET_SSID => {
             let mut ssid = vec![0u8; 36];
-            if let (Some(ap), Some(_)) = (ap, dongle.association.as_ref().filter(|a| a.linked)) {
+            let own = match (&dongle.radio.bss, air_link(dongle)) {
+                (Some(bss), _) => Some(bss.ssid.as_slice()),
+                (None, Some(link)) => Some(link.ssid.as_slice()),
+                _ => None,
+            };
+            if let Some(name) = own {
+                ssid[..4].copy_from_slice(&(name.len() as u32).to_le_bytes());
+                ssid[4..4 + name.len()].copy_from_slice(name);
+            } else if let (Some(ap), Some(_)) =
+                (ap, dongle.association.as_ref().filter(|a| a.linked))
+            {
                 ssid[..4].copy_from_slice(&(ap.ssid().len() as u32).to_le_bytes());
                 ssid[4..4 + ap.ssid().len()].copy_from_slice(ap.ssid());
             }
             return Ok(Ok(ssid));
         }
         WLC_GET_RSSI => {
+            if air_link(dongle).is_some() {
+                return Ok(Ok(i32::from(on_air::RSSI_DBM).to_le_bytes().to_vec()));
+            }
             return Ok(match dongle.association.as_ref().filter(|a| a.linked) {
                 Some(_) => Ok(i32::from(wifi_ap::RSSI_DBM).to_le_bytes().to_vec()),
                 None => Err(BCME_NOTASSOCIATED),
             });
         }
+        // The 802.1X port of a peer: a station of the BSS the radio runs,
+        // or the access point it joined. The firmware does not filter data
+        // by it here (the host's supplicant or authenticator holds frames
+        // back until the handshake is done).
         WLC_SCB_AUTHORIZE | WLC_SCB_DEAUTHORIZE => {
+            let peer = input.get(..6);
+            let station = dongle.radio.bss.as_ref().is_some_and(|bss| {
+                bss.stations
+                    .iter()
+                    .any(|s| s.associated && Some(&s.mac[..]) == peer)
+            });
+            let access_point =
+                air_link(dongle).is_some_and(|l| l.bssid.as_ref().map(|b| &b[..]) == peer);
+            if station || access_point {
+                return Ok(Ok(Vec::new()));
+            }
             return Ok(match dongle.association.as_ref().filter(|a| a.linked) {
-                Some(_) if input.get(..6) == Some(&wifi_ap::BSSID) => Ok(Vec::new()),
+                Some(_) if peer == Some(&wifi_ap::BSSID) => Ok(Vec::new()),
                 _ => Err(BCME_NOTASSOCIATED),
             });
+        }
+        // Sending a station of the BSS away: `scb_val_t` (reason, address).
+        WLC_SCB_DEAUTHENTICATE_FOR_REASON => {
+            let (Some(reason), Some(mac)) = (input.get(..4), input.get(4..10)) else {
+                return Ok(Err(BCME_BADARG));
+            };
+            let reason = u32::from_le_bytes(reason.try_into().unwrap()) as u16;
+            let config = air_config(dongle);
+            let effects = dongle
+                .radio
+                .deauthenticate(&config, mac.try_into().unwrap(), reason);
+            dongle.effects.extend(effects);
+            return Ok(Ok(Vec::new()));
         }
         // Leaving the network: the firmware reports the disassociation and
         // the link going down.
         WLC_DISASSOC => {
+            if let Some(link) = air_link(dongle) {
+                let (if_id, bssid) = (link.if_id, link.bssid.unwrap_or_default());
+                let config = air_config(dongle);
+                let effects = dongle.radio.leave(&config);
+                dongle.effects.extend(effects);
+                for kind in [WLC_E_DISASSOC, WLC_E_LINK] {
+                    dongle.effects.push(Effect::Event {
+                        if_id,
+                        kind,
+                        status: WLC_E_STATUS_SUCCESS,
+                        reason: 0,
+                        flags: 0,
+                        addr: bssid,
+                        data: Vec::new(),
+                    });
+                }
+                return Ok(Ok(Vec::new()));
+            }
+            dongle.radio.link = None;
             if let Some(association) = dongle.association.take().filter(|a| a.linked) {
                 dongle.timers.push((
                     Duration::ZERO,
@@ -2068,6 +2453,11 @@ fn dongle_ioctl(
         }
         // The current BSS: the buffer's length word, then `wl_bss_info_t`.
         WLC_GET_BSS_INFO => {
+            if let Some(link) = air_link(dongle) {
+                let mut info = input.get(..4).unwrap_or(&[0; 4]).to_vec();
+                info.extend(&link.bss_info);
+                return Ok(Ok(info));
+            }
             return Ok(
                 match (ap, dongle.association.as_ref().filter(|a| a.linked)) {
                     (Some(ap), Some(_)) => {
@@ -2111,8 +2501,12 @@ fn dongle_ioctl(
             None => Err(BCME_BADARG),
         },
         (false, "ver") => Ok(version_string(dongle)),
-        // The radio's channel: the access point's while associated, else
-        // what the host last set.
+        // The radio's channel: its BSS's, the access point's while
+        // associated, else what the host last set.
+        (false, "chanspec") if dongle.radio.bss.is_some() || air_link(dongle).is_some() => {
+            let channel = dongle.radio.channel().unwrap_or(0);
+            Ok(u32::from(chanspec_20(channel)).to_le_bytes().to_vec())
+        }
         (false, "chanspec") if dongle.association.as_ref().is_some_and(|a| a.linked) => {
             Ok(u32::from(ap.map_or(0, AccessPoint::chanspec))
                 .to_le_bytes()
@@ -2120,14 +2514,163 @@ fn dongle_ioctl(
         }
         (true, "escan") => escan(dongle, ap, if_id, value),
         // `wl_extjoin_params_t`: SSID (length, 32 bytes), join scan
-        // parameters, then the BSSID at 56 (`wlan` `0x646e0`).
+        // parameters, then `wl_join_assoc_params_t`: the BSSID at 56, the
+        // chanspec count at 64 and chanspecs from 68 (`wlan` `0x646e0`).
         (true, "join") => {
             let (Some(len), Some(bssid)) = (value.get(..4), value.get(56..62)) else {
                 return Ok(Err(BCME_BADARG));
             };
             let len = (u32::from_le_bytes(len.try_into().unwrap()) as usize).min(32);
             let ssid = value[4..4 + len].to_vec();
-            join(dongle, ap, if_id, &ssid, bssid.try_into().unwrap())
+            let channels = chanspec_list(value, 64);
+            join(
+                dongle,
+                ap,
+                if_id,
+                &ssid,
+                bssid.try_into().unwrap(),
+                channels,
+            )
+        }
+        // Keys the radio encrypts and decrypts with (CCMP only).
+        (true, "wsec_key") => {
+            let change = on_air::key_change(value)?;
+            dongle.radio.change_key(change);
+            Ok(Vec::new())
+        }
+        // Vendor elements for the frames the radio sends.
+        (true, "vndr_ie") => {
+            dongle.radio.vendor_elements(value)?;
+            Ok(Vec::new())
+        }
+        // Ends the periodic action frames (\[inference\] from the name and
+        // where `wlan` sends it: before it asks for a new series, with no
+        // value of its own, `0x10c8b0`'s buffer still holding the name).
+        (true, "nsc_aloe_cancel") => {
+            dongle.settings.remove("nsc_aloe_af_periodic");
+            Ok(Vec::new())
+        }
+        // Nintendo-specific periodic action frames (`wlan` `0x10c8b0`,
+        // called by `0xfa9a0` with the beacon period it read with
+        // `WLC_GET_BCNPRD`): the period in TU at 0, then from 20 a
+        // `wl_af_params_t` (BSSID at 28, destination at 36, the frame's
+        // length at 42, packet ID at 44, the frame from its category on
+        // from 48; traced: 1364-byte frames). Sent every period from now
+        // on, while `nsc_afmode` is on, until the setting changes.
+        // \[inference\] from the layout `wlan` builds; that the firmware
+        // sends the first frame at once is assumed.
+        (true, "nsc_aloe_af_periodic") => {
+            if value.len() < 48 {
+                return Ok(Err(BCME_BADARG));
+            }
+            dongle
+                .settings
+                .insert("nsc_aloe_af_periodic".into(), value.to_vec());
+            dongle.timers.push((
+                Duration::ZERO,
+                Deferred::Air(on_air::Work::PeriodicActionFrame {
+                    setting: value.to_vec(),
+                }),
+            ));
+            Ok(Vec::new())
+        }
+        // One action frame: `wl_af_params_t` (channel at 0, dwell time at
+        // 4, BSSID at 8, then `wl_action_frame_t`: destination at 16,
+        // length at 22, packet ID at 24, the frame from 28; public
+        // `wlioctl.h`, the layout `wlan` `0x10cb70` fills). It goes out on
+        // the channel given (the radio's own if 0) and the host hears it
+        // sent (`WLC_E_ACTION_FRAME_COMPLETE` with the packet ID).
+        (true, "actframe") => {
+            let (Some(channel), Some(bssid), Some(da), Some(length), Some(id)) = (
+                value.get(..4),
+                value.get(8..14),
+                value.get(16..22),
+                value.get(22..24),
+                value.get(24..28),
+            ) else {
+                return Ok(Err(BCME_BADARG));
+            };
+            let length = usize::from(u16::from_le_bytes([length[0], length[1]]));
+            let Some(body) = value.get(28..28 + length) else {
+                return Ok(Err(BCME_BADARG));
+            };
+            let channel = match u32::from_le_bytes(channel.try_into().unwrap()) as u8 {
+                0 => dongle
+                    .radio
+                    .channel()
+                    .unwrap_or_else(|| home_channel(dongle)),
+                c => c,
+            };
+            let config = air_config(dongle);
+            let effect = dongle.radio.action_frame(
+                &config,
+                channel,
+                da.try_into().unwrap(),
+                bssid.try_into().unwrap(),
+                body,
+            );
+            dongle.effects.push(effect);
+            dongle.effects.push(Effect::Event {
+                if_id,
+                kind: WLC_E_ACTION_FRAME_COMPLETE,
+                status: WLC_E_STATUS_SUCCESS,
+                reason: 0,
+                flags: 0,
+                addr: da.try_into().unwrap(),
+                data: id.to_vec(),
+            });
+            Ok(Vec::new())
+        }
+        // The EDCA parameters of the BSS the radio runs and of its station
+        // side: the four entries; a set replaces the entry of its access
+        // category (the ACI in bits 5-6 of the first byte).
+        (_, name @ ("wme_ac_ap" | "wme_ac_sta")) => {
+            let defaults = if name == "wme_ac_ap" {
+                WME_AC_AP
+            } else {
+                WME_AC_STA
+            };
+            let mut table = dongle
+                .settings
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| defaults.concat());
+            if !set {
+                return Ok(Ok(table));
+            }
+            let Some(entry) = value.get(..4) else {
+                return Ok(Err(BCME_BADARG));
+            };
+            // Entries are in ACI order (BE 0, BK 1, VI 2, VO 3).
+            let aci = usize::from(entry[0] >> 5 & 3);
+            table[aci * 4..aci * 4 + 4].copy_from_slice(entry);
+            dongle.settings.insert(name.to_owned(), table);
+            Ok(Vec::new())
+        }
+        // The bandwidth allowed per band: set {band, bandwidth}, get with
+        // the band (`WLC_BAND_5G` 1, `WLC_BAND_2G` 2) as parameter. `wlan`
+        // sets both bands when it configures a mode (`0x69d80`) before it
+        // reads one (`0x71aa0`).
+        (_, "bw_cap") => {
+            let Some(band) = value
+                .get(..4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            else {
+                return Ok(Err(BCME_BADARG));
+            };
+            let key = format!("bw_cap {band}");
+            if set {
+                let Some(bandwidth) = value.get(4..8) else {
+                    return Ok(Err(BCME_BADARG));
+                };
+                dongle.settings.insert(key, bandwidth.to_vec());
+                Ok(Vec::new())
+            } else {
+                match dongle.settings.get(&key) {
+                    Some(bandwidth) => Ok(bandwidth.clone()),
+                    None => return Err(format!("get of bw_cap for band {band} never set")),
+                }
+            }
         }
         (false, "nmode") => Ok(NMODE.to_le_bytes().to_vec()),
         (false, "mimo_bw_cap") => Ok(MIMO_BW_CAP.to_le_bytes().to_vec()),
@@ -2139,6 +2682,65 @@ fn dongle_ioctl(
         (true, name) if SETTINGS.contains(&name) || READ_BACK.contains(&name) => {
             dongle.settings.insert(name.to_owned(), value.to_vec());
             Ok(Vec::new())
+        }
+        // Channel measurements (`wl_chanim_stats_t` version 2: buffer
+        // length, version, count, then `chanim_stats_t`, 36 bytes each;
+        // public `wlioctl.h`), which `wlan`'s channel selection reads
+        // (`0x72790`, asking for all, 255). The firmware measures the
+        // channel it is on; the air around the emulated radio carries only
+        // what other emulators send, so it reports one sample of an idle
+        // channel: no glitches or bad PLCPs, no busy time (`ccastats`
+        // zero), the noise floor of the `--wifi-ssid` model, idle 255 of
+        // 255. \[assumption\] The values of an idle channel.
+        (false, "chanim_stats") => {
+            let channel = dongle
+                .radio
+                .channel()
+                .unwrap_or_else(|| home_channel(dongle));
+            let mut sample = vec![0u8; 36];
+            sample[17] = wifi_ap::NOISE_DBM as u8;
+            sample[18..20].copy_from_slice(&chanspec_20(channel).to_le_bytes());
+            sample[32] = 255;
+            let mut stats = words(&[12 + 36, 2, 1]);
+            stats.extend(sample);
+            Ok(stats)
+        }
+        // Whether a BSS configuration is up: get with its index, set with
+        // {index, up} (public `wlioctl.h`; brcmfmac's `bss` iovar). Only the
+        // primary configuration (index 0) exists here; `wlan` starts its BSS
+        // with `WLC_SET_SSID`, so taking one up this way is refused.
+        (_, "bss") => {
+            let Some(index) = value
+                .get(..4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            else {
+                return Ok(Err(BCME_BADARG));
+            };
+            if index != 0 {
+                return Err(format!("bss of configuration {index}: {value:02x?}"));
+            }
+            if !set {
+                return Ok(Ok(u32::from(dongle.radio.bss.is_some())
+                    .to_le_bytes()
+                    .to_vec()));
+            }
+            let Some(up) = value.get(4..8) else {
+                return Ok(Err(BCME_BADARG));
+            };
+            return Err(format!("set of bss up {up:02x?}: not modeled"));
+        }
+        // The radio's channel before the host set one: the home channel's
+        // 20 MHz chanspec (channel 1, see `home_channel`).
+        (false, "chanspec") if !dongle.settings.contains_key("chanspec") => {
+            Ok(u32::from(chanspec_20(home_channel(dongle)))
+                .to_le_bytes()
+                .to_vec())
+        }
+        // 20/40 MHz coexistence before the host set it: automatic (-1,
+        // `WL_OBSS_COEX_AUTO`), Broadcom's default \[assumption\]; `wlan`
+        // `0x71aa0` reads it before it starts a BSS.
+        (false, "obss_coex") if !dongle.settings.contains_key("obss_coex") => {
+            Ok((-1i32).to_le_bytes().to_vec())
         }
         // Settings the host reads before changing them: what it last set,
         // else the firmware's power-on state, which is nothing enabled (no
@@ -2159,6 +2761,17 @@ fn dongle_ioctl(
         (false, "txchain" | "rxchain") => match nvram_number(&dongle.nvram, &name) {
             Some(chains) => Ok(chains.to_le_bytes().to_vec()),
             None => Err(BCME_BADARG),
+        },
+        // The coexistence mode before the host set one: the NVRAM's
+        // `btcdyn_default_btc_mode` (5 in `wlan`'s embedded NVRAM; assumed
+        // to be what the firmware starts in when dynamic coexistence is
+        // configured, `btcdyn_flags=0x3`).
+        (false, "btc_mode") => match dongle.settings.get("btc_mode") {
+            Some(mode) => Ok(mode.clone()),
+            None => match nvram_number(&dongle.nvram, "btcdyn_default_btc_mode") {
+                Some(mode) => Ok(mode.to_le_bytes().to_vec()),
+                None => Err(BCME_BADARG),
+            },
         },
         // Coexistence parameters, indexed: set {index, value}, get by index.
         // Unset ones read as the NVRAM's `btc_params<index>`, else 0
@@ -2198,15 +2811,19 @@ fn dongle_ioctl(
 }
 
 /// Iovars `wlan` sets and the firmware just stores.
-const SETTINGS: [&str; 42] = [
+const SETTINGS: [&str; 53] = [
     "ampdu_hostreorder",
     "auth",
     "country",
     "buf_key_b4_m4",
-    "wsec_key",
+    "closednet",
     "pmkid_info",
     "mpc",
     "nsc_subtypeoui",
+    // Nintendo-specific: configuration of the firmware's offloads while the
+    // console sleeps (`wlan` `0x10c8b0` clears it, 9 zero bytes, before it
+    // asks for periodic action frames); nothing here depends on it.
+    "nsc_aloe_cfg",
     "bcn_timeout",
     "wpaie",
     "maxassoc",
@@ -2218,7 +2835,16 @@ const SETTINGS: [&str; 42] = [
     "sgi_tx",
     "sgi_rx",
     "vhtmode",
-    "bw_cap",
+    // The channel the firmware prefers when it picks one itself (`wlan`
+    // `0x71aa0` clears it before starting a BSS on a channel it names).
+    "pref_chanspec",
+    // Channel measurement for the automatic channel selection `wlan` runs
+    // before it starts a BSS (`0x725e0`, `0x71aa0`): sampling period, noise
+    // metric, interference parameters.
+    "chanim_sample_period",
+    "noise_metric",
+    "intfer_params",
+    "acs_update",
     "txchain",
     "rxchain",
     "2g_mrate",
@@ -2238,26 +2864,40 @@ const SETTINGS: [&str; 42] = [
     "bcn_li_dtim",
     "obss_coex",
     "mkeep_alive",
-    "vndr_ie",
+    "ap_isolate",
     "chanspec",
     "mcast_list",
+    // Bluetooth coexistence: the receive gain stage while Bluetooth is
+    // busy, set for local communication (`wlan` `0x6b0c0`).
+    "phy_btc_restage_rxgain",
+    // What `wlan` sets when it starts a BSS (`0x67650` and the helpers it
+    // calls): the beacons' rate, the coexistence mode and strobe, whether
+    // the BSS uses WME, and how stations are probed for liveness.
+    "force_bcn_rspec",
+    "btc_mode",
+    "btc_start_strobe",
+    "wme_bss_disable",
+    "scb_probe",
 ];
 /// Iovars `wlan` reads, modifies and writes back.
 const READ_BACK: [&str; 4] = ["event_msgs", "nsc_subtypes", "btc_dynctl", "nsc_afmode"];
 
 /// A join request: the firmware finds the network, authenticates and
 /// associates, which ends in events after [`ASSOCIATION_TIME`]. The access
-/// point is found when its SSID matches (and the BSSID, unless the request
-/// leaves it open); it refuses a station whose security settings
-/// (`wpa_auth`, the RSN element given with `wpaie`) do not match its own.
-/// A network nobody answers for is reported after a join scan of every
-/// channel at the default active dwell.
+/// point of `--wifi-ssid` is found when its SSID matches (and the BSSID,
+/// unless the request leaves it open); it refuses a station whose security
+/// settings (`wpa_auth`, the RSN element given with `wpaie`) do not match
+/// its own. Any other network is looked for on the air shared with other
+/// emulators, on `channels` (every valid channel if the request names
+/// none); one nobody answers for is reported after a join scan of each of
+/// them at the default active dwell.
 fn join(
     dongle: &mut Dongle,
     ap: Option<&AccessPoint>,
     if_id: u8,
     ssid: &[u8],
     bssid: [u8; 6],
+    channels: Vec<u8>,
 ) -> Result<Vec<u8>, i16> {
     if !dongle.up {
         return Err(BCME_NOTUP);
@@ -2265,6 +2905,7 @@ fn join(
     dongle.epoch += 1;
     let epoch = dongle.epoch;
     dongle.association = None;
+    dongle.radio.link = None;
     let any_bssid = bssid == [0; 6] || bssid == [0xff; 6];
     let found = ap.filter(|ap| ap.ssid() == ssid && (any_bssid || bssid == wifi_ap::BSSID));
     let setting = |name: &str| dongle.settings.get(name).cloned().unwrap_or_default();
@@ -2291,16 +2932,131 @@ fn join(
                 status: WLC_E_STATUS_FAIL,
             },
         )),
-        None => dongle.timers.push((
-            Duration::from_millis(DEFAULT_ACTIVE_DWELL_MS * CHANNELS.len() as u64),
-            Deferred::AssociationFailed {
-                epoch,
-                if_id,
-                status: WLC_E_STATUS_NO_NETWORKS,
-            },
-        )),
+        None => {
+            let channels = match channels.is_empty() {
+                true => CHANNELS.to_vec(),
+                false => channels,
+            };
+            let config = air_config(dongle);
+            let effects = dongle
+                .radio
+                .join(&config, if_id, epoch, ssid, bssid, channels);
+            dongle.effects.extend(effects);
+        }
     }
     Ok(Vec::new())
+}
+
+/// One of the periodic action frames, if the host still asks for them as
+/// it did when this one was scheduled: sent on the radio's channel, and
+/// the next one scheduled a period later.
+fn periodic_action_frame(dongle: &mut Dongle, setting: Vec<u8>) -> Vec<Effect> {
+    let on = setting_word(dongle, "nsc_afmode").unwrap_or(0) != 0;
+    if !on || dongle.settings.get("nsc_aloe_af_periodic") != Some(&setting) || !dongle.up {
+        return Vec::new();
+    }
+    let period = u32::from_le_bytes(setting[..4].try_into().unwrap());
+    let bssid: [u8; 6] = setting[28..34].try_into().unwrap();
+    let da: [u8; 6] = setting[36..42].try_into().unwrap();
+    let length = usize::from(u16::from_le_bytes([setting[42], setting[43]]));
+    let Some(body) = setting.get(48..48 + length) else {
+        return Vec::new();
+    };
+    let channel = dongle
+        .radio
+        .channel()
+        .unwrap_or_else(|| home_channel(dongle));
+    let config = air_config(dongle);
+    let frame = dongle.radio.action_frame(&config, channel, da, bssid, body);
+    let mut effects = vec![frame];
+    if period != 0 {
+        effects.push(Effect::Later {
+            delay: on_air::TU * period,
+            work: on_air::Work::PeriodicActionFrame { setting },
+        });
+    }
+    effects
+}
+
+/// Whether the host put the firmware in access point mode (`WLC_SET_AP`).
+fn access_point_mode(dongle: &Dongle) -> bool {
+    setting_word(dongle, &format!("ioctl {WLC_SET_AP}")) == Some(1)
+}
+
+/// A setting the host gave as one word.
+fn setting_word(dongle: &Dongle, name: &str) -> Option<u32> {
+    dongle
+        .settings
+        .get(name)
+        .and_then(|w| w.get(..4))
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+}
+
+/// The station's association on the air, once complete.
+fn air_link(dongle: &Dongle) -> Option<&on_air::Link> {
+    dongle
+        .radio
+        .link
+        .as_ref()
+        .filter(|l| l.stage == on_air::Stage::Associated)
+}
+
+/// The channels of a chanspec list: a count at `at`, the chanspecs
+/// (16 bits, channel in the low byte) after it.
+fn chanspec_list(params: &[u8], at: usize) -> Vec<u8> {
+    let count = params
+        .get(at..at + 4)
+        .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
+    (0..count.min(CHANNELS.len()))
+        .filter_map(|i| params.get(at + 4 + 2 * i).copied())
+        .collect()
+}
+
+/// The channel the radio's own BSS goes on: the chanspec the host set,
+/// else the channel it set (`WLC_SET_CHANNEL`), else channel 1
+/// \[assumption: the firmware's default\].
+fn home_channel(dongle: &Dongle) -> u8 {
+    setting_word(dongle, "chanspec")
+        .map(|c| c as u8)
+        .or_else(|| setting_word(dongle, &format!("ioctl {WLC_SET_CHANNEL}")).map(|c| c as u8))
+        .filter(|c| CHANNELS.contains(c))
+        .unwrap_or(1)
+}
+
+/// `WLC_SET_SSID` in access point mode: an SSID starts the BSS on the home
+/// channel, an empty one takes it down.
+fn start_bss(dongle: &mut Dongle, if_id: u8, ssid: &[u8]) -> Result<Vec<u8>, i16> {
+    if !dongle.up {
+        return Err(BCME_NOTUP);
+    }
+    let config = air_config(dongle);
+    let effects = match ssid.is_empty() {
+        true => dongle.radio.stop_bss(&config),
+        false => {
+            let channel = home_channel(dongle);
+            dongle.radio.start_bss(&config, if_id, ssid, channel)
+        }
+    };
+    dongle.effects.extend(effects);
+    Ok(Vec::new())
+}
+
+/// What the frames the radio sends depend on, from the host's settings.
+/// Unset, the firmware's defaults: no security, open network, beacon
+/// period 100 TU and DTIM period 1 (the usual defaults, assumed), at
+/// most 8 stations (assumed; `wlan` sets `maxassoc` itself).
+fn air_config(dongle: &Dongle) -> on_air::Config {
+    let word = |name: &str| setting_word(dongle, name);
+    on_air::Config {
+        mac: dongle.mac,
+        wsec: word("wsec").unwrap_or(0),
+        wpa_ie: dongle.settings.get("wpaie").cloned().unwrap_or_default(),
+        closednet: word("closednet").unwrap_or(0) != 0,
+        max_assoc: word("maxassoc").unwrap_or(8),
+        beacon_period: word(&format!("ioctl {WLC_SET_BCNPRD}")).map_or(100, |p| p as u16),
+        dtim_period: word(&format!("ioctl {WLC_SET_DTIMPRD}")).map_or(1, |p| p as u8),
+        ap_isolate: word("ap_isolate").unwrap_or(0) != 0,
+    }
 }
 
 /// `wl_escan_result_t`: buffer length, version, sync ID, BSS count, BSSs.
@@ -2377,6 +3133,15 @@ fn escan(
                 ));
             }
             dongle.scan_in_flight = Some(sync_id);
+            // On the air: the scan dwells on each channel in turn, hearing
+            // (and, active, asking with a probe request for) what is there.
+            dongle.radio.start_scan(sync_id, if_id, ssid, passive_scan);
+            for (index, &channel) in channels.iter().enumerate() {
+                dongle.timers.push((
+                    dwell * index as u32,
+                    Deferred::Air(on_air::Work::ScanChannel { sync_id, channel }),
+                ));
+            }
             dongle.timers.push((
                 dwell * channels.len() as u32,
                 Deferred::ScanDone { sync_id, if_id },
@@ -2385,6 +3150,7 @@ fn escan(
         }
         WL_SCAN_ACTION_ABORT => {
             if let Some(sync_id) = dongle.scan_in_flight.take() {
+                dongle.radio.end_scan(sync_id);
                 dongle
                     .timers
                     .push((Duration::ZERO, Deferred::ScanAborted { sync_id, if_id }));

@@ -210,8 +210,10 @@ mod tests {
         mc.write(0, 0x1c, 4, 1).unwrap();
         mc.write(0, 0x20, 4, 0xe008_0001).unwrap();
         mc.write(0, SMMU_ASID, 4, 0x8000_0001).unwrap();
+        let clock = Arc::new(crate::clock::GuestClock::new());
+        let air = Arc::new(bluetooth_uart::Air::new(Arc::clone(&clock)));
         let uart = Arc::new(Serial::new(
-            Box::new(bluetooth_uart::Line::default()),
+            Box::new(bluetooth_uart::Line::new(clock, air)),
             Box::new(|_| {}),
             Arc::default(),
         ));
