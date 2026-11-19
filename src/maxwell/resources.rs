@@ -134,6 +134,10 @@ impl GpuMemory for Tracked<'_> {
         self.writes.record(address, data.len() as u64);
         self.memory.write(address, data)
     }
+
+    fn probe(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
+        self.memory.probe(address, buffer)
+    }
 }
 
 fn read(memory: &dyn GpuMemory, address: u64, length: usize) -> Result<Vec<u8>, Unmodeled> {

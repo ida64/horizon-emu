@@ -328,6 +328,10 @@ impl GpuMemory for ChannelMemory<'_> {
     fn write(&self, address: u64, data: &[u8]) -> Option<()> {
         self.keep(self.space.write(self.bus, address, data))
     }
+
+    fn probe(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
+        self.space.read(self.bus, address, buffer).ok()
+    }
 }
 
 #[cfg(test)]

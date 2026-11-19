@@ -55,9 +55,20 @@ use serde::{Deserialize, Serialize};
 use crate::snapshot::{SnapshotError, decode, encode};
 
 /// Memory as a GPU channel addresses it: its page tables applied.
+///
+/// A failed [`read`](Self::read) or [`write`](Self::write) may leave its
+/// reason behind for the refusal it causes (the pushbuffer executor's
+/// `ChannelMemory` does). A memory that wraps another forwards all three
+/// methods to it.
 pub trait GpuMemory: Sync {
     fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()>;
     fn write(&self, address: u64, data: &[u8]) -> Option<()>;
+    /// A read whose failure the caller answers itself (it takes what is
+    /// mapped, or rechecks a cache): no refusal follows from it, so it
+    /// leaves no reason behind for an unrelated later one to carry.
+    fn probe(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
+        self.read(address, buffer)
+    }
 }
 
 /// What a method did not model.
