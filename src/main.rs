@@ -33,7 +33,10 @@ use horizon_emu::{
     },
     maxwell, nand, net, sdcard,
     secmon::{self, SmcEffect},
-    soc::{dc::Frame, emmc::EmmcImages, joycon::Button, sdcard::SdCardImage, wifi_ap::AccessPoint},
+    soc::{
+        dc::Frame, emmc::EmmcImages, joycon::Button, medium::ImageFile, sdcard::SdCardImage,
+        wifi_ap::AccessPoint,
+    },
     svc,
     symbols::SymbolTable,
 };
@@ -88,9 +91,11 @@ the console makes new ones. The processors run at full speed unless
 --cpu-slowdown says otherwise.
 
 options:
-  --dram 4|6|8        installed DRAM in GiB (default 4)
+  --dram 4|6          installed DRAM in GiB (default 4). 8 GiB consoles
+                      are a later model, with another SoC
   --seed N            seed of the secure monitor's random numbers (default 0)
-  --timeout SECONDS   wall-clock limit (default 5, or none with --window)
+  --timeout SECONDS   wall-clock limit (default 5, or none with --window
+                      or --control)
   --cpu-slowdown N[:SECONDS]
                       run the guest's processors N times slower than the
                       host can, for the first SECONDS of the run or, without
@@ -701,8 +706,13 @@ fn boot(
                 params.dram = match value()?.as_str() {
                     "4" => DramSize::Gb4,
                     "6" => DramSize::Gb6,
-                    "8" => DramSize::Gb8,
-                    other => return Err(format!("--dram: {other} is not 4, 6 or 8")),
+                    "8" => {
+                        return Err("--dram 8: no DRAM ID of 8 GiB is known for this \
+                                    console (the original one); its firmware could not \
+                                    pick memory training tables"
+                            .into());
+                    }
+                    other => return Err(format!("--dram: {other} is not 4 or 6")),
                 }
             }
             "--seed" => {
@@ -850,7 +860,6 @@ fn boot(
                     .map_err(|error| format!("--step: {error}"))?
             }
             "--debug-mode" => params.development_function_enabled = true,
-            "--disable-program-verification" => params.program_verification_disabled = true,
             other if homebrew.parse(other, &mut value)? => {}
             _ => return Err(usage()),
         }
@@ -870,15 +879,19 @@ fn boot(
     // Whether an image is opened for writing depends on a flag that may
     // come after it.
     let open_image = |path: &String| {
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(emmc_writable)
             .open(path)
-            .map_err(|error| format!("{path}: {error}"))
+            .map_err(|error| format!("{path}: {error}"))?;
+        Ok::<_, String>(ImageFile {
+            file,
+            path: PathBuf::from(path),
+        })
     };
     let [boot0, boot1] = emmc_boot.map(|path| path.map(open_image).transpose());
     let user = emmc_user.map(open_image).transpose()?;
-    let (overlay, replaced) = homebrew.overlay(user.as_ref(), &keys)?;
+    let (overlay, replaced) = homebrew.overlay(user.as_ref().map(|user| &user.file), &keys)?;
     let emmc = match user {
         Some(user) => Some(EmmcImages {
             user,
@@ -896,7 +909,11 @@ fn boot(
                 .write(sd_writable)
                 .open(path)
                 .map_err(|error| format!("{path}: {error}"))?;
-            SdCardImage::file(file, sd_writable).map_err(|error| format!("{path}: {error}"))
+            let image = ImageFile {
+                file,
+                path: PathBuf::from(path),
+            };
+            SdCardImage::file(image, sd_writable).map_err(|error| format!("{path}: {error}"))
         })
         .transpose()?;
     let sd_card = match sd_card {
@@ -906,7 +923,7 @@ fn boot(
         Some(card) => Some(card),
         None => homebrew.sd_card()?,
     };
-    params.program_verification_disabled |= homebrew.disables_verification();
+    params.program_verification_disabled = homebrew.disables_verification();
     for line in homebrew.install_keys(&mut image)?.iter().chain(&replaced) {
         println!("{line}");
     }
