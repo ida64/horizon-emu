@@ -69,7 +69,8 @@ pub const RESERVED_SIZE: u64 = 0x5000_0000 - RESERVED_BASE;
 /// not established; nothing on the boot path reads there.
 ///
 /// The first dropped write is left as a device note, and the machine goes
-/// on.
+/// on. A snapshot keeps whether it has been, so a restored machine does
+/// not note again what the saved one already did.
 pub struct AfterIram {
     notes: Arc<Notes>,
     noted: AtomicBool,
@@ -102,6 +103,22 @@ impl MmioDevice for AfterIram {
             ));
         }
         Some(())
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(self)
+    }
+}
+
+impl Snapshot for AfterIram {
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&self.noted.load(Ordering::Relaxed))
+    }
+
+    fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
+        let noted: bool = decode("after IRAM", state)?;
+        self.noted.store(noted, Ordering::Relaxed);
+        Ok(())
     }
 }
 

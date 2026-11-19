@@ -8,7 +8,11 @@
 //! modelled and refuses.
 
 use super::regs::word;
-use crate::{boot::CORE_COUNT, bus::MmioDevice};
+use crate::{
+    boot::CORE_COUNT,
+    bus::{MmioDevice, NoState},
+    snapshot::Snapshot,
+};
 
 pub const BASE: u64 = 0x6000_0000;
 pub const SIZE: u64 = 0x1000;
@@ -30,6 +34,10 @@ impl MmioDevice for PgUp {
 
     fn write(&self, _core: usize, _offset: u64, _size: u8, _value: u64) -> Option<()> {
         None
+    }
+
+    fn snapshot(&self) -> Option<&dyn Snapshot> {
+        Some(&NoState)
     }
 }
 
