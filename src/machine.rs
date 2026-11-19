@@ -44,6 +44,7 @@ use crate::{
         Panel, Screen, Soc,
         dc::NoFrame,
         emmc::{EmmcImages, ImageError},
+        max77620::{BatteryBacked, PowerDown},
         mc::{self, DeviceMemory},
         sdcard::SdCardImage,
     },
@@ -624,6 +625,9 @@ pub enum RunEnd {
     Timeout,
     /// [`RunOptions::stop`] was set.
     Requested,
+    /// The firmware had the PMIC reset itself in software: every rail went
+    /// down, and the console restarts or stays off as it says.
+    PowerDown(PowerDown),
 }
 
 #[derive(Debug)]
@@ -636,9 +640,10 @@ pub struct RunReport {
     /// Supervisor calls made and not returned from when the machine
     /// stopped, while they were being watched ([`RunOptions::trace_svc`]):
     /// what each waiting thread waits in. A thread that ended in
-    /// `ExitThread` or whose process was ended is listed with its last call,
-    /// and its return addresses are read from memory that may have been
-    /// reused since.
+    /// `ExitThread` or whose process another ended is listed with its last
+    /// call, and its return addresses are read from memory that may have
+    /// been reused since. The threads of a process that ended itself
+    /// (`ExitProcess`) are not listed.
     pub calls_in_progress: Vec<CallInProgress>,
 }
 
@@ -920,6 +925,20 @@ impl Machine {
         self.soc.pmic.power_key(held);
     }
 
+    /// What of this machine runs on through a power cycle: the PMIC's
+    /// clock, on its backup battery. Taken once the run has ended in
+    /// [`RunEnd::PowerDown`], for the machine built next.
+    pub fn battery_backed(&self) -> BatteryBacked {
+        self.soc.pmic.battery_backed()
+    }
+
+    /// Makes this machine, built and not run yet, the console a PMIC
+    /// software reset ([`PowerDown::Restart`]) powers up again, with what
+    /// the previous machine's [`Machine::battery_backed`] kept.
+    pub fn power_up_from_reset(&self, kept: BatteryBacked) {
+        self.soc.pmic.power_up_from_reset(kept);
+    }
+
     /// The WiFi function of the console's radio.
     pub fn wifi(&self) -> &std::sync::Arc<crate::soc::bcm4356::Bcm4356Wifi> {
         self.soc
@@ -1012,6 +1031,9 @@ impl Machine {
                     let core = first.core;
                     cores.push(first);
                     break RunEnd::Core(core);
+                }
+                if let Some(down) = self.soc.pmic.power_down() {
+                    break RunEnd::PowerDown(down);
                 }
                 if options.stop.load(Ordering::SeqCst) {
                     break RunEnd::Requested;
@@ -2027,7 +2049,14 @@ impl<'env> Session<'env> {
             regime: self.machine.translation_regime(vcpu)?,
             made: Instant::now(),
         };
-        self.calls.lock().unwrap().insert(caller, call);
+        let mut calls = self.calls.lock().unwrap();
+        if id == svc::EXIT_PROCESS {
+            // None of the process's threads returns from its call.
+            calls.retain(|waiting, _| waiting.context != caller.context);
+        } else {
+            calls.insert(caller, call);
+        }
+        drop(calls);
         (self.options.trace)(TraceEvent::SupervisorCall {
             core,
             id,
