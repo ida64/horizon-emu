@@ -275,7 +275,7 @@ fn a_semi_planar_slot_needs_its_chroma_plane_and_a_colour_matrix() {
     bench.set(SLOT_BASE + 0x48, 1 | 1 << 14);
     assert_eq!(bench.execute(Some(INPUT)), None);
     let notes = bench.notes.take();
-    assert!(notes[0].contains("semi-planar"), "{notes:?}");
+    assert!(notes[0].contains("2-plane YUV surface"), "{notes:?}");
     let mut methods = methods(Some(INPUT));
     methods.insert(methods.len() - 1, (0x404, (INPUT >> 8) as u32 + 1));
     assert_eq!(bench.send(methods), None);
@@ -283,14 +283,145 @@ fn a_semi_planar_slot_needs_its_chroma_plane_and_a_colour_matrix() {
     assert!(notes[0].contains("colour matrix"), "{notes:?}");
 }
 
+/// Slot 0 as [`Bench::slot`] sets it, with filter length `length` on both
+/// axes.
+fn filter_length(bench: &mut Bench, length: u64) {
+    bench.set(SLOT_BASE, 1 | 1 << 8 | length << 20 | length << 22);
+}
+
+/// Red of the first `count` pixels of a pitch-linear A8B8G8R8 output row.
+fn reds(bench: &Bench, count: usize) -> Vec<u8> {
+    (bench.peek_bytes(OUTPUT, 4 * count).chunks(4))
+        .map(|pixel| pixel[0])
+        .collect()
+}
+
+/// One source row of reds `values`, scaled to `width` with filter length
+/// `length`; the reds written.
+fn scale_row(values: &[u8], width: u64, length: u64) -> Vec<u8> {
+    let mut bench = Bench::new();
+    let count = values.len() as u64;
+    bench.output(31, None, (width, 1), [0, 0, width - 1, 0]);
+    bench.slot(
+        0,
+        31,
+        None,
+        (count, 1),
+        [0, 0, count - 1, 0],
+        [0, 0, width - 1, 0],
+    );
+    filter_length(&mut bench, length);
+    let pixels: Vec<u8> = values.iter().flat_map(|&red| [red, 0, 0, 0xff]).collect();
+    bench.poke(INPUT, &pixels);
+    bench.execute(Some(INPUT)).unwrap();
+    assert!(bench.notes.take().is_empty());
+    reds(&bench, width as usize)
+}
+
+/// Reducing with the long filters averages each destination sample's
+/// footprint, source samples weighted by the part covered.
 #[test]
-fn scaling_refuses_and_names_itself() {
+fn a_reducing_slot_averages_the_footprint_of_each_destination_sample() {
+    assert_eq!(scale_row(&[30, 60, 90, 120, 150, 180], 2, 3), [60, 150]);
+    // Ratio 1.5: [0, 1.5) and [1.5, 3).
+    assert_eq!(scale_row(&[30, 60, 90], 2, 2), [40, 80]);
+}
+
+/// Enlarging with the long filters, and the two-tap filter either way,
+/// interpolate linearly at each destination centre; past the source
+/// rectangle the edge samples repeat.
+#[test]
+fn bilinear_scaling_interpolates_at_destination_centres() {
+    // Centres −0.25, 0.25, 0.75, 1.25.
+    assert_eq!(scale_row(&[40, 200], 4, 3), [40, 80, 160, 200]);
+    assert_eq!(scale_row(&[40, 200], 4, 1), [40, 80, 160, 200]);
+    // Centres 0.5 and 2.5.
+    assert_eq!(scale_row(&[30, 60, 90, 120], 2, 1), [45, 105]);
+}
+
+/// The one-tap filter takes the sample nearest the destination centre.
+#[test]
+fn nearest_scaling_takes_the_sample_at_each_destination_centre() {
+    // Ratio 3: centres 1 and 4.
+    assert_eq!(scale_row(&[30, 60, 90, 120, 150, 180], 2, 0), [60, 150]);
+}
+
+#[test]
+fn scaling_with_noise_or_detail_filters_refuses_and_names_them() {
     let mut bench = Bench::new();
     bench.output(31, None, (4, 4), [0, 0, 3, 3]);
     bench.slot(0, 31, None, (4, 4), [0, 0, 1, 1], [0, 0, 3, 3]);
+    // FilterDetail 0x100.
+    bench.set(SLOT_BASE + 8, 0x100 << 10);
     assert_eq!(bench.execute(Some(INPUT)), None);
     let notes = bench.notes.take();
-    assert!(notes[0].contains("scaling"), "{notes:?}");
+    assert!(notes[0].contains("noise/detail"), "{notes:?}");
+}
+
+/// A single-plane slot and output use only their luma plane addresses
+/// (`vic_ceb6_types.h`: "For single plane pixel format(ARGB), only use
+/// Luma surface"): chroma addresses left from an earlier configuration are
+/// neither read nor written.
+#[test]
+fn single_plane_surfaces_ignore_their_chroma_plane_addresses() {
+    let mut bench = Bench::new();
+    bench.output(31, None, (2, 1), [0, 0, 1, 0]);
+    bench.slot(0, 31, None, (2, 1), [0, 0, 1, 0], [0, 0, 1, 0]);
+    bench.poke(INPUT, &[1, 2, 3, 4, 5, 6, 7, 8]);
+    bench.poke(CHROMA_U, &[0x22; 8]);
+    bench.poke(CHROMA_V, &[0x33; 8]);
+    let mut methods = planar_methods();
+    let execute = methods.pop().unwrap();
+    methods.extend([
+        (0x404, (CHROMA_U >> 8) as u32),
+        (0x408, (CHROMA_V >> 8) as u32),
+    ]);
+    methods.push(execute);
+    bench.send(methods).unwrap();
+    assert!(bench.notes.take().is_empty());
+    // Constant alpha 1023 makes the output opaque.
+    assert_eq!(bench.peek_bytes(OUTPUT, 8), [1, 2, 3, 0xff, 5, 6, 7, 0xff]);
+    assert_eq!(bench.peek_bytes(CHROMA_U, 8), [0x22; 8]);
+    assert_eq!(bench.peek_bytes(CHROMA_V, 8), [0x33; 8]);
+}
+
+/// A fully planar `T_Y8___U8___V8_N422R` slot (format 71) through an
+/// identity colour matrix: chroma at full horizontal resolution, sited
+/// between each pair of rows (vertical siting 1) and interpolated between
+/// them, the edge rows repeated.
+#[test]
+fn a_planar_n422r_slot_upsamples_chroma_vertically() {
+    let mut bench = Bench::new();
+    bench.output(31, None, (2, 4), [0, 0, 1, 3]);
+    bench.slot(0, 71, None, (2, 4), [0, 0, 1, 3], [0, 0, 1, 3]);
+    let base = SLOT_BASE;
+    let (w0, w1) = planar_words(71, [0, 1], (2, 4), (2, 4), (2, 2));
+    bench.set(base + 0x40, w0);
+    bench.set(base + 0x48, w1);
+    let one = 256u64;
+    bench.set(base + 0x60, one);
+    bench.set(base + 0x68, one << 20 | 1 << 63);
+    bench.set(base + 0x70, one << 40);
+    bench.set(base + 0x78, 0);
+    bench.poke(INPUT, &[10, 20, 30, 40, 50, 60, 70, 80]);
+    bench.poke(CHROMA_U, &[100, 120, 200, 220]);
+    bench.poke(CHROMA_V, &[40, 44, 80, 84]);
+    let mut methods = methods(Some(INPUT));
+    let execute = methods.pop().unwrap();
+    methods.extend([
+        (0x404, (CHROMA_U >> 8) as u32),
+        (0x408, (CHROMA_V >> 8) as u32),
+        execute,
+    ]);
+    bench.send(methods).unwrap();
+    assert!(bench.notes.take().is_empty());
+    let pixel = |x: u64, y: u64| bench.peek(OUTPUT + 8 * y + 4 * x);
+    // Rows sit at chroma positions −0.25, 0.25, 0.75 and 1.25.
+    assert_eq!(pixel(0, 0), [10, 100, 40, 0xff]);
+    assert_eq!(pixel(0, 1), [30, 125, 50, 0xff]);
+    assert_eq!(pixel(1, 1), [40, 145, 54, 0xff]);
+    assert_eq!(pixel(0, 2), [50, 175, 70, 0xff]);
+    assert_eq!(pixel(1, 3), [80, 220, 84, 0xff]);
 }
 
 /// A host1x CDMA stream as nvnflinger's `DdkVicBlit` builds it, executed
@@ -498,14 +629,8 @@ fn planar_outputs_the_model_does_not_establish_refuse_and_name_themselves() {
             false,
             "without an output colour matrix",
         ),
-        // Chroma planes for a single-plane format.
-        (
-            31,
-            [0, 0],
-            [0, 0, 3, 3],
-            true,
-            "chroma planes of a single-plane output",
-        ),
+        // Chroma sited off a full-resolution axis.
+        (69, [1, 0], [0, 0, 3, 3], true, "horizontal chroma siting 1"),
     ];
     for (format, siting, target, matrix, reason) in cases {
         let mut bench = Bench::new();
@@ -779,4 +904,95 @@ fn the_news_capture_converts_the_frame_to_planar_ycbcr_422r() {
             }
         }
     }
+}
+
+/// The EXECUTE the capture button on HOME sends after the News-style
+/// conversion (GapExplorer3 `runs/b1`): the 1280x720
+/// `T_Y8___U8___V8_N422R` picture (luma 0xe2360000, chroma 0xe2460000 and
+/// 0xe2500000, vertical siting 1) reduced with ten-tap filters to a 96x54
+/// pitch-linear A8B8G8R8 thumbnail (pitch 128 pixels) through the BT.601
+/// full-range YCbCr-to-RGB matrix, the output's chroma addresses still
+/// those of the input. With neutral chroma each thumbnail pixel is grey at
+/// the mean luma of its footprint, here the luma ramp's value at the
+/// footprint's centre.
+#[test]
+fn the_capture_thumbnail_reduces_the_planar_picture_to_rgb() {
+    let capture = Capture::new(&[0x388, 0x389, 0x3fc]);
+    let ramp = |x: f64, y: f64| x / 10.0 + y / 6.0;
+    let luma: Vec<u8> = (0..720)
+        .flat_map(|y| (0..1280).map(move |x| ramp(f64::from(x), f64::from(y)).round() as u8))
+        .collect();
+    capture.memory().write(0xe236_0000, &luma).unwrap();
+    for plane in [0xe246_0000, 0xe250_0000] {
+        capture
+            .memory()
+            .write(plane, &vec![128; 1280 * 360])
+            .unwrap();
+    }
+    capture
+        .memory()
+        .write(0xe25a_0000, &vec![0x5a; 512 * 54])
+        .unwrap();
+    capture.submit(
+        0xe272_0000,
+        &[
+            (0x000, 0x0000000000040004),
+            (0x010, 0x000000000000ffc0),
+            (0x018, 0x00350000005f0000),
+            (0x020, 0x000d405f0000021f),
+            (0x028, 0x0fffffff000d407f),
+            (0x090, 0x0000000000f00101),
+            (0x0a0, 0x000007ff000ffc00),
+            (0x0b0, 0x04ff000000000000),
+            (0x0b8, 0x02cf000000000000),
+            (0x0c0, 0x00350000005f0000),
+            (0x0d0, 0x00b3c4ff00100247),
+            (0x0d8, 0x0059c4ff00b3c4ff),
+            (0x0f0, 0xa400004000040000),
+            (0x0f8, 0x871687e9f9c00000),
+            (0x100, 0x000000d24ba59ba6),
+            (0x108, 0x0c721221f6ed3012),
+            (0x130, 0x00002050000003ff),
+            (0x138, 0x0000800000000000),
+        ],
+        &[
+            (0x200, 0x1),
+            (0x400, 0xe23600),
+            (0x404, 0xe24600),
+            (0x408, 0xe25000),
+            (0x704, 0x610110),
+            (0x708, 0xe27200),
+            (0x70c, 0xe27400),
+            (0x71c, 0x3c0),
+            (0x720, 0xe25a00),
+            (0x724, 0xe24600),
+            (0x728, 0xe25000),
+            (0x72c, 0xe0043d),
+        ],
+    );
+    let mut output = vec![0u8; 512 * 54];
+    capture.memory().read(0xe25a_0000, &mut output).unwrap();
+    let (rx, ry) = (1280.0 / 96.0, 720.0 / 54.0);
+    for y in 0..54 {
+        for x in 0..128 {
+            let at = (y * 128 + x) * 4;
+            let pixel = &output[at..at + 4];
+            if x >= 96 {
+                assert_eq!(pixel, [0x5a; 4], "outside the target ({x}, {y})");
+                continue;
+            }
+            let grey = ramp((x as f64 + 0.5) * rx - 0.5, (y as f64 + 0.5) * ry - 0.5);
+            for &component in &pixel[..3] {
+                assert!(
+                    (f64::from(component) - grey).abs() <= 1.0,
+                    "({x}, {y}): {pixel:?} for {grey}"
+                );
+            }
+            assert_eq!(pixel[3], 0xff);
+        }
+    }
+    // The input's chroma planes, named again as the output's, are unchanged.
+    let mut chroma = vec![0u8; 1280 * 360];
+    capture.memory().read(0xe246_0000, &mut chroma).unwrap();
+    assert!(chroma.iter().all(|&value| value == 128));
 }
