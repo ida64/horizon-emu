@@ -176,6 +176,18 @@ struct State {
     bpmp_cluster_control: u32,
 }
 
+impl State {
+    const AT_RESET: Self = Self {
+        halt_cop: 0,
+        cop: CopHalt::Running,
+        halt_cpu: [0; 4],
+        cpu_csr: [0; 4],
+        cop_csr: 0,
+        ram_repair: RAM_REPAIR_AT_RESET,
+        bpmp_cluster_control: 0,
+    };
+}
+
 pub struct FlowController {
     state: Mutex<State>,
     /// Set whenever the BPMP's halt changes, so the BPMP thread need not
@@ -188,19 +200,18 @@ pub struct FlowController {
 impl FlowController {
     pub fn new(clock: Arc<GuestClock>, notes: Arc<Notes>) -> Self {
         Self {
-            state: Mutex::new(State {
-                halt_cop: 0,
-                cop: CopHalt::Running,
-                halt_cpu: [0; 4],
-                cpu_csr: [0; 4],
-                cop_csr: 0,
-                ram_repair: RAM_REPAIR_AT_RESET,
-                bpmp_cluster_control: 0,
-            }),
+            state: Mutex::new(State::AT_RESET),
             halt_changed: AtomicBool::new(false),
             clock,
             notes,
         }
+    }
+
+    /// Back to the state after reset, as the SoC powers up again after
+    /// SC7: the BPMP runs.
+    pub fn reset(&self) {
+        *self.state.lock().unwrap() = State::AT_RESET;
+        self.halt_changed.store(true, Ordering::Release);
     }
 
     /// Whether a register write may have halted or released the BPMP since

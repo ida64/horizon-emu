@@ -94,6 +94,13 @@ impl Sb {
         Self::default()
     }
 
+    /// Back to the state after reset, lock-outs and reset vector cleared,
+    /// as the SoC powers up again after SC7 (the boot ROM then applies its
+    /// lock-outs again, and the warmboot firmware writes the vector).
+    pub fn reset(&self) {
+        *self.state.lock().unwrap() = State::default();
+    }
+
     /// The AArch64 reset vector.
     pub fn aa64_reset_vector(&self) -> ResetVector {
         let state = *self.state.lock().unwrap();

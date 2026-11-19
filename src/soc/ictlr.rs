@@ -97,6 +97,20 @@ impl Ictlr {
         Self::default()
     }
 
+    /// Back to the state after reset, as the SoC powers up again after
+    /// SC7: nothing enabled or forced. The inputs keep their levels: they
+    /// are the devices' lines, not the controller's state.
+    pub fn reset(&self) {
+        let mut controllers = self.controllers.lock().unwrap();
+        for controller in controllers.iter_mut() {
+            *controller = Controller {
+                inputs: controller.inputs,
+                ..Controller::default()
+            };
+        }
+        self.update(&controllers);
+    }
+
     /// Interrupt input `interrupt` (a shared interrupt's number, GIC ID
     /// minus 32) is at `level`.
     ///

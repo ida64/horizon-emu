@@ -45,6 +45,12 @@ impl Evp {
         Self::default()
     }
 
+    /// Back to the state after reset (every vector unwritten), as the SoC
+    /// powers up again after SC7.
+    pub fn reset(&self) {
+        *self.vectors.lock().unwrap() = Default::default();
+    }
+
     /// The register at `offset`, as an index into `vectors`.
     fn index(offset: u64) -> Option<usize> {
         match offset {
