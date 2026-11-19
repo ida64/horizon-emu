@@ -10,7 +10,11 @@
 //! A screen that is drawn is not always a screen that listens yet, and
 //! on a busy host a short press can fall between two of the guest's
 //! frames. A press or a touch can therefore be given what it is for (a
-//! pixel again) and is then repeated until that has happened.
+//! pixel again) and is then repeated until that has happened. HOME (23.5.0)
+//! shows both: it ignores buttons and touches for about a second after it
+//! comes up from the lock screen or opens a dialog, and it takes up a
+//! finger only if the touch lasts until its next frame. The measurements
+//! are in `horizon_emu::soc::touch::TouchInput`.
 //!
 //! The lock screen goes to sleep by itself 20 s after the last input in
 //! handheld mode. That is the firmware's doing (23.5.0), not the
@@ -50,7 +54,10 @@ use horizon_emu::{
     soc::{dc::Pixel, joycon::Button, ntag::Ntag215},
 };
 
-/// How long a button or a finger is held when a line does not say.
+/// How long a button or a finger is held when a line does not say. That is
+/// longer than the longest gap between two of HOME's frames measured on a
+/// busy host (132 ms), so HOME sees the touch. 50 ms touches were lost 7
+/// times in 74, and none of 108 touches held 100–500 ms was lost.
 const HOLD: Duration = Duration::from_millis(300);
 /// How long a repeated press or touch is given to have its effect.
 const AGAIN: Duration = Duration::from_secs(3);
