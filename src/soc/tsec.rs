@@ -82,7 +82,14 @@
 //!    bad header is refused \[inference: the firmware checks; what it does
 //!    then is not public\].
 //! 3. Security engine keyslot 0x0D gets `tsec_root_key_02` and keyslot
-//!    0x0C `tsec_key`, in that order.
+//!    0x0C `tsec_key`, in that order, and slot 0x0D is made secure-only
+//!    (its bit of `SE_CRYPTO_SECURITY_PERKEY` cleared) while both keep
+//!    every access permission \[inference: the NX bootloader's
+//!    hardware-state check, function 0x4000_2A7C, run right after the
+//!    TSEC, wants SE+0x280 to read 0xDFFF under mask 0xFFFF (only bit 13
+//!    clear) and the access registers of slots 0..13 (SE+0x284..0x2B8) to
+//!    read 0x7F; neither the boot ROM nor package1ldr writes them, and no
+//!    public source describes SecureBoot's keyslot locks\].
 //! 4. `EVP_COP_RESET_VECTOR` (0x6000_F200) gets the entry (`set_excp_vec`)
 //!    \[assumption: only the reset vector; Switchbrew names the call
 //!    without saying which vectors\].
@@ -127,8 +134,8 @@
 //!
 //! Not modeled, refused where it would be read: the SOR1 HDCP registers
 //! Keygen writes the TSEC key into, the SCP's state, `car_init` and
-//! `ccplex_init`'s side effects, the ACL and lock state of keyslots
-//! 0x0C/0x0D, the PK11 header, IV and CMAC bytes around the plaintext
+//! `ccplex_init`'s side effects, any lock of keyslots 0x0C/0x0D beyond
+//! slot 0x0D's per-key bit, the PK11 header, IV and CMAC bytes around the plaintext
 //! (left as they were).
 
 use std::{
@@ -263,8 +270,10 @@ pub trait TsecSoc: Send + Sync {
     fn ahb_read(&self, address: u32, buffer: &mut [u8]) -> Option<()>;
     /// Writes `data` at `address` there, likewise.
     fn ahb_write(&self, address: u32, data: &[u8]) -> Option<()>;
-    /// Loads `key` into AES keyslot `slot` of the security engine.
-    fn load_se_keyslot(&self, slot: usize, key: &Key) -> Option<()>;
+    /// Loads `key` into AES keyslot `slot` of the security engine;
+    /// `secure_only` clears the slot's bit of `SE_CRYPTO_SECURITY_PERKEY`,
+    /// leaving its access permissions as they are.
+    fn load_se_keyslot(&self, slot: usize, key: &Key, secure_only: bool) -> Option<()>;
     /// Restarts the BPMP in ARM state at `entry`, once the current
     /// instruction has finished.
     fn restart_bpmp(&self, entry: u32) -> Option<()>;
@@ -705,11 +714,11 @@ impl Tsec {
         let effect = |done: Option<()>, what: &str| done.ok_or_else(|| format!("{what} failed"));
         effect(soc.ahb_write(header, &plain), "writing the PK11 plaintext")?;
         effect(
-            soc.load_se_keyslot(TSEC_ROOT_KEY_SLOT, &keys.tsec_root_key),
+            soc.load_se_keyslot(TSEC_ROOT_KEY_SLOT, &keys.tsec_root_key, true),
             "loading SE keyslot 0x0D",
         )?;
         effect(
-            soc.load_se_keyslot(TSEC_KEY_SLOT, &keys.tsec_key),
+            soc.load_se_keyslot(TSEC_KEY_SLOT, &keys.tsec_key, false),
             "loading SE keyslot 0x0C",
         )?;
         effect(
@@ -847,7 +856,8 @@ mod tests {
     struct Soc {
         iram: Mutex<Vec<u8>>,
         mmio: Mutex<HashMap<u32, u32>>,
-        keyslots: Mutex<HashMap<usize, Key>>,
+        /// Key and whether the slot was made secure-only.
+        keyslots: Mutex<HashMap<usize, (Key, bool)>>,
         restarted: Mutex<Option<u32>>,
     }
 
@@ -888,8 +898,11 @@ mod tests {
             Some(())
         }
 
-        fn load_se_keyslot(&self, slot: usize, key: &Key) -> Option<()> {
-            self.keyslots.lock().unwrap().insert(slot, *key);
+        fn load_se_keyslot(&self, slot: usize, key: &Key, secure_only: bool) -> Option<()> {
+            self.keyslots
+                .lock()
+                .unwrap()
+                .insert(slot, (*key, secure_only));
             Some(())
         }
 
@@ -1116,17 +1129,16 @@ mod tests {
             bench.soc.mmio.lock().unwrap().get(&EVP_COP_RESET_VECTOR),
             Some(&entry)
         );
-        // Keyslots 0x0C and 0x0D hold the key set's values (digests only).
+        // Keyslots 0x0C and 0x0D hold the key set's values (digests only);
+        // only 0x0D is secure-only.
         let keyslots = bench.soc.keyslots.lock().unwrap();
         assert_eq!(keyslots.len(), 2);
-        assert_eq!(
-            sha256(&keyslots[&TSEC_KEY_SLOT]),
-            sha256(keys.tsec_key().unwrap())
-        );
-        assert_eq!(
-            sha256(&keyslots[&TSEC_ROOT_KEY_SLOT]),
-            sha256(keys.tsec_root_key(2).unwrap())
-        );
+        let (tsec_key, tsec_key_secure) = &keyslots[&TSEC_KEY_SLOT];
+        assert_eq!(sha256(tsec_key), sha256(keys.tsec_key().unwrap()));
+        assert!(!tsec_key_secure);
+        let (root_key, root_key_secure) = &keyslots[&TSEC_ROOT_KEY_SLOT];
+        assert_eq!(sha256(root_key), sha256(keys.tsec_root_key(2).unwrap()));
+        assert!(root_key_secure);
         drop(keyslots);
         // Nothing more is modeled: no second start, no memory access.
         assert_eq!(bench.write(CPUCTL, CPUCTL_STARTCPU), None);
