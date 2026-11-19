@@ -405,9 +405,11 @@ impl Bpmp {
 pub trait PowerDomain: Sync {
     /// Whether a wake event is pending at the PMC.
     fn wake_pending(&self) -> bool;
-    /// Resets what the SoC's power-down resets outside the BPMP's own
-    /// blocks and the registers of `SC7_RESETS`: the CPU cluster's
-    /// interrupt controller ([`crate::gic::Gic::reset`]).
+    /// The SoC has powered down: the PMC takes the wake levels of its
+    /// "auto" events from their pads ([`crate::soc::Soc::enter_sc7`]), and
+    /// what the power-down resets outside the BPMP's own blocks and the
+    /// registers of `SC7_RESETS` is reset: the CPU cluster's interrupt
+    /// controller ([`crate::gic::Gic::reset`]).
     fn power_lost(&self);
     /// Runs the boot ROM's warm path on the SoC as SC7 left it and applies
     /// what it does outside the BPMP and IRAM; gives what it leaves those.
@@ -942,15 +944,16 @@ impl Bpmp {
 }
 
 /// The machine around the BPMP in SC7: the wake comes from the SoC's PMC
-/// and PMIC ([`Soc::wake_pending`]), the warm path is the boot ROM's
-/// ([`bootrom::warm_boot`]) with the fuses it read at power-on, the PMC and
-/// DRAM as the BPMP reads them.
+/// and the pads it watches ([`Soc::wake_pending`]), the warm path is the
+/// boot ROM's ([`bootrom::warm_boot`]) with the fuses it read at power-on,
+/// the PMC and DRAM as the BPMP reads them.
 impl PowerDomain for Machine {
     fn wake_pending(&self) -> bool {
         self.soc.wake_pending()
     }
 
     fn power_lost(&self) {
+        self.soc.enter_sc7();
         self.gic.reset();
     }
 

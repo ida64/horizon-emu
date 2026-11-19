@@ -58,13 +58,24 @@ pub const LEFT_UART_INTID: u32 = 32 + 46;
 pub const RIGHT_DETECT: (usize, u8) = (7, 6);
 pub const LEFT_DETECT: (usize, u8) = (4, 6);
 /// The rails' CTS lines as GPIO pins: G3 for UART-B, D4 for UART-C
-/// (Atmosphère's pad map, `ExtUart2Cts` and `ExtUart3Cts`). `hid` turns
-/// them into any-edge wake interrupts when the console goes to sleep, for
-/// which the GPIO driver samples them. The line is low while the Joy-Con
-/// asserts it, which here is whenever one is on the rail
-/// ([`Rail::clear_to_send`]), and pulled high on an empty rail
-/// \[assumption\]. What a sleeping Joy-Con does to the line when a button
-/// is pressed, which is how one wakes a console, is not modeled.
+/// (Atmosphère's pad map, `ExtUart2Cts` and `ExtUart3Cts`). When the
+/// console goes to sleep, `hid` puts each Joy-Con on a rail to sleep
+/// (subcommand 6, state 0) and the GPIO driver makes both pins inputs with
+/// any-edge interrupts, then masks every interrupt of their ports just
+/// before the console sleeps (a 23.5.0 lock screen's auto-sleep, writes
+/// to ports D and G, `0x6000d00c` and `0x6000d108` and their rows). What
+/// wakes the console is then the PMC's wake event of each pad, enabled
+/// with the level "auto" ([`super::pmc::WAKE_EVENT_UART2_CTS`]): a change
+/// of the line.
+///
+/// The line is low while the Joy-Con asserts it, which here is whenever
+/// one is on the rail, and pulled high on an empty rail \[assumption\].
+/// A Joy-Con the console has put to sleep lets its line go high while
+/// its HOME button is held, and only then ([`Controls::cts_high`]):
+/// \[inference\] the line is the rail's only wake pad, HOME on a
+/// controller is what wakes a sleeping console (Nintendo's support
+/// pages), and its other buttons do not. How long a real Joy-Con holds
+/// the line, and whether it pulses it, is not known.
 pub const RIGHT_CTS: (usize, u8) = (6, 3);
 pub const LEFT_CTS: (usize, u8) = (3, 4);
 
@@ -148,14 +159,28 @@ const RIGHT_BUTTONS: u32 = 0x00_00FF | Button::PLUS.0 | Button::RIGHT_STICK.0 | 
 const PRO_BUTTONS: u32 = (LEFT_BUTTONS | RIGHT_BUTTONS) & !0x30_0030;
 
 /// What is being done to the pair of Joy-Con: where they are, which
-/// buttons are held and which NFC tag is held over the right one's reader.
+/// buttons are held and which NFC tag is held over the right one's reader;
+/// and which of them the console has put to sleep, which with the buttons
+/// decides the level of each rail's CTS line ([`Controls::cts_high`]).
 /// Shared between the rails and whoever is at the controls.
 #[derive(Default)]
 pub struct Controls {
     seated: AtomicBool,
     buttons: AtomicU32,
+    /// Per controller ([`Side`] as an index): put to sleep by the console
+    /// (subcommand 6, state 0); a handshake wakes it.
+    asleep: [AtomicBool; 3],
+    /// The right Joy-Con, asleep, has had HOME pressed since the console
+    /// last asked why it woke (wired command 7).
+    home_woke: AtomicBool,
     tag: Mutex<Option<Ntag215>>,
+    /// Told the level of each rail's CTS line whenever it may have
+    /// changed: the board wiring of those lines.
+    cts: Mutex<Option<CtsLines>>,
 }
+
+/// The rails' CTS lines: the rail, and whether its line is high.
+type CtsLines = Box<dyn Fn(Side, bool) + Send + Sync>;
 
 impl Controls {
     /// Whether both Joy-Con are on their rails.
@@ -164,15 +189,23 @@ impl Controls {
     }
 
     pub(super) fn set_seated(&self, seated: bool) {
-        self.seated.store(seated, Ordering::SeqCst);
+        if self.seated.swap(seated, Ordering::SeqCst) != seated {
+            self.drive_cts();
+        }
     }
 
     /// Holds or lets go of `button`.
     pub fn press(&self, button: Button, held: bool) {
-        match held {
+        let before = match held {
             true => self.buttons.fetch_or(button.0, Ordering::SeqCst),
             false => self.buttons.fetch_and(!button.0, Ordering::SeqCst),
         };
+        if (before & button.0 != 0) != held {
+            if held && button.0 & Button::HOME.0 != 0 && self.asleep(Side::Right) {
+                self.home_woke.store(true, Ordering::SeqCst);
+            }
+            self.drive_cts();
+        }
     }
 
     /// The buttons held, as a mask of [`Button`] bits.
@@ -189,27 +222,68 @@ impl Controls {
     fn tag(&self) -> MutexGuard<'_, Option<Ntag215>> {
         self.tag.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Whether the console has put the controller of `side` to sleep.
+    fn asleep(&self, side: Side) -> bool {
+        self.asleep[side.index()].load(Ordering::SeqCst)
+    }
+
+    fn set_asleep(&self, side: Side, asleep: bool) {
+        if self.asleep[side.index()].swap(asleep, Ordering::SeqCst) != asleep {
+            self.drive_cts();
+        }
+    }
+
+    /// Wires the rails' CTS lines: `lines` is told each one's level now
+    /// and whenever it may have changed.
+    pub(super) fn connect_cts(&self, lines: CtsLines) {
+        let mut cts = self.cts.lock().unwrap_or_else(PoisonError::into_inner);
+        for side in [Side::Left, Side::Right] {
+            lines(side, self.cts_high(side));
+        }
+        *cts = Some(lines);
+    }
+
+    /// Whether the CTS line of `side`'s rail is high: on an empty rail,
+    /// and while the right Joy-Con, asleep, has its HOME button held (see
+    /// [`RIGHT_CTS`]). The left Joy-Con has no HOME button.
+    pub fn cts_high(&self, side: Side) -> bool {
+        !self.seated()
+            || side == Side::Right && self.asleep(side) && self.held() & Button::HOME.0 != 0
+    }
+
+    fn drive_cts(&self) {
+        let cts = self.cts.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(lines) = cts.as_ref() {
+            for side in [Side::Left, Side::Right] {
+                lines(side, self.cts_high(side));
+            }
+        }
+    }
 }
 
 /// Saved by the SoC ([`super::Soc::snapshot_parts`]): whether the pair is
-/// on the rails, which buttons are held and the tag on the reader, with
-/// what has been written to it, so that a restored console has them where
-/// the saved one had them. The detect and CTS pins they drive are GPIO
-/// inputs, which the GPIO saves.
+/// on the rails, which buttons are held, which controllers sleep and the
+/// tag on the reader, with what has been written to it, so that a restored
+/// console has them where the saved one had them. The detect and CTS pins
+/// they drive are GPIO inputs, which the GPIO saves, so a restore drives
+/// nothing.
 impl Snapshot for Controls {
     fn save(&self) -> Result<Vec<u8>, SnapshotError> {
-        encode(&(
-            self.seated(),
-            self.buttons.load(Ordering::SeqCst),
-            &*self.tag(),
-        ))
+        let asleep = [Side::Left, Side::Right, Side::Pro].map(|side| self.asleep(side));
+        let woke = self.home_woke.load(Ordering::SeqCst);
+        encode(&(self.seated(), self.held(), asleep, woke, &*self.tag()))
     }
 
     fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
-        let (seated, buttons, tag): (bool, u32, Option<Ntag215>) =
+        let (seated, buttons, asleep, woke, tag): (bool, u32, [bool; 3], bool, Option<Ntag215>) =
             decode("Joy-Con controls", state)?;
-        self.set_seated(seated);
+        self.seated.store(seated, Ordering::SeqCst);
         self.buttons.store(buttons, Ordering::SeqCst);
+        for (flag, asleep) in self.asleep.iter().zip(asleep) {
+            flag.store(asleep, Ordering::SeqCst);
+        }
+        self.home_woke.store(woke, Ordering::SeqCst);
         self.place_tag(tag);
         Ok(())
     }
@@ -452,8 +526,6 @@ struct Session {
     processor_reports: bool,
     /// The right Joy-Con's NFC and infrared processor.
     processor: mcu::Mcu,
-    /// Put to sleep by the console (subcommand 6); the handshake wakes it.
-    asleep: bool,
     /// Guest time at which it was powered, which its report timer counts
     /// from.
     powered: Duration,
@@ -469,7 +541,6 @@ impl Session {
             vibration: false,
             processor_reports: false,
             processor: mcu::Mcu::new(),
-            asleep: false,
             powered: now,
         }
     }
@@ -493,9 +564,10 @@ impl JoyCon {
     }
 
     /// The session ends when the Joy-Con leaves the rail, or when the Pro
-    /// Controller's link drops.
+    /// Controller's link drops; and it no longer sleeps.
     pub(super) fn unplug(&mut self) {
         self.session = Session::new(self.clock.now());
+        self.controls.set_asleep(self.side, false);
     }
 
     /// The session, encoded: what a snapshot saves of the controller.
@@ -560,7 +632,7 @@ impl JoyCon {
         let (envelope, payload) = body.split_at(ENVELOPE);
         if envelope == HANDSHAKE && payload.is_empty() {
             // A sleeping Joy-Con starts over, as one just slid on.
-            if self.session.asleep {
+            if self.controls.asleep(self.side) {
                 self.unplug();
             }
             let mut answer = TO_CONSOLE.to_vec();
@@ -569,7 +641,7 @@ impl JoyCon {
             return Ok(answer);
         }
         // Asleep, it listens for nothing else [assumption].
-        if self.session.asleep {
+        if self.controls.asleep(self.side) {
             return Ok(Vec::new());
         }
         let [
@@ -614,6 +686,21 @@ impl JoyCon {
             // Interval of reports in milliseconds; they are sent when asked
             // for. The bootloader's driver knows of 5, 10 and 15.
             (COMMAND, 0x12, [5 | 10 | 15, 0, 0, 0]) => Ok(packet(COMMAND_ANSWER, 0x12, 0, &[])),
+            // Why the Joy-Con woke the console (hekate `joycon.c` names
+            // command 7 "wake reason"). `omm` asks through `hid` after a
+            // wake by the right rail's CTS pad, and only payload byte 0
+            // equal to 1 turns the screen on; anything else sends the
+            // console back to sleep. `hid` reads 4 payload bytes and takes
+            // bytes 2 and 3 as a further pair it passes on, ignoring byte 1
+            // and the status (hid 23.5.0 text `0x173200`..`0x17322c`; omm
+            // `0x7FBB0`, `0x80CE0`). \[inference\] 1 is a HOME press, which
+            // is how this model wakes the console ([`RIGHT_CTS`]); 0 says
+            // the Joy-Con did not; the other bytes zero, the value `hid`
+            // takes as nothing to report.
+            (COMMAND, 0x07, []) if self.side == Side::Right => {
+                let home = self.controls.home_woke.swap(false, Ordering::SeqCst);
+                Ok(packet(COMMAND_ANSWER, 0x07, 0, &[u8::from(home), 0, 0, 0]))
+            }
             // How the Joy-Con is to charge from the rail: the supply and
             // current settings the bootloader's driver names. `hid` sends
             // `0x14` after learning who is there and waits for an answer
@@ -800,10 +887,12 @@ impl JoyCon {
             // driver reads a packet after sending it (hekate `joycon.c`),
             // so it is acknowledged first; that the acknowledgement is the
             // plain one, and that only a new handshake wakes the Joy-Con,
-            // are assumptions. The other states (reboot into reconnecting
+            // are assumptions. Asleep, the right one raises its rail's CTS
+            // line while HOME is held, which wakes the console
+            // ([`RIGHT_CTS`]). The other states (reboot into reconnecting
             // or pairing over Bluetooth) are not modeled.
             0x06 if argument(0)? == 0 => {
-                self.session.asleep = true;
+                self.controls.set_asleep(self.side, true);
                 DONE
             }
             // Flash memory read: address, size.
@@ -898,13 +987,13 @@ impl Peer for Rail {
         }
     }
 
-    /// A Joy-Con on the rail lets the console send.
+    /// The Joy-Con asserts CTS while its line is low ([`Controls::cts_high`]).
     fn clear_to_send(&self) -> bool {
-        self.joycon.controls.seated()
+        !self.joycon.controls.cts_high(self.joycon.side)
     }
 
-    /// The Joy-Con's session; whether it is on the rail is the
-    /// [`Controls`]', which the SoC saves.
+    /// The Joy-Con's session; whether it is on the rail, and whether it
+    /// sleeps, is the [`Controls`]', which the SoC saves.
     fn save(&self) -> Result<Vec<u8>, SnapshotError> {
         encode(&self.joycon.session)
     }
@@ -1154,6 +1243,72 @@ mod tests {
         // The reboots into Bluetooth modes are not modeled.
         let (mut rail, _) = connected(Side::Left);
         assert!(subcommand(&mut rail, 0x06, &[2]).is_err());
+    }
+
+    #[test]
+    fn asleep_the_right_joycon_raises_its_cts_line_while_home_is_held() {
+        let (mut right, controls) = connected(Side::Right);
+        let mut left = Rail::new(Side::Left, Arc::clone(&controls), Arc::default());
+        open_session(&mut left);
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let wired = Arc::clone(&lines);
+        controls.connect_cts(Box::new(move |side, high| {
+            wired.lock().unwrap().push((side, high));
+        }));
+        let seen = |expected: &[(Side, bool)]| {
+            assert_eq!(std::mem::take(&mut *lines.lock().unwrap()), expected);
+        };
+        // Wiring tells the levels as they are: asserted on both rails.
+        seen(&[(Side::Left, false), (Side::Right, false)]);
+        // Awake, HOME is reported, not signalled on the line.
+        controls.press(Button::HOME, true);
+        assert!(right.clear_to_send());
+        controls.press(Button::HOME, false);
+        seen(&[(Side::Left, false), (Side::Right, false)].repeat(2));
+        subcommand(&mut right, 0x06, &[0]).unwrap();
+        subcommand(&mut left, 0x06, &[0]).unwrap();
+        lines.lock().unwrap().clear();
+        // Asleep, A does nothing to the line; HOME raises it until let go.
+        controls.press(Button::A, true);
+        controls.press(Button::A, false);
+        assert!(right.clear_to_send() && left.clear_to_send());
+        controls.press(Button::HOME, true);
+        assert!(!right.clear_to_send() && left.clear_to_send());
+        seen(&[
+            (Side::Left, false),
+            (Side::Right, false),
+            (Side::Left, false),
+            (Side::Right, false),
+            (Side::Left, false),
+            (Side::Right, true),
+        ]);
+        controls.press(Button::HOME, false);
+        assert!(right.clear_to_send());
+        // The console's handshake wakes it: HOME is reported again.
+        let handshake = [
+            0xA1, 0xA2, 0xA3, 0xA4, 0x19, 0x01, 0x03, 0x07, 0x00, 0xA5, 0x02, 0x01, 0x7E, 0x00,
+            0x00, 0x00,
+        ];
+        assert_eq!(send(&mut right, &handshake).len(), 12);
+        // Asked why it woke the console (as `hid` does then): HOME, once.
+        let why = [
+            0x19, 0x01, 0x03, 0x07, 0x00, 0x91, 0x07, 0x00, 0x00, 0x00, 0x00, 0x8E,
+        ];
+        let answer = send(&mut right, &why);
+        assert_eq!(answer[5..7], [COMMAND_ANSWER, 0x07]);
+        assert_eq!(answer[12..], [1, 0, 0, 0]);
+        assert_eq!(send(&mut right, &why)[12..], [0, 0, 0, 0]);
+        controls.press(Button::HOME, true);
+        assert!(right.clear_to_send());
+        // Snapshots keep which controllers sleep, without driving lines.
+        let saved = controls.save().unwrap();
+        let restored = Controls::default();
+        restored.restore(&saved).unwrap();
+        assert!(!restored.cts_high(Side::Right), "awake");
+        assert!(restored.asleep(Side::Left));
+        // An empty rail's line is high.
+        controls.set_seated(false);
+        assert!(controls.cts_high(Side::Left) && controls.cts_high(Side::Right));
     }
 
     #[test]

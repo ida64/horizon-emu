@@ -162,6 +162,13 @@ impl Gpio {
         let bit = 1 << pin;
         (port.configuration & port.output_enable & bit != 0).then_some(port.output & bit != 0)
     }
+
+    /// The level the board puts on a pin, as [`Gpio::set_input`] last set
+    /// it, or `None` on a port without listed inputs (or no such pin).
+    pub fn input(&self, port: usize, pin: u8) -> Option<bool> {
+        let input = self.ports.lock().unwrap().get(port)?.input?;
+        Some(input & 1u8.checked_shl(pin.into())? != 0)
+    }
 }
 
 /// Splits a register offset into port index, row, and whether it is the

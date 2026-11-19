@@ -361,6 +361,13 @@ const GPIO_INPUTS: [(usize, u8); 9] = [
     (25, 0x02),
 ];
 
+/// The PMC wake events whose pads are modeled ([`Soc::wake_pad`]).
+const WAKE_EVENTS: [u8; 3] = [
+    pmc::WAKE_EVENT_PMIC,
+    pmc::WAKE_EVENT_UART2_CTS,
+    pmc::WAKE_EVENT_UART3_CTS,
+];
+
 /// What the console's screen shows.
 pub struct Screen {
     /// The picture as someone holding the console sees it. The panel is a
@@ -613,10 +620,23 @@ impl Soc {
                 touch_reset.set_reset(high);
             }
         }));
+        let joycons = Arc::new(joycon::Controls::default());
+        let cts_gpio = Arc::downgrade(&gpio);
+        joycons.connect_cts(Box::new(move |side, high| {
+            let (port, pin) = match side {
+                joycon::Side::Left => joycon::LEFT_CTS,
+                joycon::Side::Right => joycon::RIGHT_CTS,
+                joycon::Side::Pro => return,
+            };
+            if let Some(gpio) = cts_gpio.upgrade() {
+                gpio.set_input(port, pin, high)
+                    .expect("the rails' CTS ports have their inputs listed");
+            }
+        }));
         let soc = Self {
             gpio,
             touch_input,
-            joycons: Arc::default(),
+            joycons,
             pmic: max77620::Max77620::new(Arc::clone(clock), line(gic, PMU_INTID)),
             pmc: Arc::new(if power_on {
                 Pmc::power_on()
@@ -1216,28 +1236,48 @@ impl Soc {
     }
 
     /// Slides both Joy-Con onto their rails, or off them. Each pulls its
-    /// rail's detect pin low while it is on.
+    /// rail's detect pin low while it is on, and its CTS line
+    /// ([`joycon::Controls::cts_high`]).
     pub fn seat_joycons(&self, seated: bool) {
         self.joycons.set_seated(seated);
-        for (port, pin) in [
-            joycon::LEFT_DETECT,
-            joycon::RIGHT_DETECT,
-            joycon::LEFT_CTS,
-            joycon::RIGHT_CTS,
-        ] {
+        for (port, pin) in [joycon::LEFT_DETECT, joycon::RIGHT_DETECT] {
             // Both ports have their inputs listed.
             let _ = self.gpio.set_input(port, pin, !seated);
         }
     }
 
+    /// The SoC enters deep power down (SC7): the PMC takes the wake level
+    /// of its "auto" events from their pads ([`Pmc::sample_wake_levels`]).
+    pub fn enter_sc7(&self) {
+        self.pmc.sample_wake_levels(|event| self.wake_pad(event));
+    }
+
     /// Whether something wakes the sleeping console, which the power
-    /// management controller then has on record. One wake source is
+    /// management controller then has on record. Three wake sources are
     /// modeled: the power management IC's interrupt output, which carries
-    /// the power key and the clock's alarms. A Joy-Con on a rail, the
-    /// radios, the charger, the card slot and the dock are wake sources of
-    /// the console that are not.
+    /// the power key and the clock's alarms, and the rails' CTS lines,
+    /// which a sleeping Joy-Con's HOME button changes. The radios, the
+    /// charger, the card slot and the dock are wake sources of the console
+    /// that are not.
     pub fn wake_pending(&self) -> bool {
-        self.pmic.interrupt() && self.pmc.wake(pmc::WAKE_EVENT_PMIC, false)
+        WAKE_EVENTS.into_iter().fold(false, |woke, event| {
+            let wakes = self
+                .wake_pad(event)
+                .is_some_and(|high| self.pmc.wake(event, high));
+            woke | wakes
+        })
+    }
+
+    /// The level of the pad of wake event `event`, if it is one of
+    /// [`WAKE_EVENTS`].
+    fn wake_pad(&self, event: u8) -> Option<bool> {
+        let (port, pin) = match event {
+            pmc::WAKE_EVENT_PMIC => return Some(!self.pmic.interrupt()),
+            pmc::WAKE_EVENT_UART2_CTS => joycon::RIGHT_CTS,
+            pmc::WAKE_EVENT_UART3_CTS => joycon::LEFT_CTS,
+            _ => return None,
+        };
+        self.gpio.input(port, pin)
     }
 
     /// Parts with state that no bus device saves, keyed by a name unique
@@ -1396,5 +1436,43 @@ mod tests {
                 backlight_on: true,
             }
         );
+    }
+
+    #[test]
+    fn a_change_of_a_rail_cts_line_after_sc7_entry_wakes_the_console() {
+        let params = BootParams::default();
+        let gic = Arc::new(Gic::new(CORE_COUNT, Box::new(|_| {})));
+        let ram = Arc::new(GuestRam::new(DRAM_BASE, params.dram.bytes() as usize).unwrap());
+        let clock = Arc::new(GuestClock::new());
+        let soc = Soc::new(
+            &params,
+            &gic,
+            &ram,
+            &clock,
+            None,
+            None,
+            false,
+            &mut Bus::default(),
+        )
+        .unwrap();
+        soc.seat_joycons(true);
+        let cts = |(port, pin)| soc.gpio.input(port, pin).unwrap();
+        assert!(!cts(joycon::RIGHT_CTS) && !cts(joycon::LEFT_CTS));
+        // The firmware's wake set-up: the rail CTS events enabled, level
+        // "auto" (WAKE_MASK, AUTO_WAKE_LVL_MASK), PwrIntN enabled.
+        let pmc = |offset: u64, value: u32| soc.pmc.write(0, offset, 4, value.into()).unwrap();
+        pmc(0x0C, 1 << 6 | 1 << 7);
+        pmc(0xDC, 1 << 6 | 1 << 7);
+        pmc(0x160, 1 << 19);
+        soc.enter_sc7();
+        assert!(!soc.wake_pending(), "nothing changed");
+        // Buttons of an awake Joy-Con do not touch the line.
+        soc.joycons.press(joycon::Button::HOME, true);
+        assert!(!soc.wake_pending());
+        soc.joycons.press(joycon::Button::HOME, false);
+        // Taking the Joy-Con off releases both lines: both events record.
+        soc.seat_joycons(false);
+        assert!(soc.wake_pending());
+        assert_eq!(soc.pmc.read(0, 0x14, 4), Some(1 << 6 | 1 << 7));
     }
 }
