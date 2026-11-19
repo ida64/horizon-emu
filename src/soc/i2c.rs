@@ -1,4 +1,5 @@
-//! I2C controller in packet mode, and the bus behind it.
+//! I2C controller in packet mode and in normal master mode, and the bus
+//! behind it.
 //!
 //! The `boot` process drives the controller the same way for every
 //! transfer (its text `0x3d770`, `0x3dac0`, `0x3e110`): it flushes the
@@ -8,8 +9,28 @@
 //! acknowledge or lost arbitration each time it wakes. Reads are drained
 //! from the RX FIFO according to the word count in `FIFO_STATUS`.
 //!
-//! Transfers complete the moment their last word is written: there is no
-//! bus timing, so the TX FIFO is always empty.
+//! The NX bootloader uses normal (non-packet) master mode instead, on I2C5
+//! for the PMIC and the CPU regulator (its `0x4000075C` write and
+//! `0x40000704` read): the device address goes into `CMD_ADDR0` (bit 0 set
+//! for a read), up to four data bytes into `CMD_DATA1`, then `CNFG` gets
+//! the byte count less one in bits 3:1, `CMD1` (bit 6) for a read and
+//! `NEW_MASTER_FSM` (bit 11); after a configuration load it sets `SEND`
+//! (bit 9) and polls `STATUS` until `BUSY` (bit 8) clears, the transfer
+//! having succeeded if `CMD1_STAT` (bits 3:0) reads zero. A read leaves
+//! the bytes in `CMD_DATA1`, the first in its low byte. Register and bit
+//! names are the public Tegra ones (Linux `i2c-tegra.c`, U-Boot
+//! `tegra_i2c.h`); the sequence is the bootloader's. `CMD_DATA2` carries
+//! bytes 5 to 8 of a longer transfer \[inference from the 3-bit length\].
+//! The second-slave and 10-bit address forms are not modeled. A missing
+//! acknowledge of the address byte reads as `CMD1_STAT` 1, "no
+//! acknowledge for byte 1" \[assumption: the bootloader only tests for
+//! zero\]. `SEND` reads back clear once the transfer is over
+//! \[assumption\]. Normal mode raises no interrupt status bit
+//! \[assumption: the bootloader polls, with interrupts off\].
+//!
+//! Transfers complete the moment their last word is written (in normal
+//! mode: the moment `SEND` is set): there is no bus timing, so the TX FIFO
+//! is always empty and the controller is never busy.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -27,6 +48,11 @@ use crate::{
 pub const SIZE: u64 = 0x100;
 
 const CNFG: u64 = 0x00;
+const CMD_ADDR0: u64 = 0x04;
+const CMD_ADDR1: u64 = 0x08;
+const CMD_DATA1: u64 = 0x0C;
+const CMD_DATA2: u64 = 0x10;
+const STATUS: u64 = 0x1C;
 const TX_PACKET_FIFO: u64 = 0x50;
 const RX_FIFO: u64 = 0x54;
 const PACKET_TRANSFER_STATUS: u64 = 0x58;
@@ -63,6 +89,21 @@ const TRANSFER_STATUS_NO_ACK_FOR_ADDRESS: u32 = 1 << 3;
 const TRANSFER_STATUS_COMPLETE: u32 = 1 << 24;
 
 const BUS_CLEAR_ENABLE: u32 = 1 << 0;
+
+/// `CNFG` in normal mode: 10-bit addressing (`A_MOD`), the byte count
+/// less one, a second-slave transaction, the direction of the first, the
+/// trigger, and packet mode, which turns all of them off.
+const CNFG_TEN_BIT_ADDRESS: u32 = 1 << 0;
+const CNFG_LENGTH_SHIFT: u32 = 1;
+const CNFG_LENGTH: u32 = 7;
+const CNFG_SLAVE_2: u32 = 1 << 4;
+const CNFG_CMD1_READ: u32 = 1 << 6;
+const CNFG_SEND: u32 = 1 << 9;
+const CNFG_PACKET_MODE: u32 = 1 << 10;
+/// `CMD_ADDR0` bit 0: the address byte asks for a read.
+const ADDRESS_READ: u32 = 1 << 0;
+/// `STATUS` `CMD1_STAT`: the address byte went unacknowledged.
+const STATUS_NO_ACK_FOR_BYTE_1: u32 = 1;
 
 /// Third header word: the transfer is a read.
 const HEADER_READ: u32 = 1 << 19;
@@ -106,7 +147,10 @@ struct State {
     /// addresses.
     #[serde(skip)]
     devices: HashMap<u8, Box<dyn I2cDevice>>,
-    /// Plain configuration registers.
+    /// Plain registers by offset: the configuration, normal mode's
+    /// address and data registers, which a read transfer fills, and its
+    /// `STATUS`, which only a transfer sets (in this map, so that the
+    /// saved form stays what it was before normal mode).
     configuration: HashMap<u64, u32>,
     /// Trigger levels; the flush bits never read as set.
     fifo_control: u32,
@@ -216,6 +260,60 @@ impl State {
         self.interrupt_status |= INT_PACKET_XFER_COMPLETE | INT_ALL_PACKETS_XFER_COMPLETE;
         Ok(())
     }
+
+    /// Runs the normal-mode transfer `cnfg` triggers: one transaction with
+    /// the device `CMD_ADDR0` addresses, of up to eight bytes from or into
+    /// `CMD_DATA1` and `CMD_DATA2`. `Err` carries what is not modeled.
+    fn send(&mut self, cnfg: u32) -> Result<(), String> {
+        if cnfg & (CNFG_TEN_BIT_ADDRESS | CNFG_SLAVE_2) != 0 {
+            return Err(format!(
+                "normal mode transfer with CNFG {cnfg:#x} (10-bit address or second slave) \
+                 is not modeled"
+            ));
+        }
+        let register = |state: &Self, offset| state.configuration.get(&offset).copied();
+        let address_byte = register(self, CMD_ADDR0).unwrap_or(0);
+        let is_read = cnfg & CNFG_CMD1_READ != 0;
+        if (address_byte & ADDRESS_READ != 0) != is_read {
+            return Err(format!(
+                "normal mode transfer whose CMD_ADDR0 {address_byte:#x} and CNFG {cnfg:#x} \
+                 disagree about its direction is not modeled"
+            ));
+        }
+        let address = (address_byte >> 1 & 0x7F) as u8;
+        let size = (cnfg >> CNFG_LENGTH_SHIFT & CNFG_LENGTH) as usize + 1;
+        let mut data = [0; 8];
+        for (offset, bytes) in [CMD_DATA1, CMD_DATA2].into_iter().zip(data.chunks_mut(4)) {
+            bytes.copy_from_slice(&register(self, offset).unwrap_or(0).to_le_bytes());
+        }
+        let acknowledged = match self.devices.get_mut(&address) {
+            // Nothing answers at this address.
+            None => false,
+            Some(device) if is_read => device.read(&mut data[..size]).ok_or_else(|| {
+                format!("device {address:#04x}: read of {size} bytes is not implemented")
+            })?,
+            Some(device) => device.write(&data[..size]).ok_or_else(|| {
+                format!(
+                    "device {address:#04x}: write of {:02x?} is not implemented",
+                    &data[..size]
+                )
+            })?,
+        };
+        if acknowledged && is_read {
+            for (offset, bytes) in [CMD_DATA1, CMD_DATA2].into_iter().zip(data.chunks(4)) {
+                let value = u32::from_le_bytes(bytes.try_into().unwrap());
+                self.configuration.insert(offset, value);
+            }
+        }
+        let status = if acknowledged {
+            0
+        } else {
+            STATUS_NO_ACK_FOR_BYTE_1
+        };
+        self.configuration.insert(STATUS, status);
+        self.configuration.insert(CNFG, cnfg & !CNFG_SEND);
+        Ok(())
+    }
 }
 
 impl MmioDevice for I2cController {
@@ -238,6 +336,11 @@ impl MmioDevice for I2cController {
             // Loading the configuration takes no time.
             CONFIG_LOAD => 0,
             CNFG
+            | CMD_ADDR0
+            | CMD_ADDR1
+            | CMD_DATA1
+            | CMD_DATA2
+            | STATUS
             | CLK_DIVISOR
             | BUS_CLEAR_CONFIG
             | CLKEN_OVERRIDE
@@ -286,7 +389,20 @@ impl MmioDevice for I2cController {
                     .insert(register, value & !BUS_CLEAR_ENABLE);
             }
             CONFIG_LOAD => {}
-            CNFG
+            CNFG => {
+                state.configuration.insert(register, value);
+                if value & CNFG_SEND != 0
+                    && value & CNFG_PACKET_MODE == 0
+                    && let Err(what) = state.send(value)
+                {
+                    self.notes.add(format!("{}: {what}", self.name));
+                    return None;
+                }
+            }
+            CMD_ADDR0
+            | CMD_ADDR1
+            | CMD_DATA1
+            | CMD_DATA2
             | CLK_DIVISOR
             | CLKEN_OVERRIDE
             | INTERFACE_TIMING_0
@@ -616,5 +732,237 @@ mod tests {
             wrong.restore(&saved.controller.save().unwrap()),
             Err(SnapshotError::Corrupt(_))
         ));
+    }
+
+    /// The NX bootloader's I2C driver (normal master mode), register for
+    /// register: `0x4000075C` (write), `0x40000704` (read), `0x400006E0`
+    /// (configuration load), `0x400025F0` (bus clear), `0x4000267C` and
+    /// `0x40002638` (device register write and read).
+    struct Bootloader<'a>(&'a I2cController);
+
+    impl Bootloader<'_> {
+        fn write(&self, register: u64, value: u32) {
+            self.0.write(0, register, 4, value.into()).unwrap();
+        }
+
+        fn read(&self, register: u64) -> u32 {
+            self.0.read(0, register, 4).unwrap() as u32
+        }
+
+        fn load_config(&self) {
+            self.write(CONFIG_LOAD, 0x25);
+            let mut tries = 0;
+            while self.read(CONFIG_LOAD) & 1 != 0 && tries < 20 {
+                tries += 1;
+            }
+        }
+
+        /// Sets `SEND` and waits for the transfer: whether it succeeded.
+        fn send(&self) -> bool {
+            let cnfg = self.read(CNFG);
+            self.write(CNFG, cnfg & !0x200 | 0x200);
+            while self.read(STATUS) & 0x100 != 0 {}
+            self.read(STATUS) & 0xF == 0
+        }
+
+        fn transmit(&self, address: u8, data: &[u8]) -> bool {
+            let mut word = [0; 4];
+            word[..data.len()].copy_from_slice(data);
+            self.write(CMD_ADDR0, u32::from(address) << 1);
+            self.write(CMD_DATA1, u32::from_le_bytes(word));
+            self.write(CNFG, (2 * data.len() as u32 - 2) | 0x2800);
+            self.load_config();
+            self.send()
+        }
+
+        fn receive(&self, address: u8, data: &mut [u8]) -> bool {
+            self.write(CMD_ADDR0, u32::from(address) << 1 | 1);
+            self.write(CNFG, (2 * data.len() as u32 - 2) | 0x2840);
+            self.load_config();
+            if !self.send() {
+                return false;
+            }
+            let word = self.read(CMD_DATA1).to_le_bytes();
+            data.copy_from_slice(&word[..data.len()]);
+            true
+        }
+
+        fn set(&self, address: u8, register: u8, value: u8) {
+            assert!(
+                self.transmit(address, &[register, value]),
+                "write of {register:#x}"
+            );
+        }
+
+        fn get(&self, address: u8, register: u8) -> u8 {
+            let mut value = [0];
+            assert!(self.transmit(address, &[register]) && self.receive(address, &mut value));
+            value[0]
+        }
+
+        fn clear_bus(&self) {
+            self.write(CLK_DIVISOR, 0x50001);
+            self.write(BUS_CLEAR_CONFIG, 0x90003);
+            self.load_config();
+            let mut tries = 0;
+            while self.read(INTERRUPT_STATUS) & 1 << 11 == 0 {
+                tries += 1;
+                assert!(tries < 10, "bus clear never done");
+            }
+            self.read(BUS_CLEAR_STATUS);
+            let status = self.read(INTERRUPT_STATUS);
+            self.write(INTERRUPT_STATUS, status);
+        }
+    }
+
+    /// I2C5 as the bootloader finds it: the PMIC's power block and the two
+    /// MAX77621 regulators.
+    fn power_bus() -> I2cController {
+        use super::super::{
+            max77620::{self, Max77620},
+            max77621::{self, Max77621},
+        };
+        let pmic = Max77620::new(Arc::default(), |_| {});
+        let notes: Arc<Notes> = Arc::default();
+        let devices: [(u8, Box<dyn I2cDevice>); 3] = [
+            (
+                max77620::PMIC_ADDRESS,
+                Box::new(ByteRegisters::new(
+                    "MAX77620",
+                    pmic.power_block(),
+                    Arc::clone(&notes),
+                )),
+            ),
+            (
+                max77621::CPU_ADDRESS,
+                Box::new(ByteRegisters::new(
+                    "CPU",
+                    Max77621::cpu(),
+                    Arc::clone(&notes),
+                )),
+            ),
+            (
+                max77621::GPU_ADDRESS,
+                Box::new(ByteRegisters::new(
+                    "GPU",
+                    Max77621::gpu(),
+                    Arc::clone(&notes),
+                )),
+            ),
+        ];
+        I2cController::new("I2C5", devices, Box::new(|_| {}), notes)
+    }
+
+    #[test]
+    fn the_bootloaders_power_sequence_lands_in_the_pmic_and_the_cpu_regulator() {
+        const PMIC: u8 = 0x3C;
+        const CPU: u8 = 0x1B;
+        let controller = power_bus();
+        let bootloader = Bootloader(&controller);
+        bootloader.clear_bus();
+        // Research §2.3, rows 1 to 12: configuration, power sequencers,
+        // and SD0 at 1125 mV ((1_125_000 - 600_000) / 12_500, `0x40002860`).
+        let early = [
+            (0x04, 0x40),
+            (0x41, 0x78),
+            (0x43, 0x38),
+            (0x44, 0x3A),
+            (0x45, 0x38),
+            (0x4A, 0x0F),
+            (0x4E, 0xC7),
+            (0x4F, 0x4F),
+            (0x50, 0x29),
+            (0x52, 0x1B),
+            (0x56, 0x22),
+            (0x16, 42),
+        ];
+        for (register, value) in early {
+            bootloader.set(PMIC, register, value);
+        }
+        // CCPLEX power-up (`0x40000806`): AME_GPIO read back with bit 5
+        // cleared, GPIO5 on, then the CPU regulator.
+        let ame_gpio = bootloader.get(PMIC, 0x40);
+        bootloader.set(PMIC, 0x40, ame_gpio & 0xDF);
+        bootloader.set(PMIC, 0x3B, 0x09);
+        let regulator = [(2, 0xB0), (3, 0xC1), (0, 0xB7), (1, 0xB7)];
+        for (register, value) in regulator {
+            bootloader.set(CPU, register, value);
+        }
+        // SDRAM init (`0x40002840`): SD_CFG2, SD1 at 1100 mV.
+        let late = [(0x22, 0x05), (0x17, 40)];
+        for (register, value) in late {
+            bootloader.set(PMIC, register, value);
+        }
+
+        let pmic = early
+            .into_iter()
+            .chain([(0x40, ame_gpio & 0xDF), (0x3B, 0x09)])
+            .chain(late);
+        for (register, value) in pmic {
+            assert_eq!(bootloader.get(PMIC, register), value, "PMIC {register:#x}");
+        }
+        for (register, value) in regulator {
+            assert_eq!(bootloader.get(CPU, register), value, "CPU {register}");
+        }
+        // Two bytes in one read, out of CMD_DATA1 in bus order.
+        let mut both = [0; 2];
+        assert!(bootloader.transmit(CPU, &[0]) && bootloader.receive(CPU, &mut both));
+        assert_eq!(both, [0xB7, 0xB7]);
+        assert_eq!(
+            bootloader.read(CNFG) & CNFG_SEND,
+            0,
+            "SEND reads back clear"
+        );
+        assert_eq!(
+            bootloader.read(INTERRUPT_STATUS) & !INT_LEVELS,
+            0,
+            "normal mode raises nothing"
+        );
+    }
+
+    #[test]
+    fn normal_mode_reports_a_missing_acknowledge_and_refuses_what_it_does_not_model() {
+        let bench = Bench::new();
+        let bootloader = Bootloader(&bench.controller);
+        assert!(!bootloader.transmit(0x50, &[0x00]), "nothing at 0x50");
+        assert_eq!(bootloader.read(STATUS), STATUS_NO_ACK_FOR_BYTE_1);
+        assert!(bootloader.transmit(0x3C, &[0x10, 0xAB]));
+        assert_eq!(bootloader.read(STATUS), 0);
+
+        // Eight bytes through both data registers.
+        bootloader.write(CMD_ADDR0, 0x3C << 1);
+        bootloader.write(CMD_DATA1, 0x0302_0120);
+        bootloader.write(CMD_DATA2, 0x0706_0504);
+        bootloader.write(CNFG, 7 << 1 | 0x2800);
+        assert!(bootloader.send());
+        assert!(bootloader.transmit(0x3C, &[0x20]));
+        bootloader.write(CMD_ADDR0, 0x3C << 1 | 1);
+        bootloader.write(CNFG, 6 << 1 | 0x2840);
+        assert!(bootloader.send());
+        assert_eq!(bootloader.read(CMD_DATA1), 0x0403_0201);
+        assert_eq!(bootloader.read(CMD_DATA2) & 0xFF_FFFF, 0x07_0605);
+
+        // Saved and restored with the rest of the registers.
+        let restored = Bench::new();
+        restored
+            .controller
+            .restore(&bench.controller.save().unwrap())
+            .unwrap();
+        assert_eq!(
+            Bootloader(&restored.controller).read(CMD_DATA1),
+            0x0403_0201
+        );
+
+        // A direction the address byte contradicts, a register the device
+        // lacks, and the second-slave form stop the machine.
+        bootloader.write(CMD_ADDR0, 0x3C << 1);
+        assert_eq!(bench.controller.write(0, CNFG, 4, 0x2A40), None);
+        assert!(bootloader.transmit(0x3C, &[0x7F]));
+        bootloader.write(CMD_ADDR0, 0x3C << 1 | 1);
+        assert_eq!(bench.controller.write(0, CNFG, 4, 0x2A40), None);
+        assert_eq!(bench.controller.write(0, CNFG, 4, 0x2A10), None);
+        // Packet mode is left alone by SEND.
+        bootloader.write(CNFG, 0x2E00);
+        assert_eq!(bootloader.read(CNFG), 0x2E00);
     }
 }

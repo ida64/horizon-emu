@@ -66,6 +66,12 @@ impl RegisterFile {
         registers.insert(offset, update(value));
         Some(())
     }
+
+    /// Forgets every register's value, initial ones included: what a
+    /// block that loses its contents in reset needs.
+    pub fn clear(&self) {
+        self.registers.lock().unwrap().clear();
+    }
 }
 
 impl MmioDevice for RegisterFile {

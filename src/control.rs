@@ -12,7 +12,8 @@
 //! {"op":"pixel","x":640,"y":360}
 //!     the colour at a point of the 1280x720 screen, "rrggbb"
 //! {"op":"status"}
-//!     seconds since the machine started and whether the screen is lit
+//!     seconds since the machine started and whether the panel and its
+//!     backlight are on, whether or not a picture can be composed
 //! {"op":"stop"}
 //!     stops the machine, as closing its window does
 //! {"op":"save_state","path":"/tmp/snap"}
@@ -196,11 +197,11 @@ fn answer(request: Request, controlled: &Controlled) -> Result<Value, String> {
             Ok(json!({"rgb": format!("{red:02x}{green:02x}{blue:02x}")}))
         }
         Request::Status => {
-            let screen = machine.screen().ok();
+            let panel = machine.panel();
             Ok(json!({
                 "seconds": controlled.started.elapsed().as_secs_f64(),
-                "panel_on": screen.as_ref().is_some_and(|screen| screen.panel_on),
-                "backlight_on": screen.as_ref().is_some_and(|screen| screen.backlight_on),
+                "panel_on": panel.panel_on,
+                "backlight_on": panel.backlight_on,
             }))
         }
         Request::Stop => {

@@ -15,7 +15,8 @@
 //!   `bluetooth_hid_subcommands_notes.md` and `spi_flash_notes.md`;
 //! - names of the wired commands, which controller is on which UART and
 //!   which pins detect them: the Joy-Con driver of an open-source
-//!   bootloader (hekate, `bdk/input/joycon.c`).
+//!   bootloader (hekate, `bdk/input/joycon.c`);
+//! - the right Joy-Con's NFC and infrared processor: see `joycon/mcu.rs`.
 //!
 //! The console's side of all of it is the firmware's own: `hid` sends the
 //! wake bytes and the handshake at 1 000 000 baud on both rails as soon as
@@ -26,9 +27,11 @@
 //! answers is refused with a note, so the machine stops rather than go on
 //! with a controller that says something a real one would not.
 
+mod mcu;
+
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Duration,
@@ -36,7 +39,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::serial::Peer;
+use super::{ntag::Ntag215, serial::Peer};
 use crate::{
     clock::GuestClock,
     snapshot::{Snapshot, SnapshotError, decode, encode},
@@ -65,10 +68,14 @@ pub const LEFT_DETECT: (usize, u8) = (4, 6);
 pub const RIGHT_CTS: (usize, u8) = (6, 3);
 pub const LEFT_CTS: (usize, u8) = (3, 4);
 
+/// Which controller of the family this is: a Joy-Con of either rail, or
+/// the Pro Controller, which is on no rail and speaks the same input
+/// reports and subcommands over Bluetooth (`bluetooth_hid_notes.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Left,
     Right,
+    Pro,
 }
 
 /// A button of the pair, as a bit of the three button bytes of a standard
@@ -95,6 +102,17 @@ impl Button {
     pub const LEFT: Self = Self(1 << 19);
     pub const L: Self = Self(1 << 22);
     pub const ZL: Self = Self(1 << 23);
+
+    /// Its bit (bits, for buttons held together) of a report's three
+    /// button bytes, as [`Controls::held`] gives them.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// This button and `other`, held together.
+    pub const fn and(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
 
     /// The button called `name` on the command line, in any case.
     pub fn named(name: &str) -> Option<Self> {
@@ -126,14 +144,17 @@ impl Button {
 /// share of the middle one.
 const LEFT_BUTTONS: u32 = 0xFF_0000 | Button::MINUS.0 | Button::LEFT_STICK.0 | Button::CAPTURE.0;
 const RIGHT_BUTTONS: u32 = 0x00_00FF | Button::PLUS.0 | Button::RIGHT_STICK.0 | Button::HOME.0;
+/// The Pro Controller has all of them but the rail buttons SL and SR.
+const PRO_BUTTONS: u32 = (LEFT_BUTTONS | RIGHT_BUTTONS) & !0x30_0030;
 
-/// What is being done to the pair of Joy-Con: where they are and which
-/// buttons are held. Shared between the rails and whoever is at the
-/// controls.
+/// What is being done to the pair of Joy-Con: where they are, which
+/// buttons are held and which NFC tag is held over the right one's reader.
+/// Shared between the rails and whoever is at the controls.
 #[derive(Default)]
 pub struct Controls {
     seated: AtomicBool,
     buttons: AtomicU32,
+    tag: Mutex<Option<Ntag215>>,
 }
 
 impl Controls {
@@ -153,21 +174,43 @@ impl Controls {
             false => self.buttons.fetch_and(!button.0, Ordering::SeqCst),
         };
     }
+
+    /// The buttons held, as a mask of [`Button`] bits.
+    pub fn held(&self) -> u32 {
+        self.buttons.load(Ordering::SeqCst)
+    }
+
+    /// Holds `tag` over the right Joy-Con's NFC reader, or takes the one
+    /// there away (`None`).
+    pub fn place_tag(&self, tag: Option<Ntag215>) {
+        *self.tag.lock().unwrap_or_else(PoisonError::into_inner) = tag;
+    }
+
+    fn tag(&self) -> MutexGuard<'_, Option<Ntag215>> {
+        self.tag.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// Saved by the SoC ([`super::Soc::snapshot_parts`]): whether the pair is
-/// on the rails and which buttons are held, so that a restored console has
-/// them where the saved one had them. The detect and CTS pins they drive
-/// are GPIO inputs, which the GPIO saves.
+/// on the rails, which buttons are held and the tag on the reader, with
+/// what has been written to it, so that a restored console has them where
+/// the saved one had them. The detect and CTS pins they drive are GPIO
+/// inputs, which the GPIO saves.
 impl Snapshot for Controls {
     fn save(&self) -> Result<Vec<u8>, SnapshotError> {
-        encode(&(self.seated(), self.buttons.load(Ordering::SeqCst)))
+        encode(&(
+            self.seated(),
+            self.buttons.load(Ordering::SeqCst),
+            &*self.tag(),
+        ))
     }
 
     fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
-        let (seated, buttons): (bool, u32) = decode("Joy-Con controls", state)?;
+        let (seated, buttons, tag): (bool, u32, Option<Ntag215>) =
+            decode("Joy-Con controls", state)?;
         self.set_seated(seated);
         self.buttons.store(buttons, Ordering::SeqCst);
+        self.place_tag(tag);
         Ok(())
     }
 }
@@ -180,22 +223,26 @@ struct Identity;
 impl Identity {
     /// Bluetooth addresses, most significant byte first: locally
     /// administered, next to the console's own virtual addresses.
-    const ADDRESS: [[u8; 6]; 2] = [
+    const ADDRESS: [[u8; 6]; 3] = [
         [0x02, 0x68, 0x45, 0x6D, 0x75, 0x10],
         [0x02, 0x68, 0x45, 0x6D, 0x75, 0x11],
+        [0x02, 0x68, 0x45, 0x6D, 0x75, 0x12],
     ];
-    /// Firmware version reported by "request device info": 4.32, the one
-    /// this console's system software carries for Joy-Con
-    /// (`FirmwareInfo.csv` of system data 0100000000000822: `JoyLeft,BT,
-    /// 0420`), so that it has nothing to update.
-    const FIRMWARE: [u8; 2] = [0x04, 0x20];
+    /// Firmware version reported by "request device info": 4.32 for the
+    /// Joy-Con and 4.33 for the Pro Controller, the ones this console's
+    /// system software carries (`FirmwareInfo.csv` of system data
+    /// 0100000000000822: `JoyLeft,BT,0420`, `FullKey,BT,0421`), so that
+    /// there is nothing to update.
+    const FIRMWARE: [[u8; 2]; 3] = [[0x04, 0x20], [0x04, 0x20], [0x04, 0x21]];
     /// Version of the right Joy-Con's NFC and infrared processor's
     /// firmware, likewise (`JoyRight,MCU,0920`).
     const PROCESSOR_FIRMWARE: [u16; 2] = [0x09, 0x20];
+    /// The Pro Controller's NFC processor's firmware (`FullKey,MCU,0403`).
+    const PRO_PROCESSOR_FIRMWARE: [u16; 2] = [0x04, 0x03];
     /// Bluetooth class of device (peripheral, gamepad) and names, as the
-    /// Joy-Con give them when pairing.
+    /// controllers give them when pairing.
     const CLASS: [u8; 3] = [0x08, 0x25, 0x00];
-    const NAME: [&'static str; 2] = ["Joy-Con (L)", "Joy-Con (R)"];
+    const NAME: [&'static str; 3] = ["Joy-Con (L)", "Joy-Con (R)", "Pro Controller"];
     /// The link keys the pair would use over Bluetooth once off the
     /// rails. Anything will do for a key no radio ever uses; these say
     /// what they are.
@@ -214,10 +261,10 @@ impl Identity {
     /// coefficients every documented unit has.
     const ACCELEROMETER_SCALE: i16 = 0x4000;
     const GYROSCOPE_SCALE: i16 = 0x343B;
-    /// What the accelerometer reads with the Joy-Con lying flat: the
-    /// documented default "horizontal offsets" of each side, which is
+    /// What the accelerometer reads with the controller lying flat: the
+    /// documented default "horizontal offsets" of each kind, which is
     /// where the console expects a Joy-Con at rest on its rail to be.
-    const AT_REST: [[i16; 3]; 2] = [[350, 0, 4081], [350, 0, -4081]];
+    const AT_REST: [[i16; 3]; 3] = [[350, 0, 4081], [350, 0, -4081], [-688, 0, 4038]];
     /// Stick device parameters, the documented sample (dead zone `0xAE`).
     const STICK_PARAMETERS: [u16; 12] = [
         0x019, 0x4CD, 0x0AE, 0xE14, 0x2EE, 0x2EE, 0x2EE, 0x2EE, 0xAB4, 0xAB4, 0x496, 0x496,
@@ -252,7 +299,8 @@ impl Side {
         self as usize
     }
 
-    /// Device type: 1 for a left Joy-Con, 2 for a right one.
+    /// Device type: 1 for a left Joy-Con, 2 for a right one, 3 for a Pro
+    /// Controller.
     fn kind(self) -> u8 {
         self as u8 + 1
     }
@@ -261,19 +309,19 @@ impl Side {
     /// address (`spi_flash_notes.md`).
     fn flash(self) -> Vec<(u32, Vec<u8>)> {
         let (center, travel) = (Identity::STICK_CENTER, Identity::STICK_TRAVEL);
-        // Each side has one stick; the other's calibration is not
-        // programmed.
+        // Each Joy-Con has one stick; the other's calibration is not
+        // programmed. The Pro Controller has both.
         let stick = |values: [u16; 6], present: bool| match present {
             true => pack12(&values),
             false => vec![0xFF; 9],
         };
         let mut second = stick(
             [travel, travel, center, center, travel, travel],
-            self == Side::Left,
+            self != Side::Right,
         );
         second.extend(stick(
             [center, center, travel, travel, travel, travel],
-            self == Side::Right,
+            self != Side::Left,
         ));
         second.push(0xFF);
         second.extend(Identity::BODY);
@@ -354,8 +402,10 @@ const REPORT: u8 = 0x92;
 /// Bytes of a packet before its payload: command, subcommand, payload
 /// size, status and the two checksums.
 const ENVELOPE: usize = 7;
-/// A controller report in a wired packet: `0x31` bytes.
+/// A controller report in a wired packet: `0x31` bytes; one of kind
+/// `0x31` carries the NFC and infrared processor's answer after that.
 const REPORT_SIZE: usize = 49;
+const MCU_REPORT_SIZE: usize = REPORT_SIZE + mcu::ANSWER_SIZE;
 /// How many answered packets a Joy-Con remembers for its refusals.
 const ANSWERED_KEPT: usize = 4;
 
@@ -372,12 +422,16 @@ fn packet(command: u8, subcommand: u8, status: u8, payload: &[u8]) -> Vec<u8> {
     packet
 }
 
-/// One Joy-Con, as far as its rail connector shows.
-struct JoyCon {
+/// One Joy-Con, as far as its rail connector shows; or the Pro Controller,
+/// whose input reports and subcommands are the same, carried over
+/// Bluetooth (`super::bluetooth_uart`).
+pub(super) struct JoyCon {
     side: Side,
     controls: Arc<Controls>,
     clock: Arc<GuestClock>,
     session: Session,
+    /// What a refusal of the packet being answered is to add.
+    why: Option<String>,
 }
 
 /// What the Joy-Con holds of its session with the console: everything a
@@ -393,8 +447,11 @@ struct Session {
     reporting: bool,
     motion: bool,
     vibration: bool,
-    /// The right Joy-Con's NFC and infrared processor is running.
-    processor: bool,
+    /// Input reports of kind `0x31` (subcommand 3), which carry the NFC
+    /// and infrared processor's answers, rather than `0x30`.
+    processor_reports: bool,
+    /// The right Joy-Con's NFC and infrared processor.
+    processor: mcu::Mcu,
     /// Put to sleep by the console (subcommand 6); the handshake wakes it.
     asleep: bool,
     /// Guest time at which it was powered, which its report timer counts
@@ -410,7 +467,8 @@ impl Session {
             reporting: false,
             motion: false,
             vibration: false,
-            processor: false,
+            processor_reports: false,
+            processor: mcu::Mcu::new(),
             asleep: false,
             powered: now,
         }
@@ -424,12 +482,30 @@ impl JoyCon {
             controls,
             session: Session::new(clock.now()),
             clock,
+            why: None,
         }
     }
 
-    /// The session ends when the Joy-Con leaves the rail.
-    fn unplug(&mut self) {
+    /// The Pro Controller, whose buttons are held on `controls` and whose
+    /// report timer counts guest time from `clock`.
+    pub(super) fn pro(controls: Arc<Controls>, clock: Arc<GuestClock>) -> Self {
+        Self::new(Side::Pro, controls, clock)
+    }
+
+    /// The session ends when the Joy-Con leaves the rail, or when the Pro
+    /// Controller's link drops.
+    pub(super) fn unplug(&mut self) {
         self.session = Session::new(self.clock.now());
+    }
+
+    /// The session, encoded: what a snapshot saves of the controller.
+    pub(super) fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        encode(&self.session)
+    }
+
+    pub(super) fn restore(&mut self, state: &[u8]) -> Result<(), SnapshotError> {
+        self.session = decode("Joy-Con", state)?;
+        Ok(())
     }
 
     fn refuse<T>(&self, what: impl std::fmt::Display) -> Result<T, String> {
@@ -451,10 +527,12 @@ impl JoyCon {
             return Ok(Vec::new());
         }
         let received = std::mem::take(&mut self.session.incoming);
-        let refusal = |joycon: &Self| {
+        let refusal = |joycon: &mut Self| {
+            let why = joycon.why.take().map(|why| format!(" ({why})"));
             joycon.refuse(format_args!(
-                "the packet {received:02x?}, after {:02x?},",
-                joycon.session.answered
+                "the packet {received:02x?}, after {:02x?},{}",
+                joycon.session.answered,
+                why.unwrap_or_default(),
             ))
         };
         if received[..3] != TO_JOYCON || length < ENVELOPE {
@@ -561,22 +639,25 @@ impl JoyCon {
     }
 
     /// The input report that answers output report `output`.
-    fn report(&mut self, output: &[u8]) -> Result<Vec<u8>, ()> {
+    pub(super) fn report(&mut self, output: &[u8]) -> Result<Vec<u8>, ()> {
         let side = self.side.index();
-        let own = [LEFT_BUTTONS, RIGHT_BUTTONS][side];
+        let own = [LEFT_BUTTONS, RIGHT_BUTTONS, PRO_BUTTONS][side];
         let buttons = self.controls.buttons.load(Ordering::SeqCst) & own;
         // The stick is at its centre; the other side's is not there.
         let stick = pack12(&[Identity::STICK_CENTER, Identity::STICK_CENTER]);
         let sticks = match self.side {
             Side::Left => [stick, vec![0; 3]],
             Side::Right => [vec![0; 3], stick],
+            Side::Pro => [stick.clone(), stick],
         };
         // Per side: vibration enabled, and room for more of it. Seen in
-        // the notes' captures: 7 while off, 0xC while on.
+        // the notes' captures: 7 while off, 0xC while on. The Pro
+        // Controller's is taken to be in the right Joy-Con's place
+        // \[assumption\].
         let vibrator = match self.session.vibration {
             true => 0xC,
             false => 0x7,
-        } << [4, 0][side];
+        } << [4, 0, 0][side];
         // In units of 5 ms of guest time.
         let powered_for = self.clock.now().saturating_sub(self.session.powered);
         let timer = (powered_for.as_millis() / 5) as u8;
@@ -593,8 +674,12 @@ impl JoyCon {
                 report.extend([acknowledge, *subcommand]);
                 report.extend(data);
             }
-            // Vibration data only, and the bare request for the state.
-            [0x10, _, _, _, _, _, _, _, _, _] | [0x1F] => {
+            // Vibration data only, the bare request for the state, and a
+            // request to the NFC and infrared processor after the
+            // vibration data.
+            [0x10, _, _, _, _, _, _, _, _, _]
+            | [0x1F]
+            | [0x11, _, _, _, _, _, _, _, _, _, _, ..] => {
                 report[0] = 0x30;
                 // Three samples of the motion sensor: at rest.
                 let sample = match self.session.motion {
@@ -606,6 +691,29 @@ impl JoyCon {
                     false => vec![0; 12],
                 };
                 report.extend(sample.repeat(3));
+                if let [0x11, _, _, _, _, _, _, _, _, _, request @ ..] = output {
+                    if self.side != Side::Right || !self.session.processor_reports {
+                        return Err(());
+                    }
+                    let mut tag = self.controls.tag();
+                    let now = self.clock.now();
+                    if let Err(why) = self.session.processor.request(request, &mut tag, now) {
+                        self.why = Some(why);
+                        return Err(());
+                    }
+                }
+                if self.session.processor_reports {
+                    report[0] = 0x31;
+                    let tag = self.controls.tag();
+                    let answer = self.session.processor.answer(
+                        tag.as_ref(),
+                        Identity::PROCESSOR_FIRMWARE,
+                        self.clock.now(),
+                    );
+                    report.extend(answer);
+                    debug_assert_eq!(report.len(), MCU_REPORT_SIZE);
+                    return Ok(report);
+                }
             }
             _ => return Err(()),
         }
@@ -625,7 +733,8 @@ impl JoyCon {
         const DONE: (u8, Vec<u8>) = (0x80, Vec::new());
         Ok(match subcommand {
             // Pairing over the rail, in three steps, so that the Joy-Con
-            // and the console know each other over Bluetooth afterwards.
+            // and the console know each other over Bluetooth afterwards
+            // (the Pro Controller, on no rail, pairs over the air).
             // `hid` (text `0x14F480`) takes from the first answer the
             // address, three bytes and 21 more, which are the class and
             // name it sent of itself in the same places; from the second
@@ -641,7 +750,7 @@ impl JoyCon {
             // opening as the start of a fresh pairing and goes on with
             // steps 2 and 3, and that is the answer given, which is an
             // assumption.
-            0x01 => {
+            0x01 if self.side != Side::Pro => {
                 let step = argument(0)?;
                 let side = self.side.index();
                 let data = match step {
@@ -664,15 +773,23 @@ impl JoyCon {
             }
             // Device information.
             0x02 => {
-                let mut info = Identity::FIRMWARE.to_vec();
+                let mut info = Identity::FIRMWARE[self.side.index()].to_vec();
                 info.extend([self.side.kind(), 0x02]);
                 info.extend(Identity::ADDRESS[self.side.index()]);
                 // Colours come from the flash memory.
                 info.extend([0x01, 0x01]);
                 (0x82, info)
             }
-            // Input report mode: standard full reports.
-            0x03 if argument(0)? == 0x30 => DONE,
+            // Input report mode: standard full reports, or (on the right
+            // Joy-Con) those with the NFC and infrared processor's answers.
+            0x03 if argument(0)? == 0x30 => {
+                self.session.processor_reports = false;
+                DONE
+            }
+            0x03 if argument(0)? == 0x31 && self.side == Side::Right => {
+                self.session.processor_reports = true;
+                DONE
+            }
             // How long the trigger buttons have been held: not at all.
             0x04 => (0x83, vec![0; 14]),
             // Leave the low power state of shipment.
@@ -704,34 +821,36 @@ impl JoyCon {
             // The right Joy-Con's NFC and infrared processor: suspend (0),
             // resume (1).
             0x22 if self.side == Side::Right && argument(0)? <= 1 => {
-                self.session.processor = argument(0)? == 1;
+                self.session.processor.power(argument(0)? == 1);
                 DONE
             }
-            // A command for that processor. Only the one asking how it is
-            // is modeled, which `hid` sends once it has resumed it (38
-            // bytes, built at text `0x153A10`: `0x21`, zeros, checksum).
-            // The answer is 34 bytes (checked at `0x153C60`, read at
-            // `0x158DD0`): a report of kind 1, the firmware version as two
-            // big-endian words at 3 and 5, the state at 7, and a checksum
-            // (CRC-8, polynomial 7) of the rest. State 1 is standby in
-            // public descriptions of the protocol; that the processor is
-            // there at once after being resumed is an assumption.
-            0x21 if self.session.processor && arguments.first_chunk() == Some(&[0x21, 0, 0]) => {
-                let [major, minor] = Identity::PROCESSOR_FIRMWARE.map(u16::to_be_bytes);
-                let mut status = vec![0x01, 0, 0, major[0], major[1], minor[0], minor[1], 0x01];
-                status.resize(33, 0);
-                let checksum = status.iter().fold(0, |crc, byte| {
-                    (0..8).fold(crc ^ byte, |crc: u8, _| match crc & 0x80 {
-                        0 => crc << 1,
-                        _ => crc << 1 ^ 0x07,
-                    })
-                });
-                status.push(checksum);
-                (0xA0, status)
+            // A configuration request for that processor, answered with
+            // its 34-byte state (`hid` checks it at `0x153C60`). The Pro
+            // Controller has the same processor for NFC (`FullKey,MCU` in
+            // `FirmwareInfo.csv`); `hid` asks it for its state without
+            // resuming it first, so it is taken to be in standby from the
+            // start \[assumption\].
+            0x21 if self.side != Side::Left => {
+                let firmware = match self.side {
+                    Side::Pro => {
+                        if !self.session.processor.powered() {
+                            self.session.processor.power(true);
+                        }
+                        Identity::PRO_PROCESSOR_FIRMWARE
+                    }
+                    _ => Identity::PROCESSOR_FIRMWARE,
+                };
+                let state = self
+                    .session
+                    .processor
+                    .configure(arguments, firmware)
+                    .ok_or(())?;
+                (0xA0, state)
             }
-            // Player lights; the HOME button's light on the right one.
+            // Player lights; the HOME button's light on the right Joy-Con
+            // and the Pro Controller.
             0x30 => DONE,
-            0x38 if self.side == Side::Right => DONE,
+            0x38 if self.side != Side::Left => DONE,
             // Motion sensor on or off.
             0x40 => {
                 self.session.motion = argument(0)? != 0;
@@ -1060,11 +1179,22 @@ mod tests {
         assert!(subcommand(&mut rail, 0x01, &[5]).is_err());
     }
 
+    /// The processor's configuration requests fill the 38 bytes of the
+    /// arguments: `21`, the request, its checksum at the end.
+    fn processor_config(request: &[u8]) -> Vec<u8> {
+        let mut arguments = vec![0x21];
+        arguments.extend(request);
+        arguments.resize(mcu::REQUEST_SIZE - 1, 0);
+        arguments.push(mcu::crc8(&arguments[1..]));
+        arguments
+    }
+
     #[test]
     fn the_processor_reports_only_while_resumed_and_only_on_the_right() {
-        let query = [0x21, 0, 0];
+        let query = processor_config(&[0, 0]);
         let (mut left, _) = connected(Side::Left);
         assert!(subcommand(&mut left, 0x22, &[1]).is_err());
+        assert!(subcommand(&mut left, 0x03, &[0x31]).is_err());
         let (mut rail, _) = connected(Side::Right);
         assert!(subcommand(&mut rail, 0x21, &query).is_err());
         subcommand(&mut rail, 0x22, &[1]).unwrap();
@@ -1075,14 +1205,84 @@ mod tests {
         assert_eq!(status[..8], [0x01, 0, 0, 0x00, 0x09, 0x00, 0x20, 0x01]);
         // A checksum of polynomial 7 over the rest leaves nothing when it
         // is run over its own result too.
-        let remainder = status.iter().fold(0u8, |crc, byte| {
-            (0..8).fold(crc ^ byte, |crc, _| {
-                (crc << 1) ^ if crc & 0x80 != 0 { 7 } else { 0 }
-            })
-        });
-        assert_eq!(remainder, 0);
+        assert_eq!(mcu::crc8(status), 0);
         subcommand(&mut rail, 0x22, &[0]).unwrap();
         assert!(subcommand(&mut rail, 0x21, &query).is_err());
+    }
+
+    /// An output report of kind `0x11` over the wire: the packet counter,
+    /// vibration data, then the request to the processor. The answer is
+    /// the input report, without the wired envelope.
+    fn processor_request(rail: &mut Rail, request: &[u8]) -> Result<Vec<u8>, String> {
+        let mut output = vec![0x11, 0, 0, 1, 0x40, 0x40, 0, 1, 0x40, 0x40];
+        output.extend(request);
+        let size = (output.len() as u16).to_le_bytes();
+        let mut envelope = vec![REPORT, 0, size[0], size[1], 0, crc8(&output)];
+        envelope.push(crc8(&envelope));
+        let mut packet = TO_JOYCON.to_vec();
+        packet.extend(((envelope.len() + output.len()) as u16).to_le_bytes());
+        packet.extend(envelope);
+        packet.extend(output);
+        let mut answer = Vec::new();
+        for byte in packet {
+            answer.extend(rail.byte(byte)?);
+        }
+        // The wired envelope says how long the report is.
+        assert_eq!(
+            usize::from(u16::from_le_bytes([answer[3], answer[4]])),
+            answer.len() - 5
+        );
+        assert_eq!(crc8(&answer[12..]), answer[10]);
+        Ok(answer.split_off(12))
+    }
+
+    /// An NFC request: kind 2, command, packet numbers, the last-packet
+    /// flag, the data and its checksum.
+    fn nfc_request(command: u8, data: &[u8]) -> Vec<u8> {
+        let mut request = vec![0x02, command, 0, 0, 0x08, data.len() as u8];
+        request.extend(data);
+        request.resize(mcu::REQUEST_SIZE - 1, 0);
+        request.push(mcu::crc8(&request[1..]));
+        request
+    }
+
+    #[test]
+    fn the_processor_answers_in_reports_of_kind_0x31_and_sees_the_tag() {
+        let (mut rail, controls) = connected(Side::Right);
+        // Requests to a processor not asked to report are refused.
+        assert!(processor_request(&mut rail, &nfc_request(0x04, &[])).is_err());
+        subcommand(&mut rail, 0x03, &[0x31]).unwrap();
+        subcommand(&mut rail, 0x22, &[1]).unwrap();
+        // In standby it answers a request for its state with that state.
+        let mut state_request = vec![0x01];
+        state_request.resize(mcu::REQUEST_SIZE, 0);
+        let report = processor_request(&mut rail, &state_request).unwrap();
+        assert_eq!(report.len(), MCU_REPORT_SIZE);
+        assert_eq!(report[0], 0x31);
+        let answer = &report[REPORT_SIZE..];
+        assert_eq!(answer[..8], [0x01, 0, 0, 0x00, 0x09, 0x00, 0x20, 0x01]);
+        assert_eq!(mcu::crc8(answer), 0);
+        let nfc = subcommand(&mut rail, 0x21, &processor_config(&[0x00, 0x04])).unwrap();
+        assert_eq!(nfc[15 + 7], 0x04);
+        let report =
+            processor_request(&mut rail, &nfc_request(0x01, &[0, 0, 0, 0x2C, 0x01])).unwrap();
+        assert_eq!(
+            report[REPORT_SIZE..REPORT_SIZE + 8],
+            [0x2A, 0, 5, 0, 0, 0x09, 0x31, 1]
+        );
+        let uid = [0x04, 1, 2, 3, 4, 5, 6];
+        controls.place_tag(Some(crate::soc::ntag::tests::blank(uid)));
+        let report = processor_request(&mut rail, &nfc_request(0x04, &[])).unwrap();
+        let answer = &report[REPORT_SIZE..];
+        assert_eq!(mcu::crc8(answer), 0);
+        assert_eq!(answer[7], 9);
+        assert_eq!(answer[16..23], uid);
+        controls.place_tag(None);
+        let report = processor_request(&mut rail, &nfc_request(0x04, &[])).unwrap();
+        assert_eq!(report[REPORT_SIZE + 7], 8);
+        // A command the model does not know stops the machine with a note.
+        let refusal = processor_request(&mut rail, &nfc_request(0x0F, &[])).unwrap_err();
+        assert!(refusal.contains("NFC command 0x0f"), "{refusal}");
     }
 
     #[test]

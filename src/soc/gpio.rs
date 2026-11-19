@@ -63,6 +63,9 @@ pub struct Gpio {
     ports: Mutex<[Port; PORT_COUNT]>,
     interrupts: [Line; 8],
     output_observers: Mutex<Vec<OutputObserver>>,
+    /// Whether `IN` reads zero for pins not in GPIO mode (`CNF` clear):
+    /// see [`Gpio::power_on`].
+    special_function_inputs_read_low: bool,
 }
 
 impl Gpio {
@@ -86,7 +89,25 @@ impl Gpio {
             ports: Mutex::new(ports),
             interrupts,
             output_observers: Mutex::new(Vec::new()),
+            special_function_inputs_read_low: false,
         }
+    }
+
+    /// The controller as a machine that runs the boot chain has it. Every
+    /// register the NX bootloader's hardware-state check reads is zero
+    /// (`nxbl_hwcheck.csv`, the check `0x40002A7C`, bootloader text
+    /// `0x40005288`..`0x40006AB8`: all eight controllers' rows and their
+    /// masked aliases), as the ports start here. That includes `IN` of
+    /// every port, while the board holds pins high that the boot chain
+    /// later reads high once it has made them GPIOs (rail detects E6 and
+    /// H6, the volume buttons X6 and X7: `0x400174BC`, `0x40017480`).
+    /// \[inference\] A pin's `IN` bit reads zero while the pin is not in
+    /// GPIO mode (`CNF` clear), and its level once it is. A machine
+    /// started at kernel entry keeps reading levels regardless of `CNF`,
+    /// as it always has.
+    pub fn power_on(mut self) -> Self {
+        self.special_function_inputs_read_low = true;
+        self
     }
 
     /// Observes transitions on enabled output pins, e.g. a board device reset.
@@ -172,13 +193,20 @@ impl MmioDevice for Gpio {
             OE => port.output_enable.into(),
             OUT => port.output.into(),
             IN => {
-                // Output pins read back what they drive.
+                // Output pins read back what they drive; with
+                // `special_function_inputs_read_low`, pins not in GPIO mode
+                // read low.
                 let driven = port.configuration & port.output_enable;
-                let external = match driven {
-                    0xFF => 0,
-                    _ => port.input?,
+                let sensed = if self.special_function_inputs_read_low {
+                    port.configuration & !driven
+                } else {
+                    !driven
                 };
-                u32::from(port.output & driven | external & !driven)
+                let external = match sensed {
+                    0 => 0,
+                    _ => port.input? & sensed,
+                };
+                u32::from(port.output & driven | external)
             }
             INT_STA => port.interrupt_status.into(),
             INT_ENB => port.interrupt_enable.into(),
@@ -310,5 +338,30 @@ mod tests {
         gpio.write(0, INT_ENB + MASKED, 4, 0x100).unwrap();
         assert!(!asserted.load(Ordering::SeqCst));
         assert_eq!(gpio.set_input(1, 0, true), None);
+    }
+
+    #[test]
+    fn at_power_on_inputs_read_low_until_the_pin_is_a_gpio() {
+        // Port X (controller 5, port 3: index 23; the bootloader reads its
+        // `IN` at 0x6000_D53C) with the volume buttons (pins 6 and 7) held
+        // high by the board, as the bootloader's check finds it, then makes
+        // them inputs (`0x40017480`).
+        const X: u64 = 0x50C;
+        let gpio = Gpio::new([(23, 0b1100_0000)]).power_on();
+        assert_eq!(gpio.read(0, X + IN, 4), Some(0));
+        assert_eq!(
+            gpio.read(0, X + IN + MASKED, 4),
+            Some(0),
+            "debounce enables"
+        );
+        // A port whose levels are not known reads zero too while no pin is
+        // a GPIO.
+        assert_eq!(gpio.read(0, IN, 4), Some(0));
+        gpio.write(0, X + CNF + MASKED, 4, 0xC0C0).unwrap();
+        gpio.write(0, X + OE + MASKED, 4, 0xC000).unwrap();
+        assert_eq!(gpio.read(0, X + IN, 4), Some(0b1100_0000));
+        // Started at kernel entry, the levels show regardless of CNF.
+        let gpio = Gpio::new([(23, 0b1100_0000)]);
+        assert_eq!(gpio.read(0, X + IN, 4), Some(0b1100_0000));
     }
 }

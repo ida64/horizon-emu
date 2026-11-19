@@ -3,9 +3,11 @@
 
 pub mod adsp;
 pub mod agic;
+pub mod ahb;
 pub mod ahub;
 pub mod alc5639;
 pub mod apb_dma;
+pub mod apb_misc;
 pub mod apb_security;
 pub mod bcm4356;
 pub mod bh1730;
@@ -14,18 +16,25 @@ pub mod bq24193;
 pub mod car;
 pub mod cldvfs;
 pub mod dc;
+pub mod dot11;
 pub mod dpaux;
 pub mod dsi;
 pub mod emc;
 pub mod emmc;
+pub mod evp;
 pub mod falcon_host;
+pub mod flow;
 pub mod gm20b;
 pub mod gmix;
 pub mod gpio;
 pub mod hda;
 pub mod host1x;
 pub mod host1x_channel;
+#[cfg(test)]
+mod hwcheck;
 pub mod i2c;
+pub mod ictlr;
+pub mod iram;
 pub mod joycon;
 pub mod lsm6ds3;
 pub mod m92t36;
@@ -33,20 +42,29 @@ pub mod max17050;
 pub mod max77620;
 pub mod max77621;
 pub mod mc;
-mod medium;
+pub mod mc_channel;
+pub mod medium;
 pub mod mipi_cal;
+pub mod mselect;
+pub mod ntag;
 pub mod pcie;
 pub mod pcie_endpoint;
+pub mod pinmux;
 pub mod pmc;
 pub mod regs;
+pub mod sb;
 pub mod sdcard;
 pub mod sdmmc;
+pub mod se;
 pub mod serial;
 pub mod soctherm;
 pub mod spi;
+pub mod sysctr0;
 pub mod tmp451;
 pub mod tmr;
 pub mod touch;
+pub mod tsec;
+pub mod tzram;
 pub mod vic;
 pub mod wifi_ap;
 pub mod xusb_device;
@@ -83,21 +101,6 @@ use self::{
     tmr::Timers,
 };
 
-/// Pin multiplexer: one configuration register per pin. `boot`'s pin
-/// driver reads all 175 into its tables, clearing any park bit it finds
-/// (text `0x2e9e0`), and later programs each pin's function, pull,
-/// tristate and input enable from its own configuration. Like the other
-/// pure configuration blocks the registers start at zero.
-const PINMUX_BASE: u64 = 0x7000_3000;
-const PINMUX_SIZE: u64 = 0x300;
-
-/// Pad control groups: drive strength and slew rate per group of pins,
-/// the part of the miscellaneous block the same driver reads into its
-/// tables (text `0x2eaac`) before it programs 47 of the groups.
-/// Configuration that starts at zero, like the pin multiplexer.
-const PAD_GROUPS_BASE: u64 = 0x7000_08E4;
-const PAD_GROUPS_SIZE: u64 = 0x28C;
-
 /// I2C1: battery charger and fuel gauge.
 const I2C1_BASE: u64 = 0x7000_C000;
 const I2C1_INTID: u32 = 32 + 38;
@@ -132,6 +135,9 @@ const SDMMC4_INTID: u32 = 32 + 31;
 /// empty port.
 const SDMMC2_BASE: u64 = 0x700B_0200;
 const SDMMC2_INTID: u32 = 32 + 15;
+
+/// The BPMP's cache controller (hekate `bpmp.c` `BPMP_CACHE_BASE`).
+const BPMP_CACHE_BASE: u64 = 0x5004_0000;
 
 /// Explanations devices leave when they refuse an access, for whoever reads
 /// the machine's stop report.
@@ -186,22 +192,14 @@ const PWM_WIDTH: u32 = 0x7FFF << 16;
 const BACKLIGHT_PORT: usize = 21;
 const BACKLIGHT_ENABLE_PIN: u8 = 1;
 
-/// `APB_MISC_GP_HIDREV`: which chip this is. The firmware's clock driver
-/// tells the original console's SoC from its successor by the major
-/// revision in bits 7:4, where 2 is the successor (pcv text `0x50cc0`).
-/// Here: chip ID 0x21 in bits 15:8 and major revision 1, as publicly
-/// documented for this SoC. The minor revision (bits 19:16) and the family
-/// (bits 3:0) of a console's chip are not known here and read zero, which
-/// is an assumption.
-const HIDREV_BASE: u64 = 0x7000_0804;
-const HIDREV: u32 = 0x21 << 8 | 1 << 4;
-
 /// The fuse block, as far as it is read: the chip's speed and leakage
 /// measurements from the factory, by which the firmware's clock driver
 /// picks voltages (pcv reads them once, in this order). Register names as
 /// publicly documented. A measurement belongs to one particular chip, and
 /// this console has none: they read zero, the slowest and least leaky chip
-/// there could be. Like the device ID, that is a choice, not a fact.
+/// there could be. Like the device ID, that is a choice, not a fact. With
+/// them: the SKU, key hash and hidden private key fuses the boot ROM leaves
+/// a retail Erista ([`crate::bootrom::fuses_after_boot`]).
 const FUSE_BASE: u64 = 0x7000_F800;
 const FUSE_SIZE: u64 = 0x400;
 const FUSE_CPU_SPEEDO_0_CALIB: u64 = 0x114;
@@ -229,6 +227,76 @@ const FUSE_RESERVED_CALIB0: u64 = 0x304;
 const FUSE_USB_CALIB: u64 = 0x1f0;
 /// Additional USB pad trim fields, with the same assumption as above.
 const FUSE_USB_CALIB_EXT: u64 = 0x350;
+/// `FUSE_SOC_SPEEDO_1_CALIB`: the boot ROM's patch version (switchbrew
+/// "Fuses"), which package1ldr requires to be at least 0x7F (its `0x7A0`).
+/// This console's ROM patch level is not known: \[assumption\] 0x7F, the
+/// least package1ldr accepts. Not among the measurements pcv is seen to
+/// read above; should it read this one too, 0x7F is what it gets.
+const FUSE_SOC_SPEEDO_1_CALIB: u64 = 0x138;
+const BOOTROM_PATCH_VERSION: u32 = 0x7F;
+/// `FUSE_RESERVED_ODM4`, the console's configuration (switchbrew "Fuses"):
+/// hardware type Icosa (bit 2 set, bit 8 and bits 19:16 clear) and state
+/// production (bits 1:0 clear, bit 9 set) as package1ldr decodes them
+/// (`0x24C`, `0x280`) and as the monitor reports them, and the DRAM ID in
+/// bits 7:3 and 14:12 (\[inference\] its low and high bits). A memory size
+/// with no DRAM ID has no such fuse word: reads of it are refused.
+const FUSE_RESERVED_ODM4: u64 = 0x1D8;
+const ODM4_ICOSA_PRODUCTION: u32 = 1 << 2 | 1 << 9;
+/// `FUSE_RESERVED_ODM6` and `ODM7`, the anti-downgrade fuses: 25 burnt in
+/// ODM7, what firmware 23.5.0 expects of a production unit (package1ldr
+/// `0x638`; the monitor's fuse version, 25), none in ODM6.
+const FUSE_RESERVED_ODM6: u64 = 0x1E0;
+const FUSE_RESERVED_ODM7: u64 = 0x1E4;
+const ANTI_DOWNGRADE_FUSES: u32 = 0x01FF_FFFF;
+/// `FUSE_SPARE_BIT_5`: set on production units (switchbrew "Fuses");
+/// package1ldr requires bit 0 (`0x828`).
+const FUSE_SPARE_BIT_5: u64 = 0x394;
+/// What the NX bootloader of firmware 23.5.0 requires of the fuse block in
+/// its hardware-state check (`0x40002A7C`, as NxBootloaderResearch tabled
+/// it), by offset, besides what is above: the fuse driver as the boot ROM
+/// leaves it (timings, software writes to the cache allowed, programming
+/// not disabled) and fuses that must be clear on this console. Bits its
+/// masks leave out read zero \[assumption\], except `FUSE_FUSECTRL`'s
+/// state field (bits 20:16), which reads idle (4), what package1ldr's
+/// fuse-burn path waits for.
+const FUSES_THE_BOOTLOADER_CHECKS: [(u64, u32); 36] = [
+    (0x000, 4 << 16), // FUSE_FUSECTRL
+    (0x00C, 0),       // FUSE_FUSEWDATA
+    (0x010, 0x0003_0202),
+    (0x014, 0x21),
+    (0x018, 0x0403_0202),
+    (0x01C, 0x0304_00F0), // FUSE_FUSETIME_RD1, _RD2, _PGM1, _PGM2
+    (0x020, 0),           // FUSE_PRIV2INTFC_START
+    (0x024, 0),           // FUSE_FUSEBYPASS
+    (0x02C, 0),           // FUSE_DISABLEREGPROGRAM
+    (0x030, 1),           // FUSE_WRITE_ACCESS_SW
+    (0x04C, 0x24),        // FUSE_FUSETIME_RD3
+    (0x104, 1),
+    (0x160, 0),
+    (0x194, 0),
+    (0x230, 0),
+    (0x234, 0),
+    (0x2A8, 0),
+    (0x2C0, 0),
+    (0x2F4, 0),
+    (0x30C, 0),
+    (0x310, 0),
+    (0x314, 0),
+    (0x318, 0),
+    (0x324, 0),
+    (0x328, 0),
+    (0x32C, 0),
+    (0x330, 0),
+    (0x334, 0),
+    (0x338, 0),
+    (0x33C, 0),
+    (0x340, 0),
+    (0x344, 0),
+    (0x348, 0),
+    (0x34C, 0),
+    (0x354, 0),
+    (0x37C, 0),
+];
 
 /// Levels the board puts on GPIO input pins, by port (`controller * 4 +
 /// port`). A port not listed refuses to have its inputs read.
@@ -295,6 +363,54 @@ pub struct Screen {
     pub backlight_on: bool,
 }
 
+/// The blocks only a machine that runs the boot chain itself has (see
+/// [`Soc::new`]): the BPMP's memory and the registers it starts and stops
+/// processors with. A machine started at kernel entry has none of them on
+/// its bus, exactly as before the boot chain was modelled.
+pub struct BootBlocks {
+    pub iram: Arc<iram::Iram>,
+    pub tzram: Arc<tzram::Tzram>,
+    pub flow: Arc<flow::FlowController>,
+    pub evp: Arc<evp::Evp>,
+    pub sb: Arc<sb::Sb>,
+    pub ictlr: Arc<ictlr::Ictlr>,
+    /// What the clock and reset controller tells the BPMP's machine: see
+    /// [`BootSignals`].
+    pub signals: Arc<BootSignals>,
+}
+
+/// Reset events of the clock and reset controller that start or stop a
+/// processor, for the BPMP's run loop to act on between instructions.
+#[derive(Default)]
+pub struct BootSignals {
+    /// CPU-cluster core 0 has just been let out of reset
+    /// ([`car::Car::on_cpu0_released`]).
+    pub cpu0_released: AtomicBool,
+    /// The BPMP is held in reset: `RST_DEVICES_L` bit 1 (`COP`, hekate
+    /// `clock.h`) set.
+    pub cop_held: AtomicBool,
+    /// The BPMP's reset was released since the run loop last looked: it
+    /// starts again at `EVP_COP_RESET_VECTOR`, or at [`Self::restart_at`]
+    /// if that is set.
+    pub cop_restarted: AtomicBool,
+    /// Where a restart the TSEC asks for begins
+    /// ([`tsec::TsecSoc::restart_bpmp`]).
+    pub restart_at: Mutex<Option<u32>>,
+}
+
+/// `RST_DEVICES_L` bit 1: the BPMP ("COP").
+const COP_RESET: (u64, u32) = (0x004, 1);
+
+/// How the panel and its backlight stand, whether or not the display
+/// controller's picture can be composed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Panel {
+    /// Whether the panel is awake and unblanked.
+    pub panel_on: bool,
+    /// Whether the backlight driver is powered and given a nonzero duty
+    /// cycle.
+    pub backlight_on: bool,
+}
 pub struct Soc {
     pub mc: Arc<Mc>,
     pub gpio: Arc<Gpio>,
@@ -308,9 +424,18 @@ pub struct Soc {
     pub pmic: max77620::Max77620,
     /// The power management controller, where wake events arrive.
     pmc: Arc<Pmc>,
+    /// The boot chain's blocks, in a machine that runs it.
+    pub boot: Option<BootBlocks>,
+    /// The security engine, for the boot ROM's and the TSEC's key slots.
+    pub se: Arc<se::Se>,
+    /// The TSEC, for the machine to connect to the boot chain's blocks
+    /// ([`tsec::Tsec::connect`]).
+    pub tsec: Arc<tsec::Tsec>,
     /// The WiFi function of the radio, for placing an access point around
     /// it (`--wifi-ssid`); set once the PCIe root complex is built.
     pub wifi: std::sync::OnceLock<Arc<bcm4356::Bcm4356Wifi>>,
+    /// What is in range of the Bluetooth radio (`--pro-controller`).
+    pub bluetooth: Arc<bluetooth_uart::Air>,
     /// Guest time, which the SoC's clocks count.
     pub clock: Arc<GuestClock>,
     gic: Arc<Gic>,
@@ -329,7 +454,11 @@ pub struct Soc {
 impl Soc {
     /// Builds every block and places it at its address on `bus`. `emmc`
     /// holds the contents of the eMMC module and `sd_card` those of the
-    /// microSD card; without them their slots are empty.
+    /// microSD card; without them their slots are empty. With `power_on`
+    /// the SoC is as it comes out of reset, for the boot chain to run on
+    /// ([`BootBlocks`], [`car::Car::power_on`], [`pmc::Pmc::power_on`]);
+    /// without, as the boot chain leaves it for the kernel.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         params: &BootParams,
         gic: &Arc<Gic>,
@@ -337,9 +466,14 @@ impl Soc {
         clock: &Arc<GuestClock>,
         emmc: Option<EmmcImages>,
         sd_card: Option<SdCardImage>,
+        power_on: bool,
         bus: &mut Bus,
     ) -> Result<Self, ImageError> {
-        let mc = Arc::new(Mc::new(params.dram));
+        let mc = Arc::new(if power_on {
+            Mc::power_on()
+        } else {
+            Mc::new(params.dram)
+        });
         let notes: Arc<Notes> = Arc::default();
         let violations = Arc::clone(&notes);
         mc.on_violation(Box::new(move |violation| violations.add(violation)));
@@ -398,10 +532,34 @@ impl Soc {
                 )),
             );
         }
-        let gpio = Arc::new(Gpio::with_interrupts(
-            GPIO_INPUTS,
-            gpio::INTIDS.map(|intid| line(gic, intid)),
+        let iram: Option<Arc<iram::Iram>> = power_on.then(Arc::default);
+        let tzram: Option<Arc<tzram::Tzram>> = power_on.then(Arc::default);
+        if let Some(iram) = &iram {
+            // Memory clients reach IRAM through the redirect aperture.
+            mc.attach_iram(Arc::clone(iram));
+        }
+        let se_memory: Box<dyn se::EngineMemory> = match (&iram, &tzram) {
+            (Some(iram), Some(tzram)) => Box::new(se::BootMemory::new(
+                Arc::clone(iram),
+                Arc::clone(tzram),
+                Arc::clone(ram),
+            )),
+            _ => Box::new(DeviceMemory::new(&mc, ram, mc::SMMU_SE_ASID)),
+        };
+        let se = Arc::new(se::Se::new(se_memory, Arc::clone(&notes), params.rng_seed));
+        bus.map(
+            "security engine",
+            se::BASE,
+            se::SIZE,
+            Box::new(Arc::clone(&se)),
+        );
+        let tsec = Arc::new(tsec::Tsec::new(
+            DeviceMemory::new(&mc, ram, tsec::SMMU_TSEC_ASID),
+            Arc::clone(&notes),
         ));
+        bus.map("TSEC", tsec::BASE, tsec::SIZE, Box::new(Arc::clone(&tsec)));
+        let gpio = Gpio::with_interrupts(GPIO_INPUTS, gpio::INTIDS.map(|intid| line(gic, intid)));
+        let gpio = Arc::new(if power_on { gpio.power_on() } else { gpio });
         if sd_card.is_some() {
             let (port, pin) = SD_CARD_DETECT;
             gpio.set_input(port, pin, false)
@@ -424,8 +582,27 @@ impl Soc {
             touch_input,
             joycons: Arc::default(),
             pmic: max77620::Max77620::new(Arc::clone(clock), line(gic, PMU_INTID)),
-            pmc: Arc::new(Pmc::new()),
+            pmc: Arc::new(if power_on {
+                Pmc::power_on()
+            } else {
+                Pmc::new()
+            }),
+            boot: iram.map(|iram| BootBlocks {
+                iram,
+                tzram: tzram.clone().expect("TZRAM is made with IRAM"),
+                flow: Arc::new(flow::FlowController::new(
+                    Arc::clone(clock),
+                    Arc::clone(&notes),
+                )),
+                evp: Arc::default(),
+                sb: Arc::default(),
+                ictlr: Arc::default(),
+                signals: Arc::default(),
+            }),
+            se,
+            tsec,
             wifi: std::sync::OnceLock::new(),
+            bluetooth: Arc::new(bluetooth_uart::Air::new(Arc::clone(clock))),
             clock: Arc::clone(clock),
             gic: Arc::clone(gic),
             dc: controller(DC_INTID),
@@ -437,6 +614,13 @@ impl Soc {
             mc,
             notes,
         };
+        let srk_pmc = Arc::clone(&soc.pmc);
+        soc.se.on_srk_saved(Box::new(move |words| {
+            for (offset, word) in se::SRK_SCRATCH.into_iter().zip(words) {
+                crate::bus::MmioDevice::write(srk_pmc.as_ref(), 0, offset, 4, word.into())
+                    .expect("the PMC takes its secure scratch registers");
+            }
+        }));
         bus.map(
             "XUSB device",
             xusb_device::BASE,
@@ -510,11 +694,15 @@ impl Soc {
                 bluetooth_uart::BASE,
                 "Bluetooth UART",
                 serial(
-                    Box::<bluetooth_uart::Line>::default(),
+                    Box::new(bluetooth_uart::Line::new(
+                        Arc::clone(&soc.clock),
+                        Arc::clone(&soc.bluetooth),
+                    )),
                     bluetooth_uart::INTID,
                 ),
             ),
         ];
+        bluetooth_uart::keep_radio(&uarts[2].2, Arc::clone(&soc.clock));
         for (base, name, uart) in &uarts {
             bus.map(name, *base, serial::SIZE, Box::new(Arc::clone(uart)));
         }
@@ -567,16 +755,39 @@ impl Soc {
         bus.map("PMC", pmc::BASE, pmc::SIZE, Box::new(Arc::clone(&soc.pmc)));
         bus.map(
             "pin multiplexer",
-            PINMUX_BASE,
-            PINMUX_SIZE,
-            Box::new(RegisterFile::zeroed([])),
+            pinmux::BASE,
+            pinmux::SIZE,
+            Box::new(if power_on {
+                pinmux::power_on()
+            } else {
+                pinmux::at_kernel_entry()
+            }),
         );
-        bus.map(
-            "pad groups",
-            PAD_GROUPS_BASE,
-            PAD_GROUPS_SIZE,
-            Box::new(RegisterFile::zeroed([])),
-        );
+        if power_on {
+            bus.map(
+                "APB_MISC",
+                apb_misc::BASE,
+                apb_misc::SIZE,
+                Box::new(apb_misc::ApbMisc::power_on()),
+            );
+        } else {
+            // The pad control groups, configuration that starts at zero
+            // like the pin multiplexer, and the chip ID: what the kernel's
+            // processes reach of the block.
+            let pads = apb_misc::PAD_GROUPS;
+            bus.map(
+                "pad groups",
+                apb_misc::BASE + pads.start,
+                pads.end - pads.start,
+                Box::new(RegisterFile::zeroed([])),
+            );
+            bus.map(
+                "chip ID",
+                apb_misc::BASE + apb_misc::HIDREV,
+                4,
+                Box::new(RegisterFile::strict([(0, apb_misc::HIDREV_VALUE)])),
+            );
+        }
         bus.map(
             "memory controller",
             mc::BASE,
@@ -589,7 +800,11 @@ impl Soc {
             gpio::SIZE,
             Box::new(Arc::clone(&soc.gpio)),
         );
-        let emc: Arc<emc::Emc> = Arc::default();
+        let emc: Arc<emc::Emc> = Arc::new(if power_on {
+            emc::Emc::power_on()
+        } else {
+            emc::Emc::default()
+        });
         let (clock_change, disp1, disp2) =
             (Arc::clone(&emc), Arc::clone(&soc.dc), Arc::clone(&soc.dcb));
         let agic = Arc::new(agic::Agic::new(soc.line(agic::INTID)));
@@ -647,7 +862,12 @@ impl Soc {
             )),
         );
         let adsp_reset = Arc::clone(&adsp);
-        let car = Car::new()
+        let car = if power_on {
+            Car::power_on()
+        } else {
+            Car::new()
+        };
+        let car = car
             .on_emc_clock_change(Box::new(move || clock_change.clock_changed()))
             // RST_DEVICES_L bits 27 and 26: DISP1 and DISP2 (hekate `clock.h`).
             .on_reset_asserted(0x004, 27, Box::new(move || disp1.reset()))
@@ -662,6 +882,127 @@ impl Soc {
                 adsp::RESET_BIT,
                 Box::new(move || adsp.release()),
             );
+        let car = match &soc.boot {
+            Some(boot) => {
+                let signal = |set: fn(&BootSignals)| {
+                    let signals = Arc::clone(&boot.signals);
+                    Box::new(move || set(&signals))
+                };
+                bus.map(
+                    "IRAM",
+                    iram::BASE,
+                    iram::SIZE,
+                    Box::new(Arc::clone(&boot.iram)),
+                );
+                bus.map(
+                    "address space after IRAM",
+                    iram::RESERVED_BASE,
+                    iram::RESERVED_SIZE,
+                    Box::new(iram::AfterIram::new(Arc::clone(&soc.notes))),
+                );
+                // The BPMP's cache controller (hekate `bpmp.c`
+                // `BPMP_CACHE_CONFIG`; Atmosphère `tegra_avp_cache.hpp`):
+                // only its configuration register, which the monitor's SC7
+                // stub changes by read-modify-write (it sets DISABLE_WB and
+                // DISABLE_RB, bits 10 and 11, text `0x40003464`). No cache
+                // is emulated, so its bits only store. \[assumption\] It
+                // reads 0 (cache disabled) until written: no stage of the
+                // boot chain writes it before the stub, and its power-on
+                // value is not public. Its other registers keep what is
+                // written and refuse reads until then.
+                bus.map(
+                    "BPMP cache controller",
+                    BPMP_CACHE_BASE,
+                    0x1000,
+                    Box::new(RegisterFile::strict([(0x000, 0)])),
+                );
+                bus.map(
+                    "TZRAM",
+                    tzram::BASE,
+                    tzram::SIZE,
+                    Box::new(Arc::clone(&boot.tzram)),
+                );
+                bus.map(
+                    "flow controller",
+                    flow::BASE,
+                    flow::SIZE,
+                    Box::new(Arc::clone(&boot.flow)),
+                );
+                bus.map(
+                    "legacy interrupt controller",
+                    ictlr::BASE,
+                    ictlr::SIZE,
+                    Box::new(Arc::clone(&boot.ictlr)),
+                );
+                bus.map(
+                    "exception vectors",
+                    evp::BASE,
+                    evp::SIZE,
+                    Box::new(Arc::clone(&boot.evp)),
+                );
+                bus.map(
+                    "secure boot registers",
+                    sb::BASE,
+                    sb::SIZE,
+                    Box::new(Arc::clone(&boot.sb)),
+                );
+                bus.map(
+                    "AHB arbitration",
+                    ahb::BASE,
+                    ahb::SIZE,
+                    Box::new(ahb::power_on()),
+                );
+                for (channel, base) in mc_channel::CHANNEL_BASES.into_iter().enumerate() {
+                    let aperture = mc_channel::McChannel::new(&soc.mc, channel)
+                        .expect("a powered-on memory controller has channel apertures");
+                    bus.map(
+                        ["MC0", "MC1"][channel],
+                        base,
+                        mc_channel::SIZE,
+                        Box::new(aperture),
+                    );
+                }
+                bus.map(
+                    "SYSCTR0",
+                    sysctr0::BASE,
+                    sysctr0::SIZE,
+                    Box::new(sysctr0::Sysctr0::power_on()),
+                );
+                let mselect = Arc::new(mselect::Mselect::power_on());
+                bus.map(
+                    "MSELECT",
+                    mselect::BASE,
+                    mselect::SIZE,
+                    Box::new(Arc::clone(&mselect)),
+                );
+                let (held, released) = (Arc::clone(&mselect), mselect);
+                car.on_cpu0_released(signal(|s| s.cpu0_released.store(true, Ordering::Release)))
+                    .on_reset_asserted(
+                        mselect::RESET.0,
+                        mselect::RESET.1,
+                        Box::new(move || held.hold()),
+                    )
+                    .on_reset_released(
+                        mselect::RESET.0,
+                        mselect::RESET.1,
+                        Box::new(move || released.release()),
+                    )
+                    .on_reset_asserted(
+                        COP_RESET.0,
+                        COP_RESET.1,
+                        signal(|s| s.cop_held.store(true, Ordering::Release)),
+                    )
+                    .on_reset_released(
+                        COP_RESET.0,
+                        COP_RESET.1,
+                        signal(|s| {
+                            s.cop_held.store(false, Ordering::Release);
+                            s.cop_restarted.store(true, Ordering::Release);
+                        }),
+                    )
+            }
+            None => car,
+        };
         bus.map("clock and reset", car::BASE, car::SIZE, Box::new(car));
         bus.map(
             "CL-DVFS",
@@ -679,18 +1020,12 @@ impl Soc {
             let port = EmcPort::new(&emc, View::Channel(channel));
             bus.map(["EMC0", "EMC1"][channel], base, emc::SIZE, Box::new(port));
         }
-        bus.map(
-            "timers",
-            tmr::BASE,
-            tmr::SIZE,
-            Box::new(Timers::new(elapsed(clock))),
-        );
-        bus.map(
-            "chip ID",
-            HIDREV_BASE,
-            4,
-            Box::new(RegisterFile::strict([(0, HIDREV)])),
-        );
+        let timers = if power_on {
+            Timers::power_on(elapsed(clock))
+        } else {
+            Timers::new(elapsed(clock))
+        };
+        bus.map("timers", tmr::BASE, tmr::SIZE, Box::new(timers));
         let measurements = [
             FUSE_CPU_SPEEDO_0_CALIB,
             FUSE_CPU_IDDQ_CALIB,
@@ -703,11 +1038,30 @@ impl Soc {
             FUSE_USB_CALIB,
             FUSE_USB_CALIB_EXT,
         ];
+        let configuration = params.dram.dram_id().map(|id| {
+            let id = id as u32;
+            let dram_id = (id & 0x1F) << 3 | (id >> 5 & 7) << 12;
+            (FUSE_RESERVED_ODM4, ODM4_ICOSA_PRODUCTION | dram_id)
+        });
+        let console = [
+            (FUSE_SOC_SPEEDO_1_CALIB, BOOTROM_PATCH_VERSION),
+            (FUSE_RESERVED_ODM6, 0),
+            (FUSE_RESERVED_ODM7, ANTI_DOWNGRADE_FUSES),
+            (FUSE_SPARE_BIT_5, 1),
+        ];
         bus.map(
             "fuses",
             FUSE_BASE,
             FUSE_SIZE,
-            Box::new(RegisterFile::strict(measurements.map(|fuse| (fuse, 0)))),
+            Box::new(RegisterFile::strict(
+                measurements
+                    .map(|fuse| (fuse, 0))
+                    .into_iter()
+                    .chain(console)
+                    .chain(FUSES_THE_BOOTLOADER_CHECKS)
+                    .chain(configuration)
+                    .chain(crate::bootrom::fuses_after_boot()),
+            )),
         );
         let gauge: Box<dyn I2cDevice> =
             Box::new(Max17050::new(Battery::FULL, Arc::clone(&soc.notes)));
@@ -870,13 +1224,26 @@ impl Soc {
 
     /// The screen as it is right now.
     pub fn screen(&self) -> Result<Screen, NoFrame> {
+        let frame = self.dc.frame_turned_clockwise(&self.display_memory)?;
+        let Panel {
+            panel_on,
+            backlight_on,
+        } = self.panel();
+        Ok(Screen {
+            frame,
+            panel_on,
+            backlight_on,
+        })
+    }
+
+    /// How the panel and its backlight stand right now.
+    pub fn panel(&self) -> Panel {
         let powered = self.gpio.output(BACKLIGHT_PORT, BACKLIGHT_ENABLE_PIN) == Some(true);
         let dimmer = self.pwm.get(0).unwrap_or(0);
-        Ok(Screen {
-            frame: self.dc.frame_turned_clockwise(&self.display_memory)?,
+        Panel {
             panel_on: self.dsi.panel_is_showing(),
             backlight_on: powered && dimmer & PWM_ENABLE != 0 && dimmer & PWM_WIDTH != 0,
-        })
+        }
     }
 
     /// Keeps the display controllers' frames going until `stop` is set; see
@@ -917,4 +1284,65 @@ impl Soc {
 fn line(gic: &Arc<Gic>, intid: u32) -> Box<dyn Fn(bool) + Send + Sync> {
     let gic = Arc::clone(gic);
     Box::new(move |level| gic.set_line(0, intid, level))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        boot::{CORE_COUNT, DRAM_BASE},
+        bus::MmioDevice,
+    };
+
+    #[test]
+    fn the_panel_reads_lit_while_the_display_controller_composes_no_picture() {
+        let params = BootParams::default();
+        let gic = Arc::new(Gic::new(CORE_COUNT, Box::new(|_| {})));
+        let ram = Arc::new(GuestRam::new(DRAM_BASE, params.dram.bytes() as usize).unwrap());
+        let clock = Arc::new(GuestClock::new());
+        let soc = Soc::new(
+            &params,
+            &gic,
+            &ram,
+            &clock,
+            None,
+            None,
+            false,
+            &mut Bus::default(),
+        )
+        .unwrap();
+        let dark = Panel {
+            panel_on: false,
+            backlight_on: false,
+        };
+        assert_eq!(soc.panel(), dark);
+
+        // DSI: controller on, then exit sleep and display on, as short
+        // packets through the write FIFO (`WR_DATA`, `TRIGGER`).
+        let dsi = |offset: u64, value: u32| soc.dsi.write(0, offset, 4, value.into()).unwrap();
+        dsi(0x2C, 1);
+        for packet in [0x1105, 0x2905] {
+            dsi(0x28, packet);
+            dsi(0x4C, 1 << 1);
+        }
+        // The backlight driver's enable, GPIO port V pin 1 (controller 5,
+        // port 1), driven high, and the dimmer at full duty.
+        let pin = 1 << BACKLIGHT_ENABLE_PIN;
+        for row in [0x00, 0x10, 0x20] {
+            soc.gpio.write(0, 0x504 + row, 4, pin).unwrap();
+        }
+        soc.pwm.set(0, PWM_ENABLE | PWM_WIDTH);
+
+        assert!(
+            soc.screen().is_err(),
+            "the display controller was never set up"
+        );
+        assert_eq!(
+            soc.panel(),
+            Panel {
+                panel_on: true,
+                backlight_on: true,
+            }
+        );
+    }
 }

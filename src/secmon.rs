@@ -34,15 +34,20 @@
 //! On the console the monitor then powers the whole SoC down but for the
 //! PMC and the memory, which keeps itself; a wake event starts the SoC
 //! from its boot ROM, whose warm boot path leads back into the monitor,
-//! and the monitor starts core 0 where the kernel asked. Here nothing
-//! loses power: core 0 stands still until a wake event and then starts at
-//! that address, and every device is as the firmware left it instead of
-//! out of reset. The firmware's drivers put back what a real sleep loses,
-//! which here writes what is already there. Before sleeping the monitor
-//! checks that the other cores are off and the SoC is in the state its
-//! sleep sequence expects (exosphere `secmon_smc_power_management.cpp`,
-//! `ValidateSocStateForSuspend`; `SLEEP_REQUIREMENTS` here), and aborts
-//! otherwise.
+//! and the monitor starts core 0 where the kernel asked. In a machine that
+//! ran the boot chain (the monitor did its [`cold_boot`]) that is what
+//! happens: the monitor prepares SC7 as the real one does and restarts the
+//! BPMP on its SC7 stub ([`sc7`], [`SmcEffect::SystemSuspend`]), and the
+//! warmboot firmware releases core 0 into its resume
+//! ([`SecureMonitor::core0_released`]). In one started from a kernel ELF
+//! nothing loses power: core 0 stands still until a wake event and then
+//! starts at that address, and every device is as the firmware left it
+//! instead of out of reset; the firmware's drivers put back what a real
+//! sleep loses, which there writes what is already there. Before sleeping
+//! the monitor checks that the other cores are off and the SoC is in the
+//! state its sleep sequence expects (exosphere
+//! `secmon_smc_power_management.cpp`, `ValidateSocStateForSuspend`;
+//! `SLEEP_REQUIREMENTS` here), and aborts otherwise.
 //!
 //! Config items read while booting: 1, 10 (memory mode), 11 and 12 (kernel
 //! configuration). Every wrapper in the kernel treats a non-zero status as
@@ -52,16 +57,21 @@
 
 use std::{fmt, sync::Mutex};
 
+pub mod cold_boot;
 pub mod crypto;
+pub mod sc7;
+
+pub use cold_boot::{ColdBoot, ColdBootContext, ColdBootError, Released};
 
 use crate::{
-    boot::{BootParams, CORE_COUNT, DRAM_BASE, DramSize, KernelConfiguration},
+    boot::{BootParams, CORE_COUNT, DRAM_BASE, DramSize},
     bus::{Access, Bus},
     keys::{Key, KeySet},
     memory::GuestRam,
     soc::mc::DeviceMemory,
 };
 
+use self::cold_boot::BootSettings;
 use self::crypto::{CipherMode, Crypto, CryptoError, RSA_SIZE, SavedCrypto};
 use crate::snapshot::{Snapshot, SnapshotError, decode, encode};
 
@@ -147,6 +157,10 @@ pub enum Abort {
     /// Sleep asked for with the SoC in a state the monitor does not put to
     /// sleep: a register the monitor checks off its required value.
     SocNotReadyForSleep { what: &'static str, value: u32 },
+    /// The monitor panics while preparing SC7 ([`sc7`]).
+    SuspendPanic(&'static str),
+    /// A step of the SC7 preparation that is not modelled here.
+    SuspendNotModelled(&'static str),
 }
 
 impl fmt::Display for Abort {
@@ -167,6 +181,10 @@ impl fmt::Display for Abort {
                     f,
                     "sleep asked for without {what} (register reads {value:#010x})"
                 )
+            }
+            Self::SuspendPanic(what) => write!(f, "while preparing SC7: {what}"),
+            Self::SuspendNotModelled(what) => {
+                write!(f, "SC7 preparation not modelled here: {what}")
             }
         }
     }
@@ -287,16 +305,16 @@ pub mod config_item {
     pub const HARDWARE_STATE: u32 = 6;
     /// Removed in firmware 4.0.0; the monitor answers invalid argument.
     pub const BOOT_REASON: u32 = 9;
-    /// The package2 hash: given only in a recovery boot, which this is
-    /// not, so invalid argument.
+    /// The SHA-256 of the whole package2, in `X1`-`X4`: given only in a
+    /// recovery boot, invalid argument otherwise (the 23.5.0 monitor's
+    /// GetConfig; the hash is taken on cold boot, [`super::cold_boot`]).
     pub const PACKAGE2_HASH: u32 = 17;
-    /// A field of the boot configuration the bootloader hands the monitor
-    /// (`BootConfig.data` at `+0x70`, unnamed in exosphere). A retail
-    /// console boots without a signed boot configuration, so the field is
-    /// zero \[assumption: the block is zero-filled, as exosphere's default
-    /// is\].
+    /// The quadword at `+0x70` of the boot config the bootloader hands the
+    /// monitor. A production console's monitor ignores the boot config
+    /// (the 23.5.0 monitor zeroes its copy), so the field is zero.
     pub const UNKNOWN_18: u32 = 18;
-    /// Whether the console was started into its recovery (maintenance) mode.
+    /// Whether the console was started into its recovery (maintenance)
+    /// mode: bit 0 of IRAM `0x4000001C` on cold boot, else not.
     pub const IS_RECOVERY_BOOT: u32 = 7;
     pub const DEVICE_ID: u32 = 8;
     /// Whether the console is a shop's interactive display unit, a fuse
@@ -390,10 +408,10 @@ const CORE_PARTITIONS: [u32; CORE_COUNT] = [14, 9, 10, 11];
 /// `(register, mask, required value, what it means)`; anything else
 /// aborts (exosphere `ValidateSocStateForSuspend`, bit positions from the
 /// TRM's clock and reset device numbering). Two of its checks are not
-/// here, as nothing in this machine can fail them: the BPMP halted by the
-/// flow controller (no BPMP runs) and USB, USB2, AHB DMA and the BPMP kept
-/// off the AHB arbiter (the boot chain's setting, in a block no guest
-/// software reaches here).
+/// here: the BPMP parked by the flow controller, which only a machine
+/// that runs the boot chain has and checks ([`sc7`]), and USB, USB2, AHB
+/// DMA and the BPMP kept off the AHB arbiter (the boot chain's setting, in
+/// a block not modelled here).
 const SLEEP_REQUIREMENTS: [(u64, u32, u32, &str); 8] = [
     (PMC_PWRGATE_STATUS, 7 << 9, 0, "cores 1 to 3 power-gated"),
     (
@@ -579,6 +597,12 @@ pub enum SmcEffect {
     /// wakes, the calling core starts at physical `entry` with `context`
     /// in `X0`.
     Sleep { entry: u64, context: u64 },
+    /// The console goes into SC7 through the boot chain's own firmware
+    /// ([`sc7`]): the monitor has prepared it and restarted the BPMP on
+    /// its SC7 stub. The call does not return and the calling core (core
+    /// 0) is off; it starts again only when the warmboot firmware releases
+    /// it, which [`SecureMonitor::core0_released`] turns into the resume.
+    SystemSuspend,
     /// The kernel reported a fatal error. The call does not return.
     Panic { code: u32 },
     /// The monitor gives up, as the console's does; nothing runs on.
@@ -611,9 +635,9 @@ pub struct Carveout {
 
 pub struct SecureMonitor {
     dram: DramSize,
-    kernel_configuration: KernelConfiguration,
-    development_function_enabled: bool,
-    program_verification_disabled: bool,
+    /// What the monitor was built with; on the boot chain, the options
+    /// that override what the boot config says ([`cold_boot`]).
+    params: BootParams,
     device_id: u64,
     state: Mutex<State>,
 }
@@ -625,6 +649,9 @@ struct State {
     key_rng: SplitMix64,
     cores_on: [bool; CORE_COUNT],
     carveouts: [Carveout; CARVEOUT_COUNT],
+    /// The config items the boot config and the mailbox decide: the boot
+    /// parameters' until a cold boot sets them.
+    settings: BootSettings,
     crypto: Crypto,
     /// The asynchronous operation nobody has collected yet. The security
     /// engine stays taken until then: every call that uses it answers
@@ -633,6 +660,11 @@ struct State {
     /// [`config_item::IS_CHARGER_HI_Z_MODE_ENABLED`]. Nothing here powers
     /// the console off, so the flag is only remembered.
     charger_hi_z_mode: bool,
+    /// Whether the monitor did its cold boot ([`cold_boot`]): the machine
+    /// runs the boot chain, and sleep goes through SC7 ([`sc7`]).
+    boot_chain: bool,
+    /// The kernel's `(entry, context)` while the console is in SC7.
+    suspended: Option<(u64, u64)>,
 }
 
 /// An asynchronous operation's outcome, waiting for its key.
@@ -658,9 +690,12 @@ struct SavedState {
     key_rng: SplitMix64,
     cores_on: [bool; CORE_COUNT],
     carveouts: [Carveout; CARVEOUT_COUNT],
+    settings: BootSettings,
     crypto: SavedCrypto,
     pending: Option<Pending>,
     charger_hi_z_mode: bool,
+    boot_chain: bool,
+    suspended: Option<(u64, u64)>,
 }
 
 /// Everything the monitor learned since boot. What it was built with
@@ -674,9 +709,12 @@ impl Snapshot for SecureMonitor {
             key_rng: SplitMix64(state.key_rng.0),
             cores_on: state.cores_on,
             carveouts: state.carveouts,
+            settings: state.settings.clone(),
             crypto: state.crypto.save_state(),
             pending: state.pending.clone(),
             charger_hi_z_mode: state.charger_hi_z_mode,
+            boot_chain: state.boot_chain,
+            suspended: state.suspended,
         })
     }
 
@@ -687,9 +725,12 @@ impl Snapshot for SecureMonitor {
         state.key_rng = saved.key_rng;
         state.cores_on = saved.cores_on;
         state.carveouts = saved.carveouts;
+        state.settings = saved.settings;
         state.crypto.restore_state(saved.crypto);
         state.pending = saved.pending;
         state.charger_hi_z_mode = saved.charger_hi_z_mode;
+        state.boot_chain = saved.boot_chain;
+        state.suspended = saved.suspended;
         Ok(())
     }
 }
@@ -706,18 +747,19 @@ impl SecureMonitor {
         cores_on[0] = true;
         Self {
             dram: params.dram,
-            kernel_configuration: params.kernel_configuration,
-            development_function_enabled: params.development_function_enabled,
-            program_verification_disabled: params.program_verification_disabled,
+            params: *params,
             device_id: params.device_id,
             state: Mutex::new(State {
                 rng: SplitMix64(params.rng_seed),
                 key_rng,
                 cores_on,
                 carveouts: [Carveout::default(); CARVEOUT_COUNT],
+                settings: BootSettings::from_params(params),
                 crypto: Crypto::new(keys, seal_key),
                 pending: None,
                 charger_hi_z_mode: false,
+                boot_chain: false,
+                suspended: None,
             }),
         }
     }
@@ -918,6 +960,20 @@ impl SecureMonitor {
                 if others.filter(|&(other, &on)| on && other != core).count() != 0 {
                     return SmcEffect::Abort(Abort::SleepWithCoresOn);
                 }
+                let port = sc7::Port {
+                    bus,
+                    ram: engine.ram(),
+                };
+                if state.boot_chain {
+                    if state.charger_hi_z_mode {
+                        return SmcEffect::Abort(Abort::SuspendNotModelled(
+                            "the charger's high-impedance mode over I2C1",
+                        ));
+                    }
+                    if let Err(fail) = sc7::prepare(&port) {
+                        return sc7_effect(fail);
+                    }
+                }
                 for (register, mask, required, what) in SLEEP_REQUIREMENTS {
                     let Access::Done(value) = bus.read(0, register, 4) else {
                         let register = Unimplemented::Register {
@@ -930,6 +986,24 @@ impl SecureMonitor {
                     if value & mask != required {
                         return SmcEffect::Abort(Abort::SocNotReadyForSleep { what, value });
                     }
+                }
+                if state.boot_chain {
+                    match sc7::bpmp_parked(&port) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return SmcEffect::Abort(Abort::SocNotReadyForSleep {
+                                what: "the BPMP parked by the flow controller",
+                                value: port.read(cold_boot::HALT_COP_EVENTS).unwrap_or(0),
+                            });
+                        }
+                        Err(fail) => return sc7_effect(fail),
+                    }
+                    if let Err(fail) = sc7::suspend(&port) {
+                        return sc7_effect(fail);
+                    }
+                    state.suspended = Some((x[2], x[3]));
+                    state.cores_on[core] = false;
+                    return SmcEffect::SystemSuspend;
                 }
                 return SmcEffect::Sleep {
                     entry: x[2],
@@ -962,8 +1036,11 @@ impl SecureMonitor {
     /// GetConfig, through either gate: item in `W1`, value out in `X1`-`X4`.
     fn get_config(&self, x: &mut [u64; 8]) -> SmcEffect {
         let item = x[1] as u32;
+        let settings = self.state.lock().unwrap().settings.clone();
         let value = match item {
-            config_item::DISABLE_PROGRAM_VERIFICATION => self.program_verification_disabled.into(),
+            config_item::DISABLE_PROGRAM_VERIFICATION => {
+                settings.program_verification_disabled.into()
+            }
             config_item::DRAM_ID => match self.dram.dram_id() {
                 Some(id) => id,
                 None => return SmcEffect::Unimplemented(Unimplemented::ConfigItem(item)),
@@ -972,21 +1049,34 @@ impl SecureMonitor {
             config_item::FUSE_VERSION => FUSE_VERSION,
             config_item::HARDWARE_TYPE => HARDWARE_TYPE_ICOSA,
             config_item::HARDWARE_STATE => HARDWARE_STATE_PRODUCTION,
-            config_item::IS_RECOVERY_BOOT => 0,
+            config_item::IS_RECOVERY_BOOT => settings.recovery_package2_hash.is_some().into(),
+            config_item::PACKAGE2_HASH => match settings.recovery_package2_hash {
+                Some(hash) => {
+                    x[0] = STATUS_SUCCESS;
+                    for (register, word) in x[1..5].iter_mut().zip(hash.as_chunks::<8>().0) {
+                        *register = u64::from_le_bytes(*word);
+                    }
+                    return SmcEffect::Resume;
+                }
+                None => {
+                    x[0] = STATUS_INVALID_ARGUMENT;
+                    return SmcEffect::Resume;
+                }
+            },
             config_item::DEVICE_ID => self.device_id,
             config_item::RETAIL_INTERACTIVE_DISPLAY_STATE => 0,
             config_item::REGULATOR_TYPE => 0,
             config_item::DEVICE_UNIQUE_KEY_GENERATION => 0,
-            config_item::UNKNOWN_18 => 0,
+            config_item::UNKNOWN_18 => settings.unknown_18,
             config_item::IS_DEVELOPMENT_FUNCTION_ENABLED => {
-                self.development_function_enabled.into()
+                settings.development_function_enabled.into()
             }
-            config_item::MEMORY_MODE => self.dram.memory_mode(),
-            config_item::KERNEL_CONFIGURATION => self.kernel_configuration.bits(self.dram),
+            config_item::MEMORY_MODE => settings.memory_mode,
+            config_item::KERNEL_CONFIGURATION => settings.kernel_configuration,
             config_item::IS_CHARGER_HI_Z_MODE_ENABLED => {
                 self.state.lock().unwrap().charger_hi_z_mode.into()
             }
-            // Unknown items, and those not given on this console.
+            // Unknown items.
             _ => {
                 x[0] = STATUS_INVALID_ARGUMENT;
                 return SmcEffect::Resume;
@@ -1387,6 +1477,17 @@ pub fn function_name(immediate: u16, id: u32) -> &'static str {
     }
 }
 
+/// What the machine is told when the SC7 preparation fails.
+fn sc7_effect(fail: sc7::Sc7Fail) -> SmcEffect {
+    match fail {
+        sc7::Sc7Fail::Register { address, is_write } => {
+            SmcEffect::Unimplemented(Unimplemented::Register { address, is_write })
+        }
+        sc7::Sc7Fail::Panic(what) => SmcEffect::Abort(Abort::SuspendPanic(what)),
+        sc7::Sc7Fail::Stopped => SmcEffect::Abort(Abort::SuspendPanic("the machine stopped")),
+    }
+}
+
 /// Switches the power partition of `core` on or off, as the monitor does
 /// around starting and stopping it. `false` if the PMC refused.
 fn switch_core(bus: &Bus, core: usize, on: bool) -> bool {
@@ -1454,6 +1555,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        boot::KernelConfiguration,
         memory::GuestRam,
         soc::{mc, regs::RegisterFile},
     };

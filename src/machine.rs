@@ -1,9 +1,15 @@
 //! The emulated console: DRAM holding the kernel image, the secure monitor,
 //! the devices the kernel drives, and one host thread per started core.
 
+mod bpmp;
 mod snapshot;
 
+pub use self::bpmp::{
+    BPMP_CORE, Bpmp, BpmpExit, Env, NeverWakes, Power, PowerDomain, PowerOn, Slice, TsecPort,
+    WarmStart, apply_rom_bits, run,
+};
 pub use self::snapshot::SaveReport;
+
 use std::{
     collections::{BTreeMap, HashMap},
     fmt, io,
@@ -35,7 +41,7 @@ use crate::{
     secmon::{self, SecureMonitor, SmcEffect, Unimplemented},
     snapshot::Snapshot,
     soc::{
-        Screen, Soc,
+        Panel, Screen, Soc,
         dc::NoFrame,
         emmc::{EmmcImages, ImageError},
         mc::{self, DeviceMemory},
@@ -60,6 +66,8 @@ pub enum MachineError {
     ImageOutsideRam,
     Emmc(ImageError),
     Hypervisor(HvError),
+    /// The boot ROM's hand-off cannot be applied.
+    PowerOn(String),
 }
 
 impl fmt::Display for MachineError {
@@ -71,6 +79,7 @@ impl fmt::Display for MachineError {
             }
             Self::Emmc(error) => write!(f, "eMMC: {error}"),
             Self::Hypervisor(error) => write!(f, "hypervisor: {error}"),
+            Self::PowerOn(error) => write!(f, "boot ROM hand-off: {error}"),
         }
     }
 }
@@ -100,7 +109,7 @@ const SVC_RETURN: u64 = 0x800C_5488;
 const ERET: u32 = 0xD69F_03E0;
 
 /// At most this much of the memory a supervisor call names is captured.
-const CALL_DATA_LIMIT: u64 = 0x1000;
+pub const CALL_DATA_LIMIT: u64 = 0x1000;
 
 /// Address of the thread-local region of the thread a core runs, which the
 /// kernel sets when it switches threads (image 0x8009e590).
@@ -263,6 +272,10 @@ pub struct RunOptions<'a> {
     pub trace_smc: bool,
     /// Report every supervisor call and its return. Costs two breakpoints.
     pub trace_svc: bool,
+    /// How much of each buffer a request names, from its start, the
+    /// supervisor-call reports carry ([`ipc::SHOWN_BUFFER_BYTES`] is what a
+    /// trace line shows); at most [`CALL_DATA_LIMIT`] is read.
+    pub buffer_bytes: u64,
     /// Report every device register access.
     pub trace_devices: bool,
     /// Answer device accesses nothing models (reads with zero, writes by
@@ -462,6 +475,19 @@ pub enum CoreStop {
     /// return from supervisor calls where the kernel this was written for
     /// does.
     UnknownSupervisorReturn,
+    /// The BPMP cannot go on (an access or instruction not modelled, or a
+    /// release of core 0 that is not); what it ran into is in the device
+    /// notes.
+    Bpmp {
+        pc: u32,
+    },
+    /// The secure monitor's cold boot or SC7 resume failed; why is in the
+    /// device notes.
+    ColdBoot,
+    /// The core was powered off for SC7 (`CPU_SUSPEND` in a machine powered
+    /// on): its thread ends, but the machine goes on. It is not reported;
+    /// the warmboot firmware's release of core 0 starts a new thread.
+    Suspended,
 }
 
 impl fmt::Display for CoreStop {
@@ -549,6 +575,12 @@ impl fmt::Display for CoreStop {
                 "cannot trace supervisor calls: this kernel image has no ERET at \
                  {SVC_RETURN:#x}, where the kernel that tracing knows returns from them"
             ),
+            Self::Bpmp { pc } => write!(f, "the BPMP stopped at {pc:#010x} (see the note)"),
+            Self::ColdBoot => write!(
+                f,
+                "the secure monitor's cold boot or resume failed (see the note)"
+            ),
+            Self::Suspended => write!(f, "powered off for SC7"),
         }
     }
 }
@@ -687,16 +719,29 @@ fn build_id(rodata: &[u8]) -> Option<Vec<u8>> {
         })
 }
 
+/// What a machine starts from.
+pub enum Firmware {
+    /// The kernel, entered at EL1 on core 0 as the boot chain leaves it.
+    Kernel(KernelImage),
+    /// The boot ROM's hand-off: the boot chain runs, and the kernel is the
+    /// one the secure monitor's cold boot takes from package2.
+    PowerOn(PowerOn),
+}
+
 pub struct Machine {
     // Dropped first: the VM must be gone before the memory it maps, which
     // lives until the last device sharing it is dropped.
     vm: Vm,
     ram: Arc<GuestRam>,
-    image: KernelImage,
+    /// The kernel: given at kernel entry, set by the secure monitor's cold
+    /// boot in a machine powered on. Breakpoints, symbols and supervisor
+    /// call tracing resolve against it once it is there.
+    image: bpmp::Kernel,
     secmon: SecureMonitor,
     /// Memory as the security engine, which the monitor drives, reaches it.
     engine_memory: DeviceMemory,
-    bus: Bus,
+    /// Shared with the TSEC's view of the machine ([`TsecPort`]).
+    bus: Arc<Bus>,
     gic: Arc<Gic>,
     /// Guest time, which every clock the guest sees counts.
     clock: Arc<GuestClock>,
@@ -709,15 +754,23 @@ pub struct Machine {
     pause: Pause,
     /// Where the cores of a restored machine pick up, for the next run.
     restored: Mutex<Option<[Option<ParkedCore>; CORE_COUNT]>>,
+    /// The BPMP, in a machine powered on from the boot ROM's hand-off.
+    bpmp: Option<bpmp::Bpmp>,
 }
 
 impl Machine {
-    /// Builds the machine in its state at kernel entry: image in DRAM, no
-    /// core running. `emmc` holds the contents of the eMMC module, if one is
-    /// fitted, and `sd_card` those of the microSD card, if one is in the
-    /// slot. `uart_output` receives what the guest sends to UART-A.
+    /// Builds the machine as `firmware` says, no core running. With
+    /// [`Firmware::Kernel`] it is in its state at kernel entry, the image
+    /// in DRAM. With [`Firmware::PowerOn`] it is as the boot ROM leaves
+    /// it: the SoC out of reset ([`Soc::new`]), IRAM as the ROM wrote it,
+    /// the BPMP at the bootloader's entry, DRAM empty; its run starts the
+    /// BPMP, and core 0 starts when the bootloader releases it, through
+    /// the secure monitor's cold boot. `emmc` holds the contents of the
+    /// eMMC module, if one is fitted, and `sd_card` those of the microSD
+    /// card, if one is in the slot. `uart_output` receives what the guest
+    /// sends to UART-A.
     pub fn new(
-        image: KernelImage,
+        firmware: Firmware,
         params: &BootParams,
         keys: KeySet,
         emmc: Option<EmmcImages>,
@@ -727,8 +780,16 @@ impl Machine {
         let size =
             usize::try_from(params.dram.bytes()).expect("DRAM size fits the host address space");
         let ram = Arc::new(GuestRam::new(boot::DRAM_BASE, size).map_err(MachineError::Ram)?);
-        ram.write(image.load_address(), image.bytes())
-            .ok_or(MachineError::ImageOutsideRam)?;
+        let image = bpmp::Kernel::default();
+        let power_on = match firmware {
+            Firmware::Kernel(kernel) => {
+                ram.write(kernel.load_address(), kernel.bytes())
+                    .ok_or(MachineError::ImageOutsideRam)?;
+                image.set(kernel);
+                None
+            }
+            Firmware::PowerOn(power_on) => Some(power_on),
+        };
         let vm = Vm::new()?;
         // SAFETY: `ram` is a page-aligned mmap that outlives `vm`.
         unsafe { vm.map(ram.host_ptr(), ram.base(), ram.size())? };
@@ -762,8 +823,22 @@ impl Machine {
             GIC_CPU_INTERFACE_SIZE,
             Box::new(GicCpuInterface(Arc::clone(&gic))),
         );
-        let soc = Soc::new(params, &gic, &ram, &clock, emmc, sd_card, &mut bus)
-            .map_err(MachineError::Emmc)?;
+        let soc = Soc::new(
+            params,
+            &gic,
+            &ram,
+            &clock,
+            emmc,
+            sd_card,
+            power_on.is_some(),
+            &mut bus,
+        )
+        .map_err(MachineError::Emmc)?;
+        let bus = Arc::new(bus);
+        let bpmp = power_on
+            .map(|power_on| bpmp::Bpmp::power_on(&power_on, &soc, &bus, &keys))
+            .transpose()
+            .map_err(MachineError::PowerOn)?;
 
         Ok(Self {
             vm,
@@ -780,6 +855,7 @@ impl Machine {
             signals,
             pause: Pause::default(),
             restored: Mutex::new(None),
+            bpmp,
         })
     }
 
@@ -797,6 +873,12 @@ impl Machine {
     /// What the console's screen shows at this moment.
     pub fn screen(&self) -> Result<Screen, NoFrame> {
         self.soc.screen()
+    }
+
+    /// How the panel and its backlight stand, whether or not a picture
+    /// can be composed.
+    pub fn panel(&self) -> Panel {
+        self.soc.panel()
     }
 
     /// Puts a finger on the touchscreen at `(x, y)` or moves it there
@@ -822,6 +904,11 @@ impl Machine {
         self.soc.joycons.press(button, held);
     }
 
+    /// Holds an NFC tag over the right Joy-Con's reader, or takes it away.
+    pub fn place_tag(&self, tag: Option<crate::soc::ntag::Ntag215>) {
+        self.soc.joycons.place_tag(tag);
+    }
+
     /// Holds the console's power button, or lets go of it.
     pub fn press_power(&self, held: bool) {
         self.soc.pmic.power_key(held);
@@ -833,6 +920,12 @@ impl Machine {
             .wifi
             .get()
             .expect("the SoC attaches its WiFi function when built")
+    }
+
+    /// What is in range of the console's Bluetooth radio: a Pro Controller
+    /// once placed there, its buttons and its SYNC button.
+    pub fn bluetooth(&self) -> &crate::soc::bluetooth_uart::Air {
+        &self.soc.bluetooth
     }
 
     pub fn secure_monitor(&self) -> &SecureMonitor {
@@ -885,12 +978,23 @@ impl Machine {
                             session.start_core(scope, core, Start::Restored { cpu, debug });
                         }
                     }
+                    if session.powers_on() {
+                        session.start_bpmp(scope);
+                    }
                     self.clock.resume();
                 }
+                // Powered on: the BPMP runs the boot chain, which starts
+                // core 0.
+                None if session.powers_on() => session.start_bpmp(scope),
                 None => session.start_core(
                     scope,
                     0,
-                    Start::Entry(CoreEntry::primary(self.image.load_address())),
+                    Start::Entry(CoreEntry::primary(
+                        self.image
+                            .get()
+                            .expect("a machine at kernel entry has its kernel")
+                            .load_address(),
+                    )),
                 ),
             }
             let deadline = options.timeout.map(|timeout| Instant::now() + timeout);
@@ -1089,9 +1193,15 @@ impl Machine {
     /// relies on, when a core first starts and when one starts again
     /// after having been switched off; the rest of its state it sets up
     /// itself, so what a core that starts again still holds from before
-    /// does not matter.
+    /// does not matter. In a machine powered on, `SCTLR_EL1` is what the
+    /// real monitor leaves ([`bpmp::MONITOR_SCTLR_EL1`]).
     fn start_vcpu(&self, vcpu: &Vcpu, entry: CoreEntry) -> Result<(), HvError> {
-        vcpu.set_sys_reg(SysReg::SCTLR_EL1, boot::ENTRY_SCTLR_EL1)?;
+        let sctlr = if self.bpmp.is_some() {
+            bpmp::MONITOR_SCTLR_EL1
+        } else {
+            boot::ENTRY_SCTLR_EL1
+        };
+        vcpu.set_sys_reg(SysReg::SCTLR_EL1, sctlr)?;
         vcpu.set_pstate(boot::ENTRY_PSTATE)?;
         vcpu.set_pc(entry.pc)?;
         vcpu.set_gpr(0, entry.x0)
@@ -1270,7 +1380,7 @@ impl Machine {
         let physical = regime.translate(address - offset, |table| self.ram.read_u64(table))?;
         let mut page = [0; PAGE_SIZE as usize];
         self.ram.read(physical, &mut page)?;
-        Some(self.image.locate_page(&page)? + offset)
+        Some(self.image.get()?.locate_page(&page)? + offset)
     }
 
     /// Value of a system register whose reads trap to the host.
@@ -1565,8 +1675,14 @@ impl<'env> Session<'env> {
                 stop: CoreStop::HostPanic,
                 state: None,
             });
-            // The receiver outlives the scope, so this cannot fail.
-            let _ = self.reports.send(report);
+            // The receiver outlives the scope, so this cannot fail. A core
+            // powered off for SC7 does not end the run: it only stops being
+            // counted.
+            if matches!(report.stop, CoreStop::Suspended) {
+                self.started.fetch_sub(1, Ordering::SeqCst);
+            } else {
+                let _ = self.reports.send(report);
+            }
             if let Err(payload) = outcome {
                 panic::resume_unwind(payload);
             }
@@ -1626,6 +1742,16 @@ impl<'env> Session<'env> {
             }
         };
         machine.signals.attach(core, None);
+        if let CoreStop::Suspended = stop {
+            // Detached first, so that a thread core 0's release starts next
+            // (which waits for this) never has its signals taken away.
+            self.switches[core].lock().unwrap().0 = false;
+            return CoreReport {
+                core,
+                stop,
+                state: None,
+            };
+        }
         let mut state = machine.core_state(&vcpu).ok();
         // What the core runs at this instant may not be a thread of the
         // process whose address space it is in; tracing may still know it.
@@ -1744,8 +1870,8 @@ impl<'env> Session<'env> {
             // return only for calls it could also have reported.
             if vector >> 63 != 0
                 && let Some(slide) = self.kernel_slide(vcpu)?
+                && let Some(image) = self.machine.image.get()
             {
-                let image = &self.machine.image;
                 let instruction = SVC_RETURN
                     .checked_sub(image.load_address())
                     .and_then(|offset| image.bytes().get(offset as usize..)?.first_chunk());
@@ -1954,7 +2080,7 @@ impl<'env> Session<'env> {
         buffers
             .iter()
             .map(|&buffer| {
-                let shown = buffer.size.min(ipc::SHOWN_BUFFER_BYTES);
+                let shown = buffer.size.min(self.options.buffer_bytes);
                 let bytes = self.machine.call_data(vcpu, buffer.address, shown)?;
                 Ok(ipc::Contents { buffer, bytes })
             })
@@ -2097,6 +2223,16 @@ impl<'env> Session<'env> {
                 }
                 (self.options.trace)(TraceEvent::Woke { core });
                 CoreEntry::secondary(entry, context)
+            }
+            SmcEffect::SystemSuspend => {
+                // The monitor prepared SC7 and restarted the BPMP on its
+                // stub; core 0 is off. It is no longer a thread a snapshot
+                // waits for, and starts again only when the warmboot
+                // firmware releases it (`Session::start_cold_boot`).
+                let mut pause = machine.pause.state.lock().unwrap();
+                pause.threads[core] = false;
+                machine.pause.changed.notify_all();
+                return Ok(Some(CoreStop::Suspended));
             }
             SmcEffect::Resume | SmcEffect::StartCore { .. } => {
                 for (index, &register) in registers.iter().enumerate() {

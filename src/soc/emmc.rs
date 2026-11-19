@@ -17,14 +17,14 @@
 //! protected partition and the boot operation mode are not modeled; their
 //! commands are illegal here and leave a note.
 
-use std::{collections::HashMap, fs::File, io, sync::Arc};
+use std::{collections::HashMap, io, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
 use super::{
     Notes,
-    medium::{Medium, MediumState, SECTOR_SIZE},
-    sdmmc::{Card, Response},
+    medium::{ImageFile, Medium, MediumError, MediumState, SECTOR_SIZE},
+    sdmmc::{BlockError, Card, Response},
 };
 use crate::snapshot::{SnapshotError, decode, encode};
 
@@ -118,9 +118,9 @@ const DEVICE: &str = "eMMC";
 /// Image files behind the module's partitions.
 pub struct EmmcImages {
     /// The user area; its length is the module's capacity.
-    pub user: File,
+    pub user: ImageFile,
     /// The two boot partitions, erased where no image is given.
-    pub boot: [Option<File>; 2],
+    pub boot: [Option<ImageFile>; 2],
     /// Write to the images (which must be open for writing) instead of
     /// keeping this run's writes in memory.
     pub writable: bool,
@@ -211,7 +211,7 @@ struct Saved<'a> {
 
 impl Emmc {
     pub fn new(images: EmmcImages, notes: Arc<Notes>) -> Result<Self, ImageError> {
-        let size = images.user.metadata().map_err(ImageError::Io)?.len();
+        let size = images.user.file.metadata().map_err(ImageError::Io)?.len();
         let sectors = size / SECTOR_SIZE as u64;
         if !size.is_multiple_of(SECTOR_SIZE as u64)
             || sectors <= MINIMUM_USER_SECTORS
@@ -219,9 +219,9 @@ impl Emmc {
         {
             return Err(ImageError::UserAreaSize(size));
         }
-        let boot = |image: Option<File>| {
+        let boot = |image: Option<ImageFile>| {
             if let Some(image) = &image {
-                let size = image.metadata().map_err(ImageError::Io)?.len();
+                let size = image.file.metadata().map_err(ImageError::Io)?.len();
                 if size > BOOT_PARTITION_SECTORS * SECTOR_SIZE as u64 {
                     return Err(ImageError::BootPartitionSize(size));
                 }
@@ -298,6 +298,19 @@ impl Emmc {
     fn selected_partition(&mut self) -> Option<&mut Medium> {
         let access = self.ext_csd[ext_csd::PARTITION_CONFIG] & ext_csd::PARTITION_ACCESS;
         self.partitions.get_mut(usize::from(access))
+    }
+
+    /// What a partition's answer to a data transfer is to the controller.
+    /// A sector out of range is reported in the next status as well.
+    fn sectors_moved(&mut self, moved: Result<(), MediumError>) -> Result<(), BlockError> {
+        match moved {
+            Ok(()) => Ok(()),
+            Err(MediumError::OutOfRange) => {
+                self.errors |= status::ADDRESS_OUT_OF_RANGE;
+                Err(BlockError::Timeout)
+            }
+            Err(MediumError::Host(note)) => Err(BlockError::Host(note)),
+        }
     }
 
     fn start_transfer(
@@ -476,17 +489,20 @@ impl Card for Emmc {
         }
     }
 
-    /// The next block the card sends. `None` when it is not sending, or
-    /// `block` is not the size of what it sends.
-    fn send_block(&mut self, block: &mut [u8]) -> Option<()> {
-        (self.state == State::SendingData).then_some(())?;
-        match self.data.as_mut()? {
+    /// The next block the card sends.
+    fn send_block(&mut self, block: &mut [u8]) -> Result<(), BlockError> {
+        if self.state != State::SendingData {
+            return Err(BlockError::Timeout);
+        }
+        match self.data.as_mut().ok_or(BlockError::Timeout)? {
             Data::Block(bytes) => {
-                (block.len() == bytes.len()).then_some(())?;
+                if block.len() != bytes.len() {
+                    return Err(BlockError::Timeout);
+                }
                 block.copy_from_slice(&bytes[..]);
                 self.end_of_block(Some(0));
             }
-            Data::Tuning => return None,
+            Data::Tuning => return Err(BlockError::Timeout),
             Data::Sectors { next, left } => {
                 let sector = *next;
                 *next += 1;
@@ -494,22 +510,22 @@ impl Card for Emmc {
                     *left -= 1;
                     *left
                 });
-                if self.selected_partition()?.read(sector, block).is_none() {
-                    self.errors |= status::ADDRESS_OUT_OF_RANGE;
-                    return None;
-                }
+                let partition = self.selected_partition().ok_or(BlockError::Timeout)?;
+                let read = partition.read(sector, block);
+                self.sectors_moved(read)?;
                 self.end_of_block(left);
             }
         }
-        Some(())
+        Ok(())
     }
 
-    /// Takes the next block the host sends. `None` when the card is not
-    /// receiving or cannot store the block.
-    fn receive_block(&mut self, block: &[u8]) -> Option<()> {
-        (self.state == State::ReceivingData).then_some(())?;
-        let Data::Sectors { next, left } = self.data.as_mut()? else {
-            return None;
+    /// Takes the next block the host sends.
+    fn receive_block(&mut self, block: &[u8]) -> Result<(), BlockError> {
+        if self.state != State::ReceivingData {
+            return Err(BlockError::Timeout);
+        }
+        let Some(Data::Sectors { next, left }) = self.data.as_mut() else {
+            return Err(BlockError::Timeout);
         };
         let sector = *next;
         *next += 1;
@@ -517,12 +533,11 @@ impl Card for Emmc {
             *left -= 1;
             *left
         });
-        if self.selected_partition()?.write(sector, block).is_none() {
-            self.errors |= status::ADDRESS_OUT_OF_RANGE;
-            return None;
-        }
+        let partition = self.selected_partition().ok_or(BlockError::Timeout)?;
+        let written = partition.write(sector, block);
+        self.sectors_moved(written)?;
         self.end_of_block(left);
-        Some(())
+        Ok(())
     }
 
     /// Consumes the tuning block if that is what the card is sending.
@@ -565,15 +580,6 @@ impl Card for Emmc {
 pub(crate) mod tests {
     use super::*;
 
-    /// A card with blank storage of `sectors` user sectors.
-    pub(crate) fn blank(sectors: u64) -> Emmc {
-        let boot = || Medium::new(DEVICE, BOOT_PARTITION_SECTORS, None, false);
-        Emmc::with_storage(
-            [Medium::new(DEVICE, sectors, None, false), boot(), boot()],
-            Arc::default(),
-        )
-    }
-
     fn short(response: Option<Response>) -> u32 {
         match response {
             Some(Response::Short(value)) => value,
@@ -583,7 +589,13 @@ pub(crate) mod tests {
 
     /// Takes a card through identification into the transfer state.
     pub(crate) fn selected(sectors: u64) -> Emmc {
-        let mut card = blank(sectors);
+        selected_over(Medium::new(DEVICE, sectors, None, false))
+    }
+
+    /// [`selected`], with `user` as its user area.
+    pub(crate) fn selected_over(user: Medium) -> Emmc {
+        let boot = || Medium::new(DEVICE, BOOT_PARTITION_SECTORS, None, false);
+        let mut card = Emmc::with_storage([user, boot(), boot()], Arc::default());
         assert_eq!(card.command(0, 0), None);
         assert_eq!(card.command(1, 0x4000_0080), Some(Response::Short(OCR)));
         assert_eq!(card.command(2, 0), Some(Response::Long(CID)));
@@ -611,7 +623,11 @@ pub(crate) mod tests {
         short(card.command(25, 100));
         card.receive_block(&pattern).unwrap();
         card.receive_block(&pattern).unwrap();
-        assert_eq!(card.receive_block(&pattern), None, "the count is used up");
+        assert_eq!(
+            card.receive_block(&pattern),
+            Err(BlockError::Timeout),
+            "the count is used up"
+        );
         assert_eq!(short(card.command(13, 2 << 16)) >> 9 & 0xF, 4);
 
         // An open-ended read across them, stopped by the host.
@@ -625,7 +641,7 @@ pub(crate) mod tests {
         card.send_block(&mut block).unwrap();
         assert_eq!(block, [0; SECTOR_SIZE]);
         assert_eq!(short(card.command(12, 0)) >> 9 & 0xF, 5, "was sending");
-        assert_eq!(card.send_block(&mut block), None);
+        assert_eq!(card.send_block(&mut block), Err(BlockError::Timeout));
     }
 
     #[test]

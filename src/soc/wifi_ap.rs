@@ -54,10 +54,10 @@ pub const RATES: [u8; 12] = [
 ];
 /// Capability information: ESS, short preamble, short slot time, and
 /// privacy when the network is secured (IEEE 802.11-2016 9.4.1.4).
-const CAPABILITY_ESS: u16 = 0x0001;
-const CAPABILITY_PRIVACY: u16 = 0x0010;
-const CAPABILITY_SHORT_PREAMBLE: u16 = 0x0020;
-const CAPABILITY_SHORT_SLOT: u16 = 0x0400;
+pub const CAPABILITY_ESS: u16 = 0x0001;
+pub const CAPABILITY_PRIVACY: u16 = 0x0010;
+pub const CAPABILITY_SHORT_PREAMBLE: u16 = 0x0020;
+pub const CAPABILITY_SHORT_SLOT: u16 = 0x0400;
 /// `WL_BSS_INFO_VERSION` and the fixed part of `wl_bss_info_t` (public
 /// `wlioctl.h`): the information elements follow at offset 128.
 const BSS_INFO_VERSION: u32 = 109;
@@ -155,37 +155,23 @@ impl AccessPoint {
         ies
     }
 
-    /// `wl_bss_info_t` (version 109) as the firmware reports the network in
-    /// scan results and `WLC_GET_BSS_INFO`, little-endian, length rounded
-    /// up to a multiple of 4.
+    /// `wl_bss_info_t` of the network as the firmware reports it in scan
+    /// results and `WLC_GET_BSS_INFO`.
     pub fn bss_info(&self) -> Vec<u8> {
-        let ies = self.ies();
-        let mut info = vec![0u8; BSS_INFO_FIXED_LEN];
-        let length = (BSS_INFO_FIXED_LEN + ies.len()).next_multiple_of(4);
         let mut capability = CAPABILITY_ESS | CAPABILITY_SHORT_PREAMBLE | CAPABILITY_SHORT_SLOT;
         if self.secured() {
             capability |= CAPABILITY_PRIVACY;
         }
-        info[0..4].copy_from_slice(&BSS_INFO_VERSION.to_le_bytes());
-        info[4..8].copy_from_slice(&(length as u32).to_le_bytes());
-        info[8..14].copy_from_slice(&BSSID);
-        info[14..16].copy_from_slice(&BEACON_PERIOD.to_le_bytes());
-        info[16..18].copy_from_slice(&capability.to_le_bytes());
-        info[18] = self.ssid.len() as u8;
-        info[19..19 + self.ssid.len()].copy_from_slice(&self.ssid);
-        info[52..56].copy_from_slice(&(RATES.len() as u32).to_le_bytes());
-        info[56..56 + RATES.len()].copy_from_slice(&RATES);
-        info[72..74].copy_from_slice(&self.chanspec().to_le_bytes());
-        info[76] = DTIM_PERIOD;
-        info[78..80].copy_from_slice(&RSSI_DBM.to_le_bytes());
-        info[80] = NOISE_DBM as u8;
-        info[88] = CHANNEL;
-        info[116..118].copy_from_slice(&(BSS_INFO_FIXED_LEN as u16).to_le_bytes());
-        info[120..124].copy_from_slice(&(ies.len() as u32).to_le_bytes());
-        info[124..126].copy_from_slice(&(RSSI_DBM - i16::from(NOISE_DBM)).to_le_bytes());
-        info.extend(ies);
-        info.resize(length, 0);
-        info
+        bss_info(&Bss {
+            bssid: BSSID,
+            beacon_period: BEACON_PERIOD,
+            capability,
+            ssid: &self.ssid,
+            channel: CHANNEL,
+            dtim_period: DTIM_PERIOD,
+            rssi: RSSI_DBM,
+            ies: &self.ies(),
+        })
     }
 
     /// Whether a station whose own RSN/WPA element (from `wpaie`) is
@@ -229,6 +215,60 @@ impl AccessPoint {
         self.gtk = saved.gtk;
         Ok(())
     }
+}
+
+/// What the radio knows of a network it heard: from the beacon or probe
+/// response, and the signal it heard it with.
+pub struct Bss<'a> {
+    pub bssid: [u8; 6],
+    pub beacon_period: u16,
+    pub capability: u16,
+    /// Empty for a network that hides its name.
+    pub ssid: &'a [u8],
+    pub channel: u8,
+    pub dtim_period: u8,
+    pub rssi: i16,
+    /// The information elements of the frame it was heard in.
+    pub ies: &'a [u8],
+}
+
+/// `wl_bss_info_t` (version 109) of `bss`, little-endian, length rounded
+/// up to a multiple of 4: the fixed part, then the information elements.
+/// The rate set is the one the elements carry (supported and extended
+/// supported rates), the chanspec a 20 MHz one.
+pub fn bss_info(bss: &Bss) -> Vec<u8> {
+    let mut rates: Vec<u8> = [1, 50]
+        .iter()
+        .filter_map(|&id| super::dot11::element(bss.ies, id))
+        .flatten()
+        .copied()
+        .collect();
+    rates.truncate(16);
+    let mut info = vec![0u8; BSS_INFO_FIXED_LEN];
+    let length = (BSS_INFO_FIXED_LEN + bss.ies.len()).next_multiple_of(4);
+    let ssid = &bss.ssid[..bss.ssid.len().min(32)];
+    let band = if bss.channel > 14 { 0xc000 } else { 0 };
+    let chanspec = 0x1000 | band | u16::from(bss.channel);
+    info[0..4].copy_from_slice(&BSS_INFO_VERSION.to_le_bytes());
+    info[4..8].copy_from_slice(&(length as u32).to_le_bytes());
+    info[8..14].copy_from_slice(&bss.bssid);
+    info[14..16].copy_from_slice(&bss.beacon_period.to_le_bytes());
+    info[16..18].copy_from_slice(&bss.capability.to_le_bytes());
+    info[18] = ssid.len() as u8;
+    info[19..19 + ssid.len()].copy_from_slice(ssid);
+    info[52..56].copy_from_slice(&(rates.len() as u32).to_le_bytes());
+    info[56..56 + rates.len()].copy_from_slice(&rates);
+    info[72..74].copy_from_slice(&chanspec.to_le_bytes());
+    info[76] = bss.dtim_period;
+    info[78..80].copy_from_slice(&bss.rssi.to_le_bytes());
+    info[80] = NOISE_DBM as u8;
+    info[88] = bss.channel;
+    info[116..118].copy_from_slice(&(BSS_INFO_FIXED_LEN as u16).to_le_bytes());
+    info[120..124].copy_from_slice(&(bss.ies.len() as u32).to_le_bytes());
+    info[124..126].copy_from_slice(&(bss.rssi - i16::from(NOISE_DBM)).to_le_bytes());
+    info.extend(bss.ies);
+    info.resize(length, 0);
+    info
 }
 
 /// The access point's half of the 4-way handshake with one station: all
