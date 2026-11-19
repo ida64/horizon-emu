@@ -89,8 +89,10 @@ pub const BAR1_SIZE: u64 = 0x100_0000;
 pub const STALL_INTID: u32 = 32 + 157;
 pub const NONSTALL_INTID: u32 = 32 + 158;
 
-/// How often a channel waiting for a syncpoint or semaphore looks again.
-/// Nothing tells the host when a syncpoint moves, so waits are polled.
+/// How often a channel waiting for a semaphore looks again. Nothing tells
+/// the host when memory changes, so semaphore waits are polled; a channel
+/// waiting for a syncpoint looks again at every change of the syncpoints
+/// ([`Syncpoints::on_change`]).
 const WAIT_POLL: Duration = Duration::from_micros(500);
 /// How often the host looks whether the machine runs again while it is
 /// paused.
@@ -359,6 +361,13 @@ struct State {
     kicked: bool,
     stop: bool,
     lines: (bool, bool),
+    /// The BAR1 address space as last read: `bus_bar1_block`, the TLB's
+    /// count of invalidations then, and the space ([`Shared::bar1`]).
+    bar1: Option<(u32, u64, AddressSpace)>,
+    /// The host waits with nothing to look at again by itself: every
+    /// runnable channel is idle or waits for a syncpoint. Only a GP_PUT
+    /// write then gives it work through BAR1 ([`Shared::written`]).
+    asleep: bool,
 }
 
 impl Gm20b {
@@ -373,7 +382,7 @@ impl Gm20b {
         notes: Arc<Notes>,
     ) -> Self {
         Self::with_bus(
-            Box::new(SmmuBus(memory)),
+            Box::new(SmmuBus::new(memory)),
             syncpoints,
             [stall, nonstall],
             clock,
@@ -404,6 +413,8 @@ impl Gm20b {
                 kicked: false,
                 stop: false,
                 lines: (false, false),
+                bar1: None,
+                asleep: false,
             }),
             wake: Condvar::new(),
             left: Condvar::new(),
@@ -420,6 +431,13 @@ impl Gm20b {
             clock,
             engines,
         });
+        // A channel waiting for a syncpoint looks again at every change.
+        let weak = Arc::downgrade(&shared);
+        shared.syncpoints.on_change(Box::new(move || {
+            if let Some(shared) = weak.upgrade() {
+                shared.kick();
+            }
+        }));
         let worker = {
             let shared = Arc::clone(&shared);
             thread::Builder::new()
@@ -682,6 +700,8 @@ impl MmioDevice for Bar0 {
         let offset = word(offset, size)? as u32;
         let mut state = self.0.usable()?;
         let done = state.write(&self.0, offset, value as u32);
+        // Among the writes, the MMU invalidates after a page table change.
+        self.0.bus.invalidate();
         self.0.update_lines(&mut state);
         drop(state);
         self.0.refuse(done)
@@ -707,13 +727,22 @@ impl MmioDevice for Bar1 {
 
     fn write(&self, _core: usize, offset: u64, size: u8, value: u64) -> Option<()> {
         let bytes = &value.to_le_bytes()[..usize::from(size)];
-        let done = self
-            .0
-            .bar1()
-            .and_then(|space| space.write(self.0.bus.as_ref(), offset, bytes));
-        self.0.refuse(done)?;
-        // This may have been a channel's GP_PUT: the host looks.
-        self.0.kick();
+        let bus = self.0.bus.as_ref();
+        let written = self.0.bar1().and_then(|space| {
+            // Where the bytes go, first and last. The write's own first
+            // step: it refuses as this does.
+            let first = space.translate(bus, offset, true)?;
+            space.write(bus, offset, bytes)?;
+            let span = u64::from(size.max(1)) - 1;
+            let last = if span < first.left {
+                first.address + span
+            } else {
+                space.translate(bus, offset + span, true)?.address
+            };
+            Ok((first.address, last))
+        });
+        let (first, last) = self.0.refuse(written)?;
+        self.0.written(first, last);
         Some(())
     }
 
@@ -742,13 +771,15 @@ impl Shared {
     }
 
     /// The BAR1 address space, from the instance block `bus_bar1_block`
-    /// names.
+    /// names. Kept while `bus_bar1_block` and the TLB's count of
+    /// invalidations ([`BusMemory::tlb`]) stay the same: every BAR0 write
+    /// moves the count, binding a block afresh among them.
     fn bar1(&self) -> Result<AddressSpace, Unmodeled> {
-        let block = {
+        let (block, cached) = {
             let state = self
                 .usable()
                 .ok_or_else(|| Unmodeled("BAR1 access after the GPU stopped".into()))?;
-            state.registers.get(&reg::BAR1_BLOCK).copied()
+            (state.registers.get(&reg::BAR1_BLOCK).copied(), state.bar1)
         };
         let block = block
             .filter(|block| block & BAR1_VIRTUAL != 0 && block & BAR1_TARGET == 0)
@@ -758,11 +789,41 @@ impl Shared {
                      with its instance block in video memory is modeled)"
                 ))
             })?;
-        AddressSpace::from_instance(self.bus.as_ref(), u64::from(block & BAR1_POINTER) << 12)
+        let invalidations = self.bus.tlb().map(|(_, invalidations)| invalidations);
+        if let Some((at, count, space)) = cached
+            && at == block
+            && Some(count) == invalidations
+        {
+            return Ok(space);
+        }
+        let space =
+            AddressSpace::from_instance(self.bus.as_ref(), u64::from(block & BAR1_POINTER) << 12)?;
+        if let Some(invalidations) = invalidations {
+            self.state.lock().unwrap().bar1 = Some((block, invalidations, space));
+        }
+        Ok(space)
     }
 
     fn kick(&self) {
         self.state.lock().unwrap().kicked = true;
+        self.wake.notify_one();
+    }
+
+    /// The CPU wrote bus addresses `first..=last` through BAR1. The host
+    /// looks again, unless it is asleep and the write missed every
+    /// channel's GP_PUT: no memory write moves an idle channel's GP_GET
+    /// or a syncpoint.
+    fn written(&self, first: u64, last: u64) {
+        let mut state = self.state.lock().unwrap();
+        if state.asleep
+            && !state.fifo.contexts.values().any(|context| {
+                let at = context.gp_put_at();
+                first < at + 4 && at <= last
+            })
+        {
+            return;
+        }
+        state.kicked = true;
         self.wake.notify_one();
     }
 
@@ -801,23 +862,28 @@ impl Shared {
             }
             state.kicked = false;
             drop(state);
-            let waiting = self.service();
+            let polled = self.service();
             state = self.state.lock().unwrap();
             if state.stop || state.kicked {
                 continue;
             }
-            state = if waiting {
+            // A syncpoint wait is woken by the change (a kick).
+            state = if polled {
                 self.wake.wait_timeout(state, WAIT_POLL).unwrap().0
             } else {
-                self.wake.wait(state).unwrap()
+                state.asleep = true;
+                let mut state = self.wake.wait(state).unwrap();
+                state.asleep = false;
+                state
             };
         }
     }
 
     /// Gives every runnable channel on the runlist one turn, in runlist
-    /// order. Whether one of them is left waiting.
+    /// order. Whether one of them is left waiting for a semaphore, which
+    /// nothing announces.
     fn service(&self) -> bool {
-        let mut waiting = false;
+        let mut polled = false;
         let mut done: Vec<usize> = Vec::new();
         loop {
             let mut state = self.state.lock().unwrap();
@@ -840,7 +906,7 @@ impl Shared {
                     .find(|&chid| !done.contains(&chid) && fifo.runnable(chid)),
             };
             let Some(chid) = next else {
-                return waiting;
+                return polled;
             };
             done.push(chid);
             let instance = fifo.channels[chid]
@@ -882,7 +948,7 @@ impl Shared {
             match outcome {
                 Ok(Outcome::Idle) => {}
                 Ok(Outcome::Blocked(wait)) => {
-                    waiting = true;
+                    polled |= matches!(wait, fifo::Wait::Semaphore { .. });
                     if !wait.switch() {
                         state.holding = Some(chid);
                     }
@@ -1525,5 +1591,51 @@ mod tests {
         restored.wait_for("GP_GET moves on", || restored.bus.get(gp_get) == 1);
         assert_eq!(restored.bus.get(host_release), 0);
         assert!(restored.gpu.shared.state.lock().unwrap().failure.is_none());
+    }
+
+    /// A host asleep with nothing to do is woken through BAR1 only by a
+    /// write of a channel's GP_PUT, and a channel waiting for a syncpoint
+    /// goes on once the syncpoint changes.
+    #[test]
+    fn the_host_wakes_for_gp_put_writes_and_syncpoint_changes() {
+        let bench = Bench::new();
+        let release = IOVA | 0xB_3000;
+        bench.bar1_space();
+        bench.channel(&[
+            // Host semaphore release of 1 at VA 0x3000 (4 bytes).
+            0x2004_0004,
+            0,
+            0x3000,
+            1,
+            1 << 24 | 2,
+            // Wait for syncpoint 0x18 to reach 1.
+            0x2001_001C,
+            1,
+            0x2001_001D,
+            0x18 << 8,
+            // Release of 2.
+            0x2004_0004,
+            0,
+            0x3000,
+            2,
+            1 << 24 | 2,
+        ]);
+        // Asleep with no kick pending, the channel's context loaded.
+        let asleep = || {
+            let state = bench.gpu.shared.state.lock().unwrap();
+            state.asleep && !state.kicked && !state.fifo.contexts.is_empty()
+        };
+        bench.wait_for("asleep with GP_PUT at GP_GET", asleep);
+        // Elsewhere in USERD: still asleep, nothing to look at.
+        bench.bar1.write(0, 0x1_0080, 4, 7).unwrap();
+        assert!(!bench.gpu.shared.state.lock().unwrap().kicked);
+        assert!(asleep());
+        bench.bar1.write(0, 0x1_008C, 4, 1).unwrap();
+        bench.wait_for("the release before the wait", || {
+            bench.bus.get(release) == 1
+        });
+        bench.wait_for("asleep at the wait", asleep);
+        bench.syncpoints.add(0x18, 1);
+        bench.wait_for("the release after the wait", || bench.bus.get(release) == 2);
     }
 }

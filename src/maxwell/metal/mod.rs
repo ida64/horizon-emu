@@ -60,6 +60,7 @@
 
 mod format;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -265,6 +266,10 @@ pub struct Renderer {
     /// Set while [`Renderer::flush`] writes back: its own writes pass
     /// [`Coherent`] unchecked (the state is locked by the flush).
     writing_back: std::sync::atomic::AtomicBool,
+    /// Whether a resident may be dirty: set by every draw and clear, clear
+    /// after a flush wrote them all back. While clear, an access needs no
+    /// look at the residents ([`Renderer::before_access`]).
+    any_dirty: std::sync::atomic::AtomicBool,
 }
 
 /// What a draw hands the Metal renderer once the software pipeline has
@@ -292,6 +297,7 @@ impl Renderer {
         Some(Renderer {
             state: Mutex::new(State::default()),
             writing_back: Default::default(),
+            any_dirty: Default::default(),
         })
     }
 
@@ -384,6 +390,8 @@ impl Renderer {
             }
         }
         self.writing_back.store(false, Ordering::Relaxed);
+        // Every resident's dirty rectangle was taken above.
+        self.any_dirty.store(false, Ordering::Relaxed);
         let stamp = writes.stamp();
         for (resident, current) in state.residents.iter_mut().zip(current) {
             resident.stamp = current.then_some(stamp);
@@ -400,7 +408,8 @@ impl Renderer {
         address: u64,
         length: usize,
     ) -> Result<(), Unmodeled> {
-        if self.writing_back.load(std::sync::atomic::Ordering::Relaxed) {
+        use std::sync::atomic::Ordering;
+        if self.writing_back.load(Ordering::Relaxed) || !self.any_dirty.load(Ordering::Relaxed) {
             return Ok(());
         }
         let overlaps = {
@@ -460,16 +469,23 @@ impl Renderer {
         // its owner mapped (see `pipeline::read_mapped`); an indexed read
         // there, which the interpreter refuses (hardware would fault),
         // reads 0 on Metal. No statically known read may go there.
-        let mut constants: HashMap<u32, Vec<u8>> = HashMap::new();
+        // By slot (`draw.constants` has one per slot, 18): borrowed from
+        // the draw unless padded.
+        let mut constants: [Option<Cow<'_, [u8]>>; 18] = Default::default();
         let mut sizes = [0u32; 18];
         for &slot in &translated.indirect {
             let Some((data, size)) = draw.constants.get(slot as usize) else {
                 return self.fall_back(format!("constant buffer slot {slot}"));
             };
             let readable = data.len().min(*size);
-            let mut buffer = data[..readable].to_vec();
-            buffer.resize(readable.next_multiple_of(4).max(4), 0);
-            constants.insert(slot, buffer);
+            let padded = readable.next_multiple_of(4).max(4);
+            constants[slot as usize] = Some(if padded == readable {
+                Cow::Borrowed(&data[..readable])
+            } else {
+                let mut buffer = data[..readable].to_vec();
+                buffer.resize(padded, 0);
+                Cow::Owned(buffer)
+            });
             sizes[slot as usize] = readable as u32;
         }
         // Constant buffer words read statically must be readable.
@@ -486,9 +502,9 @@ impl Renderer {
                 // Bounds-checked by the program against `sizes`.
                 continue;
             }
-            let buffer = constants.entry(slot).or_insert_with(|| data.clone());
+            let buffer = constants[slot as usize].get_or_insert(Cow::Borrowed(data.as_slice()));
             if buffer.len() < end {
-                buffer.resize(end, 0);
+                buffer.to_mut().resize(end, 0);
             }
         }
         // Textures and samplers. A handle that names no texture is bound to
@@ -685,8 +701,10 @@ impl Renderer {
             bind(gpu, &encoder, Stage::Vertex, bytes_of(&positions), 0)?;
             bind(gpu, &encoder, Stage::Fragment, bytes_of(&planes), 0)?;
             bind(gpu, &encoder, Stage::Fragment, bytes_of(&biases), 1)?;
-            for (slot, data) in &constants {
-                bind(gpu, &encoder, Stage::Fragment, data, 2 + *slot as usize)?;
+            for (slot, data) in constants.iter().enumerate() {
+                if let Some(data) = data {
+                    bind(gpu, &encoder, Stage::Fragment, data, 2 + slot)?;
+                }
             }
             if !translated.indirect.is_empty() {
                 bind(gpu, &encoder, Stage::Fragment, bytes_of_u32(&sizes), 20)?;
@@ -731,6 +749,8 @@ impl Renderer {
         }
         for &index in &residents {
             state.rendered(index, scissor, writes);
+            self.any_dirty
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         state.draws += 1;
         Ok(true)
@@ -800,6 +820,8 @@ impl Renderer {
             encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
         }
         state.rendered(residents[0], rect, writes);
+        self.any_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
     }
 
@@ -860,14 +882,28 @@ impl Renderer {
             match found {
                 Some((index, true)) => indices.push(index),
                 Some((index, false)) => {
-                    // Compare with guest memory; reload what changed.
-                    let mut window = Window::load(memory, surface, full)?;
+                    // Compare with guest memory, without holding the
+                    // state (reads may flush); reload if it changed.
+                    let mirror = std::mem::replace(
+                        &mut self.state.lock().unwrap().residents[index].mirror,
+                        Window::empty(surface),
+                    );
+                    let reloaded = match mirror.matches(memory) {
+                        Ok(true) => None,
+                        Ok(false) => Some(Window::load(memory, surface, full)),
+                        Err(refusal) => Some(Err(refusal)),
+                    };
                     let stamp = writes.stamp();
                     let mut state = self.state.lock().unwrap();
                     let resident = &mut state.residents[index];
-                    if window.data() != resident.mirror.data() {
-                        upload_surface(&resident.texture, &mut window, full);
-                        resident.mirror = window;
+                    resident.mirror = mirror;
+                    match reloaded {
+                        None => {}
+                        Some(Ok(mut window)) => {
+                            upload_surface(&resident.texture, &mut window, full);
+                            resident.mirror = window;
+                        }
+                        Some(Err(refusal)) => return Err(refusal),
                     }
                     resident.stamp = Some(stamp);
                     indices.push(index);

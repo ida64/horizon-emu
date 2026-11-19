@@ -81,6 +81,19 @@ pub struct Window {
     data: Vec<u8>,
 }
 
+/// Copies one run of [`Window::runs`]: most are one 16-byte unit of a
+/// GOB, copied as such rather than through a call per unit.
+#[inline(always)]
+fn copy_run(to: &mut [u8], from: &[u8]) {
+    match (
+        <&mut [u8; 16]>::try_from(&mut *to),
+        <&[u8; 16]>::try_from(from),
+    ) {
+        (Ok(to), Ok(from)) => *to = *from,
+        _ => to.copy_from_slice(from),
+    }
+}
+
 fn fault(what: &str, address: u64) -> Unmodeled {
     Unmodeled(format!(
         "{what}: access to unmapped GPU address {address:#x}"
@@ -88,6 +101,19 @@ fn fault(what: &str, address: u64) -> Unmodeled {
 }
 
 impl Window {
+    /// A window of `surface` holding nothing.
+    pub fn empty(surface: Surface) -> Window {
+        Window {
+            surface,
+            band0: 0,
+            bands: 0,
+            column0: 0,
+            band_bytes: 0,
+            row_bytes: 0,
+            data: Vec::new(),
+        }
+    }
+
     /// Reads the bands of `surface` covering `rect` (clipped to the
     /// surface).
     pub fn load(memory: &dyn GpuMemory, surface: Surface, rect: Rect) -> Result<Window, Unmodeled> {
@@ -98,15 +124,7 @@ impl Window {
             y1: surface.height,
         });
         let mut window = if rect.is_empty() {
-            Window {
-                surface,
-                band0: 0,
-                bands: 0,
-                column0: 0,
-                band_bytes: 0,
-                row_bytes: 0,
-                data: Vec::new(),
-            }
+            Window::empty(surface)
         } else {
             let band0 = rect.y0 / BAND_ROWS;
             let bands = rect.y1.div_ceil(BAND_ROWS) - band0;
@@ -162,6 +180,56 @@ impl Window {
         write: bool,
         only: Option<Rect>,
     ) -> Result<(), Unmodeled> {
+        // `pieces` looks only at the window's geometry.
+        let mut data = std::mem::take(&mut self.data);
+        let result = self.pieces(only, |address, range| {
+            let piece = &mut data[range];
+            if write {
+                memory.write(address, piece)
+            } else {
+                memory.read(address, piece)
+            }
+            .ok_or_else(|| fault("surface", address))
+        });
+        self.data = data;
+        result
+    }
+
+    /// Whether guest memory holds the window's bytes, compared piece by
+    /// piece (no copy of the window is made). Reads the same pieces as
+    /// [`Window::load`], and refuses where it would.
+    pub fn matches(&self, memory: &dyn GpuMemory) -> Result<bool, Unmodeled> {
+        let mut buffer = [0u8; 512];
+        let mut same = true;
+        // A difference ends the walk early, through this marker.
+        let differs = || Unmodeled(String::new());
+        let result = self.pieces(None, |address, range| {
+            let mut at = address;
+            for chunk in self.data[range].chunks(buffer.len()) {
+                let piece = &mut buffer[..chunk.len()];
+                memory.read(at, piece).ok_or_else(|| fault("surface", at))?;
+                if piece != chunk {
+                    same = false;
+                    return Err(differs());
+                }
+                at += chunk.len() as u64;
+            }
+            Ok(())
+        });
+        match result {
+            Err(_) if !same => Ok(false),
+            outcome => outcome.map(|()| true),
+        }
+    }
+
+    /// The pieces of guest memory the window holds, contiguous there and
+    /// in `data`, restricted to the bands and columns (GOBs, or pitch
+    /// rows) covering `only`: `piece(address, data range)`.
+    fn pieces(
+        &self,
+        only: Option<Rect>,
+        mut piece: impl FnMut(u64, Range<usize>) -> Result<(), Unmodeled>,
+    ) -> Result<(), Unmodeled> {
         let surface = self.surface;
         let bpp = surface.bytes_per_pixel;
         for band in 0..self.bands {
@@ -171,11 +239,11 @@ impl Window {
             {
                 continue;
             }
-            let band_data = &mut self.data[band as usize * self.band_bytes..][..self.band_bytes];
+            let band_start = band as usize * self.band_bytes;
             match surface.layout {
                 Layout::BlockLinear(block) => {
                     let width_bytes = surface.width * bpp;
-                    for (index, gob) in band_data.chunks_mut(GOB_BYTES).enumerate() {
+                    for index in 0..self.band_bytes / GOB_BYTES {
                         let x = (self.column0 + index as u32) * GOB_WIDTH;
                         if let Some(rect) = only
                             && (x + GOB_WIDTH <= rect.x0 * bpp || x >= rect.x1 * bpp)
@@ -184,16 +252,12 @@ impl Window {
                         }
                         let address = surface.address
                             + block_linear_offset(x, y, 0, width_bytes, surface.height, block);
-                        if write {
-                            memory.write(address, gob)
-                        } else {
-                            memory.read(address, gob)
-                        }
-                        .ok_or_else(|| fault("surface", address))?;
+                        let start = band_start + index * GOB_BYTES;
+                        piece(address, start..start + GOB_BYTES)?;
                     }
                 }
                 Layout::Pitch { pitch } => {
-                    for (row, line) in band_data.chunks_mut(self.row_bytes).enumerate() {
+                    for row in 0..BAND_ROWS as usize {
                         let y = y + row as u32;
                         if y >= surface.height {
                             break;
@@ -206,12 +270,8 @@ impl Window {
                         let address = surface.address
                             + u64::from(y) * u64::from(pitch)
                             + u64::from(self.column0);
-                        if write {
-                            memory.write(address, line)
-                        } else {
-                            memory.read(address, line)
-                        }
-                        .ok_or_else(|| fault("surface", address))?;
+                        let start = band_start + row * self.row_bytes;
+                        piece(address, start..start + self.row_bytes)?;
                     }
                 }
             }
@@ -233,7 +293,7 @@ impl Window {
     pub fn read_pixels(&self, rect: Rect, out: &mut [u8]) {
         let data = &self.data;
         self.runs(rect, |window, linear| {
-            out[linear].copy_from_slice(&data[window]);
+            copy_run(&mut out[linear], &data[window]);
         });
     }
 
@@ -242,7 +302,7 @@ impl Window {
         // `runs` looks only at the window's geometry.
         let mut data = std::mem::take(&mut self.data);
         self.runs(rect, |window, linear| {
-            data[window].copy_from_slice(&pixels[linear]);
+            copy_run(&mut data[window], &pixels[linear]);
         });
         self.data = data;
     }
@@ -508,6 +568,82 @@ mod tests {
                 row_bytes: self.row_bytes,
                 data: Vec::new(),
             }
+        }
+    }
+
+    /// Byte-addressed memory over [`Pattern`], with the writes kept.
+    #[derive(Default)]
+    struct Written(std::sync::Mutex<std::collections::HashMap<u64, u8>>);
+
+    impl GpuMemory for Written {
+        fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
+            let written = self.0.lock().unwrap();
+            for (i, b) in buffer.iter_mut().enumerate() {
+                let at = address + i as u64;
+                *b = written.get(&at).copied().unwrap_or(byte(at));
+            }
+            Some(())
+        }
+
+        fn write(&self, address: u64, data: &[u8]) -> Option<()> {
+            let mut written = self.0.lock().unwrap();
+            for (i, b) in data.iter().enumerate() {
+                written.insert(address + i as u64, *b);
+            }
+            Some(())
+        }
+    }
+
+    /// A window matches memory exactly when loading it again gives the
+    /// same bytes: after a load, after a store of changed bytes, and not
+    /// after a change to one byte it holds; a change outside it does not
+    /// count.
+    #[test]
+    fn matching_is_loading_and_comparing() {
+        let layouts = [
+            Layout::Pitch { pitch: 0x400 },
+            Layout::BlockLinear(BlockLinear {
+                block_height_log2: 2,
+                block_depth_log2: 0,
+            }),
+        ];
+        for layout in layouts {
+            let surface = Surface {
+                address: 0x10000,
+                width: 200,
+                height: 70,
+                bytes_per_pixel: 4,
+                layout,
+            };
+            let rect = Rect {
+                x0: 20,
+                y0: 9,
+                x1: 150,
+                y1: 50,
+            };
+            let memory = Written::default();
+            let mut window = Window::load(&memory, surface, rect).unwrap();
+            assert!(window.matches(&memory).unwrap());
+            window.write_pixels(rect, &vec![0x5A; 130 * 41 * 4]);
+            assert!(!window.matches(&memory).unwrap());
+            window.store(&memory).unwrap();
+            assert!(window.matches(&memory).unwrap());
+            let mut touched = 0;
+            for address in (0x10000..0x10000 + 0x400 * 70).step_by(97) {
+                let before = Window::load(&memory, surface, rect).unwrap();
+                let old = memory.0.lock().unwrap().get(&address).copied();
+                memory.write(address, &[!old.unwrap_or(byte(address))]);
+                let after = Window::load(&memory, surface, rect).unwrap();
+                let held = before.data() != after.data();
+                touched += usize::from(held);
+                assert_eq!(
+                    before.matches(&memory).unwrap(),
+                    !held,
+                    "{layout:?} {address:#x}"
+                );
+                assert!(after.matches(&memory).unwrap());
+            }
+            assert!(touched > 50, "{touched}");
         }
     }
 }

@@ -30,10 +30,20 @@
 //! pages are 4 KiB. The driver points each directory entry at either a
 //! small-page or a big-page table, never both (annex fifo §2.1); which one
 //! the hardware would use when both are there is not known here, so that
-//! is refused. There are no TLBs: every access walks the tables, so the
-//! invalidate handshakes have nothing to do.
+//! is refused.
+//!
+//! The GPU's own bus ([`SmmuBus`]) keeps the page table entries it walked
+//! in a TLB ([`Tlb`]), as the hardware's MMU does. The driver invalidates
+//! that after changing page tables, through BAR0 (`fb_mmu_invalidate`) or
+//! a channel's `MEM_OP` methods; here every BAR0 write, every
+//! `MEM_OP_B`/`MEM_OP_D` and every change in the memory controller
+//! ([`BusMemory::invalidate`]) drops all of it, so an entry is never kept
+//! past an invalidate. Walks that fail are not kept.
 
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +82,17 @@ const PTE_WRITE_DISABLE: u32 = 1 << 31;
 pub trait BusMemory: Send + Sync {
     fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()>;
     fn write(&self, address: u64, data: &[u8]) -> Option<()>;
+
+    /// The TLB walks through this bus may keep, if any, and the count of
+    /// invalidations it is valid for (see [`Tlb`]).
+    fn tlb(&self) -> Option<(&Tlb, u64)> {
+        None
+    }
+
+    /// Drops every translation the TLB holds before the next access, for
+    /// a page table change the driver may have announced: called after
+    /// the announcement.
+    fn invalidate(&self) {}
 }
 
 /// Reads the little-endian word at bus address `address`.
@@ -97,8 +118,23 @@ fn unreachable_memory(address: u64, len: usize, write: bool) -> Unmodeled {
 
 /// The GPU's side of the memory controller: SMMU addresses with bit 34
 /// set, through the address space the kernel attached to the GPU's memory
-/// client.
-pub struct SmmuBus(pub DeviceMemory);
+/// client, and the GPU's TLB.
+pub struct SmmuBus {
+    memory: DeviceMemory,
+    tlb: Tlb,
+    /// Invalidations ([`BusMemory::invalidate`]).
+    invalidations: AtomicU64,
+}
+
+impl SmmuBus {
+    pub fn new(memory: DeviceMemory) -> Self {
+        Self {
+            memory,
+            tlb: Tlb::default(),
+            invalidations: AtomicU64::new(0),
+        }
+    }
+}
 
 /// The SMMU address of the `len` bytes at bus address `address`, if they
 /// all carry the SMMU bit and nothing above it.
@@ -110,12 +146,69 @@ fn smmu_address(address: u64, len: usize) -> Option<u64> {
 
 impl BusMemory for SmmuBus {
     fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
-        self.0.read(smmu_address(address, buffer.len())?, buffer)
+        self.memory
+            .read(smmu_address(address, buffer.len())?, buffer)
     }
 
     fn write(&self, address: u64, data: &[u8]) -> Option<()> {
-        self.0.write(smmu_address(address, data.len())?, data)
+        self.memory.write(smmu_address(address, data.len())?, data)
     }
+
+    /// Both counts only grow, so their sum stays the same only while
+    /// neither moves: the GPU's invalidations and the memory controller's
+    /// changes, through which the walks read the tables.
+    fn tlb(&self) -> Option<(&Tlb, u64)> {
+        let invalidations = self.invalidations.load(Ordering::Acquire);
+        Some((
+            &self.tlb,
+            invalidations.wrapping_add(self.memory.mc().generation()),
+        ))
+    }
+
+    fn invalidate(&self) {
+        self.invalidations.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Page table entries walked by virtual page, kept while the count of
+/// invalidations stays at `invalidations`.
+pub struct Tlb(Mutex<TlbEntries>);
+
+/// Translations a [`Tlb`] keeps (4 KiB pages, direct-mapped).
+const TLB_ENTRIES: usize = 4096;
+
+struct TlbEntries {
+    invalidations: u64,
+    entries: Box<[Option<TlbEntry>; TLB_ENTRIES]>,
+}
+
+/// What a walk found for one 4 KiB virtual page of one address space.
+#[derive(Clone, Copy)]
+struct TlbEntry {
+    directory: u64,
+    big_page: BigPage,
+    page: u64,
+    pte: Pte,
+}
+
+impl Default for Tlb {
+    fn default() -> Self {
+        Self(Mutex::new(TlbEntries {
+            invalidations: u64::MAX,
+            entries: vec![None; TLB_ENTRIES]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("TLB_ENTRIES entries")),
+        }))
+    }
+}
+
+/// A valid page table entry in video memory, and the size of its page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pte {
+    low: u32,
+    high: u32,
+    page_shift: u32,
 }
 
 /// Size of the big pages of an address space.
@@ -183,20 +276,57 @@ impl AddressSpace {
     }
 
     /// Walks the page tables for `address`; `write` says whether the access
-    /// writes.
+    /// writes. Through the bus's TLB if it has one.
     pub fn translate(
         &self,
         bus: &dyn BusMemory,
         address: u64,
         write: bool,
     ) -> Result<Translation, Unmodeled> {
-        let fault = |what: &str| {
-            Unmodeled(format!(
-                "GPU MMU fault (not delivered by the model): virtual address {address:#x} in \
-                 the address space with page directory {:#x}: {what}",
-                self.directory
-            ))
+        let Some((tlb, invalidations)) = bus.tlb().filter(|_| address <= self.limit) else {
+            return self.access(self.walk(bus, address)?, address, write);
         };
+        let page = address >> SMALL_PAGE_SHIFT;
+        let mut tlb = tlb.0.lock().unwrap();
+        if tlb.invalidations != invalidations {
+            tlb.entries.fill(None);
+            tlb.invalidations = invalidations;
+        }
+        let slot = (page ^ self.directory >> SMALL_PAGE_SHIFT) as usize % TLB_ENTRIES;
+        let pte = match tlb.entries[slot] {
+            Some(entry)
+                if entry.page == page
+                    && entry.directory == self.directory
+                    && entry.big_page == self.big_page =>
+            {
+                entry.pte
+            }
+            _ => {
+                let pte = self.walk(bus, address)?;
+                tlb.entries[slot] = Some(TlbEntry {
+                    directory: self.directory,
+                    big_page: self.big_page,
+                    page,
+                    pte,
+                });
+                pte
+            }
+        };
+        drop(tlb);
+        self.access(pte, address, write)
+    }
+
+    fn fault(&self, address: u64, what: &str) -> Unmodeled {
+        Unmodeled(format!(
+            "GPU MMU fault (not delivered by the model): virtual address {address:#x} in \
+             the address space with page directory {:#x}: {what}",
+            self.directory
+        ))
+    }
+
+    /// The page table entry of `address`, walked from memory.
+    fn walk(&self, bus: &dyn BusMemory, address: u64) -> Result<Pte, Unmodeled> {
+        let fault = |what: &str| self.fault(address, what);
         if address > self.limit {
             return Err(fault(&format!("beyond its limit {:#x}", self.limit)));
         }
@@ -233,15 +363,30 @@ impl AddressSpace {
                 "page table entry {low:#010x} {high:#010x} is not in video memory"
             )));
         }
+        Ok(Pte {
+            low,
+            high,
+            page_shift,
+        })
+    }
+
+    /// An access to `address` through its page table entry `pte`.
+    fn access(&self, pte: Pte, address: u64, write: bool) -> Result<Translation, Unmodeled> {
+        let Pte {
+            low,
+            high,
+            page_shift,
+        } = pte;
         let denied = if write {
             low & PTE_READ_ONLY != 0 || high & PTE_WRITE_DISABLE != 0
         } else {
             high & PTE_READ_DISABLE != 0
         };
         if denied {
-            return Err(fault(&format!(
-                "page table entry {low:#010x} {high:#010x} forbids the access"
-            )));
+            return Err(self.fault(
+                address,
+                &format!("page table entry {low:#010x} {high:#010x} forbids the access"),
+            ));
         }
         let page_mask = (1 << page_shift) - 1;
         Ok(Translation {
@@ -510,5 +655,178 @@ pub(super) mod tests {
         assert_eq!(back, [1, 2, 3, 4]);
         assert!(memory.read(0x2000, &mut back).is_none());
         assert!(memory.take_fault().is_some());
+    }
+
+    /// [`TestBus`] with a TLB, invalidated only when asked.
+    struct CachedBus<'a> {
+        bus: &'a TestBus,
+        tlb: Tlb,
+        invalidations: AtomicU64,
+    }
+
+    impl BusMemory for CachedBus<'_> {
+        fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
+            self.bus.read(address, buffer)
+        }
+
+        fn write(&self, address: u64, data: &[u8]) -> Option<()> {
+            self.bus.write(address, data)
+        }
+
+        fn tlb(&self) -> Option<(&Tlb, u64)> {
+            Some((&self.tlb, self.invalidations.load(Ordering::Acquire)))
+        }
+
+        fn invalidate(&self) {
+            self.invalidations.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Translations through the TLB agree with fresh walks after every
+    /// invalidate, over random page tables of both geometries, random
+    /// changes to them, permissions and accesses across pages; and
+    /// everything that faulted is walked again without an invalidate.
+    #[test]
+    fn tlb_translations_equal_fresh_walks_after_every_invalidate() {
+        let bus = TestBus::default();
+        let cached = CachedBus {
+            bus: &bus,
+            tlb: Tlb::default(),
+            invalidations: AtomicU64::new(0),
+        };
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut below = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        // Two address spaces, one per geometry, 16 directory entries each,
+        // tables of 64 entries at IOVA 0x100_0000 on.
+        let spaces = [
+            (IOVA | 0x1000, IOVA | 0x2000, BigPage::K128),
+            (IOVA | 0x3000, IOVA | 0x4000, BigPage::K64),
+        ];
+        let table = |n: u64| IOVA | (0x100_0000 + n * 0x1000);
+        let directory_entry = |below: &mut dyn FnMut(u64) -> u64, entry: u64| match below(6) {
+            0 => {
+                bus.put(entry, 0);
+                bus.put(entry + 4, 0);
+            }
+            1 => bus.put(
+                entry,
+                ((table(below(32)) >> 8) as u32 & ENTRY_ADDRESS) | 1 | 4,
+            ),
+            2 | 3 => bus.big_table(entry, table(below(32))),
+            _ => bus.small_table(entry, table(below(32))),
+        };
+        let page_entry = |below: &mut dyn FnMut(u64) -> u64, entry: u64| {
+            let page = IOVA | below(0x1000) << 16;
+            let low = ((page >> 8) as u32 & ENTRY_ADDRESS)
+                | if below(8) == 0 { 0 } else { PTE_VALID }
+                | if below(6) == 0 { PTE_READ_ONLY } else { 0 };
+            let high = if below(10) == 0 { PTE_READ_DISABLE } else { 0 }
+                | if below(10) == 0 { PTE_WRITE_DISABLE } else { 0 }
+                | if below(20) == 0 { 1 << 1 } else { 0 };
+            bus.put(entry, low);
+            bus.put(entry + 4, high);
+        };
+        for &(instance, directory, big_page) in &spaces {
+            bus.instance(instance, directory, big_page, 1 << 37);
+            for index in 0..16 {
+                directory_entry(&mut below, directory + index * 8);
+            }
+        }
+        for entry in 0..32 * 64 {
+            page_entry(&mut below, table(0) + entry * 8);
+        }
+        let spaces =
+            spaces.map(|(instance, _, _)| AddressSpace::from_instance(&bus, instance).unwrap());
+        let mut compared = 0;
+        // Whether the tables changed since the last invalidate.
+        let mut changed;
+        for _ in 0..3000 {
+            match below(4) {
+                0 => {
+                    let directory = [IOVA | 0x2000, IOVA | 0x4000][below(2) as usize];
+                    let entry = directory + below(16) * 8;
+                    directory_entry(&mut below, entry);
+                    changed = true;
+                }
+                1 => {
+                    let entry = table(below(32)) + below(64) * 8;
+                    page_entry(&mut below, entry);
+                    changed = true;
+                }
+                _ => {
+                    cached.invalidate();
+                    changed = false;
+                }
+            }
+            for _ in 0..16 {
+                let space = &spaces[below(2) as usize];
+                let within = if below(2) == 0 {
+                    below(64) << 12
+                } else {
+                    below(64) << space.big_page.shift()
+                };
+                let address =
+                    below(16) << space.big_page.directory_shift() | within | below(0x1000);
+                let write = below(2) == 0;
+                let fresh = space.translate(&bus, address, write).map_err(|e| e.0);
+                let through = space.translate(&cached, address, write).map_err(|e| e.0);
+                if changed {
+                    // Until the invalidate, the TLB may keep what it
+                    // walked before the change.
+                    continue;
+                }
+                assert_eq!(through, fresh, "address {address:#x}, write {write}");
+                // Whole accesses, across pages, the same.
+                let mut a = [0; 0x30];
+                let mut b = [0; 0x30];
+                let at = address.saturating_sub(0x18);
+                assert_eq!(
+                    space.read(&bus, at, &mut a).map_err(|e| e.0),
+                    space.read(&cached, at, &mut b).map_err(|e| e.0)
+                );
+                assert_eq!(a, b);
+                compared += 1;
+            }
+        }
+        assert!(compared > 10_000, "{compared} compared");
+    }
+
+    /// A walk that faulted is not kept: a page mapped after it is found at
+    /// once, without an invalidate.
+    #[test]
+    fn faulting_walks_are_not_kept() {
+        let bus = TestBus::default();
+        let cached = CachedBus {
+            bus: &bus,
+            tlb: Tlb::default(),
+            invalidations: AtomicU64::new(0),
+        };
+        let instance = IOVA | 0x1000;
+        let directory = IOVA | 0x2000;
+        bus.instance(instance, directory, BigPage::K128, 1 << 37);
+        let space = AddressSpace::from_instance(&bus, instance).unwrap();
+        bus.small_table(directory, IOVA | 0x10_0000);
+        assert!(space.translate(&cached, 0x3000, false).is_err());
+        bus.page(IOVA | (0x10_0000 + 3 * 8), IOVA | 0x7_0000);
+        assert_eq!(
+            space.translate(&cached, 0x3010, false).unwrap().address,
+            IOVA | 0x7_0010
+        );
+        // And a kept entry stays until the invalidate.
+        bus.page(IOVA | (0x10_0000 + 3 * 8), IOVA | 0x8_0000);
+        assert_eq!(
+            space.translate(&cached, 0x3010, false).unwrap().address,
+            IOVA | 0x7_0010
+        );
+        cached.invalidate();
+        assert_eq!(
+            space.translate(&cached, 0x3010, false).unwrap().address,
+            IOVA | 0x8_0010
+        );
     }
 }

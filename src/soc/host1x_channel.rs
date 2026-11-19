@@ -9,10 +9,10 @@
 //! host syncpoint wait whose threshold has not been reached. Such a wait
 //! stalls the channel where it stands (ring position and gather nesting are
 //! kept), as the hardware's command processor does; it continues once the
-//! syncpoint gets there. Nothing announces syncpoint changes, so a stalled
-//! channel looks again every `WAIT_POLL` from a thread of its own, like
-//! the GPU's channel waits. The wait is channel state: a channel restored
-//! from a snapshot standing at one starts its thread again.
+//! syncpoint gets there: a thread of its own looks again at every change of
+//! the syncpoints ([`Syncpoints::wait_change`]), so at the guest time the
+//! syncpoint reached the threshold. The wait is channel state: a channel
+//! restored from a snapshot standing at one starts its thread again.
 //!
 //! Unimplemented methods/conditions fail the stream and never manufacture a
 //! fence completion; the DMAPUT write that ran into them is refused, or, for
@@ -42,10 +42,8 @@ use crate::{
 
 type Engine = dyn Fn(u32, u32, u32) -> Option<()> + Send + Sync;
 
-/// How often, in guest time, a channel stalled on a syncpoint wait looks
-/// again (the GPU's channels poll at the same rate).
-const WAIT_POLL: Duration = Duration::from_micros(500);
-/// How often the waiting thread looks at the clock while it stands still.
+/// How often the waiting thread looks at the clock while it stands still,
+/// and whether its channel is still there, when no syncpoint changes.
 const PAUSED_POLL: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,7 +195,7 @@ pub struct Channel {
 struct Inner {
     memory: DeviceMemory,
     syncpoints: Arc<Syncpoints>,
-    /// Guest time, by which a stalled channel looks again.
+    /// Guest time: a stalled channel does not go on while it stands still.
     clock: Arc<GuestClock>,
     engine: Arc<Engine>,
     notes: Arc<Notes>,
@@ -524,36 +522,32 @@ fn watch(inner: &Arc<Inner>, state: &mut State) {
     }
 }
 
-/// Continues `inner`'s stream whenever its wait is met, looking every
-/// `WAIT_POLL` of guest time, until it no longer stands at one or the
+/// Continues `inner`'s stream whenever its wait is met, looking at every
+/// change of the syncpoints, until it no longer stands at one or the
 /// channel is gone. Nothing continues while the clock stands still: the
 /// machine is paused, perhaps being saved.
 fn poll(inner: Weak<Inner>, clock: Arc<GuestClock>) {
-    let mut deadline = clock.now() + WAIT_POLL;
     loop {
-        let wait = clock.until(deadline);
-        std::thread::sleep(if wait.is_zero() && clock.is_paused() {
-            PAUSED_POLL
-        } else {
-            wait
-        });
-        let Some(inner) = inner.upgrade() else {
-            return;
+        let syncpoints = {
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            // Read before the wait is looked at: a change after it wakes
+            // the wait below.
+            let seen = inner.syncpoints.changes();
+            let mut state = inner.state.lock().unwrap();
+            if !clock.is_paused() && state.wait.is_some_and(|wait| wait.met(&inner.syncpoints)) {
+                // A failure faults the channel; its note and the refusal of
+                // the next DMAPUT write report it.
+                let _ = inner.run(&mut state);
+            }
+            if state.wait.is_none() {
+                state.polling = false;
+                return;
+            }
+            (Arc::clone(&inner.syncpoints), seen)
         };
-        let mut state = inner.state.lock().unwrap();
-        if clock.is_paused() || clock.now() < deadline {
-            continue;
-        }
-        deadline = clock.now() + WAIT_POLL;
-        if state.wait.is_some_and(|wait| wait.met(&inner.syncpoints)) {
-            // A failure faults the channel; its note and the refusal of the
-            // next DMAPUT write report it.
-            let _ = inner.run(&mut state);
-        }
-        if state.wait.is_none() {
-            state.polling = false;
-            return;
-        }
+        syncpoints.0.wait_change(syncpoints.1, PAUSED_POLL);
     }
 }
 
@@ -739,7 +733,7 @@ mod tests {
         fn engine_calls(&self, count: usize) -> Vec<(u32, u32, u32)> {
             let deadline = Instant::now() + Duration::from_secs(1);
             while self.calls.lock().unwrap().len() < count && Instant::now() < deadline {
-                std::thread::sleep(WAIT_POLL);
+                std::thread::sleep(Duration::from_micros(500));
             }
             self.calls.lock().unwrap().clone()
         }
