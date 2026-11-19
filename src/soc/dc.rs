@@ -41,8 +41,9 @@
 //! restored from a snapshot ([`Dc`]'s [`Snapshot`]) with guest time set to
 //! the saved time reaches its next boundary when the saved one would have.
 //!
-//! Nothing is scanned out continuously. [`Dc::frame`] produces the picture
-//! the controller would be sending at that moment from the active copy:
+//! Nothing is scanned out continuously. [`Dc::frame_turned_clockwise`]
+//! produces the picture the controller would be sending at that moment, as
+//! the screen shows it, from the active copy:
 //! the enabled windows' frame buffers, fetched through the SMMU like the
 //! hardware fetches them, layered on the active area.
 
@@ -301,7 +302,7 @@ impl Frame {
 pub enum NoFrame {
     /// The controller has not been set up to send frames.
     NotRunning,
-    /// It is set up in a way [`Dc::frame`] does not render.
+    /// It is set up in a way [`Dc::frame_turned_clockwise`] does not render.
     Unsupported(String),
     /// The window's frame buffer is not memory the controller can reach.
     BufferUnmapped { address: u64 },
@@ -563,7 +564,9 @@ impl Dc {
     }
 
     /// The picture being sent to the panel, with the frame buffers read
-    /// through `memory`.
+    /// through `memory`, unturned: what the tests compare against the
+    /// controller's own coordinates.
+    #[cfg(test)]
     pub fn frame(&self, memory: &DeviceMemory) -> Result<Frame, NoFrame> {
         self.render(memory, false)
     }

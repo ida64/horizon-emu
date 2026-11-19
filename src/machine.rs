@@ -35,7 +35,7 @@ use crate::{
     secmon::{self, SecureMonitor, SmcEffect, Unimplemented},
     snapshot::Snapshot,
     soc::{
-        Screen, Soc,
+        Panel, Screen, Soc,
         dc::NoFrame,
         emmc::{EmmcImages, ImageError},
         mc::{self, DeviceMemory},
@@ -797,6 +797,12 @@ impl Machine {
     /// What the console's screen shows at this moment.
     pub fn screen(&self) -> Result<Screen, NoFrame> {
         self.soc.screen()
+    }
+
+    /// How the panel and its backlight stand, whether or not a picture
+    /// can be composed.
+    pub fn panel(&self) -> Panel {
+        self.soc.panel()
     }
 
     /// Puts a finger on the touchscreen at `(x, y)` or moves it there

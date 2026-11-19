@@ -109,8 +109,16 @@ impl DramSize {
 
     /// DRAM ID config item, a fuse value naming the memory chips: Samsung
     /// ones of this size, numbered as publicly documented. The firmware's
-    /// clock driver asks for it (pcv, `spl:` request 0 with item 2). No
-    /// original console was made with 8 GiB.
+    /// clock driver asks for it (pcv, `spl:` request 0 with item 2) to pick
+    /// its memory training tables.
+    ///
+    /// `None` for 8 GiB: every 8 GiB value in Switchbrew's DramId table
+    /// (Secure Monitor page, `GetConfig` item 2: 9, 13, 18, 21, 23, 28)
+    /// names a Mariko (T214) board, and this console is an Erista (T210)
+    /// one, whose values are 0-4 (4 GiB from three makers, 6 GiB from
+    /// Samsung) \[assumption: that table is complete for Erista\]. No ID
+    /// is established for it, so the monitor refuses the item and the
+    /// command line does not offer the size.
     pub const fn dram_id(self) -> Option<u64> {
         match self {
             Self::Gb4 => Some(0),

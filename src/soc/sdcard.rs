@@ -60,14 +60,14 @@
 //!   function in the other groups; 100 mA at the 3.3 V speeds, 200 mA at
 //!   the UHS-I ones.
 
-use std::{fmt, fs::File, io, mem, sync::Arc};
+use std::{fmt, io, mem, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
 use super::{
     Notes,
-    medium::{Medium, MediumState, SECTOR_SIZE},
-    sdmmc::{Card, Response},
+    medium::{ImageFile, Medium, MediumError, MediumState, SECTOR_SIZE},
+    sdmmc::{BlockError, Card, Response},
 };
 use crate::snapshot::{SnapshotError, decode, encode};
 
@@ -180,9 +180,9 @@ impl SdCardImage {
     /// The file's length is the capacity. Writes go to it only if
     /// `writable` (it must be open for writing then); otherwise they last
     /// for the run.
-    pub fn file(file: File, writable: bool) -> Result<Self, SdCardError> {
-        let sectors = sectors(file.metadata().map_err(SdCardError::Io)?.len())?;
-        Ok(Self(Medium::new(DEVICE, sectors, Some(file), writable)))
+    pub fn file(image: ImageFile, writable: bool) -> Result<Self, SdCardError> {
+        let sectors = sectors(image.file.metadata().map_err(SdCardError::Io)?.len())?;
+        Ok(Self(Medium::new(DEVICE, sectors, Some(image), writable)))
     }
 
     /// Contents held in memory, written to in place.
@@ -322,6 +322,19 @@ impl SdCard {
     /// state, reporting and clearing the collected errors.
     fn r1(&mut self) -> Option<Response> {
         Some(Response::Short(self.status() | mem::take(&mut self.errors)))
+    }
+
+    /// What the card's answer to a data transfer is to the controller. A
+    /// sector out of range is reported in the next status as well.
+    fn sectors_moved(&mut self, moved: Result<(), MediumError>) -> Result<(), BlockError> {
+        match moved {
+            Ok(()) => Ok(()),
+            Err(MediumError::OutOfRange) => {
+                self.errors |= status::OUT_OF_RANGE;
+                Err(BlockError::Timeout)
+            }
+            Err(MediumError::Host(note)) => Err(BlockError::Host(note)),
+        }
     }
 
     /// R1 to an application-specific command, which says it was taken as
@@ -624,15 +637,19 @@ impl Card for SdCard {
         }
     }
 
-    fn send_block(&mut self, block: &mut [u8]) -> Option<()> {
-        (self.powered && self.state == State::SendingData).then_some(())?;
-        match self.data.as_mut()? {
+    fn send_block(&mut self, block: &mut [u8]) -> Result<(), BlockError> {
+        if !(self.powered && self.state == State::SendingData) {
+            return Err(BlockError::Timeout);
+        }
+        match self.data.as_mut().ok_or(BlockError::Timeout)? {
             Data::Block(bytes) => {
-                (block.len() == bytes.len()).then_some(())?;
+                if block.len() != bytes.len() {
+                    return Err(BlockError::Timeout);
+                }
                 block.copy_from_slice(bytes);
                 self.end_of_block(Some(0));
             }
-            Data::Tuning => return None,
+            Data::Tuning => return Err(BlockError::Timeout),
             Data::Sectors { next, left } => {
                 let sector = *next;
                 *next += 1;
@@ -640,20 +657,20 @@ impl Card for SdCard {
                     *left -= 1;
                     *left
                 });
-                if self.medium.read(sector, block).is_none() {
-                    self.errors |= status::OUT_OF_RANGE;
-                    return None;
-                }
+                let read = self.medium.read(sector, block);
+                self.sectors_moved(read)?;
                 self.end_of_block(left);
             }
         }
-        Some(())
+        Ok(())
     }
 
-    fn receive_block(&mut self, block: &[u8]) -> Option<()> {
-        (self.powered && self.state == State::ReceivingData).then_some(())?;
-        let Data::Sectors { next, left } = self.data.as_mut()? else {
-            return None;
+    fn receive_block(&mut self, block: &[u8]) -> Result<(), BlockError> {
+        if !(self.powered && self.state == State::ReceivingData) {
+            return Err(BlockError::Timeout);
+        }
+        let Some(Data::Sectors { next, left }) = self.data.as_mut() else {
+            return Err(BlockError::Timeout);
         };
         let sector = *next;
         *next += 1;
@@ -661,12 +678,10 @@ impl Card for SdCard {
             *left -= 1;
             *left
         });
-        if self.medium.write(sector, block).is_none() {
-            self.errors |= status::OUT_OF_RANGE;
-            return None;
-        }
+        let written = self.medium.write(sector, block);
+        self.sectors_moved(written)?;
         self.end_of_block(left);
-        Some(())
+        Ok(())
     }
 
     fn take_tuning_block(&mut self) -> bool {
@@ -932,14 +947,21 @@ mod tests {
         short(card.command(25, last - 1));
         card.receive_block(&pattern).unwrap();
         card.receive_block(&pattern).unwrap();
-        assert_eq!(card.receive_block(&pattern), None, "the count is used up");
+        assert_eq!(
+            card.receive_block(&pattern),
+            Err(BlockError::Timeout),
+            "the count is used up"
+        );
         assert_eq!(state(short(card.command(13, rca))), 4);
 
         // An open-ended read across the end of the card.
         short(card.command(18, last - 1));
         assert_eq!(receive(&mut card, SECTOR_SIZE), pattern);
         assert_eq!(receive(&mut card, SECTOR_SIZE), pattern);
-        assert_eq!(card.send_block(&mut [0; SECTOR_SIZE]), None);
+        assert_eq!(
+            card.send_block(&mut [0; SECTOR_SIZE]),
+            Err(BlockError::Timeout)
+        );
         let stop = short(card.command(12, 0));
         assert_eq!(state(stop), 5, "was sending");
         assert_ne!(stop & status::OUT_OF_RANGE, 0);
@@ -948,7 +970,10 @@ mod tests {
         let read = short(card.command(17, last + 1));
         assert_ne!(read & status::OUT_OF_RANGE, 0);
         assert_eq!(state(read), 4);
-        assert_eq!(card.send_block(&mut [0; SECTOR_SIZE]), None);
+        assert_eq!(
+            card.send_block(&mut [0; SECTOR_SIZE]),
+            Err(BlockError::Timeout)
+        );
         // Unmodeled commands: ERASE is illegal and reported next.
         assert_eq!(card.command(38, 0), None);
         assert_ne!(short(card.command(13, rca)) & status::ILLEGAL_COMMAND, 0);

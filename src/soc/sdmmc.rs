@@ -35,7 +35,9 @@
 //!
 //! Programmed I/O through the buffer data port and ADMA descriptor tables
 //! are not modeled; a transfer that asks for either stops the machine with
-//! a note. The capabilities report only what the driver insists on.
+//! a note. So does a card whose image file the host fails to read or
+//! write ([`BlockError::Host`]). The capabilities report only what the
+//! driver insists on.
 //!
 //! A machine snapshot saves the registers, the transfer paused at a buffer
 //! boundary, what the driver is yet to be told and the guest time it is
@@ -68,19 +70,28 @@ pub enum Response {
     Long([u8; 15]),
 }
 
+/// Why a card moved no block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockError {
+    /// The card is not sending or receiving, the block is not the size it
+    /// moves, or it is beyond the end: the controller sees a data timeout.
+    Timeout,
+    /// The host failed to read or write the card's image file; the machine
+    /// stops with this note.
+    Host(String),
+}
+
 /// A card on the controller's command and data lines.
 pub trait Card: Send {
     /// Executes one command. `None` is no response: the command expects
     /// none, or the card ignored it.
     fn command(&mut self, index: u8, argument: u32) -> Option<Response>;
 
-    /// The next block the card sends. `None` when it is not sending, or
-    /// `block` is not the size of what it sends.
-    fn send_block(&mut self, block: &mut [u8]) -> Option<()>;
+    /// The next block the card sends.
+    fn send_block(&mut self, block: &mut [u8]) -> Result<(), BlockError>;
 
-    /// Takes the next block the host sends. `None` when the card is not
-    /// receiving or cannot store the block.
-    fn receive_block(&mut self, block: &[u8]) -> Option<()>;
+    /// Takes the next block the host sends.
+    fn receive_block(&mut self, block: &[u8]) -> Result<(), BlockError>;
 
     /// Consumes the tuning block if that is what the card is sending.
     fn take_tuning_block(&mut self) -> bool;
@@ -671,9 +682,18 @@ impl Sdmmc {
                 if transfer.blocks_left == 0 {
                     break;
                 }
-                if transfer.to_host && card.send_block(&mut transfer.block).is_none() {
-                    host.raise_error(ERROR_DATA_TIMEOUT);
-                    return Some(());
+                if transfer.to_host {
+                    match card.send_block(&mut transfer.block) {
+                        Ok(()) => {}
+                        Err(BlockError::Timeout) => {
+                            host.raise_error(ERROR_DATA_TIMEOUT);
+                            return Some(());
+                        }
+                        Err(BlockError::Host(note)) => {
+                            self.notes.add(note);
+                            return None;
+                        }
+                    }
                 }
                 transfer.moved = 0;
             }
@@ -695,9 +715,18 @@ impl Sdmmc {
             transfer.moved += count;
             transfer.address += count as u64;
             if transfer.moved == transfer.block.len() {
-                if !transfer.to_host && card.receive_block(&transfer.block).is_none() {
-                    host.raise_error(ERROR_DATA_TIMEOUT);
-                    return Some(());
+                if !transfer.to_host {
+                    match card.receive_block(&transfer.block) {
+                        Ok(()) => {}
+                        Err(BlockError::Timeout) => {
+                            host.raise_error(ERROR_DATA_TIMEOUT);
+                            return Some(());
+                        }
+                        Err(BlockError::Host(note)) => {
+                            self.notes.add(note);
+                            return None;
+                        }
+                    }
                 }
                 transfer.blocks_left -= 1;
                 host.busy += match transfer.to_host {
@@ -1301,6 +1330,45 @@ mod tests {
             bench.read(ERROR_INTERRUPT_STATUS, 2),
             u64::from(ERROR_DATA_TIMEOUT)
         );
+    }
+
+    #[test]
+    fn an_image_the_host_fails_to_read_stops_the_machine_with_a_note_naming_it() {
+        use super::super::medium::{ImageFile, Medium};
+        let path =
+            std::env::temp_dir().join(format!("horizon-emu-sdmmc-failing-{}", std::process::id()));
+        std::fs::write(&path, [0; 16 * 512]).unwrap();
+        // Open only for writing: every read of it fails on the host.
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        let image = ImageFile {
+            file,
+            path: path.clone(),
+        };
+        let card = emmc::tests::selected_over(Medium::new("eMMC", 16, Some(image), false));
+        let bench = Bench::with_card(Some(Box::new(card)), Timing::INSTANT);
+        bench.write(
+            HOST_CONTROL_2,
+            2,
+            (CONTROL_2_VERSION_4 | CONTROL_2_64_BIT_ADDRESSING).into(),
+        );
+        bench.write(ADMA_ADDRESS, 4, BUFFER);
+        bench.write(BLOCK_SIZE, 2, 0x200);
+        bench.write(ARGUMENT, 4, 3);
+        bench.write(TRANSFER_MODE, 2, (TRANSFER_DMA | TRANSFER_TO_HOST).into());
+        assert_eq!(
+            bench.sdmmc.write(0, COMMAND as u64, 2, 17 << 8 | 0x3A),
+            None,
+            "the access is refused, not answered with a data timeout"
+        );
+        assert_eq!(bench.read(ERROR_INTERRUPT_STATUS, 2), 0);
+        let notes = bench.sdmmc.notes.take();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].starts_with("eMMC: cannot read sector 3 of the image ")
+                && notes[0].contains(&path.display().to_string()),
+            "{notes:?}"
+        );
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
