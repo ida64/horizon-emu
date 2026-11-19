@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
-        Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
@@ -30,13 +30,13 @@ use horizon_emu::{
     log_manager::{self, Packet, Reassembler},
     machine::{
         self, Caller, CodeAddress, ExceptionState, Firmware, Machine, Module, Place, Poke, PowerOn,
-        Process, RunEnd, RunOptions, SaveReport, TraceEvent,
+        Process, RunEnd, RunOptions, RunReport, SaveReport, TraceEvent,
     },
     maxwell, nand, net, sdcard,
     secmon::{self, SmcEffect},
     soc::{
-        Panel, dc::Frame, emmc::EmmcImages, joycon::Button, medium::ImageFile, sdcard::SdCardImage,
-        wifi_ap::AccessPoint,
+        Panel, bcm4356::Bcm4356Wifi, dc::Frame, emmc::EmmcImages, joycon::Button,
+        max77620::PowerDown, medium::ImageFile, sdcard::SdCardImage, wifi_ap::AccessPoint,
     },
     svc,
     symbols::SymbolTable,
@@ -62,7 +62,14 @@ usage: horizon-emu info <kernel.elf>
 
 <kernel.elf> is the package2 kernel wrapped as an ELF (see pkg2elf.py).
 boot runs until a core needs something that is not emulated, the kernel
-panics, the timeout expires, or its window is closed. power-on starts the
+panics, the timeout expires, the console turns itself off (Power Options >
+Turn Off), or its window is closed. Power Options > Restart power-cycles
+the console in the same process: a new machine is built from the same
+arguments (kernel entry again, or the boot ROM again for power-on), the
+PMIC's clock and the Joy-Con kept, DRAM lost; the window and --control
+socket stay. A restart with media whose writes host memory alone keeps
+(no --emmc-writable, --sd-writable, --amiibo-writable, or --homebrew's
+card) stops the machine instead. power-on starts the
 console the way it powers on instead, from its boot ROM (high-level
 emulated): the ROM boots package1 from the BCT in --emmc-boot0 and
 --emmc-boot1 (see format-emmc --boot0), the boot processor (BPMP) runs
@@ -1073,63 +1080,206 @@ fn boot(
             path: PathBuf::from(path),
         })
     };
-    let [boot0, boot1] = emmc_boot.map(|path| path.map(open_image).transpose());
-    let user = emmc_user.map(open_image).transpose()?;
-    let (overlay, replaced) = homebrew.overlay(user.as_ref().map(|user| &user.file), &keys)?;
-    let emmc = match user {
-        Some(user) => Some(EmmcImages {
-            user,
-            boot: [boot0?, boot1?],
-            writable: emmc_writable,
-            overlay,
-        }),
-        None if emmc_boot.iter().all(Option::is_none) => None,
-        None => return Err("eMMC boot partition images need --emmc for the module itself".into()),
+    if emmc_user.is_none() && emmc_boot.iter().any(Option::is_some) {
+        return Err("eMMC boot partition images need --emmc for the module itself".into());
+    }
+    if sd_card.is_some() && homebrew.makes_sd_card() {
+        return Err("--homebrew makes the microSD card; it cannot go with --sd".into());
+    }
+    params.program_verification_disabled = homebrew.disables_verification();
+    if kernel.is_none() && homebrew.installs_keys() {
+        return Err(
+            "--homebrew-keys and --homebrew patch the kernel's INI1, and power-on runs \
+             the real package2 as it is"
+                .into(),
+        );
+    }
+    if wifi_ssid.is_none() {
+        if wifi_passphrase.is_some() {
+            return Err("--wifi-passphrase needs --wifi-ssid".into());
+        } else if !forwards.is_empty() {
+            return Err("--forward needs --wifi-ssid".into());
+        } else if dns.is_some() {
+            return Err("--dns needs --wifi-ssid".into());
+        }
+    }
+    if amiibo_writable && amiibo.is_none() {
+        return Err("--amiibo-writable needs --amiibo".into());
+    }
+    let (mut first_image, kernel) = match kernel {
+        Some((image, path)) => {
+            let path = std::path::absolute(path).map_err(|error| error.to_string())?;
+            (Some(image), Some(path))
+        }
+        None => (None, None),
     };
-    let sd_card = sd_card
-        .map(|path| {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(sd_writable)
-                .open(path)
-                .map_err(|error| format!("{path}: {error}"))?;
-            let image = ImageFile {
-                file,
-                path: PathBuf::from(path),
-            };
-            SdCardImage::file(image, sd_writable).map_err(|error| format!("{path}: {error}"))
+    // What the guest writes that host memory alone keeps: a machine built
+    // for the next power-up would not find it.
+    let volatile: Vec<&str> = [
+        (
+            emmc_user.is_some() && !emmc_writable,
+            "the eMMC (no --emmc-writable)",
+        ),
+        (
+            sd_card.is_some() && !sd_writable,
+            "the microSD card (no --sd-writable)",
+        ),
+        (
+            homebrew.makes_sd_card(),
+            "the microSD card --homebrew makes",
+        ),
+        (
+            amiibo.is_some() && !amiibo_writable,
+            "the NFC tag (no --amiibo-writable)",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(kept_in_memory, what)| kept_in_memory.then_some(what))
+    .collect();
+
+    // The network around the console outlives its power cycles: the
+    // router and the shared air reach the radio of whichever machine is in
+    // place, and drop what comes while there is none.
+    let radio: Arc<Mutex<Option<Arc<Bcm4356Wifi>>>> = Arc::default();
+    let router = match &wifi_ssid {
+        Some(_) => {
+            let radio = Arc::clone(&radio);
+            let router = net::Router::new(
+                Box::new(move |frame| {
+                    let wifi = radio.lock().unwrap().clone();
+                    if let Some(wifi) = wifi {
+                        wifi.from_network(&frame);
+                    }
+                }),
+                dns,
+            );
+            // One line per DHCP lease, DNS query, new flow and plain-HTTP
+            // exchange: what the console does on the network, never payload.
+            router.set_trace(Box::new(|line| eprintln!("net: {line}")));
+            for &(host_port, console_port) in &forwards {
+                router
+                    .forward(host_port, console_port)
+                    .map_err(|error| format!("--forward {host_port}: {error}"))?;
+            }
+            Some(router)
+        }
+        None => None,
+    };
+    let air = air
+        .map(|address| {
+            let radio = Arc::clone(&radio);
+            horizon_emu::air::Air::join(
+                address,
+                Box::new(move |channel, frame| {
+                    let wifi = radio.lock().unwrap().clone();
+                    if let Some(wifi) = wifi {
+                        wifi.from_air(channel, frame);
+                    }
+                }),
+            )
+            .map(Arc::new)
+            .map_err(|error| format!("--air {address}: {error}"))
         })
         .transpose()?;
-    let sd_card = match sd_card {
-        Some(_) if homebrew.makes_sd_card() => {
-            return Err("--homebrew makes the microSD card; it cannot go with --sd".into());
+
+    // Builds the machine for a power-up: the media opened again, the
+    // firmware as at the first (the kernel image read again, or the boot
+    // ROM run again on the boot partitions), and what is around the
+    // console placed again. `image` is the kernel already read, if any;
+    // `first` prints what the homebrew options changed.
+    let power_up = |image: Option<KernelImage>, first: bool| -> Result<Machine, String> {
+        let [boot0, boot1] = emmc_boot.map(|path| path.map(open_image).transpose());
+        let user = emmc_user.map(open_image).transpose()?;
+        let (overlay, replaced) = homebrew.overlay(user.as_ref().map(|user| &user.file), &keys)?;
+        let emmc = user
+            .map(|user| {
+                Ok::<_, String>(EmmcImages {
+                    user,
+                    boot: [boot0?, boot1?],
+                    writable: emmc_writable,
+                    overlay,
+                })
+            })
+            .transpose()?;
+        let sd_card = match sd_card {
+            Some(path) => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(sd_writable)
+                    .open(path)
+                    .map_err(|error| format!("{path}: {error}"))?;
+                let image = ImageFile {
+                    file,
+                    path: PathBuf::from(path),
+                };
+                Some(
+                    SdCardImage::file(image, sd_writable)
+                        .map_err(|error| format!("{path}: {error}"))?,
+                )
+            }
+            None => homebrew.sd_card()?,
+        };
+        let mut changed = replaced;
+        let firmware = match &kernel {
+            Some(path) => {
+                let mut image = match image {
+                    Some(image) => image,
+                    None => KernelImage::load(path).map_err(|error| error.to_string())?,
+                };
+                let mut installed = homebrew.install_keys(&mut image)?;
+                installed.append(&mut changed);
+                changed = installed;
+                Firmware::Kernel(image)
+            }
+            None => Firmware::PowerOn(boot_rom(&keys, emmc_boot)?),
+        };
+        if first {
+            for line in &changed {
+                println!("{line}");
+            }
         }
-        Some(card) => Some(card),
-        None => homebrew.sd_card()?,
+        let machine = Machine::new(
+            firmware,
+            &params,
+            keys.clone(),
+            emmc,
+            sd_card,
+            Box::new(io::stderr()),
+        )
+        .map_err(|error| error.to_string())?;
+        machine.set_bpmp_trace(bpmp_trace);
+        if let (Some(ssid), Some(router)) = (&wifi_ssid, &router) {
+            let ap = AccessPoint::new(ssid, wifi_passphrase.as_deref())
+                .map_err(|error| format!("--wifi-ssid: {error}"))?;
+            let router = Arc::clone(router);
+            machine
+                .wifi()
+                .set_access_point(ap, Box::new(move |frame| router.send(frame)));
+        }
+        if let Some(link) = &air {
+            let link = Arc::clone(link);
+            machine.wifi().set_air(Box::new(move |channel, frame| {
+                link.transmit(channel, frame)
+            }));
+        }
+        *radio.lock().unwrap() = Some(Arc::clone(machine.wifi()));
+        if let Some(memory) = pro_controller {
+            machine
+                .bluetooth()
+                .place_pro_controller(Path::new(memory))
+                .map_err(|error| format!("--pro-controller: {error}"))?;
+        }
+        Ok(machine)
     };
-    params.program_verification_disabled = homebrew.disables_verification();
-    let (firmware, kernel) = match kernel {
-        Some((mut image, path)) => {
-            let installed = homebrew.install_keys(&mut image)?;
-            for line in installed.iter().chain(&replaced) {
-                println!("{line}");
-            }
-            let path = std::path::absolute(path).map_err(|error| error.to_string())?;
-            (Firmware::Kernel(image), Some(path))
+    // Held over the reader once the machine is as it is to run: restored,
+    // the tag is not part of a snapshot.
+    let place_amiibo = |machine: &Machine| {
+        if let Some(path) = amiibo {
+            let tag = horizon_emu::soc::ntag::Ntag215::load(Path::new(path), amiibo_writable)
+                .map_err(|error| format!("--amiibo {error}"))?;
+            machine.place_tag(Some(tag));
         }
-        None => {
-            if homebrew.installs_keys() {
-                return Err(
-                    "--homebrew-keys and --homebrew patch the kernel's INI1, and power-on runs \
-                     the real package2 as it is"
-                        .into(),
-                );
-            }
-            for line in &replaced {
-                println!("{line}");
-            }
-            (Firmware::PowerOn(boot_rom(&keys, emmc_boot)?), None)
-        }
+        Ok::<_, String>(())
     };
     // A machine somebody is watching, or something drives, runs for as
     // long as they do.
@@ -1144,60 +1294,11 @@ fn boot(
                 .map_err(|error| format!("--control {path}: {error}"))
         })
         .transpose()?;
-    let machine = Machine::new(
-        firmware,
-        &params,
-        keys,
-        emmc,
-        sd_card,
-        Box::new(io::stderr()),
-    )
-    .map_err(|error| error.to_string())?;
-    machine.set_bpmp_trace(bpmp_trace);
+    let machine = power_up(first_image.take(), true)?;
     let snapshotter = Snapshotter {
-        kernel,
+        kernel: kernel.clone(),
         flags: machine_flags,
     };
-    if let Some(ssid) = &wifi_ssid {
-        let ap = AccessPoint::new(ssid, wifi_passphrase.as_deref())
-            .map_err(|error| format!("--wifi-ssid: {error}"))?;
-        let wifi = std::sync::Arc::clone(machine.wifi());
-        let router = net::Router::new(Box::new(move |frame| wifi.from_network(&frame)), dns);
-        // One line per DHCP lease, DNS query, new flow and plain-HTTP
-        // exchange: what the console does on the network, never payload.
-        router.set_trace(Box::new(|line| eprintln!("net: {line}")));
-        for &(host_port, console_port) in &forwards {
-            router
-                .forward(host_port, console_port)
-                .map_err(|error| format!("--forward {host_port}: {error}"))?;
-        }
-        machine
-            .wifi()
-            .set_access_point(ap, Box::new(move |frame| router.send(frame)));
-    } else if wifi_passphrase.is_some() {
-        return Err("--wifi-passphrase needs --wifi-ssid".into());
-    } else if !forwards.is_empty() {
-        return Err("--forward needs --wifi-ssid".into());
-    } else if dns.is_some() {
-        return Err("--dns needs --wifi-ssid".into());
-    }
-    if let Some(address) = air {
-        let wifi = std::sync::Arc::clone(machine.wifi());
-        let link = horizon_emu::air::Air::join(
-            address,
-            Box::new(move |channel, frame| wifi.from_air(channel, frame)),
-        )
-        .map_err(|error| format!("--air {address}: {error}"))?;
-        machine.wifi().set_air(Box::new(move |channel, frame| {
-            link.transmit(channel, frame)
-        }));
-    }
-    if let Some(memory) = pro_controller {
-        machine
-            .bluetooth()
-            .place_pro_controller(Path::new(memory))
-            .map_err(|error| format!("--pro-controller: {error}"))?;
-    }
     // The WiFi radio's access point is part of what is restored, so it is
     // in place first.
     if let Some(dir) = restore {
@@ -1211,13 +1312,8 @@ fn boot(
             started.elapsed().as_secs_f64()
         );
     }
-    if let Some(path) = amiibo {
-        let tag = horizon_emu::soc::ntag::Ntag215::load(Path::new(path), amiibo_writable)
-            .map_err(|error| format!("--amiibo {error}"))?;
-        machine.place_tag(Some(tag));
-    } else if amiibo_writable {
-        return Err("--amiibo-writable needs --amiibo".into());
-    }
+    place_amiibo(&machine)?;
+    let console = Console(RwLock::new(Some(machine)));
     let mut window = show_window.then(ScreenWindow::open).transpose()?;
     let stop = AtomicBool::new(false);
     let log = LogOverlay::default();
@@ -1295,7 +1391,7 @@ fn boot(
     // `PICTURE_CHECK`.
     const PICTURE_CHECK: Duration = Duration::from_millis(250);
     let mut checked: Option<(Panel, bool, Instant)> = None;
-    let mut watch_screen = || {
+    let mut watch_screen = |machine: &Machine| {
         if !verbose {
             return;
         }
@@ -1329,85 +1425,198 @@ fn boot(
     timed_screenshots.sort_by_key(|&(at, _)| at);
     let mut timed_screenshots = timed_screenshots.into_iter().peekable();
     let started = Instant::now();
-    let ended = AtomicBool::new(false);
-    let report = thread::scope(|scope| {
-        // A window needs this thread, so the machine gets another.
-        let run = scope.spawn(|| machine.run(options));
+    let stopped = Mutex::new(None::<String>);
+    let closing = AtomicBool::new(false);
+    thread::scope(|scope| {
         if let Some(listener) = control {
             let controlled = control::Controlled {
-                machine: &machine,
+                console: &console,
                 stop: &stop,
                 started,
-                ended: &ended,
+                stopped: &stopped,
+                closing: &closing,
                 snapshot: &snapshotter,
             };
             scope.spawn(move || control::serve(listener, &controlled));
         }
-        while !run.is_finished() {
-            watch_screen();
-            match &mut window {
-                Some(window) => {
-                    if !window.show(&machine, &log) {
-                        stop.store(true, Ordering::SeqCst);
-                        break;
-                    }
-                }
-                None => thread::sleep(Duration::from_millis(20)),
-            }
-            let now = started.elapsed();
-            while let Some((at, input)) = inputs.next_if(|&(at, _)| at <= now) {
-                match input {
-                    Input::Seat(seated) => machine.seat_joycons(seated),
-                    Input::Press(button, held) => machine.press(button, held),
-                    Input::Power(held) => machine.press_power(held),
-                    Input::Touch(finger) => {
-                        if !machine.set_touch(finger)
-                            && let Some((x, y)) = finger
+        let outcome = loop {
+            // The limit is on the whole run, across restarts.
+            let options = RunOptions {
+                timeout: timeout.map(|limit| limit.saturating_sub(started.elapsed())),
+                ..options
+            };
+            // A window needs this thread, so the machine gets another.
+            let console = &console;
+            let run = scope.spawn(move || {
+                console
+                    .with(|machine| machine.run(options))
+                    .expect("a machine is in place while it runs")
+            });
+            while !run.is_finished() {
+                console.with(&mut watch_screen);
+                match &mut window {
+                    Some(window) => {
+                        if !console
+                            .with(|machine| window.show(machine, &log))
+                            .unwrap_or(true)
                         {
-                            let seconds = at.as_secs_f64();
-                            narrate(
-                                &format!(
-                                    "touch at {x},{y} after {seconds:.3} s: the touchscreen is not scanning yet"
-                                ),
-                                &tracing,
-                            );
+                            stop.store(true, Ordering::SeqCst);
+                            break;
                         }
                     }
+                    None => thread::sleep(Duration::from_millis(20)),
                 }
-            }
-            while let Some((at, path)) = timed_screenshots.next_if(|(at, _)| *at <= now) {
-                narrate(&save_screen(&machine, &path, at), &tracing);
-            }
-            if let Some(script) = &mut script {
-                script.advance(&machine, |event| {
-                    let line = match event {
-                        Event::Done { line, text } => format!("script line {line}: {text}"),
-                        Event::Screenshot(path) => save_screen(&machine, path, now),
-                    };
-                    narrate(&line, &tracing);
+                let now = started.elapsed();
+                console.with(|machine| {
+                    while let Some((at, input)) = inputs.next_if(|&(at, _)| at <= now) {
+                        apply_input(machine, at, input, &tracing);
+                    }
+                    while let Some((at, path)) = timed_screenshots.next_if(|(at, _)| *at <= now) {
+                        narrate(&save_screen(machine, &path, at), &tracing);
+                    }
+                    if let Some(script) = &mut script {
+                        script.advance(machine, |event| {
+                            let line = match event {
+                                Event::Done { line, text } => format!("script line {line}: {text}"),
+                                Event::Screenshot(path) => save_screen(machine, path, now),
+                            };
+                            narrate(&line, &tracing);
+                        });
+                    }
                 });
             }
+            let report = run
+                .join()
+                .unwrap_or_else(|payload| panic::resume_unwind(payload));
+            let ended = match report.ended {
+                RunEnd::Core(core) => format!("machine stopped by core {core}"),
+                RunEnd::Timeout => format!(
+                    "machine stopped by timeout after {:?}",
+                    timeout.unwrap_or_default()
+                ),
+                RunEnd::Requested => {
+                    "machine stopped: asked to (window closed or stop requested)".into()
+                }
+                RunEnd::PowerDown(PowerDown::Off) => "machine stopped: powered off (the PMIC's \
+                     software reset, ONOFFCNFG1 SFT_RST, without ONOFFCNFG2 SFT_RST_WK: every \
+                     rail down, and no power-up)"
+                    .into(),
+                RunEnd::PowerDown(PowerDown::Restart) if !volatile.is_empty() => format!(
+                    "machine stopped: the console restarts (the PMIC's software reset), and \
+                     what the guest wrote to {} is in host memory only: the power-up would \
+                     not find it",
+                    volatile.join(", ")
+                ),
+                RunEnd::PowerDown(PowerDown::Restart) => "console restarts: the PMIC's software \
+                     reset (ONOFFCNFG1 SFT_RST, ONOFFCNFG2 SFT_RST_WK) took every rail down, \
+                     DRAM with them, and powers the console up again"
+                    .into(),
+            };
+            // What the power cycle leaves: the PMIC's clock, and the Joy-Con
+            // where they are, on the rails or not.
+            let (kept, seated) = console
+                .with(|machine| {
+                    report_run(machine, &report, &ended, &symbols, verbose, &log);
+                    (machine.battery_backed(), machine.joycons_seated())
+                })
+                .expect("the machine that ran is in place");
+            if report.ended != RunEnd::PowerDown(PowerDown::Restart) || !volatile.is_empty() {
+                break Ok(ended);
+            }
+            // The old machine goes first: one virtual machine at a time.
+            *radio.lock().unwrap() = None;
+            drop(console.0.write().unwrap().take());
+            if let Some(tracker) = &tracing.ipc {
+                *tracker.lock().unwrap() = Tracker::default();
+            }
+            if let Some(log) = &tracing.log {
+                *log.packets.lock().unwrap() = Reassembler::default();
+            }
+            let machine = match power_up(None, false) {
+                Ok(machine) => machine,
+                Err(error) => break Err(error),
+            };
+            machine.power_up_from_reset(kept);
+            machine.seat_joycons(seated);
+            if let Err(error) = place_amiibo(&machine) {
+                break Err(error);
+            }
+            *console.0.write().unwrap() = Some(machine);
+            let from = if kernel.is_some() {
+                "kernel entry"
+            } else {
+                "the boot ROM"
+            };
+            narrate(&format!("console powered up again, from {from}"), &tracing);
+        };
+        *stopped.lock().unwrap() = Some(match &outcome {
+            Ok(ended) => ended.clone(),
+            Err(error) => error.clone(),
+        });
+        if let Some((line, text)) = script.as_ref().and_then(Script::waiting_at) {
+            println!("script: did not get past line {line}: {text}");
         }
-        let report = run
-            .join()
-            .unwrap_or_else(|payload| panic::resume_unwind(payload));
-        ended.store(true, Ordering::SeqCst);
-        report
-    });
+        let screenshot = match (&screenshot, &outcome) {
+            (Some(path), Ok(_)) => console
+                .with(|machine| final_screenshot(machine, path))
+                .unwrap_or(Ok(())),
+            _ => Ok(()),
+        };
+        if let Some(window) = &mut window {
+            window.set_stopped();
+            while console.with(|machine| window.show(machine, &log)) == Some(true) {}
+        }
+        closing.store(true, Ordering::SeqCst);
+        outcome.and(screenshot)
+    })
+}
 
-    let ended = match report.ended {
-        RunEnd::Core(core) => format!("machine stopped by core {core}"),
-        RunEnd::Timeout => format!(
-            "machine stopped by timeout after {:?}",
-            timeout.unwrap_or_default()
-        ),
-        RunEnd::Requested => "machine stopped: asked to (window closed or stop requested)".into(),
-    };
-    println!("{ended}");
-    log.push(&ended);
-    if let Some((line, text)) = script.as_ref().and_then(Script::waiting_at) {
-        println!("script: did not get past line {line}: {text}");
+/// The machine the console is at the moment. A power cycle replaces it,
+/// and between the two there is none.
+struct Console(RwLock<Option<Machine>>);
+
+impl Console {
+    /// Does `action` on the machine, unless there is none at the moment.
+    fn with<T>(&self, action: impl FnOnce(&Machine) -> T) -> Option<T> {
+        self.0.read().unwrap().as_ref().map(action)
     }
+}
+
+/// Does `input`, timed `at`, to the console.
+fn apply_input(machine: &Machine, at: Duration, input: Input, tracing: &Tracing) {
+    match input {
+        Input::Seat(seated) => machine.seat_joycons(seated),
+        Input::Press(button, held) => machine.press(button, held),
+        Input::Power(held) => machine.press_power(held),
+        Input::Touch(finger) => {
+            if !machine.set_touch(finger)
+                && let Some((x, y)) = finger
+            {
+                let seconds = at.as_secs_f64();
+                narrate(
+                    &format!(
+                        "touch at {x},{y} after {seconds:.3} s: the touchscreen is not scanning yet"
+                    ),
+                    tracing,
+                );
+            }
+        }
+    }
+}
+
+/// Prints how a run of `machine` ended (`ended`) and where it stood: each
+/// core, the calls not returned from, the secure monitor calls, the notes
+/// devices left, the GPU channels with `verbose`, the carveouts.
+fn report_run(
+    machine: &Machine,
+    report: &RunReport,
+    ended: &str,
+    symbols: &SymbolTable,
+    verbose: bool,
+    log: &LogOverlay,
+) {
+    println!("{ended}");
+    log.push(ended);
     for core in report
         .cores
         .iter()
@@ -1415,7 +1624,7 @@ fn boot(
     {
         log.push(&format!("core {}: {}", core.core, core.stop));
     }
-    let code = |address| describe(address, &symbols);
+    let code = |address| describe(address, symbols);
     for core in &report.cores {
         println!("core {}: {}", core.core, core.stop);
         if let Some(state) = core.state {
@@ -1476,26 +1685,24 @@ fn boot(
             carveout.address, carveout.size
         );
     }
-    if let Some(path) = screenshot {
-        match machine.screen() {
-            Ok(screen) => {
-                let file = File::create(path).map_err(|error| format!("{path}: {error}"))?;
-                write_png(file, &screen.frame).map_err(|error| format!("{path}: {error}"))?;
-                let state = |on| if on { "on" } else { "off" };
-                println!(
-                    "screen: {}x{}, panel {}, backlight {}",
-                    screen.frame.width,
-                    screen.frame.height,
-                    state(screen.panel_on),
-                    state(screen.backlight_on)
-                );
-            }
-            Err(reason) => println!("screen: no picture, {reason}"),
+}
+
+/// `--screenshot`: what the screen shows when the machine has stopped.
+fn final_screenshot(machine: &Machine, path: &str) -> Result<(), String> {
+    match machine.screen() {
+        Ok(screen) => {
+            let file = File::create(path).map_err(|error| format!("{path}: {error}"))?;
+            write_png(file, &screen.frame).map_err(|error| format!("{path}: {error}"))?;
+            let state = |on| if on { "on" } else { "off" };
+            println!(
+                "screen: {}x{}, panel {}, backlight {}",
+                screen.frame.width,
+                screen.frame.height,
+                state(screen.panel_on),
+                state(screen.backlight_on)
+            );
         }
-    }
-    if let Some(window) = &mut window {
-        window.set_stopped();
-        while window.show(&machine, &log) {}
+        Err(reason) => println!("screen: no picture, {reason}"),
     }
     Ok(())
 }
