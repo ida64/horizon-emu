@@ -850,6 +850,55 @@ fn alpha_test_discards_failing_fragments() {
     }
 }
 
+/// The ui2d solid quad (pixels 16..40 x 16..56, its corners counter-
+/// clockwise with the target's rows counted as y up) drawn by `kind` with
+/// back faces culled, `SET_WINDOW_ORIGIN` = `origin` and `OGL_SET_FRONT_FACE`
+/// = `front_face`; the pixel at the quad's inside after a write-back.
+fn back_culled_quad(kind: super::RendererKind, origin: u32, front_face: u32) -> [u8; 4] {
+    let elf = std::fs::read(STARTER).expect("starter ELF (fw_elf) must be present");
+    let mut frame = Frame::sized_with(SIZE, SIZE, kind);
+    frame.program(1, 0, starter_program(&elf, 0x4c0e00));
+    frame.program(5, 0x800, starter_program(&elf, 0x4be400));
+    frame.constants(0, 3, 0x30_0000, &ui2d_vertex_constants(&[]));
+    frame.constants(4, 3, 0x30_1000, &floats(&[0.25, 0.5, 1.0, 1.0]));
+    frame.method(0x13ac, origin); // SET_WINDOW_ORIGIN
+    frame.method(0x1918, 1); // OGL_SET_CULL
+    frame.method(0x1920, 0x405); // OGL_SET_CULL_FACE BACK
+    frame.method(0x191c, front_face); // OGL_SET_FRONT_FACE
+    let quad = [
+        -0.5, -0.5, 0.0, 0.25, -0.5, 0.0, 0.25, 0.75, 0.0, -0.5, 0.75, 0.0,
+    ];
+    frame.vertices(0x40_0000, 12, &quad, &[(0, 0x02)]);
+    frame.method(0x1618, 7);
+    frame.method(0x0d74, 0);
+    frame.method(0x0d78, 4);
+    frame.method(0x1614, 0);
+    frame.channel.flush(&frame.ram).unwrap();
+    frame.pixel(20, 20)
+}
+
+/// Facing follows `SET_WINDOW_ORIGIN` FLIP_Y: with it the target's rows
+/// count as y up (OpenGL window coordinates, NVN's setting), without it as
+/// y down. The Mii editor composes its frame with a full-screen strip
+/// counter-clockwise with rows up, FLIP_Y, front face CCW and back faces
+/// culled, and Settings draws with rows down and FLIP_Y clear; both must
+/// keep their triangles.
+#[test]
+fn window_origin_flip_sets_which_side_faces_front() {
+    use super::RendererKind::{Metal, Software};
+    let drawn = [64, 128, 255, 255];
+    let kept = [0, 0, 0, 255];
+    for kind in [Software, Metal] {
+        // OGL_CCW (0x901) with FLIP_Y: front, drawn.
+        assert_eq!(back_culled_quad(kind, 0x10, 0x901), drawn, "{kind:?}");
+        // OGL_CW (0x900) with FLIP_Y: back, culled.
+        assert_eq!(back_culled_quad(kind, 0x10, 0x900), kept, "{kind:?}");
+        // Without FLIP_Y the rows count down and the order reverses.
+        assert_eq!(back_culled_quad(kind, 0, 0x901), kept, "{kind:?}");
+        assert_eq!(back_culled_quad(kind, 0, 0x900), drawn, "{kind:?}");
+    }
+}
+
 /// A draw whose pixel program names a texture slot the draw leaves unset
 /// (handle TIC index 0xfffff, as netConnect's uber-shader leaves on
 /// branches its draws do not take): P0 = c3[0] != 0; @P0 BRA over a TEXS
