@@ -1,6 +1,5 @@
 mod control;
 mod homebrew_options;
-mod mcp;
 mod script;
 mod window;
 
@@ -229,8 +228,7 @@ taken as it is, such as one inside a process):
                       machine runs: script steps, screenshots, pixels,
                       status, stop, save_state (a snapshot of the running
                       machine into a directory, for restore). One JSON
-                      object per line; what `horizon-emu mcp` drives runs
-                      with
+                      object per line
   --survey            do not stop at device accesses nothing models: answer
                       reads with zero, drop writes, and print each. Not a
                       faithful run; it lists what the guest wants
@@ -259,15 +257,10 @@ fn main() -> ExitCode {
 
 /// The whole usage message: the general options and those of homebrew.
 fn usage() -> String {
-    format!("{USAGE}\n\n{}\n\n{}", homebrew_options::USAGE, mcp::USAGE)
+    format!("{USAGE}\n\n{}", homebrew_options::USAGE)
 }
 
 fn run(arguments: &[String]) -> Result<(), String> {
-    if let [command, flags @ ..] = arguments
-        && command == "mcp"
-    {
-        return mcp::serve(flags);
-    }
     let [command, path, flags @ ..] = arguments else {
         return Err(usage());
     };
