@@ -206,17 +206,24 @@ const HWCHECK_STATE: [(u64, u32); 143] = [
 
 /// Registers the boot chain reads that the check does not: see
 /// [`Pmc::power_on`].
-const POWER_ON_UNCHECKED: [(u64, u32); 5] = [
+const POWER_ON_UNCHECKED: [(u64, u32); 6] = [
     (0x1B4, 0),
     (0x810, 0),
     (0x840, 0),
     (CLAMP_STATUS, 0),
     (SECURE_SCRATCH21, 0),
+    (SECURE_SCRATCH35, 0),
 ];
 
 /// `SECURE_SCRATCH21`: the secure monitor's cold boot sets bit 4 by
 /// read-modify-write (`warmboot-research` §3, monitor `0x1F0146D14`).
 const SECURE_SCRATCH21: u64 = 0x334;
+/// `SECURE_SCRATCH35`: the high half of the resume vector, which the
+/// warmboot firmware puts in `SB_AA64_RESET_HIGH` (`0x4001077C`). The
+/// monitor writes only the low half, `SECURE_SCRATCH34` (`0x1F0147010`
+/// stores `0x1F0089768` and nothing at `0x76C`), so the high half is what
+/// the register holds from power-on.
+const SECURE_SCRATCH35: u64 = 0x36C;
 
 /// The scratch and secure scratch registers the NX bootloader packs the
 /// SDRAM parameters into for the boot ROM's warm path (text `0x4000D904`,
@@ -284,7 +291,7 @@ impl Pmc {
     /// other value for a warm reset); the scratch registers `SCRATCH188`
     /// (`0x810`, changed by read-modify-write), `SCRATCH200` (`0x840`,
     /// error codes of an earlier boot), those of `LP0_SCRATCH` and
-    /// `SECURE_SCRATCH21` (`0x334`) read 0 (\[assumption\]: scratch
+    /// `SECURE_SCRATCH21` and `35` (`0x334`, `0x36c`) read 0 (\[assumption\]: scratch
     /// registers lose their contents on a power-on reset, which is why they
     /// carry state only across warm resets; where the check has a row for
     /// one, its value wins); and `CLAMP_STATUS` reads 0 (no software clamp

@@ -18,11 +18,20 @@
 //!   away: key read, key update, OIV read, OIV update, UIV read, UIV
 //!   update, key use (bits 0 to 6). `SE_CRYPTO_SECURITY_PERKEY` has one
 //!   bit per slot that can likewise only be cleared. A key or IV word reads
-//!   back through `_DATA` while its read permission lasts and as
-//!   `0xFFFF_FFFF` once it is gone: Nintendo's warmboot firmware (package1's
-//!   `warmboot.bin`, BPMP code at `0x4001_0D58`) reads every word of every
-//!   slot and resets the SoC unless the read-protected ones read so. Other
-//!   refusals of what an access register forbids: see "Refusals".
+//!   back through `_DATA` while its read permission lasts; once it is gone
+//!   the word reads `0xFFFF_FFFF` if the slot's per-key bit is clear and 0
+//!   otherwise, and a key or IV word whose update permission is gone
+//!   ignores writes through `_DATA`. \[inference\] from Nintendo's warmboot
+//!   firmware (package1's `warmboot.bin`, BPMP code): the secure monitor's
+//!   cold boot takes the read permissions of all sixteen slots away and
+//!   clears the per-key bits of slots 6 to 15 (TZRAM `0x1F01E1368`, the
+//!   flags Atmosphère names `AllReadLock`, `KeyUse | PerKey`), and
+//!   after SC7 the warmboot clears through `_DATA` the key of every slot
+//!   but 2, 10-13 and 15 and the IVs of all, slots 6, 7 and 14 among them,
+//!   whose update permissions the monitor took away, then reads every word
+//!   of every slot (`0x4001_0D58`) and resets the SoC unless slots 0 to 5
+//!   read 0 and slots 6 to 15 all ones. Other refusals of what an access
+//!   register forbids: see "Refusals".
 //! * AES-128/192/256 over `SE_CRYPTO_LAST_BLOCK + 1` blocks, built from the
 //!   fields of `SE_CRYPTO_CONFIG` the way the hardware composes them: the
 //!   AES core's input (memory, its previous output, or the linear
@@ -55,8 +64,10 @@
 //!   word by word through `SE_RSA_KEYTABLE_ADDR`/`_DATA` (least significant
 //!   word first, as the public drivers write them), with access registers
 //!   of key read, key update and key use (bits 0 to 2); a read-protected
-//!   word reads `0xFFFF_FFFF`, as the warmboot firmware expects. Modular
-//!   exponentiation of 512 to 2048 bits (`SE_RSA_KEY_SIZE` 0 to 3,
+//!   word reads `0xFFFF_FFFF` if the slot's per-key bit
+//!   (`SE_RSA_SECURITY_PERKEY`) is clear, as the warmboot firmware expects
+//!   of both slots after the monitor's `0x1F01415A8`, and 0 otherwise.
+//!   Modular exponentiation of 512 to 2048 bits (`SE_RSA_KEY_SIZE` 0 to 3,
 //!   exponent `SE_RSA_EXP_SIZE` words) of the input list read as a
 //!   little-endian number; the result in `SE_RSA_OUTPUT_0..63`, least
 //!   significant word first.
@@ -114,9 +125,11 @@
 //!
 //! What the hardware does in these cases is not public, so the access is
 //! refused with a note (the machine stops and says what): writing a key or
-//! IV word whose update permission is gone (by register, by an operation
-//! into the key table, or through [`Se::load_key`] which returns an error
-//! instead), using a slot whose key use permission is gone, input or
+//! IV word whose update permission is gone (an RSA key word by register,
+//! any word by an operation into the key table, or through
+//! [`Se::load_key`] which returns an error instead; AES key and IV words
+//! written through `_DATA` are ignored, see above), using a slot whose key
+//! use permission is gone, input or
 //! output lists too short for the operation, restarts, and any field
 //! combination not listed above, the context save's included.
 //!
@@ -786,6 +799,16 @@ fn permissions(word: usize) -> (u32, u32) {
     }
 }
 
+/// What a word whose read permission is gone reads, by the per-key bits
+/// (`perkey`) of its slot (see the module documentation).
+fn protected_word(perkey: u32, slot: usize) -> u32 {
+    if perkey & 1 << slot == 0 {
+        0xFFFF_FFFF
+    } else {
+        0
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct RsaSlot {
     /// Least significant word first, as are the modulus's.
@@ -959,7 +982,7 @@ impl State {
                 let (slot, word) = self.key_word();
                 let (read, _) = permissions(word);
                 if self.slots[slot].access & read == 0 {
-                    0xFFFF_FFFF
+                    protected_word(self.crypto_perkey, slot)
                 } else {
                     self.slots[slot].words[word]
                 }
@@ -980,7 +1003,7 @@ impl State {
                 let (slot, modulus, word) = self.rsa_key_word();
                 let key = &self.rsa_slots[slot];
                 if key.access & RSA_ACCESS_KEY_READ == 0 {
-                    0xFFFF_FFFF
+                    protected_word(self.rsa_perkey, slot)
                 } else if modulus {
                     key.modulus[word]
                 } else {
@@ -1057,13 +1080,11 @@ impl State {
             CRYPTO_KEYTABLE_DATA => {
                 let (slot, word) = self.key_word();
                 let (_, update) = permissions(word);
-                if self.slots[slot].access & update == 0 {
-                    return Err(format!(
-                        "write to key slot {slot} word {word}, which its access register \
-                         forbids: what the engine does with it is not modelled"
-                    ));
+                // A word whose update permission is gone keeps its value
+                // (see the module documentation).
+                if self.slots[slot].access & update != 0 {
+                    self.slots[slot].words[word] = value;
                 }
-                self.slots[slot].words[word] = value;
             }
             CRYPTO_KEYTABLE_DST => {
                 if value & !KEYTABLE_DST_FIELDS != 0 {
@@ -2185,7 +2206,7 @@ mod tests {
     }
 
     #[test]
-    fn read_protected_key_words_read_all_ones() {
+    fn read_protected_key_words_read_zero_or_all_ones_if_per_key_secure() {
         let bench = Bench::new();
         let key = hex(NIST_KEY);
         bench.key_words(14, 0, &key);
@@ -2196,9 +2217,14 @@ mod tests {
         );
         bench.write(CRYPTO_KEYTABLE_ACCESS + 14 * 4, !LOCK_KEY_READ);
         assert_eq!(bench.read(CRYPTO_KEYTABLE_ACCESS + 14 * 4), 0xFE);
+        assert_eq!(bench.read(CRYPTO_KEYTABLE_DATA), 0);
+        bench.write(CRYPTO_SECURITY_PERKEY, !(1 << 14));
         assert_eq!(bench.read(CRYPTO_KEYTABLE_DATA), 0xFFFF_FFFF);
         // Through load_key too.
-        bench.se.load_key(6, &[0; 16], LOCK_KEY_READ).unwrap();
+        bench
+            .se
+            .load_key(6, &[0; 16], LOCK_KEY_READ | LOCK_PER_KEY)
+            .unwrap();
         bench.write(CRYPTO_KEYTABLE_ADDR, 6 << 4);
         assert_eq!(bench.read(CRYPTO_KEYTABLE_DATA), 0xFFFF_FFFF);
         // The OIV keeps its own permission; the key can still be used.
@@ -2212,7 +2238,7 @@ mod tests {
     }
 
     #[test]
-    fn locked_slots_refuse_key_writes_and_stay_locked() {
+    fn locked_slots_ignore_key_writes_and_stay_locked() {
         let bench = Bench::new();
         let key = hex(NIST_KEY);
         bench
@@ -2228,8 +2254,8 @@ mod tests {
         assert_eq!(bench.read(CRYPTO_KEYTABLE_ACCESS + 15 * 4), 0x7C);
         assert_eq!(bench.read(CRYPTO_SECURITY_PERKEY), 0x7FFF);
         bench.write(CRYPTO_KEYTABLE_ADDR, 15 << 4);
-        assert_eq!(bench.se.write(0, CRYPTO_KEYTABLE_DATA, 4, 0), None);
-        assert!(bench.notes.take()[0].contains("key slot 15 word 0"));
+        bench.write(CRYPTO_KEYTABLE_DATA, 0);
+        assert!(bench.notes.take().is_empty());
         assert_eq!(bench.se.load_key(15, &[0; 16], 0), Err(SeError::Locked(15)));
         // The key is the one loaded.
         bench.key_words(0, 0, &key);
@@ -2352,6 +2378,8 @@ mod tests {
             u32::from_le_bytes(key.n().to_bytes_le()[..4].try_into().unwrap())
         );
         bench.write(RSA_KEYTABLE_ACCESS + 4, !RSA_ACCESS_KEY_READ);
+        assert_eq!(bench.read(RSA_KEYTABLE_DATA), 0);
+        bench.write(RSA_SECURITY_PERKEY, !(1 << 1));
         assert_eq!(bench.read(RSA_KEYTABLE_DATA), 0xFFFF_FFFF);
         // A slot whose use is revoked refuses.
         bench.write(RSA_KEYTABLE_ACCESS + 4, !RSA_ACCESS_KEY_USE);

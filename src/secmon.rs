@@ -412,7 +412,7 @@ const CORE_PARTITIONS: [u32; CORE_COUNT] = [14, 9, 10, 11];
 /// that runs the boot chain has and checks ([`sc7`]), and USB, USB2, AHB
 /// DMA and the BPMP kept off the AHB arbiter (the boot chain's setting, in
 /// a block not modelled here).
-const SLEEP_REQUIREMENTS: [(u64, u32, u32, &str); 8] = [
+pub const SLEEP_REQUIREMENTS: [(u64, u32, u32, &str); 8] = [
     (PMC_PWRGATE_STATUS, 7 << 9, 0, "cores 1 to 3 power-gated"),
     (
         CAR_BASE + 0x008,

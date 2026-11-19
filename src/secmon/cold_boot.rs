@@ -38,7 +38,8 @@
 //!    stage, `0x400307FC`); set-up the guest cannot see here
 //!    ([`NOT_MODELLED`]) and what the warm path reads later
 //!    ([`sc7`]: `PMC_SCRATCH1` = `0x8000D000`, `SECURE_SCRATCH21` bit 4,
-//!    `SECURE_SCRATCH32` = `0x339`, `SECURE_SCRATCH34` = `0x7C012800`,
+//!    `SECURE_SCRATCH32` = `0x339`, the security engine's key slot
+//!    permissions, `SECURE_SCRATCH34` = `0x7C012800`,
 //!    `MC_SECURITY_CFG3` = 3); then it zeroes its own IRAM image
 //!    (`0x40030000`, `0xE000` bytes; the bootloader reads package2's
 //!    partition there next) and sets its state to 1.
@@ -200,8 +201,9 @@ const PACKAGE2_SIZE: RangeInclusive<u64> = 0x200..=0x7F_C000;
 /// its device drivers' bases, the system counter (SYSCTR0: checked to be
 /// unprogrammed, else panic, then started at the boot config's value or 0),
 /// PMC and flow controller settings other than the ones the warm path
-/// reads ([`sc7`]), the security engine (keyslots 0-9 cleared, per-slot
-/// access, the secure random key; the package2 key goes through keyslot 8
+/// reads ([`sc7`]), the security engine (keyslots 0-9 cleared, the keys
+/// it loads, the secure random key; only the per-slot permissions are set,
+/// [`sc7`]; the package2 key goes through keyslot 8
 /// from the master key in keyslot 13; the kernel's later key calls are
 /// served by [`super::crypto`]), the memory controller's security
 /// carveouts and TrustZone ranges (the kernel cannot read them through
@@ -528,7 +530,7 @@ const ACTMON_SOURCE: u32 = 0xC000_0000;
 /// called from `0x1F0147430`): held in reset and gated, its source set,
 /// clocked, let out of reset. The kernel's sleep needs it running
 /// ([`super::SLEEP_REQUIREMENTS`]).
-fn actmon_clock(port: &Port<'_>) -> Result<(), Sc7Fail> {
+pub(super) fn actmon_clock(port: &Port<'_>) -> Result<(), Sc7Fail> {
     port.modify(RST_DEVICES_V, 0, ACTMON_BIT)?;
     port.modify(CLK_OUT_ENB_V, ACTMON_BIT, 0)?;
     port.write(CLK_SOURCE_ACTMON, ACTMON_SOURCE)?;
@@ -690,6 +692,7 @@ mod tests {
         soc::{
             mc::{self, DeviceMemory, Mc},
             regs::RegisterFile,
+            se,
         },
     };
 
@@ -829,7 +832,7 @@ mod tests {
         );
         let controller = Arc::new(Mc::new(params.dram));
         let tzram = Arc::new(tzram::Tzram::new());
-        map_secure_blocks(&mut bus, &controller, &tzram);
+        map_secure_blocks(&mut bus, &controller, &tzram, &ram);
         let engine = DeviceMemory::new(&controller, &ram, mc::SMMU_SE_ASID);
         Console {
             monitor: SecureMonitor::new(params, firmware.keys.clone()),
@@ -841,8 +844,14 @@ mod tests {
         }
     }
 
-    /// The blocks the monitor's warm-path set-up writes: PMC, MC, TZRAM.
-    fn map_secure_blocks(bus: &mut Bus, controller: &Arc<Mc>, tzram: &Arc<tzram::Tzram>) {
+    /// The blocks the monitor's warm-path set-up writes: PMC, MC, TZRAM and
+    /// the security engine.
+    fn map_secure_blocks(
+        bus: &mut Bus,
+        controller: &Arc<Mc>,
+        tzram: &Arc<tzram::Tzram>,
+        ram: &Arc<GuestRam>,
+    ) {
         bus.map(
             "PMC",
             crate::soc::pmc::BASE,
@@ -855,6 +864,13 @@ mod tests {
             tzram::BASE,
             tzram::SIZE,
             Box::new(Arc::clone(tzram)),
+        );
+        let engine = DeviceMemory::new(controller, ram, mc::SMMU_SE_ASID);
+        bus.map(
+            "SE",
+            se::BASE,
+            se::SIZE,
+            Box::new(se::Se::new(Box::new(engine), Arc::default(), 1)),
         );
     }
 
@@ -955,6 +971,21 @@ mod tests {
         );
         assert_eq!(register(&console.bus, RST_DEVICES_V) & ACTMON_BIT, 0);
         assert_eq!(register(&console.bus, CLK_SOURCE_ACTMON), ACTMON_SOURCE);
+        // The key slots as the warmboot firmware checks them: slots 0 to 5
+        // read-protected, reading 0; 6 to 15 per-key secure, all ones;
+        // the RSA slots all ones.
+        let se_register = |offset: u64| se::BASE + offset;
+        assert_eq!(register(&console.bus, se_register(0x280)), 0x003F);
+        assert_eq!(register(&console.bus, se_register(0x284)), 0xEA);
+        assert_eq!(register(&console.bus, se_register(0x284 + 8 * 4)), 0xAA);
+        assert_eq!(register(&console.bus, se_register(0x284 + 15 * 4)), 0x80);
+        for (slot, expected) in [(0, 0), (5, 0), (6, u32::MAX), (15, u32::MAX)] {
+            let selected = console.bus.write(0, se_register(0x31C), 4, slot << 4);
+            assert!(matches!(selected, Access::Done(())));
+            assert_eq!(register(&console.bus, se_register(0x320)), expected);
+        }
+        assert_eq!(register(&console.bus, se_register(0x40C)), 0);
+        assert_eq!(register(&console.bus, se_register(0x410)), 2);
         // The resident image in TZRAM, and the SC7 stub in it.
         let mut resident = vec![0; RESIDENT_SIZE];
         console
@@ -1081,13 +1112,19 @@ mod tests {
                 0x5000_0000,
             )])),
         );
+        bus.map(
+            "CAR",
+            car::BASE,
+            car::SIZE,
+            Box::new(crate::soc::car::Car::power_on()),
+        );
         let controller = Arc::new(Mc::new(crate::boot::DramSize::Gb4));
-        map_secure_blocks(&mut bus, &controller, &Arc::default());
+        let ram = Arc::new(GuestRam::new(crate::boot::DRAM_BASE, 0x1000).unwrap());
+        map_secure_blocks(&mut bus, &controller, &Arc::default(), &ram);
         assert!(matches!(
             bus.write(0, sc7::MC_SECURITY_CFG3, 4, security_cfg3.into()),
             Access::Done(())
         ));
-        let ram = Arc::new(GuestRam::new(crate::boot::DRAM_BASE, 0x1000).unwrap());
         (monitor, bus, ram, Iram::new())
     }
 
@@ -1111,6 +1148,8 @@ mod tests {
         assert_eq!(register(&bus, pmc + 0x368), 0x7C01_2800);
         assert_eq!(register(&bus, sc7::MC_SECURITY_CFG3), 3);
         assert_eq!(register(&bus, HALT_COP_EVENTS), sc7::COP_PARKED);
+        // The activity monitor clocked again from CLK_M.
+        assert_eq!(register(&bus, car::BASE + 0x3E8), 0xC000_0000);
         assert!(monitor.state.lock().unwrap().cores_on[0]);
         // Nothing is pending any more.
         let again = monitor.core0_released(sc7::RESUME_ENTRY, context(), &stop);

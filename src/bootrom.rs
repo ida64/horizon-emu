@@ -176,6 +176,11 @@ pub const ERISTA_PUBLIC_KEY_HASH: [u8; 32] = [
 /// (switchbrew "Fuses").
 const FUSE_PRIVATEKEYDISABLE: u64 = 0x028;
 const FUSE_SKU_INFO: u64 = 0x110;
+/// `FUSE_SECURITY_MODE` (0x7000F9A0): 1 when the ODM production fuse is
+/// burnt, as on every retail unit ([`Fuses::retail`]'s `odm_production`;
+/// Fusée Gelée). The warmboot firmware reads it (`0x400104BC`) and takes
+/// its production path on 1.
+const FUSE_SECURITY_MODE: u64 = 0x1A0;
 const FUSE_PUBLIC_KEY0: u64 = 0x164;
 const FUSE_PRIVATE_KEY0: u64 = 0x1A4;
 /// "Must be 0x83"; package1ldr compares it (`0x400100D8`).
@@ -263,10 +268,10 @@ pub struct ChipFuses {
 }
 
 /// The fuse cache words the fuse block shows a retail Erista after the
-/// ROM, as `(offset, value)` in the block at 0x7000F800: the SKU, the key
-/// hash, and the private key fuses hidden (all ones) with
-/// `FUSE_PRIVATEKEYDISABLE` set (\[inference\] it reads back as written,
-/// bit 0).
+/// ROM, as `(offset, value)` in the block at 0x7000F800: the SKU, the
+/// security mode (production), the key hash, and the private key fuses
+/// hidden (all ones) with `FUSE_PRIVATEKEYDISABLE` set (\[inference\] it
+/// reads back as written, bit 0).
 pub fn fuses_after_boot() -> impl Iterator<Item = (u64, u32)> {
     let key_hash = ERISTA_PUBLIC_KEY_HASH
         .as_chunks::<4>()
@@ -280,10 +285,14 @@ pub fn fuses_after_boot() -> impl Iterator<Item = (u64, u32)> {
             )
         });
     let private_key = (0..5).map(|index| (FUSE_PRIVATE_KEY0 + 4 * index, u32::MAX));
-    [(FUSE_SKU_INFO, SKU_ID), (FUSE_PRIVATEKEYDISABLE, 1)]
-        .into_iter()
-        .chain(key_hash)
-        .chain(private_key)
+    [
+        (FUSE_SKU_INFO, SKU_ID),
+        (FUSE_SECURITY_MODE, 1),
+        (FUSE_PRIVATEKEYDISABLE, 1),
+    ]
+    .into_iter()
+    .chain(key_hash)
+    .chain(private_key)
 }
 
 /// What the ROM leaves when it starts the bootloader. It has written

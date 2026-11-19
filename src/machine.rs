@@ -6,7 +6,7 @@ mod snapshot;
 
 pub use self::bpmp::{
     BPMP_CORE, Bpmp, BpmpExit, Env, NeverWakes, Power, PowerDomain, PowerOn, Slice, TsecPort,
-    WarmStart, apply_rom_bits, run,
+    WarmStart, apply_rom_bits, run, warm_start,
 };
 pub use self::snapshot::SaveReport;
 

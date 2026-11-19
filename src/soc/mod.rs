@@ -49,6 +49,7 @@ pub mod mselect;
 pub mod ntag;
 pub mod pcie;
 pub mod pcie_endpoint;
+pub mod pg_up;
 pub mod pinmux;
 pub mod pmc;
 pub mod regs;
@@ -945,6 +946,12 @@ impl Soc {
                     sb::BASE,
                     sb::SIZE,
                     Box::new(Arc::clone(&boot.sb)),
+                );
+                bus.map(
+                    "processor tag",
+                    pg_up::BASE,
+                    pg_up::SIZE,
+                    Box::new(pg_up::PgUp),
                 );
                 bus.map(
                     "AHB arbitration",

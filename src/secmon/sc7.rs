@@ -52,12 +52,19 @@
 //!
 //! The monitor redoes its SoC security set-up only if `MC_SECURITY_CFG3`
 //! reads 0, which is how it learns the SoC lost power; the part of it
-//! modelled is `SECURE_SCRATCH34` and `MC_SECURITY_CFG3` written again and
-//! the BPMP parked again once it halted itself.
+//! modelled is `SECURE_SCRATCH34` and `MC_SECURITY_CFG3` written again,
+//! and, once the BPMP halted itself, the activity monitor's clock and the
+//! BPMP parked again, as at the end of the cold boot. Not done: the rest
+//! of its reset path (AHB arbitration, `MSELECT_CONFIG`, the GIC
+//! distributor, a new SRK, the security engine checks against the cold
+//! boot's key digest, carveouts, APB security, PMC secure scratch scrub).
 //! Then core 0 enters the kernel at the entry `CPU_SUSPEND` was given,
 //! with its context in `X0`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    ops::RangeInclusive,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use crate::{
     bus::{Access, Bus},
@@ -156,6 +163,10 @@ const SE_CRYPTO_KEYTABLE_ADDR: u64 = SE + 0x31C;
 const SE_CRYPTO_KEYTABLE_DATA: u64 = SE + 0x320;
 const SE_CRYPTO_KEYTABLE_DST: u64 = SE + 0x330;
 const SE_RNG_CONFIG: u64 = SE + 0x340;
+const SE_CRYPTO_SECURITY_PERKEY: u64 = SE + 0x280;
+const SE_CRYPTO_KEYTABLE_ACCESS: u64 = SE + 0x284;
+const SE_RSA_SECURITY_PERKEY: u64 = SE + 0x40C;
+const SE_RSA_KEYTABLE_ACCESS: u64 = SE + 0x410;
 const SE_STATUS: u64 = SE + 0x800;
 const SE_ERR_STATUS: u64 = SE + 0x804;
 const OP_START: u32 = 1;
@@ -502,13 +513,6 @@ impl Port<'_> {
         })
     }
 
-    /// Waits for the BPMP to halt itself, then parks it (end of
-    /// `0x1F0147430`).
-    pub(super) fn park_bpmp(&self, stop: &AtomicBool) -> Result<()> {
-        self.wait_for_bpmp_halt(stop)?;
-        self.write(HALT_COP_EVENTS, COP_PARKED)
-    }
-
     /// Polls `HALT_COP_EVENTS` until the BPMP halted waiting for an event.
     pub(super) fn wait_for_bpmp_halt(&self, stop: &AtomicBool) -> Result<()> {
         while self.read(HALT_COP_EVENTS)? >> 29 != HALT_MODE_WAIT_EVENT {
@@ -561,13 +565,67 @@ fn double(block: u128) -> u128 {
 /// What the cold boot sets up that the warm path relies on
 /// (`0x1F0146C80`, `0x1F0147010`): where the boot ROM finds the warmboot
 /// firmware, the warmboot's magic and the private key disable bit it
-/// re-applies, the resume vector it hands core 0, and the memory
-/// controller's "set up" mark.
+/// re-applies, the security engine's key slot permissions it checks, the
+/// resume vector it hands core 0, and the memory controller's "set up"
+/// mark.
 pub(super) fn cold_boot_setup(port: &Port<'_>) -> Result<()> {
     port.write(SCRATCH1, WARMBOOT_VECTOR)?;
     port.modify(SECURE_SCRATCH21, 0, PRIVATE_KEY_DISABLE)?;
     port.write(SECURE_SCRATCH32, WARMBOOT_MAGIC)?;
+    slot_permissions(port)?;
     resume_setup(port)
+}
+
+/// The key slot permissions the cold boot leaves (`0x1F01E1368`, called
+/// from `0x1F0146C80`), in its order, as `(slots, flags)` in the encoding
+/// of its helper `0x1F0141544`: bits 6:0 the permissions taken away (key
+/// read, key update, OIV read, OIV update, UIV read, UIV update, key use;
+/// Atmosphère's `AesKeySlotLockFlags`), bit 8 the slot's per-key bit
+/// cleared. Every slot loses its read permissions, slots 8 to 15 key use
+/// and their per-key bit, slots 6, 7 and 10 to 15 everything. The key
+/// operations between them, by which the monitor loads its own keys into
+/// slots 10 to 14, are not done: the monitor's keys are
+/// [`super::crypto`]'s here, and the slots' contents end read-protected.
+const SLOT_LOCKS: [(RangeInclusive<u32>, u32); 9] = [
+    (0..=15, 0x015),
+    (8..=15, 0x140),
+    (6..=7, 0x1FF),
+    (15..=15, 0x1FF),
+    (13..=13, 0x17F),
+    (12..=12, 0x1FF),
+    (11..=11, 0x17F),
+    (14..=14, 0x1FF),
+    (10..=10, 0x1FF),
+];
+/// Both RSA slots' (`0x1F01415A8` with `0x141`): only key update left,
+/// per-key bits cleared.
+const RSA_SLOT_LOCK: u32 = 0x141;
+const LOCK_PER_KEY: u32 = 1 << 8;
+
+fn slot_permissions(port: &Port<'_>) -> Result<()> {
+    let mut rsa_done = false;
+    for (slots, flags) in SLOT_LOCKS {
+        for slot in slots {
+            if flags & !LOCK_PER_KEY != 0 {
+                let access = SE_CRYPTO_KEYTABLE_ACCESS + u64::from(slot) * 4;
+                let old = port.read(access)?;
+                port.write(access, (old & !0x7F | flags & 0x7F) ^ 0x7F)?;
+            }
+            if flags & LOCK_PER_KEY != 0 {
+                port.modify(SE_CRYPTO_SECURITY_PERKEY, 1 << slot, 0)?;
+            }
+        }
+        // The RSA slots come after the third step.
+        if !rsa_done && flags == 0x1FF {
+            for slot in 0..2 {
+                let access = (RSA_SLOT_LOCK >> 4 & 4 | RSA_SLOT_LOCK & 3) ^ 7;
+                port.write(SE_RSA_KEYTABLE_ACCESS + slot * 4, access)?;
+                port.modify(SE_RSA_SECURITY_PERKEY, 1 << slot, 0)?;
+            }
+            rsa_done = true;
+        }
+    }
+    Ok(())
 }
 
 /// The part of the set-up the resume redoes (`0x1F0147010`).
@@ -641,13 +699,19 @@ pub(super) fn suspend(port: &Port<'_>) -> Result<()> {
     Ok(())
 }
 
-/// The resume's SoC part: the set-up again if the SoC lost it.
+/// The resume's SoC part: the set-up again if the SoC lost it, ending as
+/// the cold boot ends (`0x1F0147430`, run by both): once the BPMP halted
+/// itself, the activity monitor clocked again (the warmboot firmware turned
+/// its clock off with every other one it does not keep, `warmboot-research`
+/// §7 step 6; the kernel's next sleep needs it) and the BPMP parked.
 pub(super) fn resume(port: &Port<'_>, stop: &AtomicBool) -> Result<()> {
     if port.read(MC_SECURITY_CFG3)? != 0 {
         return Ok(());
     }
     resume_setup(port)?;
-    port.park_bpmp(stop)
+    port.wait_for_bpmp_halt(stop)?;
+    super::cold_boot::actmon_clock(port)?;
+    port.park_halted_bpmp()
 }
 
 const _: () = assert!(STUB_IRAM + STUB_SIZE as u64 <= iram::BASE + iram::SIZE);

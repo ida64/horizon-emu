@@ -9,7 +9,7 @@
 //! |---|---|---|
 //! | `0x00` | `SB_CSR` | bit 1 `NS_RST_VEC_WR_DIS`, bit 4 `PIROM_DISABLE`; sticky |
 //! | `0x04` | `SB_PIROM_START` | read only here |
-//! | `0x08` | `SB_PFCFG` | read only here |
+//! | `0x08` | `SB_PFCFG` | storage: the debug-authentication enables (hekate `SB_PFCFG`) the warmboot firmware sets on a production unit (`0x40010500`, `warmboot-research` §7 step 2); nothing here acts on them |
 //! | `0x0c`..`0x28` | `SB_SECURE_SPAREREG_0..7` | read only here |
 //! | `0x30` | `SB_AA64_RESET_LOW` | reset vector bits 31:2; bit 0 `AARCH64_MODE_EN` |
 //! | `0x34` | `SB_AA64_RESET_HIGH` | reset vector bits 63:32 |
@@ -153,6 +153,7 @@ impl MmioDevice for Sb {
             AA64_RESET_LOW | AA64_RESET_HIGH if non_secure && locked => {}
             AA64_RESET_LOW => state.reset_low = value,
             AA64_RESET_HIGH => state.reset_high = value,
+            PFCFG => state.pfcfg = value,
             _ => return None,
         }
         Some(())
