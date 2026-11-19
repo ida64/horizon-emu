@@ -419,7 +419,7 @@ fn power_on() -> Outcome {
 /// The furthest stage the chain reaches today: raised as the models get it
 /// further, up to [`Stage::KernelEntry`]. The next divergence is the stop
 /// the test prints.
-const REACHED: Stage = Stage::MonitorReady;
+const REACHED: Stage = Stage::KernelEntry;
 
 /// The chain on the BPMP, towards the kernel's entry.
 #[test]
