@@ -15,7 +15,7 @@
 //! so its key slots and the context it saves are the device's own.
 //!
 //! 1. Wake detection on, wake status cleared (`0x1F014371C`).
-//! 2. The preconditions ([`super::SLEEP_REQUIREMENTS`]) and the BPMP parked
+//! 2. The preconditions (`SLEEP_REQUIREMENTS` of [`super`]) and the BPMP parked
 //!    (`HALT_COP_EVENTS` = `0x40000000`, as the cold boot leaves it).
 //! 3. `PMC_SCRATCH0` = 1 (warm boot), `DPD_ENABLE` bit 1 (`0x1F0143548`).
 //! 4. 16 random bytes R from the engine into `SECURE_SCRATCH24..27`,
@@ -52,7 +52,8 @@
 //!
 //! The monitor redoes its SoC security set-up only if `MC_SECURITY_CFG3`
 //! reads 0, which is how it learns the SoC lost power; the part of it
-//! modelled is the cold boot's ([`cold_boot_setup`], the BPMP parked again).
+//! modelled is `SECURE_SCRATCH34` and `MC_SECURITY_CFG3` written again and
+//! the BPMP parked again once it halted itself.
 //! Then core 0 enters the kernel at the entry `CPU_SUSPEND` was given,
 //! with its context in `X0`.
 
@@ -141,7 +142,7 @@ const CORE0_PARTITIONS: [u32; 3] = [14, 15, 0];
 const TOGGLE_START: u32 = 1 << 8;
 
 const SE: u64 = se::BASE;
-const SE_SECURITY: u64 = SE + 0x000;
+const SE_SECURITY: u64 = SE;
 const SE_OPERATION: u64 = SE + 0x008;
 const SE_INT_STATUS: u64 = SE + 0x010;
 const SE_CONFIG: u64 = SE + 0x014;
@@ -871,7 +872,7 @@ mod tests {
         assert_eq!(read(bus, PWRGATE_STATUS) & (1 << 0 | 1 << 14 | 1 << 15), 0);
 
         // Asleep, the monitor lets core 0 back in only at the resume vector.
-        assert_eq!(console.monitor.state.lock().unwrap().cores_on[0], false);
+        assert!(!console.monitor.state.lock().unwrap().cores_on[0]);
     }
 
     #[test]
