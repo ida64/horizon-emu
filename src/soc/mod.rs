@@ -873,6 +873,12 @@ impl Soc {
                     Box::new(Arc::clone(&boot.iram)),
                 );
                 bus.map(
+                    "address space after IRAM",
+                    iram::RESERVED_BASE,
+                    iram::RESERVED_SIZE,
+                    Box::new(iram::AfterIram::new(Arc::clone(&soc.notes))),
+                );
+                bus.map(
                     "TZRAM",
                     tzram::BASE,
                     tzram::SIZE,

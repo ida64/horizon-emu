@@ -31,7 +31,7 @@ use std::{
     ops::Range,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     bus::MmioDevice,
     snapshot::{Snapshot, SnapshotError, decode, encode},
+    soc::Notes,
 };
 
 pub const BASE: u64 = 0x4000_0000;
@@ -47,6 +48,62 @@ pub const SIZE: u64 = 0x4_0000;
 
 /// IRAM's bus addresses.
 const ADDRESSES: Range<u32> = BASE as u32..(BASE + SIZE) as u32;
+
+/// What follows IRAM's 256 KiB up to `0x5000_0000`: no device in the
+/// address map (Switchbrew "Memory map": IRAM, then host1x at
+/// `0x5000_0000`).
+pub const RESERVED_BASE: u64 = BASE + SIZE;
+pub const RESERVED_SIZE: u64 = 0x5000_0000 - RESERVED_BASE;
+
+/// The address space after IRAM's 256 KiB up to `0x5000_0000`: writes are
+/// dropped, reads refused.
+///
+/// The NX bootloader hands its BootConfig to the monitor with
+/// `memcpy(0x4003_F800, 0x4003_0000, 0x1000)` (main, `0x400179E2`), so its
+/// last 0x800 bytes go to `0x4004_0000`..`0x4004_0800` and the console boots
+/// all the same. An alias onto IRAM's start would overwrite the mailbox
+/// and the running bootloader's code at `0x4000_0200`..`0x4000_0800`, and a
+/// bus error would end in its abort handler. \[inference: dropped writes
+/// are the only behaviour consistent with the console booting; no public
+/// source describes the decoder beyond `0x4003_FFFF`\] What a read gives is
+/// not established; nothing on the boot path reads there.
+///
+/// The first dropped write is left as a device note, and the machine goes
+/// on.
+pub struct AfterIram {
+    notes: Arc<Notes>,
+    noted: AtomicBool,
+}
+
+impl AfterIram {
+    pub fn new(notes: Arc<Notes>) -> Self {
+        Self {
+            notes,
+            noted: AtomicBool::new(false),
+        }
+    }
+}
+
+impl MmioDevice for AfterIram {
+    fn read(&self, _core: usize, offset: u64, size: u8) -> Option<u64> {
+        self.notes.add(format!(
+            "{size}-byte read at {:#x}, after IRAM's end: what reads there give is not established",
+            RESERVED_BASE + offset
+        ));
+        self.notes.survey().then_some(0)
+    }
+
+    fn write(&self, _core: usize, offset: u64, size: u8, value: u64) -> Option<()> {
+        if !self.noted.swap(true, Ordering::Relaxed) {
+            self.notes.add(format!(
+                "{size}-byte write of {value:#x} at {:#x}, after IRAM's end, dropped \
+                 (later ones are dropped without a note)",
+                RESERVED_BASE + offset
+            ));
+        }
+        Some(())
+    }
+}
 
 pub struct Iram {
     contents: Mutex<Contents>,
@@ -256,8 +313,11 @@ impl Iram {
     pub fn read_words(&self, offset: u32, words: &mut [u32]) -> Option<()> {
         let span = Self::span(u64::from(offset), 4 * words.len())?;
         let contents = self.contents.lock().unwrap();
-        for (word, chunk) in words.iter_mut().zip(contents.bytes[span].chunks_exact(4)) {
-            *word = u32::from_le_bytes(chunk.try_into().unwrap());
+        for (word, chunk) in words
+            .iter_mut()
+            .zip(contents.bytes[span].as_chunks::<4>().0)
+        {
+            *word = u32::from_le_bytes(*chunk);
         }
         Some(())
     }
@@ -270,8 +330,11 @@ impl Iram {
         if let Some(refusal) = contents.unestablished.first(span.clone()) {
             return Err(refusal);
         }
-        for (word, chunk) in words.iter_mut().zip(contents.bytes[span].chunks_exact(4)) {
-            *word = u32::from_le_bytes(chunk.try_into().unwrap());
+        for (word, chunk) in words
+            .iter_mut()
+            .zip(contents.bytes[span].as_chunks::<4>().0)
+        {
+            *word = u32::from_le_bytes(*chunk);
         }
         Ok(())
     }
@@ -283,9 +346,9 @@ impl Iram {
         let mut contents = self.contents.lock().unwrap();
         for (word, chunk) in words
             .iter()
-            .zip(contents.bytes[span.clone()].chunks_exact_mut(4))
+            .zip(contents.bytes[span.clone()].as_chunks_mut::<4>().0)
         {
-            chunk.copy_from_slice(&word.to_le_bytes());
+            *chunk = word.to_le_bytes();
         }
         contents.unestablished.establish(span);
         Some(())
@@ -454,6 +517,21 @@ mod tests {
             Err(Refusal::Unestablished { note, .. }) if note == "lost in SC7"
         ));
         assert_eq!(iram.bpmp_read(0x3_FFFE, 4), Err(Refusal::Outside));
+    }
+
+    #[test]
+    fn after_iram_drops_writes_with_one_note_and_refuses_reads() {
+        let notes = Arc::new(Notes::default());
+        let after = AfterIram::new(Arc::clone(&notes));
+        // The bootloader's BootConfig copy running past IRAM's end.
+        assert_eq!(MmioDevice::write(&after, 5, 0, 4, 0x1234), Some(()));
+        assert_eq!(MmioDevice::write(&after, 5, 0x7FC, 4, 0), Some(()));
+        let taken = notes.take();
+        assert_eq!(taken.len(), 1, "{taken:?}");
+        assert!(taken[0].contains("0x40040000"), "{taken:?}");
+        assert_eq!(MmioDevice::read(&after, 5, 0x10, 4), None);
+        assert_eq!(notes.take().len(), 1);
+        assert_eq!(RESERVED_BASE + RESERVED_SIZE, 0x5000_0000);
     }
 
     #[test]
