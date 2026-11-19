@@ -4,7 +4,7 @@
 use super::super::super::sampling::{Lod, SampleRequest, Target};
 use super::*;
 impl<const L: usize> Machine<'_, L> {
-    pub(super) fn execute_texture(&mut self, active: u8) -> Result<bool, Unmodeled> {
+    pub(super) fn execute_texture(&mut self, active: Mask) -> Result<bool, Unmodeled> {
         if self.op != Op::Texs {
             return Ok(false);
         }
@@ -68,6 +68,10 @@ impl<const L: usize> Machine<'_, L> {
         };
         self.each(active, |m, l| {
             let lod = if implicit {
+                m.require(
+                    !m.is_compute(),
+                    "implicit level of detail in a compute program",
+                )?;
                 implicit_lod
             } else {
                 Lod::Level(match encoding {

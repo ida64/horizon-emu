@@ -126,6 +126,18 @@ impl Capture {
             self.failed.store(true, Ordering::Relaxed);
         }
     }
+
+    /// Writes out what is buffered: the reads of a call that was refused,
+    /// which no later call record flushes once the machine stops.
+    fn flush(&self) {
+        let mut out = self.out.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.failed.load(Ordering::Relaxed)
+            && let Err(error) = out.flush()
+        {
+            eprintln!("GPU capture: {error}; capture stopped");
+            self.failed.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Bytes known to a capture or replay, by 4 KiB page.
@@ -241,7 +253,11 @@ impl Engines for Recorder {
             channel: self.channel,
             shadow: &self.shadow,
         };
-        self.inner.call(subchannel, method, argument, &observed)
+        let result = self.inner.call(subchannel, method, argument, &observed);
+        if result.is_err() {
+            self.capture.flush();
+        }
+        result
     }
 
     fn flush(&mut self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
@@ -563,16 +579,22 @@ impl<'a> Replayer<'a> {
     }
 }
 
-/// Replays every call of `replay` in order with renderer `kind`; `after`
-/// sees each call with its channel once it ran and how long it took.
-/// Stops at the first call the engines refuse, returning its index.
+/// Replays every call of `replay` in order with renderer `kind` (of
+/// channel `only`, if given: channels share nothing in a replay, so one
+/// replays alone as it did among the others); `after` sees each call with
+/// its channel once it ran and how long it took. Stops at the first call
+/// the engines refuse, returning its index.
 pub fn run(
     replay: &Replay,
     kind: super::RendererKind,
+    only: Option<u32>,
     mut after: impl FnMut(&ReplayCall<'_>, &mut ReplayChannel, std::time::Duration),
 ) -> Result<(), (usize, Unmodeled)> {
     let mut replayer = Replayer::new(replay, kind);
     for (index, call) in replay.calls().iter().enumerate() {
+        if only.is_some_and(|channel| channel != call.channel) {
+            continue;
+        }
         let took = replayer.step(call).map_err(|e| (index, e))?;
         let state = replayer
             .channels
@@ -613,21 +635,26 @@ mod tests {
     }
 
     /// `MAXWELL_REPLAY=<capture> [MAXWELL_RENDERER=metal] [MAXWELL_DUMP=<dir>]
-    /// cargo test --release --lib maxwell::capture::tests::replay --
-    /// --ignored --nocapture`: replays a capture, prints where the time
-    /// went by method and the time between 3D syncpoint increments per
-    /// channel, and optionally writes render target 0 at each of them.
+    /// [MAXWELL_DUMP_CHANNEL=<channel>] [MAXWELL_DUMP_EVERY=<n>] cargo test
+    /// --release --lib maxwell::capture::tests::replay -- --ignored
+    /// --nocapture`: replays a capture, prints where the time went by
+    /// method and the time between 3D syncpoint increments per channel,
+    /// and optionally writes render target 0 at each of them (of one
+    /// channel, every n-th).
     #[test]
     #[ignore]
     fn replay() {
         let path = std::env::var("MAXWELL_REPLAY").expect("MAXWELL_REPLAY");
         let dump = std::env::var_os("MAXWELL_DUMP").map(std::path::PathBuf::from);
+        let number = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok());
+        let dump_channel = number("MAXWELL_DUMP_CHANNEL");
+        let dump_every = number("MAXWELL_DUMP_EVERY").unwrap_or(1).max(1);
         let replay = Replay::load(Path::new(&path)).unwrap();
         let mut by_method: HashMap<(u8, u32), (u32, std::time::Duration)> = HashMap::new();
         let mut fences: HashMap<u32, Vec<std::time::Duration>> = HashMap::new();
         let mut since: HashMap<u32, std::time::Duration> = HashMap::new();
         let mut count = 0;
-        let result = run(&replay, kind(), |call, state, took| {
+        let result = run(&replay, kind(), dump_channel, |call, state, took| {
             let key = if call.method >= 0xE00 {
                 (call.subchannel, 0xE00 + (call.method - 0xE00) / 2 * 2)
             } else {
@@ -642,7 +669,10 @@ mod tests {
                     .entry(call.channel)
                     .or_default()
                     .push(std::mem::take(since.get_mut(&call.channel).unwrap()));
+                let frame = fences[&call.channel].len() as u32;
                 if let Some(dir) = &dump
+                    && dump_channel.is_none_or(|c| c == call.channel)
+                    && frame.is_multiple_of(dump_every)
                     && let Some(image) = state.channel.render_target(0, &state.memory)
                 {
                     image
@@ -804,6 +834,83 @@ mod tests {
         }
         for ((pipeline, address), ops) in &seen {
             println!("{pipeline} {address:#x}: {ops}");
+        }
+    }
+
+    /// `MAXWELL_REPLAY=<capture> MAXWELL_PROGS=<dir> cargo test --release
+    /// --lib maxwell::capture::tests::kernels -- --ignored --nocapture`:
+    /// writes the QMD (`qmd-<address>.bin`) and kernel code
+    /// (`kernel-<address>.bin`) of every compute launch in the capture,
+    /// and lists each launch with its grid and the kernel's instructions.
+    /// The replay stops at the first call the engines refuse.
+    #[test]
+    #[ignore]
+    fn kernels() {
+        use super::super::compute::{QMD_SIZE, Qmd};
+        use super::super::shader::Kernel;
+        let path = std::env::var("MAXWELL_REPLAY").expect("MAXWELL_REPLAY");
+        let directory = std::env::var("MAXWELL_PROGS").expect("MAXWELL_PROGS");
+        let replay = Replay::load(Path::new(&path)).unwrap();
+        let mut replayer = Replayer::new(&replay, kind());
+        // Per channel: QMD address (SEND_PCAS_A), program region.
+        let mut state: HashMap<u32, (u64, [u32; 2])> = HashMap::new();
+        for (index, call) in replay.calls().iter().enumerate() {
+            let result = replayer.step(call);
+            let Some(channel) = replayer.channels.get(&call.channel) else {
+                break;
+            };
+            let class = channel.channel.subchannels.get(call.subchannel as usize);
+            if class.copied().flatten() == Some(super::super::COMPUTE) {
+                let entry = state.entry(call.channel).or_default();
+                match call.method * 4 {
+                    0x2b4 => entry.0 = u64::from(call.argument) << 8,
+                    0x1608 => entry.1[0] = call.argument,
+                    0x160c => entry.1[1] = call.argument,
+                    0x2bc => {
+                        let (qmd_address, region) = *entry;
+                        let mut bytes = [0u8; QMD_SIZE];
+                        if channel.memory.read(qmd_address, &mut bytes).is_some() {
+                            std::fs::write(format!("{directory}/qmd-{qmd_address:x}.bin"), bytes)
+                                .unwrap();
+                            let base = u64::from(region[0] & 0xff) << 32 | u64::from(region[1]);
+                            match Qmd::parse(&bytes) {
+                                Ok(qmd) => {
+                                    let code = base + u64::from(qmd.program_offset);
+                                    let ops = match Kernel::decode(&channel.memory, code) {
+                                        Ok(kernel) => {
+                                            let mut raw = vec![0; kernel.len()];
+                                            channel.memory.read(code, &mut raw).unwrap();
+                                            std::fs::write(
+                                                format!("{directory}/kernel-{code:x}.bin"),
+                                                &raw,
+                                            )
+                                            .unwrap();
+                                            let mut ops: Vec<_> = kernel.mnemonics().collect();
+                                            ops.sort();
+                                            ops.dedup();
+                                            ops.join(" ")
+                                        }
+                                        Err(error) => error.0,
+                                    };
+                                    println!(
+                                        "call {index} channel {}: QMD {qmd_address:#x} kernel \
+                                         {code:#x} {:?} cbufs {:x?}: {ops}",
+                                        call.channel, qmd.launch, qmd.constant_buffers
+                                    );
+                                }
+                                Err(error) => {
+                                    println!("call {index}: QMD {qmd_address:#x}: {}", error.0)
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Err(error) = result {
+                println!("call {index} refused: {}", error.0);
+                break;
+            }
         }
     }
 }

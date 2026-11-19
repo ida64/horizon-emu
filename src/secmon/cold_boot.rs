@@ -35,32 +35,33 @@
 //! # The monitor's steps, in order
 //!
 //! 1. Its resident part LZ4-decompressed to TZRAM [`RESIDENT`] (the boot
-//!    stage, `0x400307FC`); set-up the guest cannot see here
-//!    ([`NOT_MODELLED`]) and what the warm path reads later
-//!    ([`sc7`]: `PMC_SCRATCH1` = `0x8000D000`, `SECURE_SCRATCH21` bit 4,
-//!    `SECURE_SCRATCH32` = `0x339`, `SECURE_SCRATCH34` = `0x7C012800`,
-//!    `MC_SECURITY_CFG3` = 3); then it zeroes its own IRAM image
-//!    (`0x40030000`, `0xE000` bytes; the bootloader reads package2's
-//!    partition there next) and sets its state to 1.
+//!    stage, `0x400307FC`); its SoC security set-up ([`super::setup`]:
+//!    the interrupt distributor, the security engine's settings and key
+//!    slot permissions and the digest the resume checks, what the warm
+//!    path reads, the shared reset path, core 0's interrupt set-up), less
+//!    what nothing here models ([`NOT_MODELLED`]); then it zeroes its own
+//!    IRAM image (`0x40030000`, `0xE000` bytes; the bootloader reads
+//!    package2's partition there next) and sets its state to 1.
 //! 2. Bootloader state 1: it copies the boot config (`0x400` bytes at IRAM
 //!    `0x4003F800`) unless the console is not a development unit, in which
 //!    case the copy is zeroes (`0x1F01E0A04`; the hardware state from fuse
 //!    `RESERVED_ODM4`, `0x1F0143A04`). This console is a production one
 //!    ([`super::config_item::HARDWARE_STATE`]), so the boot config is all
 //!    zeroes and what it says is what an all-zero boot config gives.
-//! 3. Bootloader state 2: it copies the warmboot firmware from IRAM
-//!    `0x4003E000` to DRAM `0x8000D000` (`0x17F0` bytes, `0x1F01E1734`) and writes
-//!    [`DRAM_MARKERS`] (`0x1F01E10E8`).
+//! 3. Bootloader state 2: two more peripherals secure
+//!    (`setup::apb_secure`); it copies the warmboot firmware from
+//!    IRAM `0x4003E000` to DRAM `0x8000D000` (`0x17F0` bytes,
+//!    `0x1F01E1734`) and writes [`DRAM_MARKERS`] (`0x1F01E10E8`).
 //! 4. Bootloader state 3: it takes package2 from DRAM [`PACKAGE2`], sized by
 //!    its header's counter, verifies, decrypts and places it
 //!    ([`crate::package2::unpack`] does it the same way), hashes it whole
 //!    in a recovery boot (for config item 17), and sets core 0 to start at
 //!    DRAM base + the header's entry point with `X0` = 0 (`0x1F0143C20`).
-//! 5. Bootloader state 4: final memory controller set-up ([`NOT_MODELLED`]),
-//!    a wait for the BPMP to halt itself ([`HALT_COP_EVENTS`] mode 2), the
-//!    activity monitor's clock (`0x1F0142FD4`), the BPMP parked for good
-//!    (`0x40000000`), then the drop to EL1 (`SPSR_EL3` `0x3C5`,
-//!    `0x1F0140CC0`).
+//! 5. Bootloader state 4: its last set-up (`setup::final_setup`:
+//!    a carveout, the BPMP off the AHB arbiter, a wait for the BPMP to halt
+//!    itself, [`HALT_COP_EVENTS`] mode 2, the activity monitor's clock,
+//!    `0x1F0142FD4`, the BPMP parked for good, `0x40000000`), then the drop
+//!    to EL1 (`SPSR_EL3` `0x3C5`, `0x1F0140CC0`).
 //!
 //! # What TZRAM holds here
 //!
@@ -199,18 +200,14 @@ const PACKAGE2_SIZE: RangeInclusive<u64> = 0x200..=0x7F_C000;
 /// Set-up the monitor does that nothing here models, so none of it is done:
 /// its device drivers' bases, the system counter (SYSCTR0: checked to be
 /// unprogrammed, else panic, then started at the boot config's value or 0),
-/// PMC and flow controller settings other than the ones the warm path
-/// reads ([`sc7`]), the security engine (keyslots 0-9 cleared, per-slot
-/// access, the secure random key; the package2 key goes through keyslot 8
-/// from the master key in keyslot 13; the kernel's later key calls are
-/// served by [`super::crypto`]), the memory controller's security
-/// carveouts and TrustZone ranges (the kernel cannot read them through
-/// its register call, and the kernel carveouts start empty in
-/// [`crate::soc::mc::Mc`]), walling the halted BPMP off (its exception
-/// vectors, SMMU address space and the activity monitor's watch on it,
-/// whose clock alone is set up, by `actmon_clock`), `SCR_EL3` and the
-/// EL2/EL1 system registers (the kernel overwrites the EL1 ones it needs;
-/// `SCTLR_EL1` is entered as `0x00C50838`).
+/// the PMC, fuse, timer, flow controller, SMMU and memory controller
+/// settings [`super::setup`] lists as not done, the keys it loads into
+/// the security engine (the package2 key goes through keyslot 8 from the
+/// master key in keyslot 13; the kernel's later key calls are served by
+/// [`super::crypto`]), walling the halted BPMP off (its exception
+/// vectors, SMMU address space and the activity monitor's watch on it),
+/// `SCR_EL3` and the EL2/EL1 system registers (the kernel overwrites the
+/// EL1 ones it needs; `SCTLR_EL1` is entered as `0x00C50838`).
 pub const NOT_MODELLED: &str = "SoC security, counter and power set-up";
 
 /// Machine state the cold boot reads and writes.
@@ -528,7 +525,7 @@ const ACTMON_SOURCE: u32 = 0xC000_0000;
 /// called from `0x1F0147430`): held in reset and gated, its source set,
 /// clocked, let out of reset. The kernel's sleep needs it running
 /// ([`super::SLEEP_REQUIREMENTS`]).
-fn actmon_clock(port: &Port<'_>) -> Result<(), Sc7Fail> {
+pub(super) fn actmon_clock(port: &Port<'_>) -> Result<(), Sc7Fail> {
     port.modify(RST_DEVICES_V, 0, ACTMON_BIT)?;
     port.modify(CLK_OUT_ENB_V, ACTMON_BIT, 0)?;
     port.write(CLK_SOURCE_ACTMON, ACTMON_SOURCE)?;
@@ -564,7 +561,11 @@ impl SecureMonitor {
         let resident = lz4_block(&image[RESIDENT_IMAGE], RESIDENT_LIMIT)
             .filter(|resident| resident.len() == RESIDENT_SIZE)
             .ok_or(ColdBootError::NotTheMonitor)?;
-        let port = Port { bus, ram };
+        let port = Port {
+            bus,
+            ram,
+            stack: super::setup::BOOT_STACK,
+        };
         let setup = |result: Result<(), Sc7Fail>| match result {
             Ok(()) => Ok(()),
             Err(Sc7Fail::Stopped) => Err(ColdBootError::StoppedBeforeBpmpHalt),
@@ -578,7 +579,11 @@ impl SecureMonitor {
 
         iram.load(image_offset, &[0; IMAGE_SIZE])
             .expect("monitor image inside IRAM");
-        setup(sc7::cold_boot_setup(&port))?;
+        let gic = self
+            .gic()
+            .map_err(|fail| ColdBootError::Setup(fail.to_string()))?;
+        let carveouts = self.kernel_carveouts();
+        setup(super::setup::cold_boot(&port, gic, carveouts))?;
         iram.write(MONITOR_STATE, 4, MONITOR_INITIALISED)
             .expect("mailbox inside IRAM");
 
@@ -589,6 +594,7 @@ impl SecureMonitor {
         let mut settings = BootSettings::from_boot_config(&boot_config)?;
 
         wait_for_bootloader(iram, DRAM_INITIALISED, stop)?;
+        setup(super::setup::apb_secure(&port))?;
         let mut warmboot = vec![0; WARMBOOT_SIZE];
         iram.copy_out(iram_offset(WARMBOOT_IRAM), &mut warmboot)
             .expect("warmboot inside IRAM");
@@ -628,9 +634,7 @@ impl SecureMonitor {
         }
 
         wait_for_bootloader(iram, BOOTLOADER_DONE, stop)?;
-        setup(port.wait_for_bpmp_halt(stop))?;
-        setup(actmon_clock(&port))?;
-        setup(port.park_halted_bpmp())?;
+        setup(super::setup::final_setup(&port, stop))?;
         let mut state = self.state.lock().unwrap();
         state.settings = settings.overridden_by(&self.params);
         state.boot_chain = true;
@@ -662,8 +666,15 @@ impl SecureMonitor {
         let port = Port {
             bus: context.bus,
             ram: context.ram,
+            stack: super::setup::BOOT_STACK,
         };
-        sc7::resume(&port, stop).map_err(|fail| ColdBootError::Resume(fail.to_string()))?;
+        let resumed = self.gic().and_then(|gic| {
+            if super::setup::resume(&port, gic, self.kernel_carveouts())? {
+                super::setup::final_setup(&port, stop)?;
+            }
+            super::setup::core_interrupts(gic, 0)
+        });
+        resumed.map_err(|fail| ColdBootError::Resume(fail.to_string()))?;
         let mut state = self.state.lock().unwrap();
         state.suspended = None;
         state.cores_on[0] = true;
@@ -685,11 +696,14 @@ mod tests {
 
     use super::*;
     use crate::{
+        gic::Gic,
         keys::KeySet,
         secmon::{KERNEL_SMC, SmcEffect, config_item, function},
         soc::{
+            ahb,
             mc::{self, DeviceMemory, Mc},
             regs::RegisterFile,
+            se,
         },
     };
 
@@ -774,6 +788,7 @@ mod tests {
         ram: Arc<GuestRam>,
         iram: Arc<Iram>,
         tzram: Arc<tzram::Tzram>,
+        gic: Arc<Gic>,
         bus: Bus,
         engine: DeviceMemory,
     }
@@ -801,7 +816,9 @@ mod tests {
     }
 
     /// IRAM as the bootloader leaves it when it releases core 0: the
-    /// monitor at its entry, warmboot at 0x4003E000, the mailbox zeroed.
+    /// monitor at its entry, warmboot at 0x4003E000, the mailbox zeroed;
+    /// the blocks the monitor's set-up reaches, the interrupt controller
+    /// out of reset.
     fn console(firmware: &Firmware, params: &BootParams) -> Console {
         let ram = Arc::new(GuestRam::new(crate::boot::DRAM_BASE, DRAM_SIZE).unwrap());
         let iram = Arc::new(Iram::new());
@@ -827,35 +844,68 @@ mod tests {
             car::SIZE,
             Box::new(crate::soc::car::Car::power_on()),
         );
+        bus.map("AHB", ahb::BASE, ahb::SIZE, Box::new(ahb::power_on()));
+        bus.map(
+            "APB slave security",
+            0x7000_0C00,
+            0x10,
+            Box::new(RegisterFile::zeroed([(0, 0), (4, 0), (8, 0)])),
+        );
+        bus.map(
+            "FUSE_RESERVED_ODM4",
+            0x7000_F9D8,
+            4,
+            Box::new(RegisterFile::zeroed([(0, 0)])),
+        );
+        bus.map(
+            "host1x syncpoint 160",
+            0x5000_3300,
+            4,
+            Box::new(RegisterFile::zeroed([(0, 0)])),
+        );
+        bus.map(
+            "MSELECT",
+            crate::soc::mselect::BASE,
+            4,
+            Box::new(RegisterFile::zeroed([(0, 0x0300_0000)])),
+        );
         let controller = Arc::new(Mc::new(params.dram));
         let tzram = Arc::new(tzram::Tzram::new());
-        map_secure_blocks(&mut bus, &controller, &tzram);
-        let engine = DeviceMemory::new(&controller, &ram, mc::SMMU_SE_ASID);
-        Console {
-            monitor: SecureMonitor::new(params, firmware.keys.clone()),
-            ram,
-            iram,
-            tzram,
-            bus,
-            engine,
-        }
-    }
-
-    /// The blocks the monitor's warm-path set-up writes: PMC, MC, TZRAM.
-    fn map_secure_blocks(bus: &mut Bus, controller: &Arc<Mc>, tzram: &Arc<tzram::Tzram>) {
         bus.map(
             "PMC",
             crate::soc::pmc::BASE,
             crate::soc::pmc::SIZE,
             Box::new(crate::soc::pmc::Pmc::new()),
         );
-        bus.map("MC", mc::BASE, mc::SIZE, Box::new(Arc::clone(controller)));
+        bus.map("MC", mc::BASE, mc::SIZE, Box::new(Arc::clone(&controller)));
         bus.map(
             "TZRAM",
             tzram::BASE,
             tzram::SIZE,
-            Box::new(Arc::clone(tzram)),
+            Box::new(Arc::clone(&tzram)),
         );
+        // The engine as a machine powered on has it: over IRAM, TZRAM and
+        // physical DRAM.
+        let memory = se::BootMemory::new(Arc::clone(&iram), Arc::clone(&tzram), Arc::clone(&ram));
+        bus.map(
+            "SE",
+            se::BASE,
+            se::SIZE,
+            Box::new(se::Se::new(Box::new(memory), Arc::default(), 1)),
+        );
+        let gic = Arc::new(Gic::new(crate::boot::CORE_COUNT, Box::new(|_| {})));
+        gic.reset();
+        let monitor = SecureMonitor::new(params, firmware.keys.clone());
+        monitor.attach_gic(Arc::clone(&gic));
+        Console {
+            monitor,
+            ram: Arc::clone(&ram),
+            iram,
+            tzram,
+            gic,
+            bus,
+            engine: DeviceMemory::new(&controller, &ram, mc::SMMU_SE_ASID),
+        }
     }
 
     fn register(bus: &Bus, address: u64) -> u32 {
@@ -955,6 +1005,21 @@ mod tests {
         );
         assert_eq!(register(&console.bus, RST_DEVICES_V) & ACTMON_BIT, 0);
         assert_eq!(register(&console.bus, CLK_SOURCE_ACTMON), ACTMON_SOURCE);
+        // The key slots as the warmboot firmware checks them: slots 0 to 5
+        // read-protected, reading 0; 6 to 15 per-key secure, all ones;
+        // the RSA slots all ones.
+        let se_register = |offset: u64| se::BASE + offset;
+        assert_eq!(register(&console.bus, se_register(0x280)), 0x003F);
+        assert_eq!(register(&console.bus, se_register(0x284)), 0x6A);
+        assert_eq!(register(&console.bus, se_register(0x284 + 8 * 4)), 0x2A);
+        assert_eq!(register(&console.bus, se_register(0x284 + 15 * 4)), 0);
+        for (slot, expected) in [(0, 0), (5, 0), (6, u32::MAX), (15, u32::MAX)] {
+            let selected = console.bus.write(0, se_register(0x31C), 4, slot << 4);
+            assert!(matches!(selected, Access::Done(())));
+            assert_eq!(register(&console.bus, se_register(0x320)), expected);
+        }
+        assert_eq!(register(&console.bus, se_register(0x40C)), 0);
+        assert_eq!(register(&console.bus, se_register(0x410)), 2);
         // The resident image in TZRAM, and the SC7 stub in it.
         let mut resident = vec![0; RESIDENT_SIZE];
         console
@@ -1060,60 +1125,87 @@ mod tests {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
-    /// A machine whose console is in SC7 as the warmboot firmware leaves it
-    /// when it releases core 0: `security_cfg3` in the memory controller,
-    /// the BPMP halting itself.
-    fn asleep(security_cfg3: u32) -> (SecureMonitor, Bus, Arc<GuestRam>, Iram) {
-        let monitor = SecureMonitor::new(&BootParams::default(), KeySet::default());
+    /// A console cold-booted, then as the warmboot firmware leaves it when
+    /// it releases core 0 after SC7: the kernel suspended,
+    /// `MC_SECURITY_CFG3` at `security_cfg3` (0: the SoC lost power, and
+    /// its interrupt controller with it), the BPMP halting itself.
+    fn asleep(security_cfg3: u32) -> Option<Console> {
+        let firmware = firmware()?;
+        let console = console(&firmware, &BootParams::default());
+        let stop = AtomicBool::new(false);
+        thread::scope(|scope| {
+            scope.spawn(|| bootloader(&console, &firmware.package2, &stop));
+            console.monitor.cold_boot(ENTRY, console.context(), &stop)
+        })
+        .unwrap();
         {
-            let mut state = monitor.state.lock().unwrap();
-            state.boot_chain = true;
+            let mut state = console.monitor.state.lock().unwrap();
             state.cores_on[0] = false;
             state.suspended = Some((0x8000_1234, 7));
         }
-        let mut bus = Bus::default();
-        bus.map(
-            "FLOW",
-            HALT_COP_EVENTS & !0xFFF,
-            0x1000,
-            Box::new(RegisterFile::zeroed([(
-                HALT_COP_EVENTS & 0xFFF,
-                0x5000_0000,
-            )])),
-        );
-        let controller = Arc::new(Mc::new(crate::boot::DramSize::Gb4));
-        map_secure_blocks(&mut bus, &controller, &Arc::default());
-        assert!(matches!(
-            bus.write(0, sc7::MC_SECURITY_CFG3, 4, security_cfg3.into()),
-            Access::Done(())
-        ));
-        let ram = Arc::new(GuestRam::new(crate::boot::DRAM_BASE, 0x1000).unwrap());
-        (monitor, bus, ram, Iram::new())
+        if security_cfg3 == 0 {
+            console.gic.reset();
+        }
+        for (address, value) in [
+            (sc7::MC_SECURITY_CFG3, security_cfg3),
+            (HALT_COP_EVENTS, 0x5000_0000),
+        ] {
+            let written = console.bus.write(0, address, 4, value.into());
+            assert!(matches!(written, Access::Done(())));
+        }
+        Some(console)
     }
 
     #[test]
     fn resume_redoes_the_security_set_up_after_a_reset_and_enters_the_saved_entry() {
-        let (monitor, bus, ram, iram) = asleep(0);
-        let context = || ColdBootContext {
-            ram: &ram,
-            iram: &iram,
-            bus: &bus,
+        let Some(console) = asleep(0) else {
+            return;
         };
+        let bus = &console.bus;
         let stop = AtomicBool::new(false);
-        let released = monitor
-            .core0_released(sc7::RESUME_ENTRY, context(), &stop)
+        let released = console
+            .monitor
+            .core0_released(sc7::RESUME_ENTRY, console.context(), &stop)
             .unwrap();
         assert!(matches!(
             released,
             Released::Resume(entry) if entry == CoreEntry::secondary(0x8000_1234, 7)
         ));
         let pmc = crate::soc::pmc::BASE;
-        assert_eq!(register(&bus, pmc + 0x368), 0x7C01_2800);
-        assert_eq!(register(&bus, sc7::MC_SECURITY_CFG3), 3);
-        assert_eq!(register(&bus, HALT_COP_EVENTS), sc7::COP_PARKED);
-        assert!(monitor.state.lock().unwrap().cores_on[0]);
+        assert_eq!(register(bus, pmc + 0x368), 0x7C01_2800);
+        assert_eq!(register(bus, sc7::MC_SECURITY_CFG3), 3);
+        assert_eq!(register(bus, HALT_COP_EVENTS), sc7::COP_PARKED);
+        // The activity monitor clocked again from CLK_M.
+        assert_eq!(register(bus, car::BASE + 0x3E8), 0xC000_0000);
+        // AHB arbitration and MSELECT as the reset vector leaves them, the
+        // BPMP off the arbiter as the end of the set-up does.
+        assert_eq!(register(bus, ahb::BASE + 0x004), 0x4_0062);
+        assert_eq!(register(bus, ahb::BASE + 0x008), 0xE000_0001);
+        assert_eq!(register(bus, crate::soc::mselect::BASE), 0x3800_0000);
+        // Carveouts, APB security, the scrubbed scratch locked.
+        assert_eq!(register(bus, mc::BASE + 0xC08), 0x0400_0006);
+        assert_eq!(register(bus, mc::BASE + 0xC58), 0x0440_167E);
+        assert_eq!(register(bus, 0x7000_0C00), 0x0050_6244);
+        assert_eq!(register(bus, 0x7000_0C04), 0x8370_0510);
+        assert_eq!(register(bus, pmc + 0x004) & 0xFF000, 0xFF000);
+        // The interrupt controller: the kernel's interrupts in Group 1,
+        // the monitor's in Group 0.
+        let groups = |core: usize, register: u64| {
+            console
+                .gic
+                .secure_distributor_read(core, 0x080 + register * 4)
+                .unwrap()
+        };
+        // SGIs 0 to 15 and PPIs 25 to 31 exist.
+        assert_eq!(groups(0, 0), 0xFE00_FFFF & !(1 << 28));
+        assert_eq!(groups(0, 1), u32::MAX);
+        assert_eq!(groups(0, 2), !(1 << (90 - 64) | 1 << (77 - 64)));
+        assert_eq!(groups(1, 0), 0, "core 1 is set up when it starts");
+        assert!(console.monitor.state.lock().unwrap().cores_on[0]);
         // Nothing is pending any more.
-        let again = monitor.core0_released(sc7::RESUME_ENTRY, context(), &stop);
+        let again = console
+            .monitor
+            .core0_released(sc7::RESUME_ENTRY, console.context(), &stop);
         assert!(matches!(again, Err(ColdBootError::NotSuspended)));
         assert_eq!(
             again.unwrap_err().to_string(),
@@ -1122,19 +1214,47 @@ mod tests {
     }
 
     #[test]
-    fn resume_without_a_reset_leaves_the_soc_alone() {
-        let (monitor, bus, ram, iram) = asleep(3);
-        let context = ColdBootContext {
-            ram: &ram,
-            iram: &iram,
-            bus: &bus,
+    fn resume_panics_as_the_monitor_does_on_a_different_key_digest() {
+        let Some(console) = asleep(0) else {
+            return;
         };
-        let released = monitor
-            .core0_released(sc7::RESUME_ENTRY, context, &AtomicBool::new(false))
+        let digest = (super::super::setup::DIGEST - tzram::BASE) as u32;
+        console.tzram.load(digest, &[0x5A; 16]).unwrap();
+        let error = console
+            .monitor
+            .core0_released(
+                sc7::RESUME_ENTRY,
+                console.context(),
+                &AtomicBool::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "secure monitor resume: the monitor panics: the key slots' digest differs \
+             from the cold boot's"
+        );
+    }
+
+    #[test]
+    fn resume_without_a_reset_leaves_the_soc_alone() {
+        let Some(console) = asleep(3) else {
+            return;
+        };
+        let released = console
+            .monitor
+            .core0_released(
+                sc7::RESUME_ENTRY,
+                console.context(),
+                &AtomicBool::new(false),
+            )
             .unwrap();
         assert!(matches!(released, Released::Resume(_)));
-        assert_eq!(register(&bus, HALT_COP_EVENTS), 0x5000_0000);
-        assert_eq!(register(&bus, crate::soc::pmc::BASE + 0x368), 0);
+        assert_eq!(register(&console.bus, HALT_COP_EVENTS), 0x5000_0000);
+        assert_eq!(register(&console.bus, ahb::BASE + 0x004), 2);
+        assert_eq!(
+            register(&console.bus, crate::soc::mselect::BASE),
+            0x0300_0000
+        );
     }
 
     #[test]

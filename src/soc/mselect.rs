@@ -14,10 +14,21 @@
 //! and refuses writes (what they do to a block in reset is not known).
 //!
 //! The bootloader lets it out of reset (`RST_DEVICES_V &= ~8`, its
-//! `0x400164A0`) and does not touch it again; the secure monitor then
-//! read-modify-writes `MSELECT_CONFIG` (offset 0). Out of reset, the
-//! registers' reset values are not public: reads refuse until a register
-//! is written, and written registers hold what was written.
+//! `0x400164A0`) and does not touch it again; the secure monitor's reset
+//! path (`0x7C012C5C`, cold boot and SC7 resume) and the warmboot
+//! firmware (`0x400107D8`) read-modify-write `MSELECT_CONFIG` (offset 0):
+//! bits 25:24 cleared (coreboot's names: `ERR_RESP_EN_SLAVE1/2`) and
+//! 29:27 set (`WRAP_TO_INCR_SLAVE0..2`). Out of reset, the registers'
+//! reset values are not public. `MSELECT_CONFIG` reads
+//! `0x0300_0000`: \[inference\] the error-response bits set,
+//! since every public sequence (coreboot `mselect_enable_wrap`, TF-A's
+//! Tegra210 platform code, hekate, the monitor and the warmboot here)
+//! clears them, and \[assumption\] every other bit clear; nothing here
+//! acts on its bits. Other registers refuse reads until written, and
+//! written registers hold what was written. The block loses its settings
+//! in SC7 (TF-A "Tegra210: enable WRAP to INCR burst type conversions":
+//! "During system suspend, it loses all config settings"): the machine
+//! puts it back into reset when the SoC powers down.
 
 use std::sync::Mutex;
 
@@ -41,6 +52,11 @@ const READ_IN_RESET: [u64; 12] = [
 ];
 /// What they read then.
 const IN_RESET: u32 = 0xEAFF_FFFE;
+
+const CONFIG: u64 = 0x00;
+/// `MSELECT_CONFIG` as the block comes out of reset: see the module
+/// documentation.
+const CONFIG_OUT_OF_RESET: u32 = 0x0300_0000;
 
 #[derive(Serialize, Deserialize)]
 struct State {
@@ -70,7 +86,11 @@ impl Mselect {
 
     /// The clock and reset controller let the block out of reset.
     pub fn release(&self) {
-        self.state.lock().unwrap().held = false;
+        let mut state = self.state.lock().unwrap();
+        if state.held {
+            self.registers.set(CONFIG, CONFIG_OUT_OF_RESET);
+        }
+        state.held = false;
     }
 }
 
@@ -121,12 +141,13 @@ mod tests {
         assert_eq!(mselect.read(0, 0x04, 4), None);
         assert_eq!(mselect.write(0, 0x00, 4, 0x3800_0000), None);
         mselect.release();
-        assert_eq!(mselect.read(0, 0x00, 4), None);
+        assert_eq!(mselect.read(0, 0x00, 4), Some(CONFIG_OUT_OF_RESET.into()));
+        assert_eq!(mselect.read(0, 0x04, 4), None);
         assert_eq!(mselect.write(0, 0x00, 4, 0x3800_0000), Some(()));
         assert_eq!(mselect.read(0, 0x00, 4), Some(0x3800_0000));
         mselect.hold();
         assert_eq!(mselect.read(0, 0x00, 4), Some(IN_RESET.into()));
         mselect.release();
-        assert_eq!(mselect.read(0, 0x00, 4), None);
+        assert_eq!(mselect.read(0, 0x00, 4), Some(CONFIG_OUT_OF_RESET.into()));
     }
 }

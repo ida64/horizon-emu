@@ -51,11 +51,9 @@
 //! # Resume (core 0 released at [`RESUME_ENTRY`], `0x1F014414C`)
 //!
 //! The monitor redoes its SoC security set-up only if `MC_SECURITY_CFG3`
-//! reads 0, which is how it learns the SoC lost power; the part of it
-//! modelled is `SECURE_SCRATCH34` and `MC_SECURITY_CFG3` written again and
-//! the BPMP parked again once it halted itself.
-//! Then core 0 enters the kernel at the entry `CPU_SUSPEND` was given,
-//! with its context in `X0`.
+//! reads 0, which is how it learns the SoC lost power: its reset path,
+//! the same as the cold boot's ([`super::setup`]). Then core 0 enters the
+//! kernel at the entry `CPU_SUSPEND` was given, with its context in `X0`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -90,8 +88,9 @@ const CONTEXT_PATTERN: u64 = 0x7C01_A098;
 
 /// The SC7 routine's stack: linked lists and bounce buffers.
 pub const STACK: u64 = 0x7C01_0C00;
-const IN_LIST: u64 = STACK;
-const OUT_LIST: u64 = STACK + 0x10;
+/// The engine's linked lists, at the start of a [`Port::stack`].
+const IN_LIST: u64 = 0;
+const OUT_LIST: u64 = 0x10;
 const BOUNCE: u64 = STACK + 0x40;
 const SEED: u64 = STACK + 0x80;
 const LAST_BLOCK_BUFFER: u64 = STACK + 0xC0;
@@ -103,29 +102,19 @@ const WAKE_STATUS: u64 = PMC + 0x014;
 const PWRGATE_TOGGLE: u64 = PMC + 0x030;
 const PWRGATE_STATUS: u64 = PMC + pmc::PWRGATE_STATUS;
 const SCRATCH0: u64 = PMC + 0x050;
-const SCRATCH1: u64 = PMC + 0x054;
 const WAKE2_STATUS: u64 = PMC + 0x168;
 const SCRATCH43: u64 = PMC + 0x22C;
 const SEC_DISABLE3: u64 = PMC + 0x2D8;
-const SECURE_SCRATCH21: u64 = PMC + 0x334;
 const SECURE_SCRATCH24: u64 = PMC + 0x340;
-const SECURE_SCRATCH32: u64 = PMC + 0x360;
-const SECURE_SCRATCH34: u64 = PMC + 0x368;
 const CNTRL2: u64 = PMC + 0x440;
 const SEC_DISABLE8: u64 = PMC + 0x5C0;
 const SECURE_SCRATCH112: u64 = PMC + 0xB18;
 
 /// `SECURE_SCRATCH32`: the warm boot magic the warmboot firmware checks.
 pub const WARMBOOT_MAGIC: u32 = 0x339;
-/// `SECURE_SCRATCH21` bit 4, which the warmboot firmware ORs into
-/// `FUSE_PRIVATEKEYDISABLE`.
-const PRIVATE_KEY_DISABLE: u32 = 1 << 4;
-/// `PMC_SCRATCH1`: where the boot ROM finds the warmboot firmware.
-const WARMBOOT_VECTOR: u32 = 0x8000_D000;
 
 /// `MC_SECURITY_CFG3`: 3 once the monitor set the SoC up, 0 after reset.
 pub const MC_SECURITY_CFG3: u64 = mc::BASE + 0x9BC;
-const SECURITY_CFG3_SET_UP: u32 = 3;
 
 const HALT_COP_EVENTS: u64 = flow::BASE + 0x004;
 /// `WAITEVENT` with no event: the BPMP parked for good.
@@ -199,10 +188,13 @@ impl std::fmt::Display for Sc7Fail {
 
 type Result<T, E = Sc7Fail> = std::result::Result<T, E>;
 
-/// The SoC as core 0 reaches it: the bus, and DRAM.
+/// The SoC as core 0 reaches it: the bus, and DRAM; and where on the
+/// monitor's stack its engine operations put their linked lists
+/// ([`STACK`] for the SC7 routine).
 pub(super) struct Port<'a> {
     pub(super) bus: &'a Bus,
     pub(super) ram: &'a GuestRam,
+    pub(super) stack: u64,
 }
 
 impl Port<'_> {
@@ -232,7 +224,7 @@ impl Port<'_> {
     }
 
     /// Bytes on the bus (IRAM, TZRAM), a word at a time.
-    fn read_bytes(&self, address: u64, out: &mut [u8]) -> Result<()> {
+    pub(super) fn read_bytes(&self, address: u64, out: &mut [u8]) -> Result<()> {
         for (index, word) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             *word = self.read(address + index as u64 * 4)?.to_le_bytes();
         }
@@ -254,7 +246,7 @@ impl Port<'_> {
 
     /// Starts engine operation `op` on one-entry lists and waits for it
     /// (`0x1F014140C`, then the error check `0x1F01421FC`).
-    fn engine_op(&self, op: u32, output: (u64, u32), input: (u64, u32)) -> Result<()> {
+    pub(super) fn engine_op(&self, op: u32, output: (u64, u32), input: (u64, u32)) -> Result<()> {
         let list = |(address, size): (u64, u32)| {
             let (address, size) = if address == 0 {
                 (0, 0)
@@ -266,10 +258,11 @@ impl Port<'_> {
             bytes[8..].copy_from_slice(&size.to_le_bytes());
             bytes
         };
-        self.write_bytes(IN_LIST, &list(input))?;
-        self.write_bytes(OUT_LIST, &list(output))?;
-        self.write(SE_IN_LL_ADDR, IN_LIST as u32)?;
-        self.write(SE_OUT_LL_ADDR, OUT_LIST as u32)?;
+        let (in_list, out_list) = (self.stack + IN_LIST, self.stack + OUT_LIST);
+        self.write_bytes(in_list, &list(input))?;
+        self.write_bytes(out_list, &list(output))?;
+        self.write(SE_IN_LL_ADDR, in_list as u32)?;
+        self.write(SE_OUT_LL_ADDR, out_list as u32)?;
         self.write(SE_ERR_STATUS, self.read(SE_ERR_STATUS)?)?;
         self.write(SE_INT_STATUS, self.read(SE_INT_STATUS)?)?;
         self.write(SE_OPERATION, op)?;
@@ -305,7 +298,7 @@ impl Port<'_> {
     }
 
     /// 256 random bits into `slot` (`0x1F0142338`).
-    fn random_key(&self, slot: u32) -> Result<()> {
+    pub(super) fn random_key(&self, slot: u32) -> Result<()> {
         self.write(SE_CONFIG, 0x2008)?;
         self.write(SE_CRYPTO_CONFIG, 0x108)?;
         self.write(SE_RNG_CONFIG, 4)?;
@@ -317,7 +310,7 @@ impl Port<'_> {
     }
 
     /// A new secure random key (`0x1F01414F8`).
-    fn new_srk(&self) -> Result<()> {
+    pub(super) fn new_srk(&self) -> Result<()> {
         self.write(SE_CONFIG, 0x200C)?;
         self.write(SE_CRYPTO_CONFIG, 0x108)?;
         self.write(SE_RNG_CONFIG, 6)?;
@@ -326,7 +319,7 @@ impl Port<'_> {
     }
 
     /// Every word of `slot` zero (`0x1F0141960`).
-    fn clear_slot(&self, slot: u32) -> Result<()> {
+    pub(super) fn clear_slot(&self, slot: u32) -> Result<()> {
         for word in 0..16 {
             self.write(SE_CRYPTO_KEYTABLE_ADDR, slot << 4 | word)?;
             self.write(SE_CRYPTO_KEYTABLE_DATA, 0)?;
@@ -346,11 +339,23 @@ impl Port<'_> {
 
     /// The 16 bytes at `source` decrypted with `key` into the first word
     /// quad of `slot` (`0x1F0141FBC`).
-    fn decrypt_into_slot(&self, slot: u32, key: u32, source: u64) -> Result<()> {
+    pub(super) fn decrypt_into_slot(&self, slot: u32, key: u32, source: u64) -> Result<()> {
         self.aes_config(0x108, key << 24)?;
         self.write(SE_CRYPTO_LAST_BLOCK, 0)?;
         self.write(SE_CRYPTO_KEYTABLE_DST, slot << 8)?;
         self.engine_op(OP_START, (0, 0), (source, 16))
+    }
+
+    /// The 16 bytes at `block` encrypted in place with `slot`'s key, the
+    /// engine's `SE_CONFIG` mode bits 31:16 `modes` (`0x1F0141A60`, the
+    /// block through the engine as `0x1F014283C` puts it).
+    pub(super) fn encrypt_block(&self, slot: u32, modes: u32, block: u64) -> Result<()> {
+        self.write(SE_CONFIG, 0x1000)?;
+        self.write(SE_CRYPTO_CONFIG, slot << 24 | 0x100)?;
+        let config = self.read(SE_CONFIG)?;
+        self.write(SE_CONFIG, config & 0xFFFF | modes << 16)?;
+        self.write(SE_CRYPTO_LAST_BLOCK, 0)?;
+        self.engine_op(OP_START, (block, 16), (block, 16))
     }
 
     /// `slot`'s original IV (`0x1F0141B8C`).
@@ -502,13 +507,6 @@ impl Port<'_> {
         })
     }
 
-    /// Waits for the BPMP to halt itself, then parks it (end of
-    /// `0x1F0147430`).
-    pub(super) fn park_bpmp(&self, stop: &AtomicBool) -> Result<()> {
-        self.wait_for_bpmp_halt(stop)?;
-        self.write(HALT_COP_EVENTS, COP_PARKED)
-    }
-
     /// Polls `HALT_COP_EVENTS` until the BPMP halted waiting for an event.
     pub(super) fn wait_for_bpmp_halt(&self, stop: &AtomicBool) -> Result<()> {
         while self.read(HALT_COP_EVENTS)? >> 29 != HALT_MODE_WAIT_EVENT {
@@ -556,24 +554,6 @@ enum LockState {
 /// CMAC's subkey doubling in GF(2^128).
 fn double(block: u128) -> u128 {
     block << 1 ^ if block >> 127 != 0 { 0x87 } else { 0 }
-}
-
-/// What the cold boot sets up that the warm path relies on
-/// (`0x1F0146C80`, `0x1F0147010`): where the boot ROM finds the warmboot
-/// firmware, the warmboot's magic and the private key disable bit it
-/// re-applies, the resume vector it hands core 0, and the memory
-/// controller's "set up" mark.
-pub(super) fn cold_boot_setup(port: &Port<'_>) -> Result<()> {
-    port.write(SCRATCH1, WARMBOOT_VECTOR)?;
-    port.modify(SECURE_SCRATCH21, 0, PRIVATE_KEY_DISABLE)?;
-    port.write(SECURE_SCRATCH32, WARMBOOT_MAGIC)?;
-    resume_setup(port)
-}
-
-/// The part of the set-up the resume redoes (`0x1F0147010`).
-fn resume_setup(port: &Port<'_>) -> Result<()> {
-    port.write(SECURE_SCRATCH34, RESUME_ENTRY as u32)?;
-    port.write(MC_SECURITY_CFG3, SECURITY_CFG3_SET_UP)
 }
 
 /// Steps 1 to 3 of the module's suspend, the preconditions excepted.
@@ -639,15 +619,6 @@ pub(super) fn suspend(port: &Port<'_>) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// The resume's SoC part: the set-up again if the SoC lost it.
-pub(super) fn resume(port: &Port<'_>, stop: &AtomicBool) -> Result<()> {
-    if port.read(MC_SECURITY_CFG3)? != 0 {
-        return Ok(());
-    }
-    resume_setup(port)?;
-    port.park_bpmp(stop)
 }
 
 const _: () = assert!(STUB_IRAM + STUB_SIZE as u64 <= iram::BASE + iram::SIZE);

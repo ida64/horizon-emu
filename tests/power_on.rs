@@ -12,6 +12,15 @@
 //! and ends with the kernel placed in DRAM and core 0's entry: the point
 //! where a machine would start its first vCPU.
 //!
+//! The kernel does not run here; the harness then does what its sleep
+//! leaves the monitor to do: with the SoC as the kernel's drivers leave it
+//! for sleep, `CPU_SUSPEND` on core 0. The monitor (high-level emulated)
+//! saves TZRAM and restarts the BPMP on its own SC7 stub, which puts the
+//! SoC into SC7; a wake comes at once, the boot ROM's warm path starts the
+//! warmboot firmware on the BPMP, which releases core 0 at the monitor's
+//! resume vector, and the monitor's resume gives core 0 back to the kernel
+//! where it asked.
+//!
 //! The test records each stage of that chain as it is reached. It fails
 //! if any stage up to [`REACHED`], the furthest the emulated chain is known
 //! to get, is missed, and once the kernel's entry is reached, if any stage
@@ -39,16 +48,25 @@ use std::{
 use horizon_emu::{
     boot::{BootParams, CORE_COUNT, DRAM_BASE},
     bootrom,
-    bus::Bus,
+    bus::{Access, Bus},
     clock::GuestClock,
     gic::Gic,
     image::KernelImage,
     keys::KeySet,
-    machine::{Bpmp, Env, NeverWakes, PowerOn, Slice},
+    machine::{Bpmp, Env, PowerDomain, PowerOn, Slice, WarmStart, warm_start},
     memory::GuestRam,
     nand::{self, boot_images::BootImages},
-    secmon::{ColdBootContext, SecureMonitor},
-    soc::{BootBlocks, Soc, emmc::EmmcImages, flow::CopStatus, medium::ImageFile},
+    secmon::{
+        ColdBootContext, KERNEL_SMC, Released, SLEEP_REQUIREMENTS, SecureMonitor, SmcEffect,
+        function, sc7::RESUME_ENTRY,
+    },
+    soc::{
+        BootBlocks, Soc,
+        emmc::EmmcImages,
+        flow::CopStatus,
+        mc::{self, DeviceMemory},
+        medium::ImageFile,
+    },
 };
 
 const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../");
@@ -107,6 +125,20 @@ enum Stage {
     BpmpHalted,
     /// The monitor placed the kernel and gave core 0's entry at EL1.
     KernelEntry,
+    /// The kernel's `CPU_SUSPEND`: the monitor saved TZRAM and the
+    /// engine's context and restarted the BPMP on its SC7 stub.
+    SystemSuspend,
+    /// The stub put the SoC into SC7 (`DPD_ENABLE`).
+    Sc7,
+    /// A wake: the boot ROM's warm path started the BPMP on the warmboot
+    /// firmware.
+    Warmboot,
+    /// The warmboot firmware released core 0 at the monitor's resume
+    /// vector.
+    Cpu0Resumed,
+    /// The monitor's resume gave core 0 the kernel's entry and context of
+    /// `CPU_SUSPEND`.
+    KernelResumed,
 }
 
 /// The stages reached, with the guest time of each.
@@ -295,14 +327,25 @@ fn power_on() -> Outcome {
         .as_ref()
         .expect("a SoC powered on has the boot blocks");
     bpmp.set_trace(TRACE);
+    // As `Machine::new` powered on: the interrupt controller out of reset,
+    // for the monitor to set up.
+    gic.reset();
     let monitor = SecureMonitor::new(&params, keys);
+    monitor.attach_gic(Arc::clone(&gic));
+    let wake = WakesAtOnce {
+        soc: &soc,
+        bus: &bus,
+        ram: &ram,
+        bpmp: &bpmp,
+        gic: &gic,
+    };
     let env = Env {
         blocks,
         ram: &ram,
         bus: &bus,
         clock: &clock,
         notes: &soc.notes,
-        power: &NeverWakes,
+        power: &wake,
     };
 
     let progress = Arc::new(Progress::default());
@@ -310,7 +353,8 @@ fn power_on() -> Outcome {
         progress.reach(Stage::BootRomHandoff, &clock);
     }
     let stop = AtomicBool::new(false);
-    let cold_boot = Mutex::new(None::<Result<(), String>>);
+    // What core 0's thread came to: the cold boot, then the resume.
+    let core0 = Mutex::new(None::<Result<(), String>>);
     let started = Instant::now();
     let mut stopped = None;
     thread::scope(|scope| {
@@ -321,21 +365,28 @@ fn power_on() -> Outcome {
                 stopped = Some(format!("no further stage within {DEADLINE:?} of host time"));
                 break;
             }
-            if let Some(result) = cold_boot.lock().unwrap().as_ref() {
-                match result {
-                    Ok(()) => {
-                        // The monitor went on only once the BPMP halted; the
-                        // halt may have come after the BPMP's last slice.
-                        if blocks.flow.cop_status(false, false) != CopStatus::Running {
-                            progress.reach(Stage::BpmpHalted, &clock);
-                        }
-                        break;
+            let finished = core0.lock().unwrap().take();
+            match finished {
+                Some(Ok(())) if progress.has(Stage::KernelResumed) => break,
+                Some(Ok(())) => {
+                    // The monitor went on only once the BPMP halted; the
+                    // halt may have come after the BPMP's last slice.
+                    if blocks.flow.cop_status(false, false) != CopStatus::Running {
+                        progress.reach(Stage::BpmpHalted, &clock);
                     }
-                    Err(error) => {
-                        stopped = Some(error.clone());
-                        break;
+                    match suspend(&soc, &bus, &ram, &monitor) {
+                        Ok(()) => progress.reach(Stage::SystemSuspend, &clock),
+                        Err(error) => {
+                            stopped = Some(error);
+                            break;
+                        }
                     }
                 }
+                Some(Err(error)) => {
+                    stopped = Some(error);
+                    break;
+                }
+                None => {}
             }
             let slice = bpmp.slice(&env, SLICE);
             let pc = bpmp.core().pc();
@@ -347,10 +398,10 @@ fn power_on() -> Outcome {
             if progress.has(Stage::NxBootloaderStub) && NX_BOOTLOADER_MAIN.contains(&pc) {
                 progress.reach(Stage::NxBootloaderMain, &clock);
             }
-            if released && iram_word(blocks, MONITOR_STATE) != 0 {
+            if released && !progress.has(Stage::Sc7) && iram_word(blocks, MONITOR_STATE) != 0 {
                 progress.reach(Stage::MonitorReady, &clock);
             }
-            if progress.has(Stage::Cpu0Released) {
+            if progress.has(Stage::Cpu0Released) && !progress.has(Stage::Sc7) {
                 for (state, stage) in [
                     (1, Stage::BootConfigLoaded),
                     (2, Stage::DramInitialised),
@@ -362,11 +413,18 @@ fn power_on() -> Outcome {
                 }
             }
             match slice {
-                Slice::Ran | Slice::Halted(CopStatus::Running) | Slice::Woke => {}
+                Slice::Ran | Slice::Halted(CopStatus::Running) => {}
                 Slice::Paused | Slice::Held => thread::sleep(Duration::from_millis(1)),
-                // The harness has no wake source (`NeverWakes`): SC7 ends it.
+                Slice::PoweredDown if progress.has(Stage::SystemSuspend) => {
+                    progress.reach(Stage::Sc7, &clock)
+                }
                 Slice::PoweredDown | Slice::Asleep => {
-                    stopped = Some("the SoC entered SC7".into());
+                    stopped = Some("the SoC entered SC7 before the kernel asked to sleep".into());
+                }
+                Slice::Woke => {
+                    if bpmp.core().pc() == WARMBOOT_ENTRY {
+                        progress.reach(Stage::Warmboot, &clock);
+                    }
                 }
                 Slice::Halted(halt) => {
                     if progress.has(Stage::Package2Loaded) {
@@ -379,6 +437,29 @@ fn power_on() -> Outcome {
                         _ => thread::sleep(Duration::from_millis(1)),
                     }
                 }
+                Slice::Released(entry) if progress.has(Stage::Warmboot) => {
+                    if entry != RESUME_ENTRY {
+                        stopped = Some(format!("core 0 released at {entry:#x} after SC7"));
+                        continue;
+                    }
+                    progress.reach(Stage::Cpu0Resumed, &clock);
+                    let (progress, monitor, core0) = (&progress, &monitor, &core0);
+                    let (ram, iram, bus, clock, stop) = (&ram, &blocks.iram, &bus, &clock, &stop);
+                    scope.spawn(move || {
+                        let context = ColdBootContext { ram, iram, bus };
+                        let result = match monitor.core0_released(entry, context, stop) {
+                            Ok(Released::Resume(resumed))
+                                if resumed.pc == SUSPEND_ENTRY && resumed.x0 == SUSPEND_CONTEXT =>
+                            {
+                                progress.reach(Stage::KernelResumed, clock);
+                                Ok(())
+                            }
+                            Ok(released) => Err(format!("the resume came to {released:?}")),
+                            Err(error) => Err(error.to_string()),
+                        };
+                        *core0.lock().unwrap() = Some(result);
+                    });
+                }
                 Slice::Released(entry) => {
                     if released {
                         stopped = Some(format!("core 0 released a second time, at {entry:#x}"));
@@ -390,7 +471,7 @@ fn power_on() -> Outcome {
                         continue;
                     }
                     progress.reach(Stage::Cpu0Released, &clock);
-                    let (progress, monitor, cold_boot) = (&progress, &monitor, &cold_boot);
+                    let (progress, monitor, core0) = (&progress, &monitor, &core0);
                     let (ram, iram, bus, clock, stop, kernel) =
                         (&ram, &blocks.iram, &bus, &clock, &stop, &kernel);
                     scope.spawn(move || {
@@ -415,7 +496,7 @@ fn power_on() -> Outcome {
                                 progress.reach(Stage::KernelEntry, clock);
                                 Ok(())
                             });
-                        *cold_boot.lock().unwrap() = Some(result);
+                        *core0.lock().unwrap() = Some(result);
                     });
                 }
                 Slice::Fault(fault) => stopped = Some(format!("BPMP: {fault}")),
@@ -432,12 +513,90 @@ fn power_on() -> Outcome {
     }
 }
 
-/// The furthest stage the chain reaches today: raised as the models get it
-/// further, up to [`Stage::KernelEntry`]. The next divergence is the stop
-/// the test prints.
-const REACHED: Stage = Stage::KernelEntry;
+/// Where the warmboot firmware starts (its header's entry,
+/// `warmboot-research` §6).
+const WARMBOOT_ENTRY: u32 = 0x4001_0240;
 
-/// The chain on the BPMP, towards the kernel's entry.
+/// The kernel's `CPU_SUSPEND`: the power state its sleep handler passes
+/// (SC7, as the monitor requires), and where and with what it asks to
+/// resume. The kernel does not run here, so no code of its is at the
+/// entry; the monitor only hands it back.
+const SUSPEND_POWER_STATE: u64 = 0x0201_001B;
+const SUSPEND_ENTRY: u64 = 0x8000_1000;
+const SUSPEND_CONTEXT: u64 = 0x8000_2000;
+
+/// The SoC as the kernel leaves it for sleep (what the monitor checks,
+/// [`SLEEP_REQUIREMENTS`]), then the kernel's `CPU_SUSPEND` on core 0.
+fn suspend(
+    soc: &Soc,
+    bus: &Bus,
+    ram: &Arc<GuestRam>,
+    monitor: &SecureMonitor,
+) -> Result<(), String> {
+    for (register, mask, required, what) in SLEEP_REQUIREMENTS {
+        let Access::Done(value) = bus.read(0, register, 4) else {
+            return Err(format!("{register:#x} ({what}) cannot be read"));
+        };
+        let value = value as u32;
+        if value & mask != required
+            && !matches!(
+                bus.write(0, register, 4, (value & !mask | required).into()),
+                Access::Done(())
+            )
+        {
+            return Err(format!("{register:#x} ({what}) cannot be set for sleep"));
+        }
+    }
+    let engine = DeviceMemory::new(&soc.mc, ram, mc::SMMU_SE_ASID);
+    let mut x = [0; 8];
+    x[..4].copy_from_slice(&[
+        function::CPU_SUSPEND.into(),
+        SUSPEND_POWER_STATE,
+        SUSPEND_ENTRY,
+        SUSPEND_CONTEXT,
+    ]);
+    match monitor.call(0, KERNEL_SMC, &mut x, bus, &engine) {
+        SmcEffect::SystemSuspend => Ok(()),
+        effect => Err(format!(
+            "CPU_SUSPEND came to {effect:?}; notes: {:?}",
+            soc.notes.take()
+        )),
+    }
+}
+
+/// The harness's SC7: the wake comes at once (the console's would be the
+/// power key at the PMC; no kernel ran here to arm it), and the boot ROM's
+/// warm path is the machine's.
+struct WakesAtOnce<'a> {
+    soc: &'a Soc,
+    bus: &'a Bus,
+    ram: &'a GuestRam,
+    bpmp: &'a Bpmp,
+    gic: &'a Gic,
+}
+
+impl PowerDomain for WakesAtOnce<'_> {
+    fn wake_pending(&self) -> bool {
+        true
+    }
+
+    fn power_lost(&self) {
+        self.gic.reset();
+    }
+
+    fn warm_boot(&self) -> Result<WarmStart, String> {
+        let fuses = self.bpmp.fuses().ok_or("the BPMP has no boot ROM fuses")?;
+        warm_start(self.soc, self.bus, self.ram, fuses)
+    }
+}
+
+/// The furthest stage the chain reaches today: raised as the models get it
+/// further, up to [`Stage::KernelResumed`]. The next divergence is the
+/// stop the test prints.
+const REACHED: Stage = Stage::KernelResumed;
+
+/// The chain on the BPMP, to the kernel's entry, then a sleep and a wake
+/// through the monitor's SC7 stub and the warmboot firmware.
 #[test]
 fn power_on_runs_the_boot_chain_on_the_bpmp_alone() {
     let outcome = power_on();
@@ -450,9 +609,9 @@ fn power_on_runs_the_boot_chain_on_the_bpmp_alone() {
         .iter()
         .map(|&(stage, _)| stage)
         .collect();
-    let complete = outcome.stop.is_none() && reached.contains(&Stage::KernelEntry);
+    let complete = outcome.stop.is_none() && reached.contains(&Stage::KernelResumed);
     let floor = if complete {
-        Stage::KernelEntry
+        Stage::KernelResumed
     } else {
         REACHED
     };
@@ -469,6 +628,11 @@ fn power_on_runs_the_boot_chain_on_the_bpmp_alone() {
         Stage::Package2Loaded,
         Stage::BpmpHalted,
         Stage::KernelEntry,
+        Stage::SystemSuspend,
+        Stage::Sc7,
+        Stage::Warmboot,
+        Stage::Cpu0Resumed,
+        Stage::KernelResumed,
     ] {
         assert!(
             stage > floor || reached.contains(&stage),

@@ -76,13 +76,16 @@
 //!   interrupt controller and the secure boot registers (the warmboot
 //!   writes the AArch64 reset vector again), the CPU cluster's resets in
 //!   the clock and reset controller (`RST_CPUG_CMPLX` asserted again, so
-//!   the warmboot's release is a release), and `MC_SECURITY_CFG3` (0 after
-//!   reset: how the monitor learns the SoC lost power);
+//!   the warmboot's release is a release), MSELECT (back in reset: it
+//!   loses its settings), `MC_SECURITY_CFG3` (0 after reset: how the
+//!   monitor learns the SoC lost power), and the CPU cluster's interrupt
+//!   controller ([`PowerDomain::power_lost`]; the monitor's resume sets
+//!   its Secure side up again and the kernel restores its own,
+//!   [`crate::secmon::setup`]);
 //! * kept, though lost on the console \[assumption\]: every other block,
 //!   among them the rest of the clock and reset controller, the memory and
 //!   EMC controllers (the boot ROM's restore from PMC scratch would write
-//!   back what they hold, `bootrom::warm_boot`), the GIC (the kernel
-//!   saves and restores what it uses around sleep) and the security engine
+//!   back what they hold, `bootrom::warm_boot`) and the security engine
 //!   (its context comes back from the monitor's save on the warm path);
 //! * kept, as on the console: DRAM, the PMC (bar what the wake changes),
 //!   the PMIC and its clock.
@@ -174,6 +177,9 @@ impl PowerDomain for NeverWakes {
         false
     }
 
+    /// No block outside the BPMP's is here.
+    fn power_lost(&self) {}
+
     fn warm_boot(&self) -> Result<WarmStart, String> {
         Err("no wake source".into())
     }
@@ -183,10 +189,13 @@ impl PowerDomain for NeverWakes {
 /// as register writes of the reset state: `RST_CPUG_CMPLX_SET` asserting
 /// the CPU cluster's resets as after SC7 (`car::CPUG_RESETS_AFTER_SC7`;
 /// the bits the warmboot firmware does not release are already clear,
-/// released by the NX bootloader at the cold boot), and `MC_SECURITY_CFG3`
-/// at 0 (`warmboot-research` §3: "0 after reset").
-const SC7_RESETS: [(u64, u32); 2] = [
+/// released by the NX bootloader at the cold boot), `RST_DEV_V_SET`
+/// putting MSELECT back into reset (it loses its settings in SC7,
+/// [`crate::soc::mselect`]; the warmboot firmware releases it again), and
+/// `MC_SECURITY_CFG3` at 0 (`warmboot-research` §3: "0 after reset").
+const SC7_RESETS: [(u64, u32); 3] = [
     (car::BASE + 0x450, car::CPUG_RESETS_AFTER_SC7),
+    (car::BASE + 0x430, 1 << crate::soc::mselect::RESET.1),
     (mc::BASE + 0x9BC, 0),
 ];
 
@@ -396,6 +405,10 @@ impl Bpmp {
 pub trait PowerDomain: Sync {
     /// Whether a wake event is pending at the PMC.
     fn wake_pending(&self) -> bool;
+    /// Resets what the SoC's power-down resets outside the BPMP's own
+    /// blocks and the registers of `SC7_RESETS`: the CPU cluster's
+    /// interrupt controller ([`crate::gic::Gic::reset`]).
+    fn power_lost(&self);
     /// Runs the boot ROM's warm path on the SoC as SC7 left it and applies
     /// what it does outside the BPMP and IRAM; gives what it leaves those.
     fn warm_boot(&self) -> Result<WarmStart, String>;
@@ -467,6 +480,7 @@ fn power_down(running: &mut Running, env: &Env<'_>) -> Result<(), String> {
     for (address, value) in SC7_RESETS {
         write_register(env.bus, address, value)?;
     }
+    env.power.power_lost();
     Ok(())
 }
 
@@ -936,34 +950,49 @@ impl PowerDomain for Machine {
         self.soc.wake_pending()
     }
 
+    fn power_lost(&self) {
+        self.gic.reset();
+    }
+
     fn warm_boot(&self) -> Result<WarmStart, String> {
-        let blocks = self.soc.boot.as_ref().ok_or("the SoC was not powered on")?;
         let fuses = self
             .bpmp
             .as_ref()
             .and_then(Bpmp::fuses)
             .ok_or("the BPMP did not start from the boot ROM's hand-off")?;
-        let pmc = |offset: u32| read_register(&self.bus, pmc::BASE + u64::from(offset)).ok();
-        let dram = |address: u32, length: usize| {
-            let mut bytes = vec![0; length];
-            self.ram
-                .read(u64::from(address), &mut bytes)
-                .map(|()| bytes)
-        };
-        let mut iram = vec![0; bootrom::IRAM_SIZE];
-        let handoff =
-            bootrom::warm_boot(fuses, &pmc, &dram, &mut iram).map_err(|error| error.to_string())?;
-        for bits in &handoff.registers {
-            apply_rom_bits(blocks, &self.bus, bits)?;
-        }
-        self.soc.se.restore_context(&handoff.se_context);
-        Ok(WarmStart {
-            entry: handoff.entry,
-            cpsr: handoff.cpsr,
-            iram,
-            undefined: handoff.iram_undefined,
-        })
+        warm_start(&self.soc, &self.bus, &self.ram, fuses)
     }
+}
+
+/// The boot ROM's warm path on `soc` as SC7 left it ([`bootrom::warm_boot`]
+/// with the `fuses` it read at power-on, the PMC and DRAM as the BPMP reads
+/// them): its register writes and the security engine's context applied,
+/// what it leaves the BPMP and IRAM returned.
+pub fn warm_start(
+    soc: &Soc,
+    bus: &Bus,
+    ram: &GuestRam,
+    fuses: &Fuses,
+) -> Result<WarmStart, String> {
+    let blocks = soc.boot.as_ref().ok_or("the SoC was not powered on")?;
+    let pmc = |offset: u32| read_register(bus, pmc::BASE + u64::from(offset)).ok();
+    let dram = |address: u32, length: usize| {
+        let mut bytes = vec![0; length];
+        ram.read(u64::from(address), &mut bytes).map(|()| bytes)
+    };
+    let mut iram = vec![0; bootrom::IRAM_SIZE];
+    let handoff =
+        bootrom::warm_boot(fuses, &pmc, &dram, &mut iram).map_err(|error| error.to_string())?;
+    for bits in &handoff.registers {
+        apply_rom_bits(blocks, bus, bits)?;
+    }
+    soc.se.restore_context(&handoff.se_context);
+    Ok(WarmStart {
+        entry: handoff.entry,
+        cpsr: handoff.cpsr,
+        iram,
+        undefined: handoff.iram_undefined,
+    })
 }
 
 /// The machine's kernel image: set once, at construction for a machine
@@ -1241,6 +1270,9 @@ mod tests {
         fn wake_pending(&self) -> bool {
             self.wake.load(Ordering::SeqCst)
         }
+
+        /// No interrupt controller in these tests.
+        fn power_lost(&self) {}
 
         fn warm_boot(&self) -> Result<WarmStart, String> {
             self.start

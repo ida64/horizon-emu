@@ -16,8 +16,8 @@
 //!   3D class;
 //! * [`two_d`]: Fermi 2D blits; [`copy`]: the DMA copy engine;
 //!   [`inline`]: inline-to-memory, shared by 3D, compute and 0xA140;
-//! * the compute class only as far as inline-to-memory and semaphores:
-//!   kernel launches are refused.
+//! * [`compute`]: the compute class: kernel launches run by the
+//!   [`shader`] interpreter, inline-to-memory and semaphores.
 //!
 //! Everything runs synchronously inside [`Engines::call`]: when a method
 //! returns, its effects are in memory. Whatever is not modeled returns
@@ -31,6 +31,7 @@
 
 pub mod blend;
 pub mod capture;
+pub mod compute;
 pub mod copy;
 pub mod inline;
 mod lru;
@@ -169,7 +170,7 @@ pub struct Channel {
     three_d: three_d::ThreeD,
     two_d: two_d::TwoD,
     copy: copy::Copy,
-    compute: Compute,
+    compute: compute::Compute,
     inline: inline::InlineToMemory,
     mme: mme::Mme,
     #[serde(skip)]
@@ -421,81 +422,5 @@ impl Engines for Channel {
         }
         self.hooks.writes.signal();
         Ok(())
-    }
-}
-
-/// The compute class (0xB1C0), as far as modeled: its inline-to-memory
-/// block and semaphore releases. Kernel launches are refused.
-#[derive(Default, Serialize, Deserialize)]
-struct Compute {
-    registers: Vec<u32>,
-    inline: inline::InlineToMemory,
-}
-
-impl Compute {
-    /// Whether a restored register file has the size methods index.
-    fn fits(&self) -> bool {
-        self.registers.is_empty() || self.registers.len() == 0xE00
-    }
-
-    fn method(
-        &mut self,
-        method: u32,
-        argument: u32,
-        memory: &dyn GpuMemory,
-        hooks: &Hooks,
-    ) -> Result<(), Unmodeled> {
-        if self.registers.is_empty() {
-            self.registers = vec![0; 0xE00];
-        }
-        let index = method as usize;
-        if index >= self.registers.len() {
-            return Err(Unmodeled(format!(
-                "compute (0xB1C0): method {:#x} = {argument:#x}",
-                method * 4
-            )));
-        }
-        self.registers[index] = argument;
-        match method {
-            inline::FIRST_METHOD..=inline::LAST_METHOD => {
-                match self.inline.method(method, argument, memory)? {
-                    inline::Completion::None => Ok(()),
-                    inline::Completion::Semaphore {
-                        address,
-                        payload,
-                        four_words,
-                    } => three_d::release_semaphore(memory, hooks, address, payload, four_words),
-                }
-            }
-            // NO_OPERATION, WAIT_FOR_IDLE, cache invalidations (0x1330,
-            // 0x1334, 0x1338, 0x120c, 0x1210, 0x1288, 0x1424, 0x1698): no
-            // effect with synchronous execution and no caches.
-            0x40 | 0x44 | 0x4CC | 0x4CD | 0x4CE | 0x483 | 0x484 | 0x4A2 | 0x509 | 0x5A6 => Ok(()),
-            // SET_REPORT_SEMAPHORE_D: release of the payload only.
-            0x6C3 => {
-                let address = u64::from(self.registers[0x6C0] & 0xFF) << 32
-                    | u64::from(self.registers[0x6C1]);
-                let payload = self.registers[0x6C2];
-                if argument & 3 != 0 || argument & !(3 | (1 << 28)) != 0 {
-                    return Err(Unmodeled(format!(
-                        "compute (0xB1C0): SET_REPORT_SEMAPHORE_D {argument:#x}"
-                    )));
-                }
-                three_d::release_semaphore(
-                    memory,
-                    hooks,
-                    address,
-                    payload,
-                    argument & (1 << 28) == 0,
-                )
-            }
-            // Actions: notify, launches (SEND_PCAS_A/B, SEND_SIGNALING_PCAS_B),
-            // MME loads.
-            0x43 | 0x45..=0x48 | 0xAD..=0xAF => Err(Unmodeled(format!(
-                "compute (0xB1C0): action method {:#x} = {argument:#x} not modeled",
-                method * 4
-            ))),
-            _ => Ok(()),
-        }
     }
 }
