@@ -236,6 +236,53 @@ fn the_slot_colour_matrix_override_and_mask_apply() {
     assert_eq!(bench.peek(OUTPUT), [0x30, 0xff, 0x10, 0x40]);
 }
 
+/// A semi-planar 4:2:0 slot (format 68, U first) through an identity
+/// colour matrix: R, G, B are the pixel's Y, U, V, chroma interpolated
+/// between the samples sited with the even luma samples.
+#[test]
+fn a_semi_planar_slot_upsamples_chroma_between_its_samples() {
+    let mut bench = Bench::new();
+    bench.output(31, None, (4, 2), [0, 0, 3, 1]);
+    bench.slot(0, 68, None, (4, 2), [0, 0, 3, 1], [0, 0, 3, 1]);
+    let base = SLOT_BASE;
+    // Luma 4x2, chroma 2x1 pairs (pitches 4 and 2 × 2 bytes).
+    bench.set(base + 0x48, 3 | 1 << 14 | 1 << 32);
+    let one = 256u64;
+    bench.set(base + 0x60, one);
+    bench.set(base + 0x68, one << 20 | 1 << 63);
+    bench.set(base + 0x70, one << 40);
+    bench.set(base + 0x78, 0);
+    const CHROMA: u64 = INPUT + 0x1000;
+    bench.poke(INPUT, &[10, 20, 30, 40, 50, 60, 70, 80]);
+    bench.poke(CHROMA, &[100, 200, 110, 210]);
+    let mut methods = methods(Some(INPUT));
+    methods.insert(methods.len() - 1, (0x404, (CHROMA >> 8) as u32));
+    bench.send(methods).unwrap();
+    let pixel = |x: u64, y: u64| bench.peek(OUTPUT + 16 * y + 4 * x);
+    assert_eq!(pixel(0, 0), [10, 100, 200, 0xff]);
+    assert_eq!(pixel(1, 0), [20, 105, 205, 0xff]);
+    assert_eq!(pixel(2, 0), [30, 110, 210, 0xff]);
+    // The right edge sample is repeated.
+    assert_eq!(pixel(3, 0), [40, 110, 210, 0xff]);
+    assert_eq!(pixel(1, 1), [60, 105, 205, 0xff]);
+}
+
+#[test]
+fn a_semi_planar_slot_needs_its_chroma_plane_and_a_colour_matrix() {
+    let mut bench = Bench::new();
+    bench.output(31, None, (2, 2), [0, 0, 1, 1]);
+    bench.slot(0, 68, None, (2, 2), [0, 0, 1, 1], [0, 0, 1, 1]);
+    bench.set(SLOT_BASE + 0x48, 1 | 1 << 14);
+    assert_eq!(bench.execute(Some(INPUT)), None);
+    let notes = bench.notes.take();
+    assert!(notes[0].contains("semi-planar"), "{notes:?}");
+    let mut methods = methods(Some(INPUT));
+    methods.insert(methods.len() - 1, (0x404, (INPUT >> 8) as u32 + 1));
+    assert_eq!(bench.send(methods), None);
+    let notes = bench.notes.take();
+    assert!(notes[0].contains("colour matrix"), "{notes:?}");
+}
+
 #[test]
 fn scaling_refuses_and_names_itself() {
     let mut bench = Bench::new();
