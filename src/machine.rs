@@ -42,7 +42,7 @@ use crate::{
     snapshot::Snapshot,
     soc::{
         Panel, Screen, Soc,
-        dc::NoFrame,
+        dc::{NoFrame, Pixel},
         emmc::{EmmcImages, ImageError},
         max77620::{BatteryBacked, PowerDown},
         mc::{self, DeviceMemory},
@@ -886,6 +886,12 @@ impl Machine {
         self.soc.screen()
     }
 
+    /// Point `(x, y)` of what the screen shows at this moment, without
+    /// putting the whole picture together; see [`Soc::screen_pixel`].
+    pub fn screen_pixel(&self, x: u32, y: u32) -> Result<Pixel, NoFrame> {
+        self.soc.screen_pixel(x, y)
+    }
+
     /// How the panel and its backlight stand, whether or not a picture
     /// can be composed.
     pub fn panel(&self) -> Panel {
@@ -1265,10 +1271,16 @@ impl Machine {
 
     /// The instruction the core is about to execute, if its page is mapped RAM.
     fn current_instruction(&self, vcpu: &Vcpu) -> Result<Option<u32>, HvError> {
+        self.instruction_at(vcpu, vcpu.pc()?)
+    }
+
+    /// The instruction at `address` in the core's current address space,
+    /// if its page is mapped RAM.
+    fn instruction_at(&self, vcpu: &Vcpu, address: u64) -> Result<Option<u32>, HvError> {
         let regime = self.translation_regime(vcpu)?;
         let mut instruction = [0; 4];
         Ok(regime
-            .translate(vcpu.pc()?, |table| self.ram.read_u64(table))
+            .translate(address, |table| self.ram.read_u64(table))
             .and_then(|physical| self.ram.read(physical, &mut instruction))
             .map(|()| u32::from_le_bytes(instruction)))
     }
@@ -1503,8 +1515,16 @@ struct CoreSignal {
     /// The core's vCPU while it is inside the run loop; cleared, under this
     /// lock, before the vCPU is destroyed.
     vcpu: Mutex<Option<VcpuHandle>>,
-    notified: Mutex<bool>,
+    state: Mutex<SignalState>,
     wake: Condvar,
+}
+
+#[derive(Default)]
+struct SignalState {
+    /// [`CoreSignals::notify`] was called since the last wait returned.
+    notified: bool,
+    /// The core's thread is in [`CoreSignals::wait`].
+    waiting: bool,
 }
 
 impl CoreSignals {
@@ -1514,9 +1534,17 @@ impl CoreSignals {
 
     fn notify(&self, core: usize) {
         let signal = &self.0[core];
-        *signal.notified.lock().unwrap() = true;
+        let waiting = {
+            let mut state = signal.state.lock().unwrap();
+            state.notified = true;
+            state.waiting
+        };
         signal.wake.notify_one();
-        if let Some(vcpu) = *signal.vcpu.lock().unwrap() {
+        // A core in `wait` looks again at whatever it waits for, its
+        // interrupt input included, before it enters the guest again; a
+        // kick would only make that entry return at once. A core not in
+        // `wait` may be in the guest or on its way there.
+        if !waiting && let Some(vcpu) = *signal.vcpu.lock().unwrap() {
             vcpu.kick().expect("an attached vCPU is live");
         }
     }
@@ -1530,14 +1558,19 @@ impl CoreSignals {
     }
 
     /// Blocks until [`CoreSignals::notify`] has been called for `core` since
-    /// the last wait returned.
+    /// the last wait returned. The caller looks again at what it waits for
+    /// before it enters the guest: a notification that finds it here does
+    /// not kick the vCPU.
     fn wait(&self, core: usize) {
         let signal = &self.0[core];
-        let mut notified = signal
+        let mut state = signal.state.lock().unwrap();
+        state.waiting = true;
+        let mut state = signal
             .wake
-            .wait_while(signal.notified.lock().unwrap(), |notified| !*notified)
+            .wait_while(state, |state| !state.notified)
             .unwrap();
-        *notified = false;
+        state.notified = false;
+        state.waiting = false;
     }
 }
 
@@ -1674,9 +1707,16 @@ const WAKE_POLL: Duration = Duration::from_millis(5);
 struct SvcProbes {
     /// The vector every call enters the kernel through.
     vector: u64,
+    /// Whether the vector's first instruction is a `CLREX`, which the
+    /// host carries out in place of the core (see [`pass_clrex`]).
+    vector_clears_exclusives: bool,
     /// [`SVC_RETURN`] where the kernel has relocated it.
     returns: u64,
 }
+
+/// `CLREX`, whatever its (ignored) immediate.
+const CLREX: u32 = 0xD503_305F;
+const CLREX_IMMEDIATE: u32 = 0xF << 8;
 
 impl<'env> Session<'env> {
     /// Whether the processors are being slowed at this moment.
@@ -1908,6 +1948,10 @@ impl<'env> Session<'env> {
                 }
                 let svc = SvcProbes {
                     vector,
+                    vector_clears_exclusives: self
+                        .machine
+                        .instruction_at(vcpu, vector)?
+                        .is_some_and(|word| word & !CLREX_IMMEDIATE == CLREX),
                     returns: SVC_RETURN.wrapping_add(slide),
                 };
                 for address in [svc.vector, svc.returns] {
@@ -1943,9 +1987,25 @@ impl<'env> Session<'env> {
         pc: u64,
     ) -> Result<Option<CoreStop>, HvError> {
         let options = &self.options;
+        // The core would next step off the breakpoint, one more exit; the
+        // host does the instruction instead where it can, unless the core
+        // is being stepped for a breakpoint of the user's.
+        let passes = probes.stepping.is_none();
         match probes.svc {
-            Some(svc) if svc.vector == pc => return self.supervisor_call(core, vcpu),
-            Some(svc) if svc.returns == pc => return self.supervisor_return(core, vcpu),
+            Some(svc) if svc.vector == pc => {
+                let stop = self.supervisor_call(core, vcpu)?;
+                if stop.is_none() && passes && svc.vector_clears_exclusives {
+                    pass_clrex(vcpu, pc)?;
+                }
+                return Ok(stop);
+            }
+            Some(svc) if svc.returns == pc => {
+                let stop = self.supervisor_return(core, vcpu)?;
+                if stop.is_none() && passes {
+                    pass_return_to_el0(vcpu)?;
+                }
+                return Ok(stop);
+            }
             _ => {}
         }
         let offset = probes.offset.unwrap_or(0);
@@ -2446,6 +2506,41 @@ impl<'env> Session<'env> {
 
 fn skip_instruction(vcpu: &Vcpu) -> Result<(), HvError> {
     vcpu.set_pc(vcpu.pc()?.wrapping_add(4))
+}
+
+/// Carries out the `CLREX` the core is on at `pc` in place of the core, as
+/// supervisor call tracing does for the kernel's vector instead of
+/// stepping off its breakpoint there. The instruction clears the core's
+/// local exclusive monitor, which the core's next entry into the guest,
+/// an exception return from the hypervisor, clears as well (Arm ARM
+/// `AArch64.ExceptionReturn`), as the exit that ends a step would have.
+/// What remains is moving on to the next instruction, from which
+/// [`GuestDebug`] lets the core run on as from any other.
+pub fn pass_clrex(vcpu: &Vcpu, pc: u64) -> Result<(), HvError> {
+    vcpu.set_pc(pc.wrapping_add(4))
+}
+
+/// Carries out the `ERET` the core is on in place of the core, as
+/// supervisor call tracing does for the kernel's return from a call, when
+/// it returns to AArch64 at EL0 with no single step or illegal state
+/// pending and to an untagged address, as every call returns: PSTATE
+/// becomes `SPSR_EL1` and the PC `ELR_EL1`. The local exclusive monitor is
+/// cleared and the event register set by the next entry, an exception
+/// return too. `false`, nothing done, for any other return, which is left
+/// for the core to step through.
+pub fn pass_return_to_el0(vcpu: &Vcpu) -> Result<bool, HvError> {
+    /// `M[4:0]`: AArch64 EL0 (with `SP_EL0`) is zero.
+    const MODE: u64 = 0x1F;
+    const ILLEGAL: u64 = 1 << 20;
+    const SINGLE_STEP: u64 = 1 << 21;
+    let spsr = vcpu.sys_reg(SysReg::SPSR_EL1)?;
+    let elr = vcpu.sys_reg(SysReg::ELR_EL1)?;
+    if spsr & (MODE | ILLEGAL | SINGLE_STEP) != 0 || elr & 3 != 0 || elr >> 48 != 0 {
+        return Ok(false);
+    }
+    vcpu.set_pstate(spsr)?;
+    vcpu.set_pc(elr)?;
+    Ok(true)
 }
 
 /// `X0`-`X7`, the registers that carry call arguments and results.

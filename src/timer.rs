@@ -9,7 +9,7 @@
 use std::{
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -73,6 +73,9 @@ pub struct Timers {
     /// controller in the order they were computed.
     timers: Mutex<[PhysicalTimer; CORE_COUNT]>,
     changed: Condvar,
+    /// The count at which [`Timers::run`] looks again unless woken,
+    /// [`u64::MAX`] for never; written and read with `timers` held.
+    waiting_for: AtomicU64,
 }
 
 impl Timers {
@@ -84,6 +87,7 @@ impl Timers {
             line,
             timers: Mutex::new([PhysicalTimer::default(); CORE_COUNT]),
             changed: Condvar::new(),
+            waiting_for: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -118,8 +122,17 @@ impl Timers {
             }
             TimerRegister::CompareValue => timers[core].compare_value = value,
         }
-        self.drive(&mut timers[core], core, self.count());
-        self.changed.notify_all();
+        let count = self.count();
+        let timer = &mut timers[core];
+        self.drive(timer, core, count);
+        // The timer thread looks again by when it waits for anyway; it
+        // needs waking only for a deadline before that.
+        if timer.control == CONTROL_ENABLE
+            && timer.compare_value > count
+            && timer.compare_value < self.waiting_for.load(Ordering::Relaxed)
+        {
+            self.changed.notify_all();
+        }
         Some(())
     }
 
@@ -146,6 +159,8 @@ impl Timers {
                 .filter(|timer| timer.control == CONTROL_ENABLE && timer.compare_value > count)
                 .map(|timer| timer.compare_value)
                 .min();
+            self.waiting_for
+                .store(next_deadline.unwrap_or(u64::MAX), Ordering::Relaxed);
             timers = match next_deadline {
                 Some(compare_value) => {
                     let wait = self.clock.until(duration(compare_value));
@@ -225,5 +240,64 @@ mod tests {
         }
         // The kernel parks idle timers at the maximum compare value.
         assert!(duration(u64::MAX) > Duration::from_secs(1 << 30));
+    }
+
+    /// The timer thread is woken only for a deadline before the one it
+    /// waits for; lines still rise when their deadlines pass, whether the
+    /// write woke it or not.
+    #[test]
+    fn lines_rise_at_their_deadlines_however_the_thread_was_woken() {
+        use std::time::Instant;
+        let clock = Arc::new(GuestClock::new());
+        let raised = Arc::new(Mutex::new(Vec::new()));
+        let timers = {
+            let (clock, raised) = (Arc::clone(&clock), Arc::clone(&raised));
+            Timers::new(
+                Arc::clone(&clock),
+                Box::new(move |core, level| {
+                    raised
+                        .lock()
+                        .unwrap()
+                        .push((core, level, ticks(clock.now())))
+                }),
+            )
+        };
+        let stop = AtomicBool::new(false);
+        let ms = COUNTER_HZ / 1000;
+        std::thread::scope(|scope| {
+            scope.spawn(|| timers.run(&stop));
+            let arm = |core: usize, after: u64| {
+                let at = timers.count() + after * ms;
+                timers.write(core, TimerRegister::CompareValue, at).unwrap();
+                timers
+                    .write(core, TimerRegister::Control, CONTROL_ENABLE)
+                    .unwrap();
+                at
+            };
+            // The thread waits for core 0's deadline; core 1's comes first
+            // and wakes it. Core 2's comes later, and core 0's moved to
+            // after core 1's, so neither wakes it.
+            arm(0, 400);
+            std::thread::sleep(Duration::from_millis(20));
+            let first = arm(1, 60);
+            let last = arm(2, 600);
+            let moved = arm(0, 300);
+            let start = Instant::now();
+            while raised.lock().unwrap().len() < 3 && start.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            stop.store(true, Ordering::SeqCst);
+            timers.wake();
+            let raised = raised.lock().unwrap().clone();
+            let cores: Vec<_> = raised
+                .iter()
+                .map(|&(core, level, _)| (core, level))
+                .collect();
+            assert_eq!(cores, [(1, true), (0, true), (2, true)]);
+            for (&(_, _, at), deadline) in raised.iter().zip([first, moved, last]) {
+                assert!(at >= deadline, "{at} before {deadline}");
+                assert!(at < deadline + 150 * ms, "{at} long after {deadline}");
+            }
+        });
     }
 }

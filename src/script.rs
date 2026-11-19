@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use horizon_emu::{
     machine::Machine,
-    soc::{joycon::Button, ntag::Ntag215},
+    soc::{dc::Pixel, joycon::Button, ntag::Ntag215},
 };
 
 /// How long a button or a finger is held when a line does not say.
@@ -280,15 +280,19 @@ impl Script {
 }
 
 /// Whether someone looking at the console sees that colour at `(x, y)`.
+/// Only that pixel is worked out, not the whole picture.
 fn shows(machine: &Machine, x: u32, y: u32, rgb: [u8; 3]) -> bool {
-    let Ok(screen) = machine.screen() else {
-        return false;
-    };
-    let frame = &screen.frame;
-    if !(screen.panel_on && screen.backlight_on) || x >= frame.width || y >= frame.height {
+    let panel = machine.panel();
+    if !(panel.panel_on && panel.backlight_on) {
         return false;
     }
-    let [_, red, green, blue] = frame.pixels[(y * frame.width + x) as usize].to_be_bytes();
+    let Ok(Pixel {
+        value: Some(value), ..
+    }) = machine.screen_pixel(x, y)
+    else {
+        return false;
+    };
+    let [_, red, green, blue] = value.to_be_bytes();
     [red, green, blue]
         .into_iter()
         .zip(rgb)

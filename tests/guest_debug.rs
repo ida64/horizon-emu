@@ -673,6 +673,61 @@ fn an_interrupt_can_preempt_the_step_off_a_breakpoint(vm: &Vm, loader: &Loader) 
     assert_eq!(core.resume(), Event::Hvc(0));
 }
 
+/// Supervisor call tracing passes its breakpoints on the kernel's vector
+/// (a `CLREX`) and return (`ERET`) by carrying the instructions out on the
+/// host instead of stepping the core off them: the core goes through the
+/// same breakpoints and ends in the same state either way.
+fn passing_svc_breakpoints_on_the_host_ends_as_stepping(vm: &Vm, loader: &Loader) {
+    const CLREX: u32 = 0xD503_3F5F;
+    // Three calls, then a load from outside the VM's memory, an exit.
+    let user = loader.code(&[
+        movz(0, 3),
+        add(1, 1, 1),
+        svc(5),
+        subs(0, 0, 1),
+        b_ne(-3),
+        movz(4, 0x1000),
+        ldr(3, 4),
+    ]);
+    let vectors = loader.vectors(&[(VECTOR_SYNC_EL0, &[CLREX, add(2, 2, 1), ERET])]);
+    let (vector, returns) = (vectors + VECTOR_SYNC_EL0, vectors + VECTOR_SYNC_EL0 + 8);
+    let run = |passed: bool| {
+        let mut core = Core::new_el0(vm, loader, user, vectors);
+        core.debug.add_breakpoint(vector).unwrap();
+        core.debug.add_breakpoint(returns).unwrap();
+        let mut reached = Vec::new();
+        let end = loop {
+            match core.resume() {
+                Event::Breakpoint(pc) => {
+                    reached.push(pc);
+                    if passed && pc == vector {
+                        horizon_emu::machine::pass_clrex(&core.vcpu, pc).unwrap();
+                    }
+                    if passed && pc == returns {
+                        assert!(horizon_emu::machine::pass_return_to_el0(&core.vcpu).unwrap());
+                    }
+                }
+                event => break event,
+            }
+        };
+        (reached, end, core.vcpu.save_state().unwrap())
+    };
+    let stepped = run(false);
+    assert_eq!(stepped.0, [vector, returns].repeat(3));
+    assert_eq!((stepped.2.x[1], stepped.2.x[2]), (3, 3));
+    assert_eq!(run(true), stepped);
+
+    // A return to EL1 is left to the core.
+    let core = Core::new(vm, loader.code(&[ERET]), vectors);
+    core.vcpu
+        .set_sys_reg(SysReg::SPSR_EL1, EL1H_MASKED)
+        .unwrap();
+    core.vcpu.set_sys_reg(SysReg::ELR_EL1, user).unwrap();
+    let before = core.vcpu.save_state().unwrap();
+    assert!(!horizon_emu::machine::pass_return_to_el0(&core.vcpu).unwrap());
+    assert_eq!(core.vcpu.save_state().unwrap(), before);
+}
+
 fn breakpoints_match_virtual_addresses_with_the_mmu_on(vm: &Vm, loader: &Loader) {
     /// The kernel's regime: 39-bit halves, 4 KiB granule.
     const TCR: u64 = 0x11_B519_3519;
@@ -717,6 +772,50 @@ fn breakpoints_match_virtual_addresses_with_the_mmu_on(vm: &Vm, loader: &Loader)
     assert_eq!(core.x(1), 4);
 }
 
+/// An exit to the host and the entry back, an exception return, clear the
+/// guest's exclusive monitor: a store-exclusive after one fails as after a
+/// `CLREX`. Supervisor call tracing relies on that when it passes the
+/// kernel's vector `CLREX` without the core executing it.
+fn an_exit_clears_the_exclusive_monitor(vm: &Vm, loader: &Loader) {
+    /// Block, access flag, inner shareable, EL1 read/write, attribute 0.
+    const BLOCK: u64 = 1 << 10 | 3 << 8 | 1;
+    const TCR: u64 = 0x11_B519_3519;
+    let ldxr = |rt: u32, rn: u32| 0xC85F_7C00 | rn << 5 | rt;
+    let stxr = |rs: u32, rt: u32, rn: u32| 0xC800_7C00 | rs << 16 | rn << 5 | rt;
+    let table = loader.allocate(0x1000, 0x1000);
+    loader
+        .ram
+        .write(
+            table + 8 * (RAM_BASE >> 30),
+            &(RAM_BASE | BLOCK).to_le_bytes(),
+        )
+        .unwrap();
+    let word = loader.allocate(8, 64);
+    let entry = loader.code(&[
+        // A pair with nothing in between succeeds; one with an exit in
+        // between fails.
+        ldxr(5, 6),
+        stxr(8, 5, 6),
+        ldxr(5, 6),
+        hvc(1),
+        stxr(7, 5, 6),
+        hvc(0),
+    ]);
+    let mut core = Core::new(vm, entry, loader.vectors(&[]));
+    core.vcpu.set_sys_reg(MAIR_EL1, 0xFF).unwrap();
+    core.vcpu.set_sys_reg(SysReg::TCR_EL1, TCR).unwrap();
+    core.vcpu.set_sys_reg(SysReg::TTBR0_EL1, table).unwrap();
+    core.vcpu
+        .set_sys_reg(SysReg::SCTLR_EL1, 0x30D0_0800 | 0x1005)
+        .unwrap();
+    core.vcpu.set_gpr(6, word).unwrap();
+    core.vcpu.set_gpr(7, 9).unwrap();
+    core.vcpu.set_gpr(8, 9).unwrap();
+    assert_eq!(core.resume(), Event::Hvc(1));
+    assert_eq!(core.resume(), Event::Hvc(0));
+    assert_eq!((core.x(8), core.x(7)), (0, 1));
+}
+
 #[test]
 fn guest_debug() {
     let vm = Vm::new().unwrap();
@@ -742,6 +841,8 @@ fn guest_debug() {
     guest_brk_reaches_the_guest_unchanged(&vm, &loader);
     an_external_abort_reaches_the_guest_vectors(&vm, &loader);
     an_interrupt_can_preempt_the_step_off_a_breakpoint(&vm, &loader);
+    passing_svc_breakpoints_on_the_host_ends_as_stepping(&vm, &loader);
     breakpoints_match_virtual_addresses_with_the_mmu_on(&vm, &loader);
+    an_exit_clears_the_exclusive_monitor(&vm, &loader);
     drop(vm);
 }
