@@ -2323,6 +2323,7 @@ impl<'env> Session<'env> {
                 machine.signals.wait(core);
             },
             SmcEffect::Sleep { entry, context } => {
+                machine.soc.enter_sc7();
                 while !machine.soc.wake_pending() {
                     if self.stop.load(Ordering::SeqCst) {
                         return Ok(Some(CoreStop::Requested));

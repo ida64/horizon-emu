@@ -124,12 +124,28 @@ pub fn power_on_value(offset: u64) -> Option<u32> {
 const WAKE_MASK: [u64; 2] = [0x0C, 0x160];
 const WAKE_LVL: [u64; 2] = [0x10, 0x164];
 const WAKE_STATUS: [u64; 2] = [0x14, 0x168];
+/// The events whose wake level the PMC takes from their pads as the SoC
+/// enters deep power down (`AUTO_WAKE_LVL_MASK`, `AUTO_WAKE2_LVL_MASK`):
+/// see [`Pmc::sample_wake_levels`]. The firmware sets the bit of every
+/// event its table gives the level "auto" and clears that event's
+/// `WAKE_LVL` bit (Atmosphère `wec_api.cpp` `SetWakeEventLevel`; a 23.5.0
+/// boot traced through the monitor's register call left `0x17FEBCFF` and
+/// `0xEFE7E01A` here, the rail CTS events among them, and never wrote
+/// `AUTO_WAKE_LVL` at `0xD8` other than with 0).
+const AUTO_WAKE_LVL_MASK: [u64; 2] = [0xDC, 0x170];
 
 /// The wake event of the power management IC's interrupt output, active
 /// low (`PwrIntN` in Atmosphère's list of this board's wake events,
 /// `wec_wake_event.board.nintendo_nx.hpp`; the firmware enables it, bit
 /// 19 of `WAKE2_MASK`).
 pub const WAKE_EVENT_PMIC: u8 = 51;
+/// The wake events of the CTS pads of UART-B and UART-C, the right and
+/// the left Joy-Con rail's (`Uart2Cts`, `Uart3Cts` in the same list; the
+/// pad map `gpio_internal_pad_map_combination.inc` gives them to pads G3
+/// and D4). The firmware enables both, level "auto" (bits 6 and 7 of
+/// `WAKE_MASK` and `AUTO_WAKE_LVL_MASK` in the trace above).
+pub const WAKE_EVENT_UART2_CTS: u8 = 6;
+pub const WAKE_EVENT_UART3_CTS: u8 = 7;
 
 /// Partitions powered at kernel entry: the CPU rail (CRAIL, 0), the
 /// non-CPU part of the fast cluster (C0NC, 15) and its first core (CE0, 14)
@@ -322,6 +338,31 @@ impl Pmc {
         }
         wakes
     }
+
+    /// The SoC enters deep power down: each event marked in
+    /// `AUTO_WAKE_LVL_MASK` takes as its wake level the opposite of what
+    /// `pad` says its input is now (`None`: a pad not modeled, whose level
+    /// is left as programmed). So such an event wakes the console when its
+    /// input changes, whichever way.
+    ///
+    /// The public Tegra2 TRM (§9.1.15.55-56, `APBDEV_PMC_AUTO_WAKE_LVL_0`
+    /// and `_MASK_0`, the same offsets as here) has the PMC sample the
+    /// masked wake pads "just before entering DPD" and transfer the value
+    /// to `WAKE_LVL`. \[inference\] Transferred inverted: a wake level
+    /// equal to the input at entry would match it at once, as the level
+    /// match in [`Pmc::wake`] is the wake.
+    pub fn sample_wake_levels(&self, pad: impl Fn(u8) -> Option<bool>) {
+        for index in 0..2 {
+            let auto = self.registers.get(AUTO_WAKE_LVL_MASK[index]).unwrap_or(0);
+            let mut level = self.registers.get(WAKE_LVL[index]).unwrap_or(0);
+            for bit in (0..32).filter(|bit| auto & 1 << bit != 0) {
+                if let Some(high) = pad(index as u8 * 32 + bit) {
+                    level = level & !(1 << bit) | u32::from(!high) << bit;
+                }
+            }
+            self.registers.set(WAKE_LVL[index], level);
+        }
+    }
 }
 
 impl Default for Pmc {
@@ -493,5 +534,36 @@ mod tests {
         assert_eq!(status(&pmc), 1 << 19);
         pmc.write(0, WAKE_STATUS[1], 4, 0xFFFF_FFFF).unwrap();
         assert_eq!(status(&pmc), 0);
+    }
+
+    #[test]
+    fn an_auto_event_wakes_on_a_change_of_its_pad_from_deep_power_down_entry() {
+        let pmc = Pmc::new();
+        let read = |offset| pmc.read(0, offset, 4).unwrap() as u32;
+        // As the firmware leaves it: both rail CTS events enabled, level
+        // "auto"; the radio's active high and not auto; PwrIntN low.
+        pmc.write(0, WAKE_MASK[0], 4, 0x0800_45D0).unwrap();
+        pmc.write(0, WAKE_LVL[0], 4, 0x100).unwrap();
+        pmc.write(0, AUTO_WAKE_LVL_MASK[0], 4, 0x17FE_BCFF).unwrap();
+        pmc.write(0, WAKE_MASK[1], 4, 0x0019_000C).unwrap();
+        pmc.write(0, AUTO_WAKE_LVL_MASK[1], 4, 0xEFE7_E01A).unwrap();
+        // The right rail's line is low (asserted), the left one's high; the
+        // PMIC's interrupt is not modeled as an "auto" pad.
+        let pads = |event| match event {
+            WAKE_EVENT_UART2_CTS => Some(false),
+            WAKE_EVENT_UART3_CTS => Some(true),
+            WAKE_EVENT_PMIC => Some(true),
+            _ => None,
+        };
+        pmc.sample_wake_levels(pads);
+        assert_eq!(read(WAKE_LVL[0]), 0x100 | 1 << 6, "inverted, the rest kept");
+        assert_eq!(read(WAKE_LVL[1]), 0, "PwrIntN keeps its level");
+        // Unchanged pads do not wake; a change does, and is recorded.
+        assert!(!pmc.wake(WAKE_EVENT_UART2_CTS, false));
+        assert!(!pmc.wake(WAKE_EVENT_UART3_CTS, true));
+        assert!(pmc.wake(WAKE_EVENT_UART2_CTS, true));
+        assert_eq!(read(WAKE_STATUS[0]), 1 << 6);
+        assert!(pmc.wake(WAKE_EVENT_UART3_CTS, false));
+        assert_eq!(read(WAKE_STATUS[0]), 1 << 6 | 1 << 7);
     }
 }

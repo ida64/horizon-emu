@@ -581,6 +581,7 @@ impl PowerDomain for WakesAtOnce<'_> {
     }
 
     fn power_lost(&self) {
+        self.soc.enter_sc7();
         self.gic.reset();
     }
 
