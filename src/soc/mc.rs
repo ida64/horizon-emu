@@ -134,7 +134,7 @@ pub struct Mc {
     /// a machine that has IRAM to offer.
     iram: OnceLock<Arc<Iram>>,
     /// The per-channel apertures' copies, in a machine that runs the boot
-    /// chain ([`mc_channel`](super::mc_channel)).
+    /// chain ([`mc_channel`]).
     channels: Option<mc_channel::Channels>,
 }
 
@@ -177,7 +177,7 @@ impl Mc {
     }
 
     /// The block as the SoC comes out of reset and package1ldr finds it,
-    /// with its channel apertures ([`mc_channel`](super::mc_channel)).
+    /// with its channel apertures ([`mc_channel`]).
     pub fn power_on() -> Self {
         Self {
             registers: RegisterFile::zeroed(mc_channel::POWER_ON_STATE),
