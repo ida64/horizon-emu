@@ -33,7 +33,36 @@ const INFO_ADDRESS: u16 = 0x100;
 /// 1280x720, origin top left. hid takes them from contact events unchanged
 /// (text `0xdf460` unpacks X from bytes 1 and 3 high nibble, Y from bytes 2
 /// and 3 low nibble; `0xc6aa0` stores them as the client-visible touch
-/// state's X and Y), so these are the coordinates applications see.
+/// state's X and Y). These are the panel's coordinates, where the finger
+/// is; what a program is told can differ, because hid moves every touch
+/// by an offset am sets for the program in front.
+///
+/// HOME (qlaunch, which also holds System Settings and its Test Touch
+/// Screen) and the overlay applet ask for touches 15 pixels higher than
+/// the finger, so they see `(x, y - 15)` and nothing above panel row 15.
+/// The offset comes from the firmware, not from anything the emulator
+/// answers, as these 23.5.0 sources show:
+/// - qlaunch's TouchManager set-up (text `0xc07f1c`) calls
+///   ICommonStateGetter 610 with the constants x 0.0, y −15/720
+///   (`0xbcaaaaab`), then 611 with 1, if its applet kind field
+///   (`+0x218`) is 2 or 3. The constructor (`0x5c146c`) sets that field
+///   to 3, and nothing found writes it again. \[inference: no other
+///   store to the field turned up in a search of the text\]
+/// - am's window system (update loop `0x5d9bc`, then `0x5c678`,
+///   `0x5cc8c`, `0x61190`, `0x63198`) passes the pair on to hid:sys 1326
+///   `SetTouchScreenOffset` (`0x78f4c`, `0x135ae0`) when it changes.
+/// - hid adds `round(y × 720)` to each touch (`0xc2460`), then drops
+///   touches that land off the screen (`0xc2500`).
+/// - An `--trace-ipc` boot showed overlayDisp sending 610 with
+///   `[0, bcaaaaab]` at 15.79 s, qlaunch the same at 15.89 s, and am then
+///   sending hid:sys 1326 `[0, bcaaaaab]` with the frame-record chain
+///   above. Album (photoViewer), opened from HOME and closed again, sent
+///   only 611 with 1, and am sent hid no other offset meanwhile.
+///   \[inference: Album therefore gets the same shift; why the firmware
+///   wants it, perhaps to make up for a finger covering what it touches,
+///   is not documented anywhere at hand; whether an application in front
+///   clears it was not tried\]
+///
 /// Events are queued immediately, so a press and release between two of
 /// hid's polls are both reported.
 pub struct TouchInput {

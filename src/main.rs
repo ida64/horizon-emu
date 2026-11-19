@@ -207,7 +207,11 @@ options:
                       machine starts, lifting it HOLD_MS milliseconds later
                       (default 100); may be given more than once. With
                       --window, holding the left mouse button on the
-                      picture touches it too
+                      picture touches it too. X,Y is where the finger is on
+                      the panel; HOME (with System Settings) and the overlay
+                      applet ask hid for touches 15 pixels higher, so they
+                      see X,Y-15, as the firmware intends
+                      (horizon_emu::soc::touch::TouchInput)
   --joycons SECONDS[:off]
                       slide both Joy-Con onto the console's rails SECONDS
                       after the machine starts (0: they are on from power
