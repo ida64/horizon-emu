@@ -74,7 +74,11 @@ struct Region {
 
 #[derive(Default)]
 pub struct Bus {
+    /// In the order they were mapped, which [`Bus::devices`] keeps.
     regions: Vec<Region>,
+    /// Indices into `regions` of the non-empty ones, by base address, for
+    /// finding the device an access reaches by binary search.
+    by_address: Vec<usize>,
 }
 
 impl Bus {
@@ -91,6 +95,12 @@ impl Bus {
                 .all(|region| region.range.end <= range.start || range.end <= region.range.start),
             "{name} overlaps another device"
         );
+        if !range.is_empty() {
+            let at = self
+                .by_address
+                .partition_point(|&index| self.regions[index].range.start < base);
+            self.by_address.insert(at, self.regions.len());
+        }
         self.regions.push(Region {
             range,
             name,
@@ -112,10 +122,17 @@ impl Bus {
 
     /// Name of the device mapped at `address`.
     pub fn device_at(&self, address: u64) -> Option<&'static str> {
-        self.regions
-            .iter()
-            .find(|region| region.range.contains(&address))
-            .map(|region| region.name)
+        self.region_at(address).map(|region| region.name)
+    }
+
+    /// The region whose range contains `address`. Ranges do not overlap,
+    /// so it is the last one starting at or below it, if any.
+    fn region_at(&self, address: u64) -> Option<&Region> {
+        let after = self
+            .by_address
+            .partition_point(|&index| self.regions[index].range.start <= address);
+        let region = &self.regions[*self.by_address.get(after.checked_sub(1)?)?];
+        region.range.contains(&address).then_some(region)
     }
 
     /// Every mapped device with the key its state is saved under: its
@@ -135,9 +152,10 @@ impl Bus {
         size: u8,
         access: impl FnOnce(&dyn MmioDevice, u64) -> Option<T>,
     ) -> Access<T> {
-        let Some(region) = self.regions.iter().find(|region| {
-            region.range.contains(&address) && address + u64::from(size) <= region.range.end
-        }) else {
+        let Some(region) = self
+            .region_at(address)
+            .filter(|region| address + u64::from(size) <= region.range.end)
+        else {
             return Access::Unmapped;
         };
         match access(region.device.as_ref(), address - region.range.start) {
@@ -188,5 +206,41 @@ mod tests {
         let mut bus = Bus::default();
         bus.map("first", 0x1000, 0x1000, Box::new(Probe));
         bus.map("second", 0x1FFF, 0x10, Box::new(Probe));
+    }
+
+    /// Finding a device by binary search finds what looking at every
+    /// mapping in turn finds, mapped in any order, empty mappings among them.
+    #[test]
+    fn binary_search_finds_the_device_a_linear_scan_finds() {
+        let mut bus = Bus::default();
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut random = move |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % below
+        };
+        // Slots of 0x100 bytes, each mapped with some size or left out,
+        // in a shuffled order.
+        let mut slots: Vec<u64> = (0..64).collect();
+        for index in (1..slots.len()).rev() {
+            slots.swap(index, random(index as u64 + 1) as usize);
+        }
+        for slot in slots {
+            if random(4) != 0 {
+                bus.map("slot", slot * 0x100, random(0x101), Box::new(Probe));
+            }
+        }
+        for address in (0..64 * 0x100 + 8).step_by(3) {
+            let linear = bus
+                .regions
+                .iter()
+                .find(|region| region.range.contains(&address));
+            assert_eq!(
+                bus.region_at(address).map(|region| region.range.clone()),
+                linear.map(|region| region.range.clone()),
+                "{address:#x}"
+            );
+        }
     }
 }

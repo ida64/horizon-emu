@@ -35,7 +35,7 @@ use horizon_emu::{
     maxwell, nand, net, sdcard,
     secmon::{self, SmcEffect},
     soc::{
-        dc::Frame, emmc::EmmcImages, joycon::Button, medium::ImageFile, sdcard::SdCardImage,
+        Panel, dc::Frame, emmc::EmmcImages, joycon::Button, medium::ImageFile, sdcard::SdCardImage,
         wifi_ap::AccessPoint,
     },
     svc,
@@ -109,8 +109,7 @@ cloned for the restored one into
   --workdir DIR       (default: a new directory under the system's
                       temporary directory, printed at start)
 Host connections of the saved machine are gone, as after a dropped link;
-the console makes new ones. The processors run at full speed unless
---cpu-slowdown says otherwise.
+the console makes new ones.
 
 options:
   --dram 4|6          installed DRAM in GiB (default 4). 8 GiB consoles
@@ -122,16 +121,13 @@ options:
                       run the guest's processors N times slower than the
                       host can, for the first SECONDS of the run or, without
                       SECONDS, throughout. Timers and device waits keep real
-                      time either way. The console's own processor is
-                      roughly a tenth of the host's speed, and its boot
-                      counts on that: while the system's programs are being
-                      launched, loading them (processor work) has to take
-                      its time next to what the first drivers wait for
-                      (real time), or three processes can end up waiting for
-                      each other and the boot stops with nothing on screen
-                      (seen in 1 of 6 boots at full speed, none of 8 with
-                      the default). Default 10:12; 1 for full speed
-                      throughout
+                      time either way, as the console's own processor,
+                      roughly a tenth of the host's speed, would see them.
+                      Default 1: full speed. Boots once stopped with nothing
+                      on screen at full speed (1 of 6), three processes
+                      waiting for each other while the system's programs
+                      were launched; none of 24 full-speed boots to HOME did
+                      since
   --symbols FILE      function names for kernel addresses (JSON export)
   --keys FILE         console keys (name = hex lines); without them the
                       secure monitor cannot derive keys for the guest
@@ -1264,11 +1260,7 @@ fn boot(
             (None, false) => None,
         },
     };
-    // A restored machine is past the boot that the default slows.
-    let cpu_slowdown = cpu_slowdown.unwrap_or(match restore {
-        Some(_) => (1, None),
-        None => (10, Some(Duration::from_secs(12))),
-    });
+    let cpu_slowdown = cpu_slowdown.unwrap_or((1, None));
     let options = RunOptions {
         timeout,
         stop: &stop,
@@ -1297,14 +1289,26 @@ fn boot(
     };
     // What the screen was last said to show: panel awake, backlight lit.
     let mut shown = None;
+    // The panel as last looked at, whether a picture could be put
+    // together then, and when that was. The panel is cheap to look at;
+    // a picture is put together again when the panel changes, or after
+    // `PICTURE_CHECK`.
+    const PICTURE_CHECK: Duration = Duration::from_millis(250);
+    let mut checked: Option<(Panel, bool, Instant)> = None;
     let mut watch_screen = || {
         if !verbose {
             return;
         }
-        let now = machine
-            .screen()
-            .ok()
-            .map(|screen| (screen.panel_on, screen.backlight_on));
+        let panel = machine.panel();
+        let pictured = match checked {
+            Some((last, pictured, at)) if last == panel && at.elapsed() < PICTURE_CHECK => pictured,
+            _ => {
+                let pictured = machine.screen().is_ok();
+                checked = Some((panel, pictured, Instant::now()));
+                pictured
+            }
+        };
+        let now = pictured.then_some((panel.panel_on, panel.backlight_on));
         if now != shown {
             let state = |on| if on { "on" } else { "off" };
             let line = match now {

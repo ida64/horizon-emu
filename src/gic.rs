@@ -201,6 +201,12 @@ impl Interrupt {
     }
 }
 
+/// Whether a shared interrupt can be forwarded: enabled, pending and not
+/// active.
+fn forwardable(spi: &Interrupt) -> bool {
+    spi.enabled && !spi.active && spi.pending()
+}
+
 /// One CPU interface and the distributor state banked for its processor.
 #[derive(Serialize, Deserialize)]
 struct Cpu {
@@ -352,24 +358,32 @@ impl State {
         if !self.forwarding {
             return None;
         }
-        let cpu = &self.cpus[core];
-        let private = cpu
-            .private
-            .iter()
-            .enumerate()
-            .filter(|&(intid, interrupt)| match cpu.sgi_sources.get(intid) {
-                Some(&sources) => sources != 0,
-                None => interrupt.pending(),
-            });
         let shared = self
             .spis
             .iter()
             .enumerate()
-            .filter(|(_, spi)| spi.targets & (1 << core) != 0 && spi.pending())
-            .map(|(index, spi)| (PRIVATE_COUNT + index, spi));
-        private
-            .chain(shared)
-            .filter(|(_, interrupt)| interrupt.enabled && !interrupt.active)
+            .filter(|(_, spi)| spi.targets & (1 << core) != 0 && forwardable(spi))
+            .map(|(index, spi)| (spi.priority, PRIVATE_COUNT + index))
+            .min();
+        [self.highest_private(core), shared]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// [`Self::highest_pending`] among `core`'s own interrupts, 0-31.
+    fn highest_private(&self, core: usize) -> Option<(u8, usize)> {
+        let cpu = &self.cpus[core];
+        cpu.private
+            .iter()
+            .enumerate()
+            .filter(|&(intid, interrupt)| {
+                let pending = match cpu.sgi_sources.get(intid) {
+                    Some(&sources) => sources != 0,
+                    None => interrupt.pending(),
+                };
+                pending && interrupt.enabled && !interrupt.active
+            })
             .map(|(intid, interrupt)| (interrupt.priority, intid))
             .min()
     }
@@ -382,6 +396,48 @@ impl State {
         }
         self.highest_pending(core)
             .filter(|&(priority, _)| cpu.permits(priority))
+    }
+
+    /// The cores whose CPU interfaces signal an interrupt, a bit each:
+    /// [`Self::signaled`] of every core, with one pass over the shared
+    /// interrupts for all of them.
+    fn signaling(&self) -> u8 {
+        if !self.forwarding {
+            return 0;
+        }
+        let listening = (0..self.cpus.len())
+            .filter(|&core| self.cpus[core].control & CONTROL_ENABLE_GROUP1 != 0)
+            .fold(0u8, |cores, core| cores | 1 << core);
+        if listening == 0 {
+            return 0;
+        }
+        // Per core, the shared interrupt it would be offered. IDs rise, so
+        // the first of a priority stays.
+        let mut shared = [None::<(u8, usize)>; MAX_CORES];
+        for (index, spi) in self.spis.iter().enumerate() {
+            let mut targets = spi.targets & listening;
+            if targets == 0 || !forwardable(spi) {
+                continue;
+            }
+            let offer = (spi.priority, PRIVATE_COUNT + index);
+            while targets != 0 {
+                let best = &mut shared[targets.trailing_zeros() as usize];
+                if best.is_none_or(|best| offer.0 < best.0) {
+                    *best = Some(offer);
+                }
+                targets &= targets - 1;
+            }
+        }
+        (0..self.cpus.len())
+            .filter(|&core| listening & 1 << core != 0)
+            .filter(|&core| {
+                [self.highest_private(core), shared[core]]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .is_some_and(|(priority, _)| self.cpus[core].permits(priority))
+            })
+            .fold(0, |cores, core| cores | 1 << core)
     }
 
     /// `intid` as `GICC_IAR` and `GICC_HPPIR` present it to `core`: an SGI
@@ -476,18 +532,24 @@ impl State {
         Some(())
     }
 
-    fn set_line(&mut self, core: usize, intid: usize, asserted: bool) {
+    /// Drives the input; `false` if it already was at that level, when
+    /// nothing changes.
+    fn set_line(&mut self, core: usize, intid: usize, asserted: bool) -> bool {
         let forwarding = self.forwarding;
         let interrupt = match intid {
             FIRST_PPI..PRIVATE_COUNT => &mut self.cpus[core].private[intid],
             PRIVATE_COUNT..INTID_LIMIT => &mut self.spis[intid - PRIVATE_COUNT],
             _ => panic!("interrupt {intid} has no input line"),
         };
+        if interrupt.line == asserted {
+            return false;
+        }
         // TRM 2.8: an edge cannot set the pending state while the distributor is disabled.
-        if asserted && !interrupt.line && interrupt.edge_triggered && forwarding {
+        if asserted && interrupt.edge_triggered && forwarding {
             interrupt.latched = true;
         }
         interrupt.line = asserted;
+        true
     }
 
     fn read_byte_field(&self, core: usize, field: ByteField) -> u8 {
@@ -783,14 +845,24 @@ impl Gic {
     /// Runs `access` on the state, then brings the IRQ outputs up to date and
     /// reports the ones that rose.
     fn update<R>(&self, access: impl FnOnce(&mut State) -> R) -> R {
+        self.update_if(|state| (access(state), true))
+    }
+
+    /// [`Self::update`] for an access that says whether it changed the
+    /// state; the outputs, which follow from the state, are left as they
+    /// are when it did not.
+    fn update_if<R>(&self, access: impl FnOnce(&mut State) -> (R, bool)) -> R {
         let mut raised = 0u8;
         let result = {
             let mut state = self.state.lock().unwrap();
-            let result = access(&mut state);
-            for (core, output) in self.outputs.iter().enumerate() {
-                let level = state.signaled(core).is_some();
-                if !output.swap(level, Ordering::SeqCst) && level {
-                    raised |= 1 << core;
+            let (result, changed) = access(&mut state);
+            if changed {
+                let levels = state.signaling();
+                for (core, output) in self.outputs.iter().enumerate() {
+                    let level = levels & 1 << core != 0;
+                    if !output.swap(level, Ordering::SeqCst) && level {
+                        raised |= 1 << core;
+                    }
                 }
             }
             result
@@ -848,7 +920,7 @@ impl Gic {
     /// If `intid` has no input: SGIs, the PPIs the GIC-400 lacks (16..=24)
     /// and IDs from [`INTERRUPT_COUNT`] up.
     pub fn set_line(&self, core: usize, intid: u32, asserted: bool) {
-        self.update(|state| state.set_line(core, intid as usize, asserted));
+        self.update_if(|state| ((), state.set_line(core, intid as usize, asserted)));
     }
 
     /// Current level of the IRQ signal to `core`'s processor.
@@ -1635,5 +1707,99 @@ mod tests {
         assert_eq!(restored.take_raised(), [2]);
         restored.gic.set_line(0, 40, false);
         assert_eq!(restored.asserted(), [false, false, false, false]);
+    }
+
+    /// `State::highest_pending` as it was before it was split up, one
+    /// filter over every interrupt the core sees.
+    fn reference_highest_pending(state: &State, core: usize) -> Option<(u8, usize)> {
+        if !state.forwarding {
+            return None;
+        }
+        let cpu = &state.cpus[core];
+        let private = cpu
+            .private
+            .iter()
+            .enumerate()
+            .filter(|&(intid, interrupt)| match cpu.sgi_sources.get(intid) {
+                Some(&sources) => sources != 0,
+                None => interrupt.pending(),
+            });
+        let shared = state
+            .spis
+            .iter()
+            .enumerate()
+            .filter(|(_, spi)| spi.targets & (1 << core) != 0 && spi.pending())
+            .map(|(index, spi)| (PRIVATE_COUNT + index, spi));
+        private
+            .chain(shared)
+            .filter(|(_, interrupt)| interrupt.enabled && !interrupt.active)
+            .map(|(intid, interrupt)| (interrupt.priority, intid))
+            .min()
+    }
+
+    /// [`State::signaling`] looks at the shared interrupts once for all
+    /// cores; it must agree with [`State::signaled`] core by core, which
+    /// `GICC_IAR` acknowledges by, and that with the single filter it
+    /// replaced, on any state.
+    #[test]
+    fn signaling_of_all_cores_agrees_with_each_core_signaled() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut random = move |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % below
+        };
+        for round in 0..2000 {
+            let mut state = State::new(4);
+            state.forwarding = round % 17 != 0;
+            // Few interrupts in play and few priorities, for ties.
+            let sparse = 1 + random(8);
+            let shuffle = |interrupt: &mut Interrupt, random: &mut dyn FnMut(u64) -> u64| {
+                *interrupt = Interrupt {
+                    enabled: random(4) != 0,
+                    latched: random(sparse * 4) == 0,
+                    active: random(6) == 0,
+                    line: random(sparse * 4) == 0,
+                    edge_triggered: random(2) == 0,
+                    priority: (random(4) as u8) << 6,
+                    targets: random(16) as u8,
+                };
+            };
+            for spi in &mut state.spis {
+                shuffle(spi, &mut random);
+            }
+            for cpu in &mut state.cpus {
+                cpu.control = if random(5) == 0 {
+                    0
+                } else {
+                    CONTROL_ENABLE_GROUP1
+                };
+                cpu.priority_mask = (random(5) as u8) << 6;
+                cpu.binary_point = MIN_BINARY_POINT + random(5) as u8;
+                cpu.active_priorities = random(1 << 16) as u16 & (random(2) as u16 * 0xFFFF);
+                for interrupt in &mut cpu.private {
+                    shuffle(interrupt, &mut random);
+                }
+                for sources in &mut cpu.sgi_sources {
+                    *sources = if random(sparse * 2) == 0 {
+                        random(16) as u8
+                    } else {
+                        0
+                    };
+                }
+            }
+            for core in 0..4 {
+                assert_eq!(
+                    state.highest_pending(core),
+                    reference_highest_pending(&state, core),
+                    "round {round}, core {core}"
+                );
+            }
+            let each = (0..4)
+                .filter(|&core| state.signaled(core).is_some())
+                .fold(0u8, |cores, core| cores | 1 << core);
+            assert_eq!(state.signaling(), each, "round {round}");
+        }
     }
 }

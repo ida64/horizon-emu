@@ -354,8 +354,9 @@ pub struct Screen {
     /// The picture as someone holding the console sees it. The panel is a
     /// portrait one mounted on its side, its first scan line along the
     /// console's right edge, so this is the display controller's picture
-    /// turned a quarter turn clockwise.
-    pub frame: Frame,
+    /// turned a quarter turn clockwise. Shared with every other look at the
+    /// same frame.
+    pub frame: Arc<Frame>,
     /// Whether the panel is awake and unblanked.
     pub panel_on: bool,
     /// Whether the backlight driver is powered and given a nonzero duty
