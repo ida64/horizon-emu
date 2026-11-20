@@ -34,6 +34,7 @@ pub mod bootrom;
 pub mod bpmp;
 pub mod bus;
 pub mod clock;
+pub mod falcon;
 pub mod gic;
 pub mod homebrew;
 pub mod hvf;

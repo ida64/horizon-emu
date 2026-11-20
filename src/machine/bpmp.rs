@@ -1503,6 +1503,7 @@ mod tests {
                     let clock = Arc::clone(&clock);
                     Box::new(move || clock.now())
                 })),
+                usb2: Arc::default(),
                 rom: None,
             };
             let mut bus = Bus::default();

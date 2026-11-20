@@ -410,16 +410,16 @@ pub struct BootBlocks {
     /// The timer block, whose watchdogs the BPMP's machine watches
     /// ([`tmr::Timers::watchdog_expired`]).
     pub timers: Arc<tmr::Timers>,
+    /// USB1, the port of the ROM's recovery mode ([`usb2`]).
+    pub usb2: Arc<usb2::Usb2>,
     /// What only a machine that runs the boot ROM itself has
     /// ([`Start::Reset`]); without, the ROM is high-level emulated.
     pub rom: Option<RomBlocks>,
 }
 
-/// The blocks of a machine given a dump of the boot ROM: its memory, and
-/// the USB port it sets up on every cold boot.
+/// The blocks of a machine given a dump of the boot ROM: its memory.
 pub struct RomBlocks {
     pub irom: Arc<irom::Irom>,
-    pub usb2: Arc<usb2::Usb2>,
 }
 
 impl BootBlocks {
@@ -692,6 +692,17 @@ impl Soc {
             }
         }));
         let sb: Arc<sb::Sb> = Arc::default();
+        // USB1, which the ROM sets up on every cold boot: at reset where
+        // the ROM runs, as the ROM leaves it where it is high-level
+        // emulated.
+        let usb2 = power_on.then(|| {
+            let usb2 = Arc::new(match &start {
+                Start::Reset { .. } => usb2::Usb2::new(),
+                _ => usb2::Usb2::after_rom(),
+            });
+            bus.map("USB1", usb2::BASE, usb2::SIZE, Box::new(Arc::clone(&usb2)));
+            usb2
+        });
         let rom = match &start {
             Start::Reset { rom, .. } => {
                 let irom = Arc::new(irom::Irom::new(rom.clone(), Arc::clone(&sb)));
@@ -701,9 +712,7 @@ impl Soc {
                     irom::IPATCH_SIZE,
                     Box::new(irom::Ipatch(Arc::clone(&irom))),
                 );
-                let usb2 = Arc::new(usb2::Usb2::new());
-                bus.map("USB1", usb2::BASE, usb2::SIZE, Box::new(Arc::clone(&usb2)));
-                Some(RomBlocks { irom, usb2 })
+                Some(RomBlocks { irom })
             }
             _ => None,
         };
@@ -730,6 +739,7 @@ impl Soc {
                 ictlr: Arc::default(),
                 signals: Arc::default(),
                 timers: Arc::new(Timers::power_on(elapsed(clock))),
+                usb2: usb2.expect("USB1 is made with IRAM"),
                 rom,
             }),
             se,
@@ -1362,17 +1372,19 @@ impl Soc {
     /// The SoC enters deep power down (SC7): the PMC takes the wake level
     /// of its "auto" events from their pads ([`Pmc::sample_wake_levels`]).
     ///
-    /// In a machine that runs the boot ROM itself, the blocks the ROM
-    /// sets up lose their state with the SoC's power, for the ROM to find
-    /// them as at power-on when it runs again at the wake: the fuse block
-    /// (the private key fuses readable again), the patch unit, USB1 and
-    /// the security engine, whose context the ROM restores from the
-    /// monitor's save.
+    /// USB1 loses its settings with the SoC's power. In a machine that
+    /// runs the boot ROM itself, so do the other blocks the ROM sets up,
+    /// for the ROM to find them as at power-on when it runs again at the
+    /// wake: the fuse block (the private key fuses readable again), the
+    /// patch unit and the security engine, whose context the ROM restores
+    /// from the monitor's save.
     pub fn enter_sc7(&self) {
         self.pmc.sample_wake_levels(|event| self.wake_pad(event));
+        if let Some(boot) = &self.boot {
+            boot.usb2.power_off();
+        }
         if let Some(rom) = self.boot.as_ref().and_then(|boot| boot.rom.as_ref()) {
             rom.irom.power_off();
-            rom.usb2.power_off();
             self.se.power_off();
             if let Some(fuse) = self.fuse.get() {
                 fuse.power_off();

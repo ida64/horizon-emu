@@ -238,6 +238,20 @@ pub type InterruptLine = Box<dyn Fn(bool) + Send + Sync>;
 /// time stands still.
 const PAUSED_POLL: Duration = Duration::from_millis(20);
 
+/// How long the supply has to be off before the card has lost its power.
+///
+/// The SD specification asks a host that wants a power cycle to keep the
+/// supply below 0.5 V for at least 1 ms (Physical Layer Simplified
+/// Specification 9.00 §6.4.1.2); a card whose supply dips for less is not
+/// promised to start over, and the rail's capacitance keeps the level up
+/// across a short gap anyway. \[inference\] The card keeps its state
+/// across a shorter one: a bootloader's second stage sets the enable pin
+/// up again (low, then output, then high, three register writes apart)
+/// with the card mounted, and goes on reading it. How long the board's
+/// rail really takes to fall is not known; this is the specification's
+/// bound.
+const SUPPLY_HOLD_UP: Duration = Duration::from_millis(1);
+
 /// How long the card in the slot takes over data.
 #[derive(Clone, Copy)]
 pub struct Timing {
@@ -312,6 +326,9 @@ struct Host {
     busy: Duration,
     /// What the driver is told once the card is done.
     held: Option<Held>,
+    /// Guest time the card's supply was switched off at, until it is
+    /// switched on again.
+    supply_off: Option<Duration>,
     /// The controller is gone; the completion thread ends.
     closed: bool,
 }
@@ -354,6 +371,8 @@ struct Saved {
     transfer: Option<Transfer>,
     tuning_commands: u32,
     held: Option<Held>,
+    /// [`Host::supply_off`].
+    supply_off: Option<Duration>,
 }
 
 impl Transfer {
@@ -400,6 +419,17 @@ fn reset_state() -> [u8; SIZE as usize] {
 }
 
 impl Host {
+    /// Takes the card's power away once its supply has been switched off
+    /// for [`SUPPLY_HOLD_UP`].
+    fn settle_supply(&mut self, now: Duration) {
+        if let Some(since) = self.supply_off
+            && now.saturating_sub(since) >= SUPPLY_HOLD_UP
+            && let Some(card) = self.card.as_mut()
+        {
+            card.power(false);
+        }
+    }
+
     /// Latches normal interrupt status bits whose status enable is set.
     fn raise(&mut self, bits: u16) {
         let enabled = u16_at(&self.registers, NORMAL_STATUS_ENABLE);
@@ -519,6 +549,7 @@ impl Sdmmc {
                 timing,
                 busy: Duration::ZERO,
                 held: None,
+                supply_off: None,
                 closed: false,
             }),
             changed: Condvar::new(),
@@ -571,11 +602,25 @@ impl Sdmmc {
 
     /// What switches the supply of the card in the slot: the board's
     /// regulator enable, for whoever models the pin that drives it.
+    ///
+    /// The card does not lose its supply the moment the enable goes low:
+    /// it is without power once the enable has been low for a millisecond
+    /// (`SUPPLY_HOLD_UP`, with the reasons), and until then an enable that
+    /// comes back finds the card as it was.
     pub fn card_supply(&self) -> Box<dyn Fn(bool) + Send + Sync> {
         let shared = Arc::clone(&self.shared);
+        let clock = Arc::clone(&self.clock);
         Box::new(move |on| {
-            if let Some(card) = shared.host.lock().unwrap().card.as_mut() {
-                card.power(on);
+            let mut host = shared.host.lock().unwrap();
+            let now = clock.now();
+            host.settle_supply(now);
+            if on {
+                host.supply_off = None;
+                if let Some(card) = host.card.as_mut() {
+                    card.power(true);
+                }
+            } else if host.supply_off.is_none() {
+                host.supply_off = Some(now);
             }
         })
     }
@@ -586,6 +631,7 @@ impl Sdmmc {
         let command = u16_at(&host.registers, COMMAND);
         let index = (command >> 8) as u8 & 0x3F;
         let argument = u32_at(&host.registers, ARGUMENT);
+        host.settle_supply(self.clock.now());
         match host
             .card
             .as_mut()
@@ -820,6 +866,7 @@ impl Snapshot for Sdmmc {
             transfer: host.transfer.clone(),
             tuning_commands: host.tuning_commands,
             held: host.held.clone(),
+            supply_off: host.supply_off,
         })
     }
 
@@ -857,6 +904,7 @@ impl Snapshot for Sdmmc {
         host.tuning_commands = saved.tuning_commands;
         host.busy = Duration::ZERO;
         host.held = saved.held;
+        host.supply_off = saved.supply_off;
         self.shared.changed.notify_all();
         Ok(())
     }
@@ -1412,6 +1460,37 @@ mod tests {
         bench.write(HOST_CONTROL_2, 2, CONTROL_2_SIGNALING_1V8.into());
         bench.write(CLOCK_CONTROL, 2, 0x0007);
         assert_eq!(bench.read(PRESENT_STATE, 4), u64::from(PRESENT_STATE_IDLE));
+    }
+
+    #[test]
+    fn the_card_keeps_its_state_across_a_gap_in_its_supply_too_short_for_a_power_cycle() {
+        use super::super::sdcard::{SdCard, SdCardImage};
+        let image = SdCardImage::memory(vec![0; (0x1010 + 1) << 19]).unwrap();
+        let card = SdCard::new(image, Arc::default());
+        let bench = Bench::with_card(Some(Box::new(card)), Timing::INSTANT);
+        let supply = bench.sdmmc.card_supply();
+        supply(true);
+        let command = |index: u16, argument: u64| {
+            bench.write(ARGUMENT, 4, argument);
+            bench.write(COMMAND, 2, (index << 8 | 0x1A).into());
+            bench.read(RESPONSE, 4)
+        };
+        command(0, 0);
+        assert_eq!(command(8, 0x1AA), 0x1AA);
+        command(55, 0);
+        assert_eq!(command(41, 0x4010_0000) >> 31, 1, "ready");
+        // The enable goes low and straight back: the card is where it
+        // was, past the idle state, whose interface check it ignores.
+        bench.clock.pause();
+        supply(false);
+        supply(true);
+        bench.clock.resume();
+        assert_ne!(command(8, 0x1A5), 0x1A5);
+        // Low for longer than a power cycle takes: the card starts over.
+        supply(false);
+        thread::sleep(SUPPLY_HOLD_UP * 3);
+        supply(true);
+        assert_eq!(command(8, 0x1A5), 0x1A5);
     }
 
     #[test]

@@ -16,7 +16,8 @@
 //!   on this SoC (Linux's `tegra210.dtsi` gives the node none), and
 //!   neither package1ldr nor anything after it enables it \[inference\].
 //! * `MAILBOX0`/`MAILBOX1`, `ITFEN`, `BOOTVEC` hold what is written.
-//! * `IDLESTATE` reads 0: the processor is never seen busy (below).
+//! * `IDLESTATE` bit 0 reads 1 while the processor runs (envytools
+//!   `io.rst`, STATUS).
 //! * `DMACTL`: the scrubbing bits read 0, the memories are scrubbed (zero)
 //!   at once. `REQUIRE_CTX` set makes transfers refuse: there is no
 //!   context model.
@@ -34,12 +35,16 @@
 //!   auto-increment on write (bit 24) and read (bit 25). Secure uploads
 //!   (bits 28-31) are refused.
 //! * `CPUCTL`: `STARTCPU` alone starts the processor (see below); the
-//!   register reads `HALTED` once the firmware has finished, 0 before.
+//!   register reads `HALTED` once the processor has stopped, 0 before
+//!   and while it runs.
+//! * `HWCFG`: the sizes of the two memories as they are here, 64 KiB
+//!   each, the reach of the 16-bit offsets \[assumption: the unit's real
+//!   sizes and its FIFO and queue depths, which read 0 here, are not
+//!   published; a firmware puts its stack at the top of the data memory
+//!   it is told of\].
 //!
-//! Everything else in the block (THI, SCP, TFBIF, `HWCFG` whose memory
-//! sizes are not published for this unit, the other Falcon registers) is
-//! refused with a note. Both memories are 64 KiB here, the reach of the
-//! 16-bit offsets, because their real sizes are not established.
+//! Everything else in the block (THI, SCP, TFBIF, the other Falcon
+//! registers) is refused with a note.
 //!
 //! The DMA engine reaches memory through the memory controller, without
 //! the SMMU (a TSEC address space enabled in `MC_SMMU_TSEC_ASID` is
@@ -49,7 +54,36 @@
 //! MMIO (Switchbrew "Package1", 6.2.0+). That side of the bus is the
 //! machine's, through [`TsecSoc`].
 //!
-//! # The firmware: modeled by what it leaves behind
+//! # The processor
+//!
+//! What the host loads and starts runs on a Falcon version 5 core
+//! ([`crate::falcon`]): its code is IMEM, mapped page by page as the
+//! uploads say (a code transfer maps the page at the external offset, a
+//! page written through `IMEMD` at the tag in `IMEMT`; envytools
+//! `xfer.rst` and `vm.rst`), its data is DMEM, and its IO space is this
+//! block's registers: the processor's address `a` is the register the
+//! host has at `0x1000 + (a >> 6)`, so its mailboxes are the host's.
+//! `IRQSTAT` bits enabled in `IRQMASK` and routed to the processor by
+//! `IRQDEST` interrupt it. `exit` and a trap inside a trap handler stop
+//! it (`CPUCTL` reads `HALTED`, `IRQSTAT` gets `HALT`), and the host may
+//! start it again at `BOOTVEC`.
+//!
+//! \[decision\] The processor has no clock of its own here. It runs
+//! inside the host's accesses of this block (`Tsec::advance`): at its
+//! start and at every later read or write it goes as far as it can
+//! without the host, which is until it stops, sleeps, or reads the same
+//! IO register again with nothing changed (a firmware waiting for the
+//! host's answer in a mailbox). So the host never sees it half way
+//! through work that a console's Falcon, clocked at hundreds of MHz,
+//! would have done within microseconds; work that takes a console
+//! longer is done too early here.
+//!
+//! What the processor cannot do here is refused, and the host's access it
+//! happened in with it: the secure modes and the crypto coprocessor
+//! (below), transfers the processor starts itself, and registers of this
+//! block that are not modeled.
+//!
+//! # The 23.5.0 firmware: modeled by what it leaves behind
 //!
 //! package1ldr (BPMP) loads NVIDIA's and Nintendo's signed TSEC firmware
 //! from its own data (IRAM 0x4001_0E00, 0x3300 bytes, 51 IMEM transfers),
@@ -58,7 +92,7 @@
 //! forever: it reads nothing back (package1ldr `tsec_boot`, text 0xBB4).
 //! The firmware's authenticated parts run in Heavy Secure mode, keyed by
 //! secrets inside the chip, and are encrypted, so they cannot run here.
-//! No Falcon instruction is executed. Instead, starting the processor
+//! For this firmware no Falcon instruction is executed. Instead, starting the processor
 //! with exactly the firmware of 23.5.0 (SHA-256 of IMEM `0..0x3300`,
 //! [`FIRMWARE_SHA256`]) and BOOTVEC 0 does at once what Switchbrew's
 //! account of that firmware ("TSEC Firmware", SecureBootLdr and
@@ -116,10 +150,11 @@
 //!    bootloader's entry sets its mode and registers itself, so any
 //!    register file is equivalent (its first instructions, at 0x4002_E104).
 //!
-//! Any other firmware (another digest, another extent of IMEM written,
-//! another boot vector), a second start, and DMA or memory-port access
-//! after the run are refused: what the firmware rewrote and locked in its
-//! memories is not known.
+//! After this run a second start, and DMA or memory-port access, are
+//! refused: what the firmware rewrote and locked in its memories is not
+//! known. Any other firmware (another digest, another extent of IMEM
+//! written, another boot vector) is not modeled this way: it runs on the
+//! processor, as above.
 //!
 //! Timing: all of this happens within the BPMP's `CPUCTL` write, on the
 //! writing core's thread, before the write returns. On a console it takes
@@ -165,6 +200,7 @@ use sha2::{Digest, Sha256};
 use super::{Notes, mc::DeviceMemory};
 use crate::{
     bus::MmioDevice,
+    falcon,
     keys::{Key, KeySet},
     secmon::crypto::cmac,
     snapshot::{Snapshot, SnapshotError, decode, encode},
@@ -177,6 +213,8 @@ pub const SIZE: u64 = 0x4_0000;
 /// Linux `tegra210.c` swgroup table: `tsec`, register 0x294).
 pub const SMMU_TSEC_ASID: u64 = 0x294;
 
+/// Where the Falcon's registers start, relative to [`BASE`].
+const FALCON: u64 = 0x1000;
 /// Falcon registers, relative to [`BASE`] (Switchbrew "TSEC").
 const IRQSSET: u64 = 0x1000;
 const IRQSCLR: u64 = 0x1004;
@@ -192,6 +230,7 @@ const ITFEN: u64 = 0x1048;
 const IDLESTATE: u64 = 0x104C;
 const CPUCTL: u64 = 0x1100;
 const BOOTVEC: u64 = 0x1104;
+const HWCFG: u64 = 0x1108;
 const DMACTL: u64 = 0x110C;
 const DMATRFBASE: u64 = 0x1110;
 const DMATRFMOFFS: u64 = 0x1114;
@@ -350,10 +389,32 @@ struct Wiring {
     keys: Result<SecureBootKeys, String>,
 }
 
+/// A code page's entry in the processor's TLB (envytools `vm.rst`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Tlb {
+    /// The virtual page the physical one is mapped at.
+    virt: u16,
+    flags: u8,
+}
+
+const TLB_USABLE: u8 = 1 << 0;
+/// Mapped, but still being uploaded.
+const TLB_BUSY: u8 = 1 << 1;
+const TLB_SECRET: u8 = 1 << 2;
+
+/// Instructions the processor runs within one access of the host.
+const BUDGET: u32 = 5_000_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Cpu {
     /// Out of reset, never started.
     Stopped,
+    /// Executing what is loaded ([`crate::falcon`]).
+    Running,
+    /// In `sleep`, until an interrupt.
+    Sleeping,
+    /// Stopped by `exit` or a trap inside a trap handler.
+    Exited,
     /// The 23.5.0 firmware has done its work and halted.
     Halted,
 }
@@ -380,6 +441,11 @@ struct State {
     dmem: Vec<u8>,
     /// IMEM bytes from 0 to the highest the host has written.
     imem_loaded: u32,
+    /// The code memory's page table: an entry per physical page.
+    tlb: Vec<Tlb>,
+    core: falcon::Falcon,
+    /// The processor waits for the host ([`Tsec::advance`]).
+    waiting: bool,
     cpu: Cpu,
 }
 
@@ -404,6 +470,9 @@ impl Default for State {
             imem: vec![0; MEMORY_SIZE],
             dmem: vec![0; MEMORY_SIZE],
             imem_loaded: 0,
+            tlb: vec![Tlb::default(); MEMORY_SIZE / IMEM_BLOCK],
+            core: falcon::Falcon::default(),
+            waiting: false,
             cpu: Cpu::Stopped,
         }
     }
@@ -517,8 +586,78 @@ impl Tsec {
         })
     }
 
+    /// A read by the host: the processor, if it runs, has first gone as
+    /// far as it can.
     fn read_register(&self, offset: u64) -> Result<u32, String> {
         let mut s = self.state.lock().unwrap();
+        self.advance(&mut s)?;
+        self.read_locked(&mut s, offset)
+    }
+
+    /// Runs the processor until it stops, sleeps, or waits for the host,
+    /// for at most [`BUDGET`] instructions.
+    ///
+    /// It waits for the host when it reads an IO register twice in the
+    /// same state with nothing written in between: it is then in a loop
+    /// only a change from outside ends, and stands until the host writes
+    /// a register.
+    fn advance(&self, s: &mut State) -> Result<(), String> {
+        if s.cpu == Cpu::Sleeping && s.vectors() != [false; 2] {
+            s.cpu = Cpu::Running;
+        }
+        if s.cpu != Cpu::Running || s.waiting {
+            return Ok(());
+        }
+        let mut core = std::mem::take(&mut s.core);
+        let mut bus = CoreBus {
+            tsec: self,
+            s,
+            polled: false,
+            wrote: false,
+            page: None,
+        };
+        let mut last_poll: Option<falcon::Falcon> = None;
+        let mut result = Ok(());
+        for _ in 0..BUDGET {
+            bus.polled = false;
+            bus.wrote = false;
+            match core.step(&mut bus) {
+                falcon::Step::Ran => {
+                    if bus.wrote {
+                        last_poll = None;
+                    }
+                    if bus.polled {
+                        if last_poll.as_ref() == Some(&core) {
+                            bus.s.waiting = true;
+                            break;
+                        }
+                        last_poll = Some(core.clone());
+                    }
+                }
+                falcon::Step::Exit => {
+                    bus.s.cpu = Cpu::Exited;
+                    bus.s.irq_status |= IRQ_HALT;
+                    break;
+                }
+                falcon::Step::Sleep => {
+                    bus.s.cpu = Cpu::Sleeping;
+                    break;
+                }
+                falcon::Step::Stalled => {
+                    bus.s.waiting = true;
+                    break;
+                }
+                falcon::Step::Refused(why) => {
+                    result = Err(why);
+                    break;
+                }
+            }
+        }
+        s.core = core;
+        result
+    }
+
+    fn read_locked(&self, s: &mut State, offset: u64) -> Result<u32, String> {
         Ok(match offset {
             IRQSTAT => s.irq_status,
             IRQMODE => s.irq_mode,
@@ -527,11 +666,17 @@ impl Tsec {
             MAILBOX0 => s.mailbox[0],
             MAILBOX1 => s.mailbox[1],
             ITFEN => s.itfen,
-            IDLESTATE => 0,
+            // Bit 0: the processor is running (envytools `io.rst`,
+            // STATUS).
+            IDLESTATE => u32::from(s.cpu == Cpu::Running),
             CPUCTL => match s.cpu {
-                Cpu::Stopped => 0,
-                Cpu::Halted => CPUCTL_HALTED,
+                Cpu::Stopped | Cpu::Running | Cpu::Sleeping => 0,
+                Cpu::Exited | Cpu::Halted => CPUCTL_HALTED,
             },
+            HWCFG => {
+                let pages = (MEMORY_SIZE / IMEM_BLOCK) as u32;
+                pages | pages << 9
+            }
             BOOTVEC => s.bootvec,
             DMACTL => s.dma_control & !DMACTL_SCRUBBING,
             DMATRFBASE => s.dma_base,
@@ -543,7 +688,6 @@ impl Tsec {
             DMEMC => s.dmem_port,
             IMEMD | DMEMD => {
                 s.running_out("memory port read")?;
-                let s = &mut *s;
                 let (port, memory) = if offset == IMEMD {
                     (&mut s.imem_port, &s.imem)
                 } else {
@@ -560,8 +704,24 @@ impl Tsec {
         })
     }
 
+    /// A write by the host: the processor, if it runs, sees it at once.
     fn write_register(&self, offset: u64, value: u32) -> Result<(), String> {
         let mut s = self.state.lock().unwrap();
+        self.advance(&mut s)?;
+        self.write_locked(&mut s, offset, value, false)?;
+        s.waiting = false;
+        self.advance(&mut s)
+    }
+
+    /// A register write, by the host or (`from_core`) by the processor
+    /// through its IO space.
+    fn write_locked(
+        &self,
+        s: &mut State,
+        offset: u64,
+        value: u32,
+        from_core: bool,
+    ) -> Result<(), String> {
         match offset {
             IRQSSET => s.irq_status |= value,
             IRQSCLR => s.irq_status &= !value,
@@ -577,7 +737,7 @@ impl Tsec {
             DMATRFBASE => s.dma_base = value,
             DMATRFMOFFS => s.dma_memory_offset = value & DMATRFMOFFS_OFFS,
             DMATRFFBOFFS => s.dma_external_offset = value,
-            DMATRFCMD => self.transfer(&mut s, value)?,
+            DMATRFCMD => self.transfer(s, value)?,
             IMEMC | DMEMC => {
                 if value & !PORT_MODELED != 0 {
                     return Err(format!(
@@ -593,7 +753,6 @@ impl Tsec {
             IMEMT => s.imem_tag = value & IMEMT_TAG,
             IMEMD | DMEMD => {
                 s.running_out("memory port write")?;
-                let s = &mut *s;
                 let (port, memory) = if offset == IMEMD {
                     (&mut s.imem_port, &mut s.imem)
                 } else {
@@ -606,16 +765,43 @@ impl Tsec {
                 }
                 if offset == IMEMD {
                     s.imem_loaded = s.imem_loaded.max(at as u32 + 4);
+                    // The page takes its virtual index with its first
+                    // word and is usable with its last (`vm.rst`).
+                    let entry = &mut s.tlb[at / IMEM_BLOCK];
+                    match at % IMEM_BLOCK {
+                        0 => {
+                            *entry = Tlb {
+                                virt: s.imem_tag as u16,
+                                flags: TLB_BUSY,
+                            }
+                        }
+                        0xFC => entry.flags = TLB_USABLE,
+                        _ => {}
+                    }
                 }
             }
             CPUCTL => {
+                if from_core {
+                    return Err("the processor's own write of CPUCTL".into());
+                }
                 if value != CPUCTL_STARTCPU {
                     return Err(format!("CPUCTL {value:#x}: only STARTCPU alone is modeled"));
                 }
-                if s.cpu != Cpu::Stopped {
-                    return Err("second start of the processor".into());
+                match s.cpu {
+                    Cpu::Halted => return Err("second start of the processor".into()),
+                    Cpu::Running | Cpu::Sleeping => {
+                        return Err("start of a processor that is running".into());
+                    }
+                    Cpu::Stopped | Cpu::Exited => {}
                 }
-                self.run_firmware(&mut s)?;
+                if s.cpu == Cpu::Stopped && s.pinned() {
+                    self.run_firmware(s)?;
+                } else {
+                    let entry = s.bootvec;
+                    s.core.start(entry);
+                    s.cpu = Cpu::Running;
+                    s.waiting = false;
+                }
             }
             _ => return Err(format!("unmodeled write of {value:#x} to +{offset:#x}")),
         }
@@ -645,6 +831,12 @@ impl Tsec {
             }
             self.dma_read(external, &mut s.imem[local..local + IMEM_BLOCK])?;
             s.imem_loaded = s.imem_loaded.max((local + IMEM_BLOCK) as u32);
+            // The page is mapped where the external offset says
+            // (envytools `xfer.rst`), and complete.
+            s.tlb[local / IMEM_BLOCK] = Tlb {
+                virt: (s.dma_external_offset >> 8) as u16,
+                flags: TLB_USABLE,
+            };
         } else {
             let size = (command & DMATRFCMD_SIZE) >> DMATRFCMD_SIZE_SHIFT;
             if size > 6 {
@@ -665,21 +857,9 @@ impl Tsec {
         Ok(())
     }
 
-    /// `STARTCPU`: the firmware's whole run, as the module describes it.
+    /// `STARTCPU` with the 23.5.0 firmware loaded ([`State::pinned`]): its
+    /// whole run, as the module describes it.
     fn run_firmware(&self, s: &mut State) -> Result<(), String> {
-        if s.bootvec != 0 || s.imem_loaded != FIRMWARE_SIZE {
-            return Err(format!(
-                "start at boot vector {:#x} with IMEM loaded up to {:#x}: only the 23.5.0 \
-                 firmware (vector 0, {FIRMWARE_SIZE:#x} bytes) is modeled",
-                s.bootvec, s.imem_loaded
-            ));
-        }
-        let digest = hex(&Sha256::digest(&s.imem[..FIRMWARE_SIZE as usize]));
-        if digest != FIRMWARE_SHA256 {
-            return Err(format!(
-                "unknown TSEC firmware (IMEM SHA-256 {digest}); only 23.5.0's is modeled"
-            ));
-        }
         let wiring = self.soc("firmware start")?;
         let keys = wiring
             .keys
@@ -753,13 +933,151 @@ impl Tsec {
 }
 
 impl State {
+    /// Refuses `what` once the 23.5.0 firmware has been modeled away.
     fn running_out(&self, what: &str) -> Result<(), String> {
         match self.cpu {
-            Cpu::Stopped => Ok(()),
             Cpu::Halted => Err(format!(
                 "{what} after the firmware ran: what it left in its memories is not modeled"
             )),
+            _ => Ok(()),
         }
+    }
+
+    /// Whether what is loaded is the 23.5.0 firmware, started the way
+    /// package1ldr starts it: the one whose run is modeled by what it
+    /// leaves instead of executed.
+    fn pinned(&self) -> bool {
+        self.bootvec == 0
+            && self.imem_loaded == FIRMWARE_SIZE
+            && hex(&Sha256::digest(&self.imem[..FIRMWARE_SIZE as usize])) == FIRMWARE_SHA256
+    }
+
+    /// Whether a pending, enabled interrupt line is routed to the
+    /// processor's vector 0 and vector 1 (`IRQDEST`: bit n sends line n to
+    /// the host, bit 16 + n picks the processor's second vector).
+    fn vectors(&self) -> [bool; 2] {
+        let active = self.irq_status & self.irq_mask & 0xFFFF;
+        let own = active & !self.irq_dest;
+        let second = self.irq_dest >> 16;
+        [own & !second != 0, own & second != 0]
+    }
+
+    /// The TLB entries that map virtual page `virt`.
+    fn mapped(&self, virt: u16) -> impl Iterator<Item = (usize, &Tlb)> {
+        self.tlb
+            .iter()
+            .enumerate()
+            .filter(move |(_, entry)| entry.flags != 0 && entry.virt == virt)
+    }
+}
+
+/// The engine as its processor sees it.
+struct CoreBus<'a> {
+    tsec: &'a Tsec,
+    s: &'a mut State,
+    /// The instruction read an IO register.
+    polled: bool,
+    /// It wrote data or an IO register.
+    wrote: bool,
+    /// The virtual page last fetched from, and its physical page.
+    page: Option<(u16, usize)>,
+}
+
+impl CoreBus<'_> {
+    /// The register an address of the processor's IO space names: the one
+    /// the host has at `0x1000 + (address >> 6)`. Bits 7:2 select among
+    /// copies of the same register, which none modeled here has more than
+    /// one of (envytools `io.rst`).
+    fn register(address: u32) -> Result<u64, String> {
+        if address & 3 != 0 || address >= 0x4_0000 {
+            return Err(format!("IO address {address:#x}"));
+        }
+        Ok(FALCON + u64::from(address >> 6 & !3))
+    }
+}
+
+impl falcon::Bus for CoreBus<'_> {
+    fn fetch(&mut self, address: u32) -> falcon::Fetch {
+        let virt = (address >> 8) as u16;
+        let offset = (address & 0xFF) as usize;
+        if let Some((cached, physical)) = self.page
+            && cached == virt
+        {
+            return falcon::Fetch::Byte(self.s.imem[physical * IMEM_BLOCK + offset]);
+        }
+        let mut found = self.s.mapped(virt);
+        let Some((physical, entry)) = found.next() else {
+            return falcon::Fetch::NoHit;
+        };
+        if found.next().is_some() {
+            return falcon::Fetch::MultiHit;
+        }
+        if entry.flags & TLB_USABLE != 0 {
+            self.page = Some((virt, physical));
+            falcon::Fetch::Byte(self.s.imem[physical * IMEM_BLOCK + offset])
+        } else if entry.flags & TLB_BUSY != 0 {
+            falcon::Fetch::Busy
+        } else {
+            falcon::Fetch::Secret
+        }
+    }
+
+    fn data(&self) -> &[u8] {
+        &self.s.dmem
+    }
+
+    fn store(&mut self, address: u32, bytes: &[u8]) {
+        let at = address as usize;
+        self.s.dmem[at..at + bytes.len()].copy_from_slice(bytes);
+        self.wrote = true;
+    }
+
+    fn io_read(&mut self, address: u32) -> Result<u32, String> {
+        self.polled = true;
+        let offset = Self::register(address)?;
+        self.tsec.read_locked(self.s, offset)
+    }
+
+    fn io_write(&mut self, address: u32, value: u32) -> Result<(), String> {
+        self.wrote = true;
+        self.page = None;
+        let offset = Self::register(address)?;
+        self.tsec.write_locked(self.s, offset, value, true)
+    }
+
+    fn tlb(&mut self, command: falcon::TlbCommand) -> u32 {
+        self.page = None;
+        match command {
+            falcon::TlbCommand::Invalidate(physical) => {
+                if let Some(entry) = self.s.tlb.get_mut(physical as usize)
+                    && entry.flags & TLB_SECRET == 0
+                {
+                    *entry = Tlb::default();
+                }
+                0
+            }
+            falcon::TlbCommand::Physical(physical) => {
+                self.s.tlb.get(physical as usize).map_or(0, |entry| {
+                    u32::from(entry.flags) << 24 | u32::from(entry.virt) << 8
+                })
+            }
+            falcon::TlbCommand::Virtual(address) => {
+                let (mut physical, mut flags, mut matches) = (0, 0, 0);
+                for (index, entry) in self.s.mapped((address >> 8) as u16) {
+                    physical = index as u32;
+                    flags |= u32::from(entry.flags);
+                    matches += 1;
+                }
+                physical
+                    | flags << 24
+                    | if matches == 0 { 1 << 31 } else { 0 }
+                    | if matches > 1 { 1 << 30 } else { 0 }
+            }
+        }
+    }
+
+    fn interrupts(&mut self) -> [bool; 2] {
+        self.s.vectors()
     }
 }
 
@@ -843,7 +1161,10 @@ impl Snapshot for Tsec {
 
     fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
         let state: State = decode("TSEC", state)?;
-        if state.imem.len() != MEMORY_SIZE || state.dmem.len() != MEMORY_SIZE {
+        if state.imem.len() != MEMORY_SIZE
+            || state.dmem.len() != MEMORY_SIZE
+            || state.tlb.len() != MEMORY_SIZE / IMEM_BLOCK
+        {
             return Err(SnapshotError::Corrupt(format!(
                 "TSEC: memories of {:#x}/{:#x} bytes saved, {MEMORY_SIZE:#x} expected",
                 state.imem.len(),
@@ -1038,7 +1359,8 @@ mod tests {
         assert_eq!(bench.read(DMEMD), Some(7));
         // Secure uploads, unknown registers and widths are refused.
         assert_eq!(bench.write(IMEMC, 1 << 28), None);
-        assert_eq!(bench.read(0x1108), None); // HWCFG
+        // HWCFG: 0x100 pages of code and of data.
+        assert_eq!(bench.read(0x1108), Some(0x100 | 0x100 << 9));
         assert_eq!(bench.read(0x0000), None); // THI
         assert_eq!(bench.tsec.read(0, MAILBOX0, 1), None);
         assert!(
@@ -1048,10 +1370,8 @@ mod tests {
                 .iter()
                 .all(|note| note.starts_with("TSEC: "))
         );
-        // A start with anything but the known firmware is refused, and so
-        // is any CPUCTL value but STARTCPU.
+        // Any CPUCTL value but STARTCPU is refused.
         assert_eq!(bench.write(CPUCTL, 3), None);
-        assert_eq!(bench.write(CPUCTL, CPUCTL_STARTCPU), None);
         assert_eq!(bench.read(CPUCTL), Some(0));
     }
 
@@ -1172,26 +1492,52 @@ mod tests {
         assert_eq!(other.read(IRQMASK), Some(0xFFF2));
     }
 
+    /// A firmware that is not the modeled one runs: it answers in a
+    /// mailbox, waits there for the host, and stops when told.
     #[test]
-    fn an_unknown_firmware_is_refused() {
-        let (bench, _, _) = bench_with_package1();
-        let mut byte = [0];
-        bench.soc.ahb_read(0x4001_1000, &mut byte).unwrap();
-        bench.soc.ahb_write(0x4001_1000, &[byte[0] ^ 1]).unwrap();
-        let ciphertext = bench.soc.iram(0x4001_7000, 0x20);
-        assert_eq!(bench.boot_like_package1ldr(), None);
-        let notes = bench.notes.take();
-        assert!(
-            notes
-                .iter()
-                .any(|note| note.contains("unknown TSEC firmware")),
-            "{notes:?}"
-        );
-        assert_eq!(bench.read(CPUCTL), Some(0));
-        assert_eq!(bench.read(MAILBOX1), Some(0));
-        assert_eq!(bench.soc.iram(0x4001_7000, 0x20), ciphertext);
+    fn another_firmware_runs_on_the_processor() {
+        let bench = Bench::new(&KeySet::default());
+        let program = [
+            0x49, 0x00, 0x11, // mov $r9 0x1100 (MAILBOX1)
+            0xCF, 0x98, 0x00, // iord $r8 I[$r9]
+            0x90, 0x88, 0x01, // add b32 $r8 $r8 1
+            0xF6, 0x98, 0x00, // iowr I[$r9] $r8
+            0x49, 0x00, 0x10, // mov $r9 0x1000 (MAILBOX0)
+            0xCF, 0x98, 0x00, // iord $r8 I[$r9]
+            0xB0, 0x86, 0x55, // cmp b32 $r8 0x55
+            0xF4, 0x1B, 0xFA, // bra ne -6
+            0xF8, 0x02, // exit
+        ];
+        let mut page = [0u8; IMEM_BLOCK];
+        page[..program.len()].copy_from_slice(&program);
+        // The page is uploaded at physical 0x200 and mapped at virtual 0.
+        bench.write(IMEMC, PORT_AINCW | 0x200).unwrap();
+        bench.write(IMEMT, 0).unwrap();
+        for word in page.as_chunks::<4>().0 {
+            bench.write(IMEMD, u32::from_le_bytes(*word)).unwrap();
+        }
+        bench.write(MAILBOX1, 0x10).unwrap();
+        bench.write(BOOTVEC, 0).unwrap();
+        bench.write(CPUCTL, CPUCTL_STARTCPU).unwrap();
+        assert_eq!(bench.read(MAILBOX1), Some(0x11));
+        assert_eq!(bench.read(CPUCTL), Some(0), "it waits for the host");
+        assert_eq!(bench.read(IDLESTATE), Some(1));
+        assert_eq!(bench.write(CPUCTL, CPUCTL_STARTCPU), None, "it is running");
+        bench.write(MAILBOX0, 0x55).unwrap();
+        assert_eq!(bench.read(CPUCTL), Some(CPUCTL_HALTED));
+        assert_eq!(bench.read(IRQSTAT).unwrap() & IRQ_HALT, IRQ_HALT);
+        // Started again, it runs again from the boot vector.
+        bench.write(CPUCTL, CPUCTL_STARTCPU).unwrap();
+        assert_eq!(bench.read(MAILBOX1), Some(0x12));
+        assert_eq!(bench.read(CPUCTL), Some(CPUCTL_HALTED));
+        // Nothing of the modeled firmware happened.
         assert!(bench.soc.keyslots.lock().unwrap().is_empty());
         assert_eq!(*bench.soc.restarted.lock().unwrap(), None);
+        // Where nothing is mapped the processor traps, with no handler
+        // twice, and stops.
+        bench.write(BOOTVEC, 0x4000).unwrap();
+        bench.write(CPUCTL, CPUCTL_STARTCPU).unwrap();
+        assert_eq!(bench.read(CPUCTL), Some(CPUCTL_HALTED));
     }
 
     #[test]

@@ -36,6 +36,11 @@
 //! Not modelled, and refused: any other offset, and running the
 //! controller (`USBCMD` bit 0, `RS`): recovery mode needs a host on the
 //! other end of the cable.
+//!
+//! A machine whose ROM is high-level emulated has the block as the ROM
+//! leaves it ([`Usb2::after_rom`]): a payload started in package1's place
+//! may go on from there (one seen changes `UTMIP_MISC_CFG0` by
+//! read-modify-write before anything else).
 
 use std::{collections::HashMap, sync::Mutex};
 
@@ -78,6 +83,37 @@ pub struct Usb2 {
 impl Usb2 {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The block as the boot ROM leaves it on a cold boot, for a machine
+    /// whose ROM is high-level emulated: the PHY configured and running,
+    /// the controller reset and in device mode, stopped.
+    ///
+    /// These are the registers this model holds after the ROM itself has
+    /// run on it from reset (a dump of the T210's ROM, its writes to the
+    /// block followed to the hand-off): they are what the ROM wrote last,
+    /// over this model's zero reset values, so the bits the ROM kept from
+    /// a register's reset value are zero here \[assumption, as for the
+    /// reset values\].
+    pub fn after_rom() -> Self {
+        /// `USBMODE`: device.
+        const USBMODE: u64 = 0x1F8;
+        let left = [
+            (USB_SUSP_CTRL, SUSP_UTMIP_PHY_ENB),
+            (0x404, 0x1800),
+            (0x810, 0x8_C000),
+            (0x814, 0x12),
+            (0x820, 0x8_0000),
+            (0x828, 0x4000_0000),
+            (0x82C, 0xBB80),
+            (0x834, 0xFFFF_FF80),
+            (0x83C, 0x7_8153),
+            (0x854, 0x400),
+            (USBMODE, 2),
+        ];
+        Self {
+            registers: Mutex::new(left.into_iter().collect()),
+        }
     }
 
     /// The block loses its settings with the SoC's power (SC7).
