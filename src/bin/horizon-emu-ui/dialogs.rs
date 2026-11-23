@@ -71,6 +71,9 @@ struct FormatEmmc {
     image: PathBuf,
     firmware: Firmware,
     prodinfo: Option<PathBuf>,
+    /// The keys of the console the PRODINFO is from, which may not be the
+    /// emulated console's.
+    download_keys: Option<PathBuf>,
     boot_images: bool,
     job: Option<Job>,
     error: Option<String>,
@@ -383,6 +386,11 @@ fn new_machine_form(app: &mut App, ui: &mut Ui, form: &mut NewMachine) -> Outcom
                         image: new_image(&machine.name, "emmc"),
                         firmware,
                         prodinfo: app.settings.prodinfo.clone(),
+                        download_keys: app
+                            .settings
+                            .prodinfo_keys
+                            .clone()
+                            .or_else(|| machine.keys.clone()),
                         boot_images: machine.start == Start::PowerOn,
                         job: None,
                         error: None,
@@ -555,6 +563,13 @@ fn validate(machine: &Machine) -> Option<String> {
         }
         _ => {}
     }
+    if let (Some(keys), false) = (
+        &machine.keys,
+        matches!(machine.start, Start::Snapshot { .. }),
+    ) && let Some(problem) = model::keys_problem(keys, machine.start == Start::PowerOn)
+    {
+        return Some(problem);
+    }
     let passphrase = machine.wifi_passphrase.len();
     if !machine.wifi_ssid.trim().is_empty() && passphrase != 0 && !(8..=63).contains(&passphrase) {
         return Some("A WPA2 passphrase has 8 to 63 characters.".into());
@@ -619,6 +634,15 @@ fn format_emmc(
                 return false;
             }
             Err(error) => {
+                // The job made these (they did not exist before it ran);
+                // half-made, they are of no use.
+                for path in [
+                    form.image.clone(),
+                    boot_image(&form.image, "boot0"),
+                    boot_image(&form.image, "boot1"),
+                ] {
+                    let _ = std::fs::remove_file(path);
+                }
                 form.error = Some(error);
                 form.job = None;
             }
@@ -663,15 +687,22 @@ fn format_emmc(
                 if form.firmware == Firmware::Download {
                     ui.horizontal(|ui| {
                         ui.add_space(26.0);
-                        ui.label(RichText::new("As the console whose PRODINFO and keys are given:").size(13.0).color(MUTED));
+                        ui.label(RichText::new("As the console whose decrypted PRODINFO and keys are given (its own TLS identity):").size(13.0).color(MUTED));
                     });
                     ui.horizontal(|ui| {
                         ui.add_space(26.0);
-                        theme::path_label(ui, form.prodinfo.as_deref(), "decrypted PRODINFO (CAL0)");
+                        theme::path_label(ui, form.prodinfo.as_deref(), "PRODINFO (CAL0)");
                         if theme::small_button(ui, "Choose…").clicked()
                             && let Some(path) = tabs::pick_file(form.prodinfo.as_deref())
                         {
                             form.prodinfo = Some(path);
+                        }
+                        ui.add_space(12.0);
+                        theme::path_label(ui, form.download_keys.as_deref(), "its keys");
+                        if theme::small_button(ui, "Choose…").clicked()
+                            && let Some(path) = tabs::pick_file(form.download_keys.as_deref())
+                        {
+                            form.download_keys = Some(path);
                         }
                     });
                 }
@@ -741,6 +772,9 @@ fn emmc_job(
     machine: &Machine,
 ) -> Result<Job, String> {
     let keys = machine.keys.clone().ok_or("Choose the keys first.")?;
+    if let Some(problem) = model::keys_problem(&keys, form.boot_images) {
+        return Err(problem);
+    }
     if form.image.exists() {
         return Err(format!(
             "{} exists already; choose a new file.",
@@ -769,7 +803,12 @@ fn emmc_job(
                 .prodinfo
                 .clone()
                 .ok_or("Choose the console's PRODINFO to download with.")?;
+            let download_keys = form
+                .download_keys
+                .clone()
+                .ok_or("Choose the keys of the console the PRODINFO is from.")?;
             app.settings.prodinfo = Some(prodinfo.clone());
+            app.settings.prodinfo_keys = Some(download_keys.clone());
             let download = model::firmware_dir().join("download");
             steps.push((
                 emulator.clone(),
@@ -777,7 +816,7 @@ fn emmc_job(
                     "download-firmware".into(),
                     text(&download),
                     "--keys".into(),
-                    text(&keys),
+                    text(&download_keys),
                     "--prodinfo".into(),
                     text(&prodinfo),
                 ],
@@ -859,6 +898,7 @@ fn format_sd(ctx: &egui::Context, form: &mut FormatSd, machine: &mut Machine) ->
                 return false;
             }
             Err(error) => {
+                let _ = std::fs::remove_file(&form.image);
                 form.error = Some(error);
                 form.job = None;
             }

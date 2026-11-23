@@ -596,8 +596,86 @@ impl Stored {
 pub struct Settings {
     pub keys: Option<PathBuf>,
     /// The decrypted calibration data of the console whose identity
-    /// downloads firmware from Nintendo.
+    /// downloads firmware from Nintendo, and that console's keys.
     pub prodinfo: Option<PathBuf>,
+    pub prodinfo_keys: Option<PathBuf>,
+}
+
+/// The entries of the key file at `path` that the emulated console needs
+/// and the file lacks: those that make its eMMC image (storage, content
+/// archive header, key area, save MAC and TLS key wrapping keys, and their
+/// sources) and, with `power_on`, the secure boot key the boot ROM's
+/// emulation needs. Empty when nothing is missing.
+pub fn missing_keys(path: &Path, power_on: bool) -> Result<Vec<&'static str>, String> {
+    let keys = horizon_emu::keys::KeySet::load(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut missing = Vec::new();
+    let mut need = |present: bool, name: &'static str| {
+        if !present {
+            missing.push(name);
+        }
+    };
+    need(keys.device_key().is_some(), "device_key");
+    need(keys.master_key(0).is_some(), "master_key_00");
+    need(
+        keys.aes_kek_generation_source().is_some(),
+        "aes_kek_generation_source",
+    );
+    need(
+        keys.aes_key_generation_source().is_some(),
+        "aes_key_generation_source",
+    );
+    need(
+        keys.retail_specific_aes_key_source().is_some(),
+        "retail_specific_aes_key_source",
+    );
+    need(keys.bis_kek_source().is_some(), "bis_kek_source");
+    for (index, name) in [
+        "bis_key_source_00",
+        "bis_key_source_01",
+        "bis_key_source_02",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        need(keys.bis_key_source(index).is_some(), name);
+    }
+    need(keys.header_kek_source().is_some(), "header_kek_source");
+    need(keys.header_key_source().is_some(), "header_key_source");
+    need(
+        keys.key_area_key_source(2).is_some(),
+        "key_area_key_system_source",
+    );
+    need(keys.save_mac_kek_source().is_some(), "save_mac_kek_source");
+    need(
+        keys.save_mac_key_source().is_some(),
+        "save_mac_key_source_00",
+    );
+    need(
+        keys.ssl_rsa_kekek_source().is_some(),
+        "ssl_rsa_kekek_source",
+    );
+    need(keys.ssl_rsa_kek_source().is_some(), "ssl_rsa_kek_source");
+    if power_on {
+        need(keys.secure_boot_key().is_some(), "secure_boot_key");
+    }
+    Ok(missing)
+}
+
+/// Why the key file at `path` cannot be the emulated console's, if it
+/// cannot.
+pub fn keys_problem(path: &Path, power_on: bool) -> Option<String> {
+    match missing_keys(path, power_on) {
+        Err(error) => Some(error),
+        Ok(missing) if missing.is_empty() => None,
+        Ok(missing) => Some(format!(
+            "{} lacks {}. The emulated console needs a complete key dump of an original \
+             console (Lockpick_RCM's prod.keys with device_key and secure_boot_key); a \
+             partial one cannot make or start its eMMC.",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            missing.join(", ")
+        )),
+    }
 }
 
 impl Settings {

@@ -46,6 +46,9 @@ const SAVE_MAC_KEK_SOURCE: &str = "save_mac_kek_source";
 /// A key file holds two; this one keys the CMAC of the system saves the
 /// filesystem process wrote itself, the other does not.
 const SAVE_MAC_KEY_SOURCE: &str = "save_mac_key_source_00";
+/// The same value under the name key files gave it before there were two
+/// (seen to be equal to `save_mac_key_source_00` in two key files).
+const SAVE_MAC_KEY_SOURCE_UNNUMBERED: &str = "save_mac_key_source";
 /// The monitor's source of the title key's ES common key: decrypted with a
 /// master key it gives that generation's `titlekek`.
 const TITLEKEK_SOURCE: &str = "titlekek_source";
@@ -206,7 +209,7 @@ impl KeySet {
                 keys.key_area_key_sources[index] = Some(key()?);
             } else if name == SAVE_MAC_KEK_SOURCE {
                 keys.save_mac_kek_source = Some(key()?);
-            } else if name == SAVE_MAC_KEY_SOURCE {
+            } else if name == SAVE_MAC_KEY_SOURCE || name == SAVE_MAC_KEY_SOURCE_UNNUMBERED {
                 keys.save_mac_key_source = Some(key()?);
             } else if name == TITLEKEK_SOURCE {
                 keys.titlekek_source = Some(key()?);

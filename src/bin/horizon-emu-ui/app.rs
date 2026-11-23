@@ -221,6 +221,15 @@ impl App {
             self.toast(error, true);
             return;
         }
+        let machine = self.entries[index].machine();
+        let cold = snapshot.is_none() && !matches!(machine.start, Start::Snapshot { .. });
+        if cold
+            && let Some(keys) = &machine.keys
+            && let Some(problem) = crate::model::keys_problem(keys, machine.start == Start::PowerOn)
+        {
+            self.toast(problem, true);
+            return;
+        }
         let entry = &mut self.entries[index];
         let socket = std::env::temp_dir().join(format!(
             "hemu-{}-{}.sock",
