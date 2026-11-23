@@ -409,7 +409,7 @@ pub enum NandError {
     /// The image does not start with the table of [`format_user_area`].
     NotPartitioned,
     Key(MissingKey),
-    /// The TLS client key cannot be wrapped: what is missing.
+    /// The TLS client key cannot be wrapped or unwrapped: why.
     SslKey(&'static str),
     /// The calibration partition does not hold what was expected.
     Calibration(&'static str),
@@ -446,7 +446,7 @@ impl fmt::Display for NandError {
             Self::Image(error) => write!(f, "cannot read the image: {error}"),
             Self::NotPartitioned => write!(f, "the image is not a partitioned user area"),
             Self::Key(missing) => write!(f, "cannot derive the storage keys: {missing}"),
-            Self::SslKey(what) => write!(f, "cannot wrap the TLS client key: {what}"),
+            Self::SslKey(what) => write!(f, "TLS client key: {what}"),
             Self::Calibration(what) => write!(f, "{what}"),
             Self::NoSuchVolume(name) => write!(f, "no partition {name} with a filesystem"),
             Self::Filesystem { partition, error } => write!(f, "{partition}: {error}"),

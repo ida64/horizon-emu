@@ -16,9 +16,10 @@
 //! * [`soc`] holds the rest of the system-on-chip and the board devices
 //!   the initial processes drive; [`keys`] loads the console keys the
 //!   secure monitor derives from; [`nand`] makes the eMMC image of a
-//!   console that has the firmware installed, and [`sdcard`] the image of
-//!   a microSD card with files on it; [`homebrew`] runs programs Nintendo
-//!   did not sign on it.
+//!   console that has the firmware installed, [`cdn`] fetches that
+//!   firmware from Nintendo as the console it is for, and [`sdcard`] makes
+//!   the image of a microSD card with files on it; [`homebrew`] runs
+//!   programs Nintendo did not sign on it.
 //! * [`machine`] ties these into a console and executes it.
 //! * [`symbols`] and [`svc`] name things for traces, [`ipc`] decodes the
 //!   messages processes send each other, and [`log_manager`] the log
@@ -33,6 +34,7 @@ pub mod boot;
 pub mod bootrom;
 pub mod bpmp;
 pub mod bus;
+pub mod cdn;
 pub mod clock;
 pub mod falcon;
 pub mod gic;

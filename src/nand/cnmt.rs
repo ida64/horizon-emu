@@ -29,6 +29,7 @@ const CONTENT_META_INFO_SIZE: usize = 0x10;
 
 pub const CONTENT_TYPE_META: u8 = 0;
 pub const CONTENT_TYPE_DELTA_FRAGMENT: u8 = 6;
+pub const META_TYPE_SYSTEM_UPDATE: u8 = 3;
 pub const META_TYPE_PATCH: u8 = 0x81;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +89,28 @@ impl ContentInfo {
         bytes[23] = self.id_offset;
         bytes
     }
+
+    pub fn from_bytes(bytes: &[u8; CONTENT_INFO_SIZE]) -> Self {
+        let mut size = [0; 8];
+        size[..5].copy_from_slice(&bytes[16..21]);
+        Self {
+            id: bytes[..16].try_into().unwrap(),
+            size: u64::from_le_bytes(size),
+            attributes: bytes[21],
+            content_type: bytes[22],
+            id_offset: bytes[23],
+        }
+    }
+}
+
+/// A title a content meta names, as a system update names the titles it
+/// is made of: ID, version, meta type, attributes, two bytes of padding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentMetaInfo {
+    pub id: u64,
+    pub version: u32,
+    pub meta_type: u8,
+    pub attributes: u8,
 }
 
 /// A packaged content meta, bounds-checked.
@@ -155,6 +178,33 @@ impl<'a> PackagedContentMeta<'a> {
             .map(|info| &info[PACKAGED_CONTENT_INFO_SIZE - CONTENT_INFO_SIZE..])
     }
 
+    /// The content infos with the SHA-256 of each content, in their order.
+    pub fn packaged_contents(&self) -> impl Iterator<Item = ([u8; 32], ContentInfo)> + 'a {
+        let start = self.content_infos_start();
+        self.bytes[start..self.content_meta_infos_start()]
+            .as_chunks::<PACKAGED_CONTENT_INFO_SIZE>()
+            .0
+            .iter()
+            .map(|info| {
+                let (hash, info) = info.split_first_chunk::<32>().unwrap();
+                (*hash, ContentInfo::from_bytes(info.try_into().unwrap()))
+            })
+    }
+
+    /// The titles this content meta names, in their order.
+    pub fn content_meta_infos(&self) -> impl Iterator<Item = ContentMetaInfo> + 'a {
+        self.bytes[self.content_meta_infos_start()..self.content_meta_infos_end()]
+            .as_chunks::<CONTENT_META_INFO_SIZE>()
+            .0
+            .iter()
+            .map(|info| ContentMetaInfo {
+                id: u64::from_le_bytes(info[..8].try_into().unwrap()),
+                version: u32::from_le_bytes(info[8..12].try_into().unwrap()),
+                meta_type: info[12],
+                attributes: info[13],
+            })
+    }
+
     /// The database value of this content meta, `meta` being the content
     /// info of the NCA it came in.
     pub fn database_value(&self, meta: &ContentInfo) -> Vec<u8> {
@@ -209,6 +259,21 @@ mod tests {
             key.to_bytes().to_vec(),
             hex("0800000000000001b004005c01000000")
         );
+        let program_id: [u8; 16] = hex("9d7556bb740ee7a90e972a8416e25f10").try_into().unwrap();
+        let contents: Vec<_> = meta.packaged_contents().collect();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].0[..16], program_id);
+        assert_eq!(
+            contents[0].1,
+            ContentInfo {
+                id: program_id,
+                size: 0x1A600,
+                attributes: 0,
+                content_type: 1,
+                id_offset: 0,
+            }
+        );
+        assert_eq!(meta.content_meta_infos().count(), 0);
         let meta_info = ContentInfo {
             id: hex("38ac7257e3e822af9d4eb6f22d778826").try_into().unwrap(),
             size: 0xE00,

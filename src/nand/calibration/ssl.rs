@@ -65,14 +65,15 @@
 
 use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
 use rsa::{
-    BigUint, Pkcs1v15Sign, RsaPrivateKey,
+    BigUint, Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey,
+    pkcs8::DecodePublicKey,
     traits::{PrivateKeyParts, PublicKeyParts},
 };
 use sha2::{Digest, Sha256};
 
 use super::super::NandError;
 use crate::{
-    keys::KeySet,
+    keys::{Key, KeySet},
     secmon::crypto::{self, CryptoError, SEAL_DECRYPT_DEVICE_UNIQUE_DATA},
 };
 
@@ -170,30 +171,14 @@ impl SslIdentity {
     /// `keys` its key set: the private exponent wrapped as the monitor
     /// unwraps it for `ssl`, then the key generation.
     pub fn wrapped_key(&self, keys: &KeySet, device_id: u64) -> Result<[u8; KEY_SIZE], NandError> {
-        let source = |source: Option<_>, name| source.ok_or(NandError::SslKey(name));
-        let kek_source = source(
-            keys.ssl_rsa_kekek_source(),
-            "ssl_rsa_kekek_source is not in the key file",
-        )?;
-        let key_source = source(
-            keys.ssl_rsa_kek_source(),
-            "ssl_rsa_kek_source is not in the key file",
-        )?;
-        let key = crypto::device_unique_data_key(
-            keys,
-            kek_source,
-            key_source,
-            KEY_GENERATION.into(),
-            crypto::kek_option(SEAL_DECRYPT_DEVICE_UNIQUE_DATA),
-        )
-        .map_err(|error| match error {
-            CryptoError::Unimplemented(what) => NandError::SslKey(what),
-            CryptoError::InvalidArgument => unreachable!("the option is a valid one"),
-        })?;
         // A factory draws the IV at random; this one follows from the seed.
         let iv = derive(&self.seed, b"iv");
-        let wrapped =
-            crypto::seal_device_unique_data(&key, &iv, &self.private_exponent(), device_id);
+        let wrapped = crypto::seal_device_unique_data(
+            &wrapping_key(keys)?,
+            &iv,
+            &self.private_exponent(),
+            device_id,
+        );
         let mut data = [0; KEY_SIZE];
         data[..WRAPPED_SIZE].copy_from_slice(&wrapped);
         data[WRAPPED_SIZE..].copy_from_slice(&KEY_GENERATION.to_le_bytes());
@@ -204,6 +189,126 @@ impl SslIdentity {
     fn private_exponent(&self) -> [u8; MODULUS_SIZE] {
         unsigned(self.key.d())
     }
+}
+
+/// The key the key data of key generation 0 is wrapped with on the console
+/// `keys` describes: what `spl` has the monitor open it with for `ssl`.
+fn wrapping_key(keys: &KeySet) -> Result<Key, NandError> {
+    let source = |source: Option<_>, name| source.ok_or(NandError::SslKey(name));
+    let kek_source = source(
+        keys.ssl_rsa_kekek_source(),
+        "ssl_rsa_kekek_source is not in the key file",
+    )?;
+    let key_source = source(
+        keys.ssl_rsa_kek_source(),
+        "ssl_rsa_kek_source is not in the key file",
+    )?;
+    crypto::device_unique_data_key(
+        keys,
+        kek_source,
+        key_source,
+        KEY_GENERATION.into(),
+        crypto::kek_option(SEAL_DECRYPT_DEVICE_UNIQUE_DATA),
+    )
+    .map_err(|error| match error {
+        CryptoError::Unimplemented(what) => NandError::SslKey(what),
+        CryptoError::InvalidArgument => unreachable!("the option is a valid one"),
+    })
+}
+
+/// The private exponent in `data`, the key data of command 16 of the
+/// console `device_id` names, `keys` being its key set: what `ssl` gets
+/// back from `DecryptDeviceUniqueData` at boot. The inverse of
+/// [`SslIdentity::wrapped_key`].
+///
+/// Only key generation 0, the format `ssl` decrypts itself: a later one
+/// is opened by the monitor under a device key of that generation, which
+/// [`crypto`] does not derive.
+pub fn unwrap_key(
+    keys: &KeySet,
+    device_id: u64,
+    data: &[u8; KEY_SIZE],
+) -> Result<[u8; MODULUS_SIZE], NandError> {
+    let (wrapped, generation) = data.split_at(WRAPPED_SIZE);
+    if generation != KEY_GENERATION.to_le_bytes() {
+        return Err(NandError::SslKey(
+            "it is of a key generation after the first, which the monitor opens \
+             with a later device key this emulator does not derive",
+        ));
+    }
+    let mut wrapped = wrapped.to_vec();
+    crypto::open_device_unique_data(&wrapping_key(keys)?, &mut wrapped, device_id).ok_or(
+        NandError::SslKey("it does not open with these keys for this console"),
+    )?;
+    Ok(wrapped[..MODULUS_SIZE].try_into().expect("the payload"))
+}
+
+/// The private key whose public half `certificate` (DER) carries and whose
+/// private exponent is `exponent`, big-endian: the key data has no modulus,
+/// and `ssl` takes it and the public exponent from the certificate
+/// (`0x14d8e4`). The primes follow from the three; an exponent that does
+/// not belong to the certificate's key yields none.
+pub fn private_key(
+    certificate: &[u8],
+    exponent: &[u8; MODULUS_SIZE],
+) -> Result<RsaPrivateKey, NandError> {
+    let public = subject_public_key_info(certificate)
+        .and_then(|info| RsaPublicKey::from_public_key_der(info).ok())
+        .ok_or(NandError::SslKey(
+            "the certificate is not a DER X.509 certificate with an RSA key",
+        ))?;
+    RsaPrivateKey::from_components(
+        public.n().clone(),
+        public.e().clone(),
+        BigUint::from_bytes_be(exponent),
+        Vec::new(),
+    )
+    .ok()
+    .filter(|key| key.validate().is_ok())
+    .ok_or(NandError::SslKey(
+        "its private exponent does not match the certificate",
+    ))
+}
+
+/// One DER element off the front of `data`: its tag, the whole element,
+/// its content, and what follows it.
+fn der_element(data: &[u8]) -> Option<(u8, &[u8], &[u8], &[u8])> {
+    let (&tag, rest) = data.split_first()?;
+    let (&first, rest) = rest.split_first()?;
+    let (len, rest) = if first < 0x80 {
+        (usize::from(first), rest)
+    } else {
+        let count = usize::from(first & 0x7F);
+        if count > size_of::<usize>() {
+            return None;
+        }
+        let (digits, rest) = rest.split_at_checked(count)?;
+        let len = digits
+            .iter()
+            .fold(0, |len, &digit| len << 8 | usize::from(digit));
+        (len, rest)
+    };
+    let (content, after) = rest.split_at_checked(len)?;
+    let whole = &data[..data.len() - after.len()];
+    Some((tag, whole, content, after))
+}
+
+/// The `SubjectPublicKeyInfo` element of an X.509 certificate (RFC 5280,
+/// section 4.1): the seventh field of the `TBSCertificate`, or the sixth
+/// when the version, `[0]`, is left out.
+fn subject_public_key_info(certificate: &[u8]) -> Option<&[u8]> {
+    let (_, _, certificate, _) = der_element(certificate)?;
+    let (_, _, mut fields, _) = der_element(certificate)?;
+    let (tag, _, _, rest) = der_element(fields)?;
+    if tag == 0xA0 {
+        fields = rest;
+    }
+    // Serial number, signature algorithm, issuer, validity, subject.
+    for _ in 0..5 {
+        fields = der_element(fields)?.3;
+    }
+    let (tag, info, _, _) = der_element(fields)?;
+    (tag == 0x30).then_some(info)
 }
 
 /// Sixteen bytes for `purpose` that follow from `seed`.

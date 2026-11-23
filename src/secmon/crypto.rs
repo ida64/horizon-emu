@@ -347,10 +347,11 @@ pub fn seal_device_unique_data(key: &Key, iv: &Key, payload: &[u8], device_id: u
 
 /// The monitor's side of [`seal_device_unique_data`]: decrypts `data` in
 /// place, the plain bytes (payload, padding, device ID) from its start and
-/// the rest as it was, and checks the GMAC and that the device ID is
-/// `device_id`. The stored ID's top byte, or `None`, with `data` partly
-/// decrypted, when either check fails.
-fn open_device_unique_data(key: &Key, data: &mut [u8], device_id: u64) -> Option<u8> {
+/// the rest as it was, and checks the GMAC and that the low 56 bits of the
+/// device ID are those of `device_id`, which may carry a top byte (the ID
+/// a console's certificates name does). The stored ID's top byte, or
+/// `None`, with `data` partly decrypted, when either check fails.
+pub fn open_device_unique_data(key: &Key, data: &mut [u8], device_id: u64) -> Option<u8> {
     let iv: Key = data[..IV_SIZE].try_into().expect("an IV");
     let encrypted = data.len() - IV_SIZE - MAC_SIZE;
     let mac: [u8; MAC_SIZE] = data[IV_SIZE + encrypted..].try_into().expect("a MAC");
@@ -358,7 +359,7 @@ fn open_device_unique_data(key: &Key, data: &mut [u8], device_id: u64) -> Option
     let plain = &mut data[..encrypted];
     ctr(key, &iv, plain);
     let stored_id = u64::from_be_bytes(plain[encrypted - DEVICE_ID_SIZE..].try_into().unwrap());
-    (gmac(key, &iv, plain) == mac && stored_id & DEVICE_ID_LOW == device_id)
+    (gmac(key, &iv, plain) == mac && stored_id & DEVICE_ID_LOW == device_id & DEVICE_ID_LOW)
         .then_some((stored_id >> 56) as u8)
 }
 

@@ -79,6 +79,8 @@ mod ssl;
 
 use std::{fs::File, ops::Range, os::unix::fs::FileExt};
 
+use rsa::RsaPrivateKey;
+
 pub use self::ssl::SslIdentity;
 use super::{NandError, bis, crypto::sha256, partition_range, storage_keys};
 use crate::keys::KeySet;
@@ -583,6 +585,70 @@ fn device_id(data: &[u8]) -> Option<u64> {
     u64::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
 }
 
+/// A console's TLS client identity as its calibration data holds it,
+/// unwrapped: what `ssl` presents for `nim` and the other clients of
+/// Nintendo's servers.
+pub struct ClientIdentity {
+    pub device_id: u64,
+    /// DER.
+    pub certificate: Vec<u8>,
+    pub key: RsaPrivateKey,
+}
+
+/// The TLS client identity in `data`, the decrypted calibration data of
+/// the console `keys` describes, read as `settings` serves it (commands 16
+/// and 17, see [`ssl`]) and unwrapped as `ssl` unwraps it: each block has
+/// to pass its check, and the key has to open for the device ID the
+/// eticket certificate names and belong to the certificate.
+pub fn client_identity(data: &[u8], keys: &KeySet) -> Result<ClientIdentity, NandError> {
+    if data.len() < SIZE || data[..4] != MAGIC {
+        return Err(NandError::Calibration(
+            "not decrypted calibration data: no CAL0 magic",
+        ));
+    }
+    let crc_ok =
+        |block: Block| crc16(&data[block.data()]).to_le_bytes() == data[block.crc_offset()..][..2];
+    let device_id = device_id(data).ok_or(NandError::Calibration(
+        "the eticket certificate in PRODINFO names no device ID",
+    ))?;
+    if !crc_ok(EXTENDED_SSL_KEY) {
+        return Err(NandError::Calibration(
+            "the extended SSL key in PRODINFO fails its CRC",
+        ));
+    }
+    let mut key: [u8; ssl::KEY_SIZE] = data[EXTENDED_SSL_KEY.offset..][..ssl::KEY_SIZE]
+        .try_into()
+        .expect("the key data");
+    // As `settings` answers it: no key generation up to version 8.
+    if u32::from_le_bytes(data[4..8].try_into().unwrap()) <= 8 {
+        key[ssl::KEY_SIZE - 4..].fill(0);
+    }
+    if !crc_ok(SSL_CERTIFICATE_SIZE) {
+        return Err(NandError::Calibration(
+            "the SSL certificate size in PRODINFO fails its CRC",
+        ));
+    }
+    let size = u64::from_le_bytes(data[SSL_CERTIFICATE_SIZE.offset..][..8].try_into().unwrap());
+    let certificate = usize::try_from(size)
+        .ok()
+        .filter(|&size| size <= SSL_CERTIFICATE.capacity)
+        .map(|size| &data[SSL_CERTIFICATE.offset..][..size])
+        .ok_or(NandError::Calibration(
+            "the SSL certificate in PRODINFO is larger than its field",
+        ))?;
+    if sha256(certificate)[..] != data[SSL_CERTIFICATE.offset + SSL_CERTIFICATE.capacity..][..32] {
+        return Err(NandError::Calibration(
+            "the SSL certificate in PRODINFO fails its hash",
+        ));
+    }
+    let exponent = ssl::unwrap_key(keys, device_id, &key)?;
+    Ok(ClientIdentity {
+        device_id,
+        key: ssl::private_key(certificate, &exponent)?,
+        certificate: certificate.to_vec(),
+    })
+}
+
 /// The calibration data of a console with `identity`, whose TLS client
 /// identity is `ssl_key` and `ssl_certificate` ([`SslIdentity`]).
 pub fn build(
@@ -960,6 +1026,40 @@ mod tests {
                 .all(|&byte| byte == 0)
         );
         assert_eq!(certificate[0], 0x30, "DER");
+    }
+
+    #[test]
+    fn the_tls_identity_reads_back_as_its_key_for_its_console_only() {
+        use rsa::traits::{PrivateKeyParts, PublicKeyParts};
+        let keys = KeySet::parse(&ssl::tests::key_file()).unwrap();
+        let ssl = ssl::tests::identity();
+        let identity = Identity {
+            device_id: ssl::tests::DEVICE_ID,
+            ..Identity::VIRTUAL_CONSOLE
+        };
+        let data = built(&identity);
+        let read = client_identity(&data, &keys).unwrap();
+        assert_eq!(read.device_id, ssl::tests::DEVICE_ID);
+        assert_eq!(read.certificate, ssl.certificate());
+        assert_eq!(read.key.n(), ssl.key().n());
+        assert_eq!(read.key.d(), ssl.key().d());
+
+        // Wrapped for this console, the key does not open for another.
+        let other = built(&Identity {
+            device_id: ssl::tests::DEVICE_ID ^ 1,
+            ..Identity::VIRTUAL_CONSOLE
+        });
+        assert!(matches!(
+            client_identity(&other, &keys),
+            Err(NandError::SslKey(_))
+        ));
+        // Nor does encrypted calibration data read as calibration data.
+        let mut encrypted = data.clone();
+        encrypted[..4].fill(0);
+        assert!(matches!(
+            client_identity(&encrypted, &keys),
+            Err(NandError::Calibration(_))
+        ));
     }
 
     #[test]

@@ -7,6 +7,7 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::{self, Write},
+    num::NonZeroUsize,
     panic,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -24,7 +25,7 @@ use horizon_emu::{
         exception_class::{DATA_ABORT_LOWER, INSTRUCTION_ABORT_LOWER},
     },
     boot::{BootParams, DramSize},
-    bootrom,
+    bootrom, cdn,
     image::KernelImage,
     ipc::{self, Client, ResultCode, Tracker},
     keys::KeySet,
@@ -61,6 +62,8 @@ usage: horizon-emu info <kernel.elf>
                    --boot0 FILE --boot1 FILE
        horizon-emu patch-prodinfo <image file> --keys FILE [--wlan-mac MAC]
        horizon-emu format-sd <new image file> --size SIZE [--add HOST=CARD ...]
+       horizon-emu download-firmware <dir> --keys FILE --prodinfo FILE
+                   [--version VERSION] [--jobs N]
 
 <kernel.elf> is the package2 kernel wrapped as an ELF (see pkg2elf.py).
 boot runs until a core needs something that is not emulated, the kernel
@@ -113,6 +116,19 @@ G for binary multiples; a multiple of 512K above 2088M and up to 32G),
 formatted as the console formats a card, with each --add's host file HOST
 at the absolute path CARD (/hbmenu.nro, /switch/foo.nro), directories
 created as needed.
+
+download-firmware fetches a system update from Nintendo's servers into
+<dir> (made if missing) as the console whose keys (--keys) and decrypted
+calibration data (--prodinfo, the PRODINFO partition, starting CAL0) are
+given: with its own TLS client certificate and key, unwrapped from the
+calibration data with the keys, as its nim does. VERSION is the newest
+update the servers offer the console unless given, as MAJOR.MINOR.MICRO.
+RELSTEP (23.5.0.640) or a title version (0x5c500280). Every title's meta
+content lands as <id>.cnmt.nca and every other content as <id>.nca, each
+checked against its content ID or record first: the directory
+format-emmc --firmware takes. Contents already there complete are kept,
+so an interrupted run can be repeated; N contents are fetched at a time
+(default 4).
 
 restore builds the machine a snapshot was taken of (see the control
 socket's save_state) and goes on from where it was: the same kernel, keys,
@@ -396,6 +412,9 @@ fn run(arguments: &[String]) -> Result<(), String> {
     }
     if command == "patch-prodinfo" {
         return patch_prodinfo(path, flags).map_err(|error| format!("{path}: {error}"));
+    }
+    if command == "download-firmware" {
+        return download_firmware(path, flags).map_err(|error| format!("{path}: {error}"));
     }
     if command == "restore" {
         return restore(Path::new(path), flags);
@@ -791,6 +810,67 @@ fn patch_prodinfo(path: &str, flags: &[String]) -> Result<(), String> {
     let device_id = nand::calibration::install_ssl_identity(&image, &keys)
         .map_err(|error| error.to_string())?;
     println!("console {device_id:016X}: made-up TLS client identity installed");
+    Ok(())
+}
+
+fn download_firmware(dir: &str, flags: &[String]) -> Result<(), String> {
+    const DEFAULT_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+    let (mut keys, mut prodinfo, mut version, mut jobs) = (None, None, None, DEFAULT_JOBS);
+    let mut flags = flags.iter();
+    while let Some(flag) = flags.next() {
+        let value = flags.next().ok_or_else(usage)?;
+        match flag.as_str() {
+            "--keys" => keys = Some(value),
+            "--prodinfo" => prodinfo = Some(value),
+            "--version" => {
+                version = Some(cdn::parse_version(value).ok_or_else(|| {
+                    format!("--version {value}: expected MAJOR.MINOR.MICRO.RELSTEP or a number")
+                })?)
+            }
+            "--jobs" => {
+                jobs = value
+                    .parse()
+                    .map_err(|_| format!("--jobs {value}: expected a positive number"))?
+            }
+            _ => return Err(usage()),
+        }
+    }
+    let (Some(keys), Some(prodinfo)) = (keys, prodinfo) else {
+        return Err("download-firmware needs --keys and --prodinfo".into());
+    };
+    let keys = KeySet::load(Path::new(keys)).map_err(|error| error.to_string())?;
+    let calibration = std::fs::read(prodinfo).map_err(|error| format!("{prodinfo}: {error}"))?;
+    let identity = nand::calibration::client_identity(&calibration, &keys)
+        .map_err(|error| format!("{prodinfo}: {error}"))?;
+    let client = cdn::Client::new(&identity).map_err(|error| error.to_string())?;
+    let version = match version {
+        Some(version) => version,
+        None => client
+            .latest_system_update()
+            .map_err(|error| error.to_string())?,
+    };
+    println!(
+        "console {:016X}: system update {} ({version:#x})",
+        identity.device_id,
+        cdn::version_string(version)
+    );
+    let progress = |progress| match progress {
+        cdn::Progress::Title { id, version } => println!("title {id:016x} version {version}"),
+        cdn::Progress::Content { id, size, fetched } => println!(
+            "content {} {size} bytes{}",
+            id.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            if fetched { "" } else { ", already there" }
+        ),
+    };
+    let downloaded = client
+        .download_system_update(&keys, version, Path::new(dir), jobs, &progress)
+        .map_err(|error| error.to_string())?;
+    println!(
+        "{} titles, {} contents: {} bytes fetched, {} bytes already there",
+        downloaded.titles, downloaded.contents, downloaded.fetched_bytes, downloaded.present_bytes
+    );
     Ok(())
 }
 
