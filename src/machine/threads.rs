@@ -3,9 +3,10 @@
 //! supervisor call it is in and, where that call waits for something
 //! another thread provides, who provides it (the server of a session, the
 //! owner of a lock, the holders of an event's writable side); and, while
-//! it runs, whether the boot's program launcher is still a process. Nothing
-//! is watched in the guest, so a stalled boot looked at this way stalls
-//! with the timing it has without the looking.
+//! it runs, whether the boot's program launcher is still a process, and
+//! the address spaces of a program's processes. Nothing is watched in the
+//! guest, so a stalled boot looked at this way stalls with the timing it has
+//! without the looking.
 //!
 //! The layout is that of kernel 23.5.0 (`kernel_normal.elf`); every offset
 //! below names the code it is read off, by image address.
@@ -236,6 +237,24 @@ impl Kernel<'_> {
             .then(|| self.u16(object + layout::CLASS_TOKEN))
             .flatten()
     }
+
+    /// The live process objects of the kernel slid by `slide`: `None` while
+    /// its process slab cannot be read (before the kernel has set it up, or
+    /// not kernel 23.5.0).
+    fn processes(&self, slide: u64) -> Option<impl Iterator<Item = u64> + '_> {
+        let slab = layout::PROCESS_SLAB.wrapping_add(slide);
+        let size = self.u64(slab + layout::SLAB_OBJECT_SIZE)?;
+        let begin = self.u64(slab + layout::SLAB_BEGIN)?;
+        let end = self.u64(slab + layout::SLAB_END)?;
+        if size == 0 || end <= begin || (end - begin) / size > 0x10000 {
+            return None;
+        }
+        Some(
+            (begin..end)
+                .step_by(size as usize)
+                .filter(|&process| self.token(process) == Some(layout::PROCESS_TOKEN)),
+        )
+    }
 }
 
 /// The open handles of each process, by the object they stand for.
@@ -326,18 +345,39 @@ impl Machine {
             machine: self,
             regime,
         };
-        let slab = layout::PROCESS_SLAB.wrapping_add(slide);
-        let size = kernel.u64(slab + layout::SLAB_OBJECT_SIZE)?;
-        let begin = kernel.u64(slab + layout::SLAB_BEGIN)?;
-        let end = kernel.u64(slab + layout::SLAB_END)?;
-        if size == 0 || end <= begin || (end - begin) / size > 0x10000 {
-            return None;
-        }
-        Some((begin..end).step_by(size as usize).any(|process| {
-            kernel.token(process) == Some(layout::PROCESS_TOKEN)
-                && kernel.u64(process + super::kernel_layout::PROCESS_PROGRAM_ID)
-                    == Some(layout::LAUNCHER_PROGRAM_ID)
+        Some(kernel.processes(slide)?.any(|process| {
+            kernel.u64(process + super::kernel_layout::PROCESS_PROGRAM_ID)
+                == Some(layout::LAUNCHER_PROGRAM_ID)
         }))
+    }
+
+    /// The processes running `program_id`, each with its address space
+    /// (the kernel's translation regime with the process's `TTBR0_EL1`):
+    /// `None` while the kernel's process objects cannot be read, as for
+    /// [`Self::launcher_running`].
+    pub(super) fn program_processes(
+        &self,
+        regime: &TranslationRegime,
+        slide: u64,
+        program_id: u64,
+    ) -> Option<Vec<(Process, TranslationRegime)>> {
+        let kernel = Kernel {
+            machine: self,
+            regime,
+        };
+        let found = kernel
+            .processes(slide)?
+            .filter(|&process| {
+                kernel.u64(process + super::kernel_layout::PROCESS_PROGRAM_ID) == Some(program_id)
+            })
+            .filter_map(|process| {
+                Some((
+                    self.process_object(regime, process)?,
+                    self.process_regime(&kernel, slide, process)?,
+                ))
+            })
+            .collect();
+        Some(found)
     }
 
     /// The process a process object describes, if it is readable as one.

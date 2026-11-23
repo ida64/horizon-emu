@@ -16,22 +16,38 @@
 //! Two properties matter beyond a valid volume. Partitions whose driver
 //! instance runs in "FAT safe" mode (`0xe2020` enables it for the safe
 //! mode, user and system partitions) get their FATs rounded up to 32
-//! sectors. And when such a volume is first mounted, the driver looks
-//! through the reserved sectors for one that is all zero to keep the
-//! location of its recovery file `PRF2SAFE.RCV` in (`0x11ecb0`, requests 1
-//! and 4, reached from `safe_backup_on` at `0xe4e00`); the mount fails if
-//! there is none. On storage that decrypts to noise where nothing was
-//! written, that sector has to be written, so the whole reserved area is.
-//! Booted on volumes from [`format()`], the driver put its record in sector
-//! 3 and the recovery file in the root directory.
+//! sectors. And a mount of such a volume (`0xe4e00`) journals it. The
+//! driver keeps a record in reserved sector 3: the record sector of its
+//! context as `0x11c570` sets it, which request 11 of `0x11ecb0`, the only
+//! way to change it, is never asked to (so the searches of requests 1 and
+//! 4 for another sector never run). The record holds `PRF2SAFE`, the first
+//! cluster of the recovery file `PRF2SAFE.RCV` in the root directory and
+//! its length, the FAT sectors over 4096 rounded up plus 21, and a CRC-32
+//! (requests 1 and 4). Sector 3 without that mark is no record: the mount
+//! (`safe_backup_on`, `0x11af10`) writes one there and makes a new recovery
+//! file. The formatter writes the whole reserved area, sector 3 zero;
+//! booted on volumes from [`format()`], the driver put its record there
+//! and the file in the root.
+//!
+//! The recovery file starts with a header and its copy, whose word at byte
+//! 32 is the operation in progress (`0x11cf30`). Every operation writes it
+//! before changing the volume (`0x11ce30`), saves the directory sectors it
+//! overwrites into the file first (`0x11e200`), copies the FAT sectors it
+//! changed from the second FAT to the first (`0x11d1d0`) and writes the
+//! word zero again (`0x11d0c0`). A mount that finds it nonzero completes
+//! the operation or puts the saved sectors back (`safe_recover`,
+//! `0x11aae0`, request 12), over whatever was written since. One that
+//! finds it zero only clears the file where it is (request 7, `0x11fb80`).
 //!
 //! [`Fat32`] adds directories and files to a volume no console has mounted
-//! yet. It refuses one that holds the recovery file: after an unclean stop
-//! the driver repairs the volume from that file (`safe_recover`, same
-//! routine), and how that treats changes it did not make itself has not
-//! been established. Names are stored the VFAT way, a long name in front of
-//! a generated `BASIS~N.EXT` alias, unless a name already is an upper-case
-//! 8.3 name.
+//! yet, and to one a console has mounted and stopped between operations,
+//! whose header says zero: it never writes reserved sectors, takes only
+//! free clusters, and writes both FATs alike. It refuses a volume whose
+//! console stopped during an operation ([`FatError::RecoveryPending`]) and
+//! one whose record or recovery file is damaged or does not match the
+//! volume ([`FatError::RecoveryDamaged`]). Names are stored the VFAT way,
+//! a long name in front of a generated `BASIS~N.EXT` alias that no entry of
+//! the directory has yet, unless a name already is an upper-case 8.3 name.
 
 use std::{
     collections::BTreeMap,
@@ -107,8 +123,18 @@ pub enum FatError {
     NotFat32(&'static str),
     /// The volume contradicts itself.
     Corrupt(&'static str),
-    /// A console has mounted the volume and keeps a recovery file on it.
-    Journaled,
+    /// A console stopped while its FAT driver was in the middle of operation
+    /// `operation` (transaction `transaction`) on the volume. Its next mount
+    /// completes or undoes that operation from `PRF2SAFE.RCV`, over
+    /// whatever is written in between.
+    RecoveryPending {
+        transaction: u32,
+        operation: u32,
+    },
+    /// The FAT driver's record or recovery file is damaged or does not
+    /// match the volume: why. Depending on which, the console's mount fails
+    /// or makes a new recovery file, where this writer may have put files.
+    RecoveryDamaged(&'static str),
     /// Not a name this writer stores: empty, longer than 255 characters,
     /// outside printable ASCII, or with a character FAT forbids.
     InvalidName(String),
@@ -136,11 +162,19 @@ impl fmt::Display for FatError {
             }
             Self::NotFat32(why) => write!(f, "not a FAT32 volume: {why}"),
             Self::Corrupt(what) => write!(f, "corrupt volume: {what}"),
-            Self::Journaled => write!(
+            Self::RecoveryPending {
+                transaction,
+                operation,
+            } => write!(
                 f,
-                "the volume has been mounted by a console (PRF2SAFE.RCV exists); \
-                 writing behind its recovery file would corrupt it"
+                "the console stopped in the middle of FAT operation {operation} \
+                 (transaction {transaction}) on this volume, which its next mount \
+                 completes or undoes from PRF2SAFE.RCV over anything written \
+                 now; boot the image once and stop it while idle, then retry"
             ),
+            Self::RecoveryDamaged(why) => {
+                write!(f, "the FAT driver's recovery data is unusable: {why}")
+            }
             Self::InvalidName(name) => write!(f, "{name:?} is not a storable name"),
             Self::NotFound(path) => write!(f, "{path} does not exist"),
             Self::NotADirectory(path) => write!(f, "{path} is not a directory"),
@@ -548,8 +582,19 @@ const MAXIMUM_DIRECTORY: usize = 65536 * ENTRY_SIZE;
 /// Date of every entry this writer makes, 1 January 1980: an image is the
 /// same whenever it is built.
 const DATE: u16 = 1 << 5 | 1;
-/// The driver's recovery file, in the root directory.
-const RECOVERY_FILE: &str = "PRF2SAFE.RCV";
+/// The FAT-safe driver's recovery file, in the root directory, as its
+/// short entry names it.
+const RECOVERY_FILE: ShortName = *b"PRF2SAFERCV";
+/// Mark of the driver's record, of the headers of the recovery file and
+/// of the entries in it (`0x120190`).
+const SAFE_MAGIC: &[u8; 8] = b"PRF2SAFE";
+/// Reserved sector of the driver's record: the driver context's record
+/// sector as `0x11c570` sets it, which nothing changes.
+const RECORD_SECTOR: u32 = 3;
+/// Sectors of the recovery file besides its bitmap of FAT sectors, one bit
+/// per FAT sector: the header and its copy, 18 of saved directory sectors
+/// and one after the bitmap.
+const RECOVERY_FIXED_SECTORS: u32 = 21;
 /// Bytes of file data handed to the storage at once.
 const WRITE_CHUNK: usize = 1 << 20;
 
@@ -627,6 +672,19 @@ fn short_checksum(short: &ShortName) -> u8 {
     short.iter().fold(0, |sum: u8, &character| {
         sum.rotate_right(1).wrapping_add(character)
     })
+}
+
+/// Whether `sector` is a record or recovery-file header of the FAT-safe
+/// driver: its mark, a version the driver reads (byte 17 below 0x66 or
+/// byte 16 100; it writes 100 and 101), and at byte 508 the CRC-32 of the
+/// sector with those four bytes zero (`0x120220`).
+fn safe_sector_valid(sector: &[u8]) -> bool {
+    let mut unsummed = [0; SECTOR_SIZE];
+    unsummed.copy_from_slice(sector);
+    unsummed[508..].fill(0);
+    sector[..SAFE_MAGIC.len()] == *SAFE_MAGIC
+        && (sector[17] < 0x66 || sector[16] == 100)
+        && super::crc32(&unsummed) == get32(sector, 508)
 }
 
 fn validate_name(name: &str) -> Result<(), FatError> {
@@ -778,7 +836,10 @@ fn parse_directory(data: &[u8]) -> (Vec<Entry>, usize) {
 }
 
 /// A FAT32 volume being added to. Nothing but file contents reaches the
-/// storage before [`Fat32::finish`].
+/// storage before [`Fat32::finish`], which writes directories and FATs:
+/// never a reserved sector, where the FAT-safe driver keeps its record and
+/// the information sector it leaves at "unknown", and every FAT copy
+/// alike, the first being the one the driver goes by.
 pub struct Fat32<S> {
     storage: S,
     sectors_per_cluster: u32,
@@ -800,12 +861,73 @@ pub struct Fat32<S> {
 }
 
 impl<S: Sectors> Fat32<S> {
+    /// The volume on `storage`, which no console has mounted or one has
+    /// mounted and left between two operations (see the module
+    /// documentation).
     pub fn open(storage: S) -> Result<Self, FatError> {
         let mut volume = Self::read_volume(storage)?;
-        if volume.find(volume.root, RECOVERY_FILE)?.is_some() {
-            return Err(FatError::Journaled);
-        }
+        volume.check_recovery()?;
         Ok(volume)
+    }
+
+    /// That the FAT-safe driver's next mount neither undoes nor completes
+    /// anything over what is written now, and keeps its recovery file in
+    /// clusters the FAT gives to it: the checks of `safe_check`
+    /// (`0x11a610`) and `safe_backup_on` (`0x11af10`). Stricter than the
+    /// driver where it would go on regardless: two damaged headers, or a
+    /// record without its file, which it would replace.
+    fn check_recovery(&mut self) -> Result<(), FatError> {
+        let damaged = FatError::RecoveryDamaged;
+        if self.fat_start <= RECORD_SECTOR {
+            return Ok(());
+        }
+        let mut record = [0; SECTOR_SIZE];
+        self.storage.read(RECORD_SECTOR.into(), &mut record)?;
+        // Without its mark the sector is no record: the next mount makes a
+        // new one and a new recovery file, whatever the root holds.
+        if record[..SAFE_MAGIC.len()] != *SAFE_MAGIC {
+            return Ok(());
+        }
+        // Request 1 of `0x11ecb0`.
+        let (first, sectors) = (get32(&record, 32), get32(&record, 36));
+        let bitmap = self.fat_sectors.div_ceil(8 * SECTOR_SIZE as u32);
+        if !safe_sector_valid(&record)
+            || !(2..self.cluster_end - 2).contains(&first)
+            || sectors != bitmap + RECOVERY_FIXED_SECTORS
+        {
+            return Err(damaged("its record in reserved sector 3 is invalid"));
+        }
+        // Request 3: the file the record names, in clusters of its own.
+        self.load(self.root)?;
+        let file = self.directories[&self.root]
+            .entries
+            .iter()
+            .find(|entry| entry.short_name == RECOVERY_FILE && !entry.directory);
+        if !file
+            .is_some_and(|file| file.cluster == first && file.size == sectors * SECTOR_SIZE as u32)
+        {
+            return Err(damaged("PRF2SAFE.RCV is not where its record says"));
+        }
+        let clusters = self.chain(first)?;
+        let contiguous = clusters.windows(2).all(|pair| pair[1] == pair[0] + 1);
+        if !contiguous || (clusters.len() as u32) * self.sectors_per_cluster < sectors {
+            return Err(damaged("PRF2SAFE.RCV is not in one run of clusters"));
+        }
+        // Request 2: the header, or its copy when the header is damaged.
+        let mut headers = [0; 2 * SECTOR_SIZE];
+        self.storage
+            .read(self.cluster_sector(first), &mut headers)?;
+        let header = headers
+            .chunks(SECTOR_SIZE)
+            .find(|header| safe_sector_valid(header))
+            .ok_or(damaged("both headers of PRF2SAFE.RCV are damaged"))?;
+        match get32(header, 32) {
+            0 => Ok(()),
+            operation => Err(FatError::RecoveryPending {
+                transaction: get32(header, 22),
+                operation,
+            }),
+        }
     }
 
     /// The volume's parameters and FAT, whoever mounted it before.
@@ -1195,10 +1317,11 @@ pub struct FileInfo {
     pub size: u32,
 }
 
-/// A FAT32 volume a console may have mounted, for reading files and for
-/// rewriting what an existing file holds. Neither touches a directory or
-/// a FAT, the only sectors the driver's recovery file (see the module
-/// documentation) records and would restore, so it stays valid.
+/// A FAT32 volume a console may have mounted, in whatever state, for
+/// reading files and for rewriting what an existing file holds. Neither
+/// touches a directory or a FAT, the only sectors the driver's recovery
+/// file (see the module documentation) saves and, when the console
+/// stopped during an operation, puts back, so it stays valid.
 pub struct MountedFat32<S>(Fat32<S>);
 
 impl<S: Sectors> MountedFat32<S> {
@@ -1811,8 +1934,183 @@ pub(crate) mod tests {
         );
     }
 
+    /// A record or recovery-file header of the FAT-safe driver with the
+    /// words `words` (offset, value), as `0x11ecb0` request 4 and
+    /// `0x11cf30` write them.
+    fn safe_sector(words: &[(usize, u32)]) -> [u8; SECTOR_SIZE] {
+        let mut sector = [0; SECTOR_SIZE];
+        sector[..SAFE_MAGIC.len()].copy_from_slice(SAFE_MAGIC);
+        sector[16] = 100;
+        sector[17] = 101;
+        for &(offset, value) in words {
+            put32(&mut sector, offset, value);
+        }
+        let sum = super::super::crc32(&sector);
+        put32(&mut sector, 508, sum);
+        sector
+    }
+
+    const CONSOLE_FILE: &str = "/Contents/registered/00e7f53ae3ee4d6fd915b1ae26fbd1be.nca";
+
+    /// Makes `memory` a FAT-safe volume as a console leaves it after
+    /// mounting it: things of its own, then the recovery file, full of
+    /// stale entries behind a header that has `operation` in progress (0
+    /// when the console stopped between operations), and the record in
+    /// sector 3. Where the recovery file lies, in sectors.
+    fn mounted(memory: &mut Memory, operation: u32) -> Range<usize> {
+        let layout = format(memory, SECTORS as u64, true, 7).unwrap();
+        let mut volume = Fat32::open(&mut *memory).unwrap();
+        volume.create_dir_all("/save").unwrap();
+        volume.create_dir_all("/Contents/registered").unwrap();
+        let console = pattern(3000, 3);
+        volume
+            .write_file(CONSOLE_FILE, &mut console.as_slice(), 3000)
+            .unwrap();
+        let sectors = layout.fat_sectors.div_ceil(4096) + RECOVERY_FIXED_SECTORS;
+        let mut recovery = pattern(sectors as usize * SECTOR_SIZE, 5);
+        let transaction = if operation == 0 { 0 } else { 6 };
+        let header = safe_sector(&[(22, transaction), (32, operation)]);
+        for copy in recovery.chunks_mut(SECTOR_SIZE).take(2) {
+            copy.copy_from_slice(&header);
+        }
+        volume
+            .write_file(
+                "/PRF2SAFE.RCV",
+                &mut recovery.as_slice(),
+                recovery.len() as u64,
+            )
+            .unwrap();
+        volume.finish().unwrap();
+        let first = Reader::open(&mut *memory).item("/PRF2SAFE.RCV").cluster;
+        let record = safe_sector(&[(32, first), (36, sectors)]);
+        memory.write(RECORD_SECTOR.into(), &record).unwrap();
+        // Clusters are single sectors here.
+        let start = layout.data_start() as usize + first as usize - 2;
+        start..start + sectors as usize
+    }
+
     #[test]
-    fn a_volume_with_the_drivers_recovery_file_is_refused() {
+    fn a_volume_a_console_left_between_operations_takes_files_around_its_recovery_file() {
+        let mut memory = Memory::new(SECTORS);
+        let recovery = mounted(&mut memory, 0);
+        let reserved = get16(&memory.data, 14) as usize;
+        let reserved_before = memory.data[..reserved * SECTOR_SIZE].to_vec();
+        let bytes = |sectors: &Range<usize>| sectors.start * SECTOR_SIZE..sectors.end * SECTOR_SIZE;
+        let recovery_before = memory.data[bytes(&recovery)].to_vec();
+        memory.written.fill(false);
+
+        let mut volume = Fat32::open(&mut memory).unwrap();
+        volume
+            .create_dir_all("/Contents/registered/000000EE")
+            .unwrap();
+        let nca = pattern(7000, 8);
+        let path = "/Contents/registered/000000EE/test.nca";
+        volume.write_file(path, &mut nca.as_slice(), 7000).unwrap();
+        // Shares its first six characters with the console's file.
+        let neighbour = "/Contents/registered/00e7f53a00000000000000000000000f.nca";
+        volume
+            .write_file(neighbour, &mut &[4u8; 10][..], 10)
+            .unwrap();
+        volume
+            .write_file("/save/8000000000000120", &mut &[5u8; 600][..], 600)
+            .unwrap();
+        let error = volume.write_file("/prf2safe.rcv", &mut &[][..], 0);
+        assert!(matches!(error, Err(FatError::Exists(_))));
+        let error = volume.create_dir_all("/PRF2SAFE.RCV/x");
+        assert!(matches!(error, Err(FatError::NotADirectory(_))));
+        volume.finish().unwrap();
+
+        assert!(
+            memory.written[..reserved].iter().all(|&written| !written),
+            "no reserved sector written"
+        );
+        assert!(
+            memory.written[recovery.clone()]
+                .iter()
+                .all(|&written| !written)
+        );
+        assert_eq!(memory.data[..reserved * SECTOR_SIZE], reserved_before);
+        assert_eq!(memory.data[bytes(&recovery)], recovery_before);
+
+        let mut reader = Reader::open(&mut memory);
+        assert_eq!(reader.file(path), nca);
+        assert_eq!(reader.file(neighbour), [4; 10]);
+        assert_eq!(reader.file(CONSOLE_FILE), pattern(3000, 3));
+        assert_eq!(reader.file("/save/8000000000000120"), [5; 600]);
+        assert_eq!(
+            reader.item("/Contents/registered/000000EE").short,
+            "000000EE"
+        );
+        let registered = reader.item("/Contents/registered").cluster;
+        let aliases: Vec<String> = reader
+            .directory(registered)
+            .into_iter()
+            .map(|item| item.short)
+            .collect();
+        assert_eq!(
+            aliases,
+            [".", "..", "00E7F5~1.NCA", "000000EE", "00E7F5~2.NCA"]
+        );
+        let first = reader.item("/PRF2SAFE.RCV").cluster;
+        assert_eq!(reader.chain(first).len(), recovery.len());
+        assert_eq!(reader.fat(0), reader.fat(1));
+        drop(reader);
+        assert!(Fat32::open(&mut memory).is_ok(), "still between operations");
+    }
+
+    #[test]
+    fn a_volume_a_console_left_during_an_operation_is_refused() {
+        let mut memory = Memory::new(SECTORS);
+        mounted(&mut memory, 9);
+        assert!(matches!(
+            Fat32::open(&mut memory),
+            Err(FatError::RecoveryPending {
+                transaction: 6,
+                operation: 9
+            })
+        ));
+    }
+
+    #[test]
+    fn recovery_data_that_does_not_match_the_volume_is_refused() {
+        // A damaged record.
+        let mut memory = Memory::new(SECTORS);
+        mounted(&mut memory, 0);
+        memory.data[RECORD_SECTOR as usize * SECTOR_SIZE + 40] ^= 1;
+        assert!(matches!(
+            Fat32::open(&mut memory),
+            Err(FatError::RecoveryDamaged(_))
+        ));
+        // A header and its copy damaged.
+        let mut memory = Memory::new(SECTORS);
+        let recovery = mounted(&mut memory, 0);
+        for copy in 0..2 {
+            memory.data[(recovery.start + copy) * SECTOR_SIZE + 100] ^= 1;
+        }
+        assert!(matches!(
+            Fat32::open(&mut memory),
+            Err(FatError::RecoveryDamaged(_))
+        ));
+        // Only the header damaged: its copy counts.
+        let mut memory = Memory::new(SECTORS);
+        let recovery = mounted(&mut memory, 0);
+        memory.data[recovery.start * SECTOR_SIZE + 100] ^= 1;
+        assert!(Fat32::open(&mut memory).is_ok());
+        // A record that names another place than the file's.
+        let mut memory = Memory::new(SECTORS);
+        let recovery = mounted(&mut memory, 0);
+        let elsewhere = safe_sector(&[(32, 3), (36, recovery.len() as u32)]);
+        memory.write(RECORD_SECTOR.into(), &elsewhere).unwrap();
+        assert!(matches!(
+            Fat32::open(&mut memory),
+            Err(FatError::RecoveryDamaged(_))
+        ));
+    }
+
+    #[test]
+    fn a_recovery_file_without_a_record_is_the_writers_own_business() {
+        // Without the record the driver's next mount ignores the file and
+        // makes another, so the volume counts as never mounted.
         let mut memory = Memory::new(SECTORS);
         format(&mut memory, SECTORS as u64, true, 7).unwrap();
         let mut volume = Fat32::open(&mut memory).unwrap();
@@ -1820,7 +2118,7 @@ pub(crate) mod tests {
             .write_file("/PRF2SAFE.RCV", &mut &[0u8; 16][..], 16)
             .unwrap();
         volume.finish().unwrap();
-        assert!(matches!(Fat32::open(&mut memory), Err(FatError::Journaled)));
+        assert!(Fat32::open(&mut memory).is_ok());
     }
 
     #[test]

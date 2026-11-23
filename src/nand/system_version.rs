@@ -169,7 +169,7 @@ pub fn installed_system_version(image: &File, keys: &KeySet) -> Result<SystemVer
 }
 
 /// The whole file `path` of `volume`.
-fn read_whole(
+pub(super) fn read_whole(
     volume: &mut MountedFat32<EncryptedPartition<'_>>,
     path: &str,
 ) -> Result<Vec<u8>, FatError> {

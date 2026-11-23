@@ -58,6 +58,7 @@ pub mod content_db;
 pub mod crypto;
 pub mod fat;
 pub mod nca;
+pub mod nsp;
 pub mod romfs;
 pub mod save;
 pub mod save_indexer;

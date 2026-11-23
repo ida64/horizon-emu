@@ -67,6 +67,16 @@ impl ContentMetaKey {
         bytes[13] = self.install_type;
         bytes
     }
+
+    /// The key as the database stores it, [`Self::to_bytes`]'s inverse.
+    pub fn from_bytes(bytes: &[u8; 0x10]) -> Self {
+        Self {
+            id: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            version: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            meta_type: bytes[12],
+            install_type: bytes[13],
+        }
+    }
 }
 
 /// Where one content is and what it is: its ID (the first half of its
@@ -159,6 +169,13 @@ impl<'a> PackagedContentMeta<'a> {
 
     fn content_infos_start(&self) -> usize {
         PACKAGED_HEADER_SIZE + self.extended_header_size()
+    }
+
+    /// The extended header of the meta type: for an application its patch
+    /// ID and required system version, for a patch or an add-on the
+    /// application's ID first.
+    pub fn extended_header(&self) -> &'a [u8] {
+        &self.bytes[PACKAGED_HEADER_SIZE..self.content_infos_start()]
     }
 
     fn content_meta_infos_start(&self) -> usize {

@@ -2,6 +2,7 @@
 //! the devices the kernel drives, and one host thread per started core.
 
 mod bpmp;
+mod es_patch;
 mod snapshot;
 mod threads;
 
@@ -9,6 +10,7 @@ pub use self::bpmp::{
     BPMP_CORE, Bpmp, BpmpExit, Env, NeverWakes, Power, PowerDomain, PowerOn, Slice, TsecPort,
     WarmStart, apply_rom_bits, run, warm_start,
 };
+pub use self::es_patch::ForgedTickets;
 pub use self::snapshot::SaveReport;
 pub use self::threads::{GuestThread, KernelObject, ThreadCall, ThreadState};
 
@@ -353,6 +355,10 @@ pub struct RunOptions<'a> {
     /// from the kernel's own objects ([`RunReport::threads`]). Nothing is
     /// watched while the guest runs, so this does not change its timing.
     pub list_threads: bool,
+    /// Have ES take stored tickets without checking their signatures, by
+    /// a patch of its code in DRAM once it is loaded (see [`es_patch`]);
+    /// reported as [`TraceEvent::ForgedTickets`].
+    pub accept_forged_tickets: bool,
     /// Receives the reports, on the thread of the core they concern.
     pub trace: &'a (dyn Fn(TraceEvent<'_>) + Sync),
 }
@@ -443,6 +449,8 @@ pub enum TraceEvent<'a> {
     /// The processors stopped being slowed: the boot's program launcher
     /// ended (`launcher_ended`), or the slowing's time is up.
     FullSpeed { launcher_ended: bool },
+    /// What [`RunOptions::accept_forged_tickets`] did to ES.
+    ForgedTickets(ForgedTickets),
     /// A survey answered a device access that nothing models.
     Unmodeled {
         core: usize,
@@ -1053,6 +1061,9 @@ impl Machine {
             scope.spawn(|| self.soc.keep_time(&session.stop));
             if options.cpu_slowdown > 1 {
                 scope.spawn(|| session.pace());
+            }
+            if options.accept_forged_tickets {
+                scope.spawn(|| session.accept_forged_tickets());
             }
             match self.restored.lock().unwrap().take() {
                 // A restored machine's guest time stood still since the
@@ -1717,9 +1728,10 @@ struct Session<'a> {
     /// seen executing relocated kernel code.
     slide: OnceLock<u64>,
     /// A core's translation regime, whose kernel half every core shares,
-    /// and the kernel's slide: taken at the first secure monitor call from
-    /// the relocated kernel, or when a core stops, where
-    /// [`RunOptions::list_threads`] or [`PacingEnd::LauncherDone`] needs it.
+    /// and the kernel's slide: taken at the first secure monitor call or
+    /// `WFI` from the relocated kernel, or when a core stops, where
+    /// [`RunOptions::list_threads`], [`PacingEnd::LauncherDone`] or
+    /// [`RunOptions::accept_forged_tickets`] needs it.
     kernel_view: OnceLock<(TranslationRegime, u64)>,
     /// Supervisor calls that have not returned, by who made them. A thread
     /// is in one call at a time, so its next call replaces one that never
@@ -1854,8 +1866,9 @@ impl<'env> Session<'env> {
     /// Takes the kernel's half of the address space and its slide from a
     /// core in the relocated kernel, once, where something needs them.
     fn note_kernel_view(&self, vcpu: &Vcpu) -> Result<(), HvError> {
-        let wanted =
-            self.options.list_threads || self.options.cpu_slowdown_until == PacingEnd::LauncherDone;
+        let wanted = self.options.list_threads
+            || self.options.cpu_slowdown_until == PacingEnd::LauncherDone
+            || self.options.accept_forged_tickets;
         if !wanted || self.kernel_view.get().is_some() {
             return Ok(());
         }
@@ -2404,6 +2417,9 @@ impl<'env> Session<'env> {
                 self.device_access(core, vcpu, syndrome, physical_address, virtual_address)
             }
             exception_class::WFX => {
+                // The kernel's idle loop, which a restored machine reaches
+                // long before it next calls the secure monitor.
+                self.note_kernel_view(vcpu)?;
                 // ISS bit 0 distinguishes WFE, which may always complete at once.
                 if syndrome & 1 == 0 {
                     self.wait_for_interrupt(core);

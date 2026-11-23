@@ -64,6 +64,7 @@ usage: horizon-emu info <kernel.elf>
        horizon-emu format-sd <new image file> --size SIZE [--add HOST=CARD ...]
        horizon-emu download-firmware <dir> --keys FILE --prodinfo FILE
                    [--version VERSION] [--jobs N]
+       horizon-emu install-nsp <image file> --keys FILE <nsp> ...
 
 <kernel.elf> is the package2 kernel wrapped as an ELF (see pkg2elf.py).
 boot runs until a core needs something that is not emulated, the kernel
@@ -129,6 +130,17 @@ checked against its content ID or record first: the directory
 format-emmc --firmware takes. Contents already there complete are kept,
 so an interrupted run can be repeated; N contents are fetched at a time
 (default 4).
+
+install-nsp installs the titles of each NSP onto the eMMC user area
+image of a console that has started once and is stopped, as its own
+services store an installed title: the content archives under
+USER:/Contents/registered, the content meta in NCM's database of the
+user storage, the tickets in ES's ticket database and the application
+record in NS's (see horizon_emu::nand::nsp). Contents and tickets are
+checked first: hashes against the content meta, a ticket for every
+title key. A ticket whose signature Nintendo did not make (one an
+NSP's packer converted) is stored as it is; ES then refuses its title
+key at launch unless the machine runs with --accept-forged-tickets.
 
 restore builds the machine a snapshot was taken of (see the control
 socket's save_state) and goes on from where it was: the same kernel, keys,
@@ -303,6 +315,14 @@ options:
                       (horizon_emu::soc::touch::TouchInput)
   --debug-mode        report development functions as enabled to the kernel,
                       which turns on its debug log (UART-A, shown on stderr)
+  --accept-forged-tickets
+                      once ES (0x0100000000000033) is loaded, replace in
+                      DRAM the call that checks a stored ticket's signature
+                      when its title key is asked for (ES 23.5.0 main+0x4EE80,
+                      BL to MOV W0, WZR), so that a ticket installed with a
+                      forged signature (an NSP's) can launch its title;
+                      ImportTicket still checks. One line reports it. Only
+                      ES 23.5.0 is patched; the eMMC image is not changed
 
 tracing and debugging (output on stderr; WHERE is a kernel image address
 as 0x..., a function name from --symbols, or @0x... for a virtual address
@@ -414,6 +434,9 @@ fn run(arguments: &[String]) -> Result<(), String> {
     }
     if command == "patch-prodinfo" {
         return patch_prodinfo(path, flags).map_err(|error| format!("{path}: {error}"));
+    }
+    if command == "install-nsp" {
+        return install_nsp(path, flags).map_err(|error| format!("{path}: {error}"));
     }
     if command == "download-firmware" {
         return download_firmware(path, flags).map_err(|error| format!("{path}: {error}"));
@@ -815,6 +838,57 @@ fn patch_prodinfo(path: &str, flags: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn install_nsp(path: &str, flags: &[String]) -> Result<(), String> {
+    let [flag, keys, packages @ ..] = flags else {
+        return Err(usage());
+    };
+    if flag != "--keys" || packages.is_empty() {
+        return Err(usage());
+    }
+    let keys = KeySet::load(Path::new(keys)).map_err(|error| error.to_string())?;
+    let image = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |time| time.as_secs());
+    for package in packages {
+        let failed = |error: &dyn std::fmt::Display| format!("{package}: {error}");
+        let nsp = nand::nsp::Nsp::open(Path::new(package)).map_err(|error| failed(&error))?;
+        let mut shown = 0;
+        let contents = nand::nsp::read_package(&nsp, &keys, |done, total| {
+            let percent = done * 100 / total.max(1);
+            if percent >= shown + 10 {
+                shown = percent;
+                println!("checking: {percent}%");
+            }
+        })
+        .map_err(|error| failed(&error))?;
+        let mut shown = 0;
+        let installed = nand::nsp::install(&image, &keys, &nsp, &contents, now, |stage, done, total| {
+            let percent = done * 100 / total.max(1);
+            if stage == nand::nsp::Stage::Copying && percent >= shown + 10 {
+                shown = percent;
+                println!("copying: {percent}%");
+            }
+        })
+        .map_err(|error| failed(&error))?;
+        for key in &installed.titles {
+            println!(
+                "installed {:016x} version {} (type {:#x})",
+                key.id, key.version, key.meta_type
+            );
+        }
+        println!(
+            "{} contents written ({} bytes), {} already there",
+            installed.written, installed.bytes, installed.kept
+        );
+    }
+    Ok(())
+}
+
 fn download_firmware(dir: &str, flags: &[String]) -> Result<(), String> {
     const DEFAULT_JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
     let (mut keys, mut prodinfo, mut version, mut jobs) = (None, None, None, DEFAULT_JOBS);
@@ -1015,6 +1089,7 @@ fn boot(
     let (mut trace_smc, mut trace_svc, mut trace_devices) = (false, false, false);
     let (mut trace_ipc, mut trace_times, mut verbose) = (false, false, false);
     let (mut survey, mut list_threads) = (false, false);
+    let mut accept_forged_tickets = false;
     let mut bpmp_trace = 0;
     let mut crash_dump = None::<PathBuf>;
     let (mut log_lines, mut log_file) = (false, None::<PathBuf>);
@@ -1198,6 +1273,7 @@ fn boot(
             "--trace-times" => trace_times = true,
             "--verbose" => verbose = true,
             "--list-threads" => list_threads = true,
+            "--accept-forged-tickets" => accept_forged_tickets = true,
             "--crash-dump" => crash_dump = Some(PathBuf::from(value()?)),
             "--log" => log_lines = true,
             "--log-file" => log_file = Some(PathBuf::from(value()?)),
@@ -1578,6 +1654,7 @@ fn boot(
         pokes: &pokes,
         steps_after_breakpoint,
         list_threads,
+        accept_forged_tickets,
         trace: &trace,
     };
     // What the screen was last said to show: panel awake, backlight lit.
@@ -2429,6 +2506,7 @@ fn write_event(out: &mut impl Write, event: TraceEvent, tracing: &Tracing) -> io
                 false => "the slowdown's time is up",
             }
         ),
+        TraceEvent::ForgedTickets(outcome) => writeln!(out, "{outcome}"),
         TraceEvent::SecureAccess {
             core,
             block,
