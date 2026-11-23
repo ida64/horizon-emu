@@ -960,6 +960,11 @@ impl Machine {
         self.soc.panel()
     }
 
+    /// Frames presented on the panel so far, see [`crate::soc::Soc::display_flips`].
+    pub fn display_flips(&self) -> u64 {
+        self.soc.display_flips()
+    }
+
     /// Guest time: how long the machine has run, as its clocks count.
     pub fn guest_time(&self) -> Duration {
         self.clock.now()

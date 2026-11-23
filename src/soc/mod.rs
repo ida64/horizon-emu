@@ -1496,6 +1496,12 @@ impl Soc {
         }
     }
 
+    /// Pictures the panel's display controller has been given to show
+    /// ([`dc::Dc::flips`]).
+    pub fn display_flips(&self) -> u64 {
+        self.dc.flips()
+    }
+
     /// Keeps the display controllers' frames going until `stop` is set; see
     /// [`dc::keep_time`].
     pub fn keep_time(&self, stop: &AtomicBool) {

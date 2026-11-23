@@ -428,11 +428,18 @@ impl Registers {
         (0..WINDOW_COUNT).filter(move |window| header >> WINDOW_SELECT_SHIFT >> window & 1 != 0)
     }
 
-    /// Makes the armed copy of the parts in `parts` active.
-    fn activate(&mut self, parts: u32) {
+    /// Makes the armed copy of the parts in `parts` active. Returns how
+    /// many windows that gave another buffer (`WINBUF_START_ADDR`): the
+    /// pictures a client presented.
+    fn activate(&mut self, parts: u32) -> u64 {
+        let mut flips = 0;
         for part in (0..PART_COUNT).filter(|part| parts >> part & 1 != 0) {
+            let before = self.active.part(part).get(&register::WINBUF_START_ADDR).copied();
             *self.active.part_mut(part) = self.armed.part(part).clone();
+            let after = self.active.part(part).get(&register::WINBUF_START_ADDR).copied();
+            flips += u64::from(part > 0 && after.is_some() && before != after);
         }
+        flips
     }
 
     fn sending(&self) -> bool {
@@ -463,6 +470,8 @@ pub struct Dc {
     /// The picture last put together, given again to every look within the
     /// same frame while the active copy stays as it was.
     shown: Mutex<Option<Shown>>,
+    /// Pictures presented since the machine was built ([`Dc::flips`]).
+    flips: AtomicU64,
 }
 
 /// See [`Dc::shown`].
@@ -503,7 +512,14 @@ impl Dc {
             line,
             scratch: Mutex::default(),
             shown: Mutex::default(),
+            flips: AtomicU64::new(0),
         }
+    }
+
+    /// How many times a window has been given a new buffer to show since
+    /// the machine was built: frames presented, whatever the refresh.
+    pub fn flips(&self) -> u64 {
+        self.flips.load(Ordering::Relaxed)
     }
 
     /// Brings the controller up to date with the frames sent since the last
@@ -558,7 +574,8 @@ impl Dc {
                 // stop the controller; frames after that were only sent if
                 // it still runs.
                 let pending = std::mem::take(&mut registers.pending);
-                registers.activate(pending);
+                let flips = registers.activate(pending);
+                self.flips.fetch_add(flips, Ordering::Relaxed);
                 self.release_increments(registers);
                 registers.status |= FRAME_END_INT | VBLANK_INT;
                 let sent = if registers.sending() { passed } else { 1 };
@@ -605,7 +622,8 @@ impl Dc {
             registers.pending |= requests;
         } else {
             // Stopped, nothing is ever pending.
-            registers.activate(requests);
+            let flips = registers.activate(requests);
+            self.flips.fetch_add(flips, Ordering::Relaxed);
             self.release_increments(registers);
         }
         Some(())

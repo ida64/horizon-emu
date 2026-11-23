@@ -17,7 +17,9 @@
 //!     whether the processors are slowed (--cpu-slowdown) at the moment,
 //!     and "state": "running", "restarting" (between the machine a restart
 //!     took down and the one it powers up) or "stopped", with "stopped"
-//!     saying why (a power-off among the reasons)
+//!     saying why (a power-off among the reasons); "flips", the pictures
+//!     presented on the panel so far (a window given another buffer), whose
+//!     rate over two looks is the frame rate
 //! {"op":"stop"}
 //!     stops the machine, as closing its window does
 //! {"op":"save_state","path":"/tmp/snap"}
@@ -323,6 +325,7 @@ fn answer(request: Request, controlled: &Controlled) -> Result<Value, String> {
                     machine.panel(),
                     machine.guest_time(),
                     machine.joycons_seated(),
+                    machine.display_flips(),
                 )
             });
             let state = match (&stopped, machine) {
@@ -330,13 +333,14 @@ fn answer(request: Request, controlled: &Controlled) -> Result<Value, String> {
                 (None, Some(_)) => "running",
                 (None, None) => "restarting",
             };
-            let panel = machine.map(|(panel, _, _)| panel);
+            let panel = machine.map(|(panel, ..)| panel);
             Ok(json!({
                 "seconds": controlled.started.elapsed().as_secs_f64(),
-                "guest_seconds": machine.map(|(_, guest, _)| guest.as_secs_f64()),
+                "guest_seconds": machine.map(|(_, guest, ..)| guest.as_secs_f64()),
+                "flips": machine.map(|(.., flips)| flips),
                 "panel_on": panel.is_some_and(|panel| panel.panel_on),
                 "backlight_on": panel.is_some_and(|panel| panel.backlight_on),
-                "joycons_seated": machine.is_some_and(|(_, _, seated)| seated),
+                "joycons_seated": machine.is_some_and(|(_, _, seated, _)| seated),
                 "cpu_paced": controlled.paced.load(Ordering::Relaxed),
                 "state": state,
                 "stopped": stopped,
