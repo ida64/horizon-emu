@@ -146,6 +146,15 @@ impl Key {
     }
 }
 
+/// Holds the key a script's `press` names (`a`, `l+r`, `power`,
+/// `pro:b`, `pro:sync`) down, or lets go of it.
+pub fn hold(machine: &Machine, name: &str, held: bool) -> Result<(), String> {
+    Key::named(name)
+        .ok_or_else(|| format!("{name}: not a button"))?
+        .hold(machine, held);
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Step {
     /// Until the pixel at `(x, y)` of the screen has this colour.

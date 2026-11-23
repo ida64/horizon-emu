@@ -260,6 +260,39 @@ pub fn key_value_archive<'a>(
     out
 }
 
+/// The entries (key, value) of the key-value archive `archive`, in its
+/// order; `Err` says what is malformed.
+pub fn key_value_entries(archive: &[u8]) -> Result<Vec<(&[u8], &[u8])>, &'static str> {
+    let word = |at: usize| {
+        archive
+            .get(at..at + 4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) as usize)
+    };
+    if !archive.starts_with(ARCHIVE_MAGIC) {
+        return Err("no IMKV magic");
+    }
+    let count = word(8).ok_or("a short archive header")?;
+    let mut entries = Vec::new();
+    let mut at = 12;
+    for _ in 0..count {
+        if !archive
+            .get(at..)
+            .is_some_and(|rest| rest.starts_with(ENTRY_MAGIC))
+        {
+            return Err("an entry without IMEN magic");
+        }
+        let past = "an entry past the end of the archive";
+        let key_start = at + 12;
+        let value_start = key_start + word(at + 4).ok_or(past)?;
+        let end = value_start + word(at + 8).ok_or(past)?;
+        let key = archive.get(key_start..value_start).ok_or(past)?;
+        let value = archive.get(value_start..end).ok_or(past)?;
+        entries.push((key, value));
+        at = end;
+    }
+    Ok(entries)
+}
+
 /// The `imkvdb.arc` of the firmware in `firmware_dir`.
 pub fn build(firmware_dir: &Path, keys: &KeySet) -> Result<Vec<u8>, ContentDbError> {
     Ok(archive(&records(firmware_dir, keys)?))

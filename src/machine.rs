@@ -952,6 +952,11 @@ impl Machine {
         self.soc.panel()
     }
 
+    /// Guest time: how long the machine has run, as its clocks count.
+    pub fn guest_time(&self) -> Duration {
+        self.clock.now()
+    }
+
     /// Puts a finger on the touchscreen at `(x, y)` or moves it there
     /// (screen coordinates, 1280x720, origin top left), or lifts it with
     /// `None`. `false` if the touch controller is not scanning yet, so the

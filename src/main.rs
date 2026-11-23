@@ -359,8 +359,10 @@ taken as it is, such as one inside a process):
   --control SOCKET    serve requests on a Unix socket at SOCKET while the
                       machine runs: script steps, screenshots, pixels,
                       status, stop, save_state (a snapshot of the running
-                      machine into a directory, for restore). One JSON
-                      object per line
+                      machine into a directory, for restore), frames
+                      (the raw picture), buttons, touches, the Joy-Con
+                      rails and amiibo held or let go as the client says.
+                      One JSON object per line, a connection per thread
   --survey            do not stop at device accesses nothing models: answer
                       reads with zero, drop writes, and print each. Not a
                       faithful run; it lists what the guest wants
@@ -1541,6 +1543,16 @@ fn boot(
         Some(_) => (1, PacingEnd::Never),
         None => (machine::CONSOLE_SLOWDOWN, PacingEnd::LauncherDone),
     });
+    // Whether the run in progress slows the processors, for the control
+    // socket's status: from the start of each run, until it says it no
+    // longer does.
+    let paced = AtomicBool::new(false);
+    let trace = |event: TraceEvent| {
+        if matches!(event, TraceEvent::FullSpeed { .. }) {
+            paced.store(false, Ordering::Relaxed);
+        }
+        print_event(event, &tracing);
+    };
     let options = RunOptions {
         timeout,
         stop: &stop,
@@ -1566,7 +1578,7 @@ fn boot(
         pokes: &pokes,
         steps_after_breakpoint,
         list_threads,
-        trace: &|event| print_event(event, &tracing),
+        trace: &trace,
     };
     // What the screen was last said to show: panel awake, backlight lit.
     let mut shown = None;
@@ -1621,10 +1633,12 @@ fn boot(
                 stopped: &stopped,
                 closing: &closing,
                 snapshot: &snapshotter,
+                paced: &paced,
             };
             scope.spawn(move || control::serve(listener, &controlled));
         }
         let outcome = loop {
+            paced.store(cpu_slowdown.0 > 1, Ordering::Relaxed);
             // The limit is on the whole run, across restarts.
             let options = RunOptions {
                 timeout: timeout.map(|limit| limit.saturating_sub(started.elapsed())),

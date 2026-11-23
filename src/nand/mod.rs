@@ -61,6 +61,7 @@ pub mod nca;
 pub mod romfs;
 pub mod save;
 pub mod save_indexer;
+pub mod system_version;
 
 const SECTOR_SIZE: u64 = 512;
 
@@ -438,6 +439,8 @@ pub enum NandError {
     /// The program content to replace is not there once, or its
     /// replacement could not be made.
     Replacement(String),
+    /// The installed system version cannot be read.
+    SystemVersion(system_version::SystemVersionError),
 }
 
 impl fmt::Display for NandError {
@@ -460,6 +463,9 @@ impl fmt::Display for NandError {
                 write!(f, "cannot build the content meta database: {error}")
             }
             Self::Replacement(why) => write!(f, "cannot replace the program: {why}"),
+            Self::SystemVersion(error) => {
+                write!(f, "cannot read the installed system version: {error}")
+            }
         }
     }
 }

@@ -24,10 +24,11 @@ use std::fmt;
 /// Size of the packaged header and of the database's key.
 const PACKAGED_HEADER_SIZE: usize = 0x20;
 const PACKAGED_CONTENT_INFO_SIZE: usize = 0x38;
-const CONTENT_INFO_SIZE: usize = 0x18;
+pub const CONTENT_INFO_SIZE: usize = 0x18;
 const CONTENT_META_INFO_SIZE: usize = 0x10;
 
 pub const CONTENT_TYPE_META: u8 = 0;
+pub const CONTENT_TYPE_DATA: u8 = 2;
 pub const CONTENT_TYPE_DELTA_FRAGMENT: u8 = 6;
 pub const META_TYPE_SYSTEM_UPDATE: u8 = 3;
 pub const META_TYPE_PATCH: u8 = 0x81;
