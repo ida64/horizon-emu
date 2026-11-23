@@ -84,7 +84,7 @@
 //! pictures cannot give them.
 
 mod h264;
-mod videotoolbox;
+pub(crate) mod videotoolbox;
 
 use std::{
     collections::BTreeMap,

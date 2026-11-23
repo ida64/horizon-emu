@@ -51,6 +51,7 @@ pub mod mipi_cal;
 pub mod mselect;
 pub mod ntag;
 pub mod nvdec;
+pub mod nvenc;
 pub mod pcie;
 pub mod pcie_endpoint;
 pub mod pg_up;
@@ -610,9 +611,25 @@ impl Soc {
             falcon_host::SIZE,
             Box::new(Arc::clone(&nvdec)),
         );
+        let nvenc = Arc::new(falcon_host::HostFalcon::new(
+            DeviceMemory::new(&mc, ram, mc::SMMU_NVENC_ASID),
+            nvenc::Nvenc::new(
+                DeviceMemory::new(&mc, ram, mc::SMMU_NVENC_ASID),
+                Arc::clone(&syncpoints),
+                Arc::clone(&notes),
+            ),
+            Arc::clone(&notes),
+        ));
+        bus.map(
+            "NVENC",
+            falcon_host::NVENC_BASE,
+            falcon_host::SIZE,
+            Box::new(Arc::clone(&nvenc)),
+        );
         let channels: Vec<Arc<host1x_channel::Channel>> = (0..7)
             .map(|index| {
-                let (vic, nvdec) = (Arc::clone(&vic), Arc::clone(&nvdec));
+                let (vic, nvdec, nvenc) =
+                    (Arc::clone(&vic), Arc::clone(&nvdec), Arc::clone(&nvenc));
                 let channel = Arc::new(host1x_channel::Channel::new(
                     DeviceMemory::new(&mc, ram, mc::SMMU_HOST1X_ASID),
                     Arc::clone(&syncpoints),
@@ -620,6 +637,7 @@ impl Soc {
                     // The VIC refuses any class but its own.
                     Arc::new(move |class, offset, value| match class {
                         nvdec::CLASS => nvdec.method(class, offset, value),
+                        nvenc::CLASS => nvenc.method(class, offset, value),
                         _ => vic.method(class, offset, value),
                     }),
                     Arc::clone(&notes),

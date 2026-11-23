@@ -183,6 +183,9 @@ pub struct Machine {
     pub amiibo: Option<PathBuf>,
     pub amiibo_writable: bool,
     pub homebrew: Homebrew,
+    /// `--accept-forged-tickets`: ES takes the title keys of tickets an
+    /// NSP's packer converted (see `horizon-emu install-nsp`).
+    pub accept_forged_tickets: bool,
     pub debug: Debug,
 }
 
@@ -215,6 +218,7 @@ impl Default for Machine {
             amiibo: None,
             amiibo_writable: false,
             homebrew: Homebrew::default(),
+            accept_forged_tickets: false,
             debug: Debug::default(),
         }
     }
@@ -356,6 +360,9 @@ impl Machine {
             if self.amiibo_writable {
                 put("--amiibo-writable", None);
             }
+        }
+        if self.accept_forged_tickets {
+            put("--accept-forged-tickets", None);
         }
         let debug = &self.debug;
         for (on, flag) in [

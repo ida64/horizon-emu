@@ -614,11 +614,52 @@ fn a_planar_n420_output_averages_each_two_by_two_block() {
     assert_eq!(bench.peek_bytes(CHROMA_V, 1), [128]);
 }
 
+/// grc's encoder input: NV12 (68), block-linear, chroma co-sited with the
+/// even luma column and between the two rows. Each chroma pair is the
+/// mean of the U (V) of the even column's two pixels; the odd columns'
+/// chroma has no weight.
+#[test]
+fn a_block_linear_nv12_output_takes_chroma_from_the_even_column() {
+    let mut bench = Bench::new();
+    bench.set(0x18, rect([0, 0, 3, 1]));
+    let (w0, w1) = planar_words(68, [0, 1], (4, 2), (4, 2), (2, 1));
+    bench.set(0x20, w0 | 1 << 11);
+    bench.set(0x28, w1);
+    for (offset, word) in YCBCR_MATRIX {
+        bench.set(offset, word);
+    }
+    bench.slot(0, 31, None, (4, 2), [0, 0, 3, 1], [0, 0, 3, 1]);
+    let (red, green, blue) = ([0xff, 0, 0, 0xff], [0, 0xff, 0, 0xff], [0, 0, 0xff, 0xff]);
+    let (white, black, brown) = ([0xff; 4], [0, 0, 0, 0xff], [0x80, 0x40, 0x20, 0xff]);
+    let pixels = [red, black, blue, white, green, white, brown, black];
+    bench.poke(INPUT, &pixels.concat());
+    bench.send(planar_methods()).unwrap();
+    assert!(bench.notes.take().is_empty());
+    let gob = |row_bytes| {
+        BlockLinearSurface::new(
+            row_bytes,
+            2,
+            BlockLinear {
+                block_height_log2: 0,
+                block_depth_log2: 0,
+            },
+        )
+    };
+    let luma = bench.peek_bytes(OUTPUT, 512);
+    let at = |y| gob(4).offset(0, y, 0) as usize;
+    assert_eq!(luma[at(0)..at(0) + 4], [76, 0, 29, 255]);
+    assert_eq!(luma[at(1)..at(1) + 4], [150, 255, 79, 0]);
+    // U, V: red and green (85.0, 255; 43.5, 21.2) → (64.3, 138.1); blue
+    // and brown (255, 107.3; 101.2, 162.6) → (178.1, 135.0).
+    let chroma = bench.peek_bytes(CHROMA_U, 512);
+    assert_eq!(chroma[..4], [64, 138, 178, 135]);
+}
+
 #[test]
 fn planar_outputs_the_model_does_not_establish_refuse_and_name_themselves() {
     let cases = [
-        // Chroma co-sited with the even luma sample on a subsampled axis.
-        (72, [0, 1], [0, 0, 3, 3], true, "horizontal chroma siting 0"),
+        // Siting 3 is none of even, between and odd.
+        (72, [3, 1], [0, 0, 3, 3], true, "horizontal chroma siting 3"),
         // A target whose top row shares its chroma with the row above.
         (71, [0, 1], [0, 1, 3, 2], true, "splits"),
         // No output matrix: what would be Y, U and V is not said.

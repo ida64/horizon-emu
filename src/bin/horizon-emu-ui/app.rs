@@ -17,7 +17,7 @@ use horizon_emu::{keys::KeySet, nand::system_version};
 use serde_json::json;
 
 use crate::{
-    child::{self, Child},
+    child::{self, Child, Job},
     dialogs::{self, Dialog},
     model::{Machine, Settings, Snapshot, SnapshotInfo, Start, Stored},
     screen, tabs,
@@ -57,6 +57,10 @@ pub struct Entry {
     /// Whether an amiibo is held over the reader, as the UI last said;
     /// `None` until it says anything to this run.
     pub amiibo_on: Option<bool>,
+    /// An NSP being installed onto the eMMC image, and how the last one
+    /// went.
+    pub install: Option<Job>,
+    pub installed: Option<Result<String, String>>,
 }
 
 impl Entry {
@@ -72,6 +76,8 @@ impl Entry {
             log_filter: String::new(),
             log_follow: true,
             amiibo_on: None,
+            install: None,
+            installed: None,
         }
     }
 

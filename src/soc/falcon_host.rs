@@ -1,7 +1,7 @@
 //! Host-engine Falcon boot interface, not a Falcon instruction emulator.
 //!
-//! nvservices 23.5.0 `0x809e0` (VIC) and `0x835e0` (NVDEC) load 256-byte
-//! DMEM/IMEM blocks through 0x1110..0x111c, start CPUCTL, and require
+//! nvservices 23.5.0 `0x809e0` (VIC, NVENC) and `0x835e0` (NVDEC) load
+//! 256-byte DMEM/IMEM blocks through 0x1110..0x111c, start CPUCTL, and require
 //! IDLESTATE == 0 (spec §5.2). Firmware bytes are fetched through the
 //! engine SMMU and retained; the [`Engine`] is shown them when CPUCTL
 //! starts the processor and may refuse firmware it does not know.
@@ -22,6 +22,9 @@ use std::sync::{Arc, Mutex};
 
 pub const VIC_BASE: u64 = 0x5434_0000;
 pub const NVDEC_BASE: u64 = 0x5448_0000;
+/// nvservices' NVENC engine configuration (`0xee170`) names this aperture,
+/// 0x40000 bytes, and host1x class 0x21.
+pub const NVENC_BASE: u64 = 0x544C_0000;
 pub const SIZE: u64 = 0x40000;
 
 /// The engine a host falcon runs: what its THI registers and class methods

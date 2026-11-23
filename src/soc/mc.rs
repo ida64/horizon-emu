@@ -81,6 +81,8 @@ pub const SMMU_VIC_ASID: u64 = 0x284;
 pub const SMMU_HOST1X_ASID: u64 = 0x250;
 /// NVDEC client ASID (`nvdec` swgroup), from the same public swgroup table.
 pub const SMMU_NVDEC_ASID: u64 = 0xAB4;
+/// NVENC client ASID (`nvenc` swgroup), from the same public swgroup table.
+pub const SMMU_NVENC_ASID: u64 = 0x264;
 /// Address space register of the eMMC port's host controller.
 pub const SMMU_SDMMC4A_ASID: u64 = 0xAA0;
 /// Address space register of the game card port's host controller (two

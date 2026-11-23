@@ -17,7 +17,9 @@
 //! Unimplemented methods/conditions fail the stream and never manufacture a
 //! fence completion; the DMAPUT write that ran into them is refused, or, for
 //! a stream that failed while continuing after a wait, the next one. Shared
-//! wait-base registers and conditional host increments are not modeled. A
+//! wait-base registers are not modeled; a host increment of any of the four
+//! conditions counts when the command processor reaches it (see
+//! `Inner::method`), a reserved condition refuses. A
 //! failed stream stays faulted until DMA GET reset, so retrying a failed
 //! submission cannot replay its effects.
 //!
@@ -287,13 +289,26 @@ impl Inner {
         }
         match offset {
             0 => {
-                if value & !0xff != 0 {
-                    return Err("conditional/reserved host syncpoint increment is unsupported");
+                // INCR_SYNCPT: index 7:0, condition 15:8 (Linux
+                // `hw_host1x04_uclass.h`: 0 IMMEDIATE, 1 OP_DONE, 2 RD_DONE,
+                // 3 REG_WR_SAFE). The host class's own operations are its
+                // methods, each done when the command processor goes past
+                // it: by the time this one is reached every earlier one in
+                // the stream is done, read and written, so all four hold
+                // at once [inference: the conditions name the class's own
+                // unit, which for class 1 is the command processor]. An
+                // engine's work started earlier is not waited for: that is
+                // the engine's own increment's to say (a client waits for an
+                // engine with a WAIT_SYNCPT on that increment).
+                let (index, condition) = ((value & 0xff) as usize, value >> 8);
+                if condition > 3 {
+                    self.notes.add(format!(
+                        "host1x channel: host syncpoint increment {value:#x} (condition {condition})"
+                    ));
+                    return Err("reserved host syncpoint increment condition");
                 }
-                self.syncpoints
-                    .get(value as usize)
-                    .ok_or("invalid syncpoint ID")?;
-                self.syncpoints.add(value as usize, 1);
+                self.syncpoints.get(index).ok_or("invalid syncpoint ID")?;
+                self.syncpoints.add(index, 1);
             }
             8 => {
                 let index = (value >> 24) as usize;
@@ -964,5 +979,30 @@ mod tests {
         for opcode in [7, 8, 9, 10, 11, 12, 13, 14, 15] {
             assert_eq!(decode(opcode << 28), None);
         }
+    }
+
+    /// Host-class increments. With Minecraft running and video capture on,
+    /// the channel that carries the VIC's submissions sends host increment
+    /// 0x10C (syncpoint 12, condition 1, OP_DONE). Each of the four
+    /// conditions counts when the processor reaches it; a reserved one
+    /// refuses and names the value.
+    #[test]
+    fn host_increments_of_every_condition_count_at_once() {
+        let bench = Bench::new();
+        let mut words = Vec::new();
+        for condition in 0..4 {
+            words.extend([setclass(1, 0, 1), condition << 8 | 9]);
+        }
+        bench.submit(&words).unwrap();
+        assert_eq!(bench.syncpoints.get(9), Some(4));
+        assert!(bench.idle());
+        let bench = Bench::new();
+        assert_eq!(bench.submit(&[setclass(1, 0, 1), 4 << 8 | 9]), None);
+        assert_eq!(bench.syncpoints.get(9), Some(0));
+        let notes = bench.notes.take();
+        assert!(
+            notes[0].contains("increment 0x409 (condition 4)"),
+            "{notes:?}"
+        );
     }
 }

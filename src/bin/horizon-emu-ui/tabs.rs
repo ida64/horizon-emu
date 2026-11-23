@@ -7,7 +7,7 @@ use eframe::egui::{self, Align, Color32, Layout, RichText, TextEdit, Ui};
 
 use crate::{
     app::Entry,
-    child::Stream,
+    child::{self, Job, Stream},
     model::{CpuSpeed, Machine, Renderer, SavedBoot, Start},
     theme::{self, AMBER, MUTED, RED, Rows},
 };
@@ -63,10 +63,12 @@ fn text_field(ui: &mut Ui, value: &mut String, hint: &str, width: f32) {
 
 pub fn settings(ui: &mut Ui, entry: &mut Entry) {
     let locked = entry.locked();
+    let running = entry.running();
     let snapshot_boot = match &entry.machine().start {
         Start::Snapshot { dir: Some(dir) } => Some(SavedBoot::load(dir)),
         _ => None,
     };
+    let (install, installed) = (&mut entry.install, &mut entry.installed);
     let machine = &mut entry.stored.machine;
     ui.columns(2, |columns| {
         let (left, right) = columns.split_at_mut(1);
@@ -80,6 +82,10 @@ pub fn settings(ui: &mut Ui, entry: &mut Entry) {
             theme::section(right, "From the snapshot", |ui| recorded(ui, saved));
         } else {
             theme::section(right, "Storage", |ui| storage(ui, machine, locked));
+            right.add_space(12.0);
+            theme::section(right, "Games", |ui| {
+                games(ui, machine, running, install, installed)
+            });
             right.add_space(12.0);
         }
         theme::section(right, "Network", |ui| network(ui, machine, locked));
@@ -388,6 +394,87 @@ fn storage(ui: &mut Ui, machine: &mut Machine, locked: bool) {
     machine.sd_writable = sd_writable;
     rows.row(ui, "Symbols", |ui| {
         file_controls(ui, &mut machine.symbols, "Choose", "None", true);
+    });
+}
+
+/// Installing an NSP onto the machine's eMMC image (`install-nsp`), which
+/// the console must have started from once and which must not be in use.
+fn games(
+    ui: &mut Ui,
+    machine: &mut Machine,
+    running: bool,
+    install: &mut Option<Job>,
+    installed: &mut Option<Result<String, String>>,
+) {
+    if let Some(outcome) = install.as_ref().and_then(Job::finished) {
+        let printed = install
+            .take()
+            .map(|job| {
+                let log = job.log.lock().unwrap();
+                log.lines
+                    .iter()
+                    .filter(|line| line.text.starts_with("installed "))
+                    .map(|line| line.text.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        if outcome.is_ok() {
+            machine.accept_forged_tickets = true;
+        }
+        *installed = Some(outcome.map(|()| printed));
+    }
+    let mut rows = Rows::new();
+    rows.row(ui, "Install NSP", |ui| {
+        let ready = !running && install.is_none() && machine.emmc.is_some() && machine.keys.is_some();
+        let button = ui.add_enabled_ui(ready, |ui| theme::small_button(ui, "Install…")).inner;
+        let button = button.on_disabled_hover_text(if running {
+            "Stop the machine first: the image must not be in use."
+        } else {
+            "Needs the machine's eMMC image and keys."
+        });
+        if button.clicked()
+            && let (Some(emmc), Some(keys)) = (&machine.emmc, &machine.keys)
+            && let Some(nsp) = rfd::FileDialog::new()
+                .add_filter("NSP", &["nsp"])
+                .pick_file()
+        {
+            let ctx = ui.ctx().clone();
+            *installed = None;
+            *install = Some(Job::run(
+                vec![(
+                    child::emulator(),
+                    vec![
+                        "install-nsp".into(),
+                        emmc.display().to_string(),
+                        "--keys".into(),
+                        keys.display().to_string(),
+                        nsp.display().to_string(),
+                    ],
+                )],
+                |_, _, _| Ok(()),
+                move || ctx.request_repaint(),
+            ));
+        }
+        if let Some(job) = install {
+            ui.spinner();
+            let log = job.log.lock().unwrap();
+            if let Some(line) = log.lines.back() {
+                ui.label(RichText::new(&line.text).color(MUTED));
+            }
+        } else if let Some(outcome) = installed {
+            match outcome {
+                Ok(titles) => ui.label(RichText::new(titles.as_str()).color(MUTED)),
+                Err(error) => ui.label(RichText::new(error.as_str()).color(RED)),
+            };
+        }
+    });
+    rows.row(ui, "Converted tickets", |ui| {
+        theme::labelled_switch(ui, &mut machine.accept_forged_tickets, "Accept").on_hover_text(
+            "--accept-forged-tickets: ES gives out the title keys of tickets whose signature \
+             an NSP's packer made, as consoles with signature patches do. Turned on by an \
+             install.",
+        );
     });
 }
 

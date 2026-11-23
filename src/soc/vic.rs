@@ -44,11 +44,11 @@
 //! selections (libdrm `vic.h` enum names), override and mask, alpha fill
 //! modes opaque, background and composited (DXVA-HD names in libdrm
 //! `vic.h`), the output flips, transposition of a pitch-linear RGB output
-//! (`Surface::transposed`), and as output the fully planar 8-bit YUV
-//! formats 69-72 (pitch-linear, chroma sited between the luma samples it
-//! is shared by; see `Planar`). Everything else (fractional source
-//! rectangles, noise and detail filters, other YUV input, semi-planar
-//! output and 10-bit YUV, deinterlacing and denoise, luma key, gamut
+//! (`Surface::transposed`), and as output the 8-bit YUV formats 67-72
+//! (semi-planar 4:2:0, grc's NV12 encoder input, and fully planar;
+//! pitch-linear or block-linear; see `Planar`). Everything else
+//! (fractional source rectangles, noise and detail filters, other YUV
+//! input, 10-bit YUV, deinterlacing and denoise, luma key, gamut
 //! matrix, gamma modes 2-3, clear rectangles, decompression,
 //! downsampling) refuses with the field named.
 //!
@@ -528,6 +528,13 @@ enum Layout {
 /// of an earlier configuration in place: the capture button's thumbnail
 /// EXECUTE writes an A8B8G8R8 output with 0x724/0x728 still naming the
 /// chroma planes of the planar YUV picture it reads.
+///
+/// Device address 0 is a plane address like any other: grc's capture
+/// EXECUTEs (Minecraft running, video capture on) read the game's frames,
+/// A8R8G8B8 block-linear 1280×720, from VIC addresses 0, 0x3C0000 and
+/// 0x780000 in turn — three buffers of 0x3C0000 bytes from the bottom of
+/// the VIC's address space \[inference: the game's swapchain, mapped
+/// there\]. An unmapped address refuses when the surface is read.
 #[derive(Clone, Copy, Debug)]
 struct Surface {
     address: u64,
@@ -561,9 +568,6 @@ impl Surface {
         let row_bytes = luma_width * BYTES_PER_PIXEL;
         let layout = plane_layout(kind, block_height_log2, row_bytes, luma_height)
             .map_err(|e| format!("{name}: {e}"))?;
-        if address == 0 {
-            return Err(format!("{name}: no plane address"));
-        }
         Ok(Surface {
             address: u64::from(address) << 8,
             format,
@@ -765,6 +769,29 @@ impl SamplePlane {
 
     fn sample(&self, rows: &Rows, x_bytes: u32, y: u32) -> f32 {
         f32::from(rows.bytes[(self.offset(x_bytes, y) - rows.start) as usize]) / 255.0
+    }
+
+    /// Stores `line` at byte `x_bytes` of row `y` in `rows` (read by
+    /// [`SamplePlane::read`] to hold that row). A GOB keeps 16-byte runs
+    /// of a row together, so a block-linear row goes by such runs.
+    fn place(&self, rows: &mut Rows, x_bytes: u32, y: u32, line: &[u8]) {
+        match self.layout {
+            Layout::Pitch(_) => {
+                let at = (self.offset(x_bytes, y) - rows.start) as usize;
+                rows.bytes[at..at + line.len()].copy_from_slice(line);
+            }
+            Layout::Block(..) => {
+                let mut x = x_bytes;
+                let mut rest = line;
+                while !rest.is_empty() {
+                    let run = ((16 - x % 16) as usize).min(rest.len());
+                    let at = (self.offset(x, y) - rows.start) as usize;
+                    rows.bytes[at..at + run].copy_from_slice(&rest[..run]);
+                    x += run as u32;
+                    rest = &rest[run..];
+                }
+            }
+        }
     }
 }
 
@@ -1017,75 +1044,62 @@ fn planar_subsampling(code: u32) -> Option<[u32; 2]> {
     }
 }
 
-/// One pitch-linear plane of 8-bit samples.
-#[derive(Clone, Copy, Debug)]
-struct Plane {
-    address: u64,
-    pitch: u64,
-}
-
-impl Plane {
-    fn offset(&self, x: u32, y: u32) -> u64 {
-        u64::from(y) * self.pitch + u64::from(x)
-    }
-
-    /// Reads the bytes from the first sample of `rect` to its last.
-    fn read(&self, memory: &DeviceMemory, rect: Rect) -> Result<Rows, String> {
-        let start = self.offset(rect.left, rect.top);
-        let end = self.offset(rect.right, rect.bottom - 1);
-        let mut bytes = vec![0; (end - start) as usize];
-        memory
-            .read(self.address + start, &mut bytes)
-            .ok_or_else(|| format!("plane at {:#x} is not mapped", self.address + start))?;
-        Ok(Rows { start, bytes })
-    }
-}
-
-/// A fully planar 8-bit YUV output surface ([`planar_subsampling`]),
-/// pitch-linear.
+/// An 8-bit YUV output surface: the fully planar formats
+/// ([`planar_subsampling`]) and the semi-planar 4:2:0 ones, 67 and 68
+/// ([`yuv_input`]: 68 is NV12, U the lower byte of a pair), pitch-linear
+/// or block-linear (16Bx2 GOBs, the block kind and height of w0 as for a
+/// slot surface).
 ///
 /// The output surface configuration (libdrm `vic40.h`
 /// `OutputSurfaceConfig`) gives the padded luma and chroma plane widths in
 /// samples; as for the RGB formats, where libdrm sets the luma width to its
 /// stride (`vic.c`: pitch = stride × bytes per pixel), each is the plane's
-/// pitch, here in bytes. The output colour matrix gives Y, U and V as its
+/// pitch, here in samples (a U/V pair of an interleaved plane being one
+/// sample of two bytes). The output colour matrix gives Y, U and V as its
 /// rows 0, 1 and 2 (`vic_ceb6_types.h` names the output clamps "R/Y",
 /// "G/U", "B/V").
 ///
 /// Chroma siting (`OutChromaLocHoriz`/`Vert`, `vic_ceb6_types.h`: 0 with
 /// the even luma sample, 1 between the even and the odd, 2 with the odd):
-/// on a subsampled axis a chroma sample sited between its two luma samples
-/// is the mean of their two chroma values, each clamped to 0..1 first,
-/// then quantized [inference: the value at the midpoint by linear
+/// on a subsampled axis chroma sample `k` sits at luma position
+/// `2k + siting / 2`, and its value is the linear interpolation there of
+/// the two luma positions' chroma, each clamped to 0..1 first, then
+/// quantized: the mean of the two for siting 1, the even one's own for 0,
+/// the odd one's for 2 [inference: the value at that point by linear
 /// interpolation, after the clamp that ends the per-pixel pipeline; the
-/// VIC's decimation filter is not public]. Other sitings on a subsampled
-/// axis, and any but 0 on a full-resolution one, refuse.
+/// VIC's decimation filter is not public]. Siting 3, and any but 0 on a
+/// full-resolution axis, refuse. grc's encoder input (Minecraft, video
+/// capture on) is NV12 block-linear (2-GOB blocks), 1280×720, chroma 0
+/// horizontally and 1 vertically: the MPEG-2/H.264 default siting.
 #[derive(Clone, Copy, Debug)]
 struct Planar {
-    /// Y, U, V.
-    planes: [Plane; 3],
+    luma: SamplePlane,
+    chroma: ChromaPlanes,
     subsampling: [u32; 2],
+    siting: [u32; 2],
     width: u32,
     height: u32,
 }
 
 impl Planar {
-    fn new([w0, w1]: [u64; 2], addresses: &[u32], subsampling: [u32; 2]) -> Result<Planar, String> {
+    fn new(
+        [w0, w1]: [u64; 2],
+        addresses: &[u32],
+        (layout, subsampling): (ChromaLayout, [u32; 2]),
+    ) -> Result<Planar, String> {
         let siting = [field(w0, 7, 2), field(w0, 9, 2)];
         for (axis, (factor, siting)) in ["horizontal", "vertical"]
             .into_iter()
             .zip(subsampling.into_iter().zip(siting))
         {
-            if siting != u32::from(factor == 2) {
+            if siting == 3 || (factor == 1 && siting != 0) {
                 return Err(format!(
                     "output: {axis} chroma siting {siting} with {factor}:1 subsampling"
                 ));
             }
         }
         let kind = field(w0, 11, 4);
-        if kind != 0 {
-            return Err(format!("output: block kind {kind} of a planar YUV surface"));
-        }
+        let block_height_log2 = field(w0, 15, 4);
         let width = field(w0, 32, 14) + 1;
         let height = field(w0, 46, 14) + 1;
         let luma = [field(w1, 0, 14) + 1, field(w1, 14, 14) + 1];
@@ -1101,16 +1115,36 @@ impl Planar {
                 luma[0], luma[1], chroma[0], chroma[1]
             ));
         }
-        if addresses.contains(&0) {
+        let used = match layout {
+            ChromaLayout::Interleaved { .. } => 2,
+            ChromaLayout::Separate => 3,
+        };
+        if addresses[..used].contains(&0) {
             return Err(format!("output: plane addresses {addresses:#x?}"));
         }
-        let plane = |index: usize, pitch: u32| Plane {
-            address: u64::from(addresses[index]) << 8,
-            pitch: pitch.into(),
+        let plane = |address: u32, row_bytes: u32, rows: u32| {
+            Ok::<_, String>(SamplePlane {
+                address: u64::from(address) << 8,
+                layout: plane_layout(kind, block_height_log2, row_bytes, rows)
+                    .map_err(|e| format!("output: {e}"))?,
+                row_bytes,
+            })
+        };
+        let chroma_planes = match layout {
+            ChromaLayout::Interleaved { u_first } => ChromaPlanes::Interleaved {
+                plane: plane(addresses[1], 2 * chroma[0], chroma[1])?,
+                u_first,
+            },
+            ChromaLayout::Separate => ChromaPlanes::Separate([
+                plane(addresses[1], chroma[0], chroma[1])?,
+                plane(addresses[2], chroma[0], chroma[1])?,
+            ]),
         };
         Ok(Planar {
-            planes: [plane(0, luma[0]), plane(1, chroma[0]), plane(2, chroma[0])],
+            luma: plane(addresses[0], luma[0], luma[1])?,
+            chroma: chroma_planes,
             subsampling,
+            siting,
             width,
             height,
         })
@@ -1136,41 +1170,70 @@ impl Planar {
         let width = area.width() as usize;
         let at =
             |x: u32, y: u32| colors[(y - area.top) as usize * width + (x - area.left) as usize];
-        // Every plane is read before any is written: an unmapped one leaves
-        // the others as they were.
-        let mut planes = Vec::with_capacity(3);
-        for (index, plane) in self.planes.iter().enumerate() {
-            let rect = if index == 0 { area } else { chroma_area };
-            planes.push((plane, rect, plane.read(memory, rect)?));
-        }
-        let samples = (sx * sy) as usize;
-        for (component, (plane, rect, rows)) in planes.iter_mut().enumerate() {
-            // The bytes read run from `rect`'s first sample to its last:
-            // a row of them a pitch, from the rectangle's left edge.
-            let pitch = plane.pitch as usize;
-            let rect = *rect;
-            let work =
-                (rect.width() * rect.height()) as usize * if component == 0 { 1 } else { samples };
-            in_bands(&mut rows.bytes, pitch, work, |first, band| {
-                for (y, row) in (rect.top + first as u32..).zip(band.chunks_mut(pitch)) {
-                    for (x, byte) in (rect.left..rect.right).zip(row) {
-                        let value = if component == 0 {
-                            at(x, y)[0]
-                        } else {
-                            let mut sum = 0.0;
-                            for dy in 0..sy {
-                                for dx in 0..sx {
-                                    sum += at(x * sx + dx, y * sy + dy)[component].clamp(0.0, 1.0);
-                                }
-                            }
-                            sum / (sx * sy) as f32
-                        };
-                        *byte = unorm8(value);
+        // The luma positions a chroma sample takes its value from on each
+        // axis, with their weights (see the siting above).
+        let taps = |axis: usize, k: u32| -> [(u32, f32); 2] {
+            if self.subsampling[axis] == 1 {
+                return [(k, 1.0), (k, 0.0)];
+            }
+            let odd = self.siting[axis] as f32 / 2.0;
+            [(2 * k, 1.0 - odd), (2 * k + 1, odd)]
+        };
+        let chroma = |cx: u32, cy: u32, component: usize| {
+            let mut sum = 0.0;
+            for (y, wy) in taps(1, cy) {
+                for (x, wx) in taps(0, cx) {
+                    if wx * wy != 0.0 {
+                        sum += wx * wy * at(x, y)[component].clamp(0.0, 1.0);
+                    }
+                }
+            }
+            sum
+        };
+        // Each plane's bytes of the area, a row of them a line, computed
+        // in bands of rows; then placed in the plane's layout.
+        let fill = |rect: Rect, samples: u32, value: &(dyn Fn(u32, u32) -> u8 + Sync)| {
+            let row = (rect.width() * samples) as usize;
+            let mut bytes = vec![0u8; row * rect.height() as usize];
+            let work = bytes.len();
+            in_bands(&mut bytes, row, work, |first, band| {
+                for (y, line) in (rect.top + first as u32..).zip(band.chunks_mut(row)) {
+                    for (x, byte) in (rect.left * samples..).zip(line) {
+                        *byte = value(x, y);
                     }
                 }
             });
+            bytes
+        };
+        let mut planes = vec![(self.luma, area, fill(area, 1, &|x, y| unorm8(at(x, y)[0])))];
+        match self.chroma {
+            ChromaPlanes::Interleaved { plane, u_first } => {
+                let value = move |x: u32, y: u32| {
+                    let byte = (x % 2) as usize;
+                    let component = if u_first { 1 + byte } else { 2 - byte };
+                    unorm8(chroma(x / 2, y, component))
+                };
+                planes.push((plane, chroma_area, fill(chroma_area, 2, &value)));
+            }
+            ChromaPlanes::Separate(separate) => {
+                for (index, plane) in separate.into_iter().enumerate() {
+                    let value = |x: u32, y: u32| unorm8(chroma(x, y, 1 + index));
+                    planes.push((plane, chroma_area, fill(chroma_area, 1, &value)));
+                }
+            }
         }
-        for (plane, _, rows) in planes {
+        // Every plane is read before any is written: an unmapped one leaves
+        // the others as they were.
+        let mut stored = Vec::with_capacity(planes.len());
+        for (plane, rect, _) in &planes {
+            stored.push(plane.read(memory, rect.top, rect.bottom)?);
+        }
+        for ((plane, rect, bytes), mut rows) in planes.into_iter().zip(stored) {
+            let row = bytes.len() / rect.height() as usize;
+            let left = rect.left * row as u32 / rect.width();
+            for (y, line) in (rect.top..).zip(bytes.chunks(row)) {
+                plane.place(&mut rows, left, y, line);
+            }
             memory
                 .write(plane.address + rows.start, &rows.bytes)
                 .ok_or_else(|| format!("plane at {:#x} is not mapped", plane.address))?;
@@ -1190,8 +1253,8 @@ impl Output {
     /// `words` are the output surface configuration, `planes` the luma,
     /// chroma U and chroma V plane addresses.
     fn new(words: [u64; 2], planes: &[u32]) -> Result<Output, String> {
-        if let Some(subsampling) = planar_subsampling(field(words[0], 0, 7)) {
-            return Planar::new(words, planes, subsampling).map(Output::Planar);
+        if let Some(format) = yuv_input(field(words[0], 0, 7)) {
+            return Planar::new(words, planes, format).map(Output::Planar);
         }
         // Chroma plane addresses are ignored, see [`Surface`].
         Surface::new(words, planes[0], "output").map(Output::Rgb)
