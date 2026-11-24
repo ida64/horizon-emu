@@ -1226,10 +1226,14 @@ pub fn draw(
 
     // The vertex stage on the host GPU, when the draw is large enough for
     // it to matter (or has several instances, or its vertex program
-    // addresses global memory) and Metal can run it (see `native`).
+    // addresses global memory or samples textures) and Metal can run it
+    // (see `native`).
     if let (Some(metal), Some(pixel), None) = (context.metal, &pixel, &geometry)
         && r.get(SET_RASTER_ENABLE) & 1 != 0
-        && (batch.len() >= NATIVE_MINIMUM || instances > 1 || vertex.addresses_global_memory())
+        && (batch.len() >= NATIVE_MINIMUM
+            || instances > 1
+            || vertex.addresses_global_memory()
+            || vertex.texture_handle_extent() > 0)
     {
         let fragments = fragments(context, pixel)?;
         if native(
@@ -1320,9 +1324,10 @@ pub fn draw(
 /// vertex stage and per-triangle setup of anything larger cost more than
 /// a native draw \[assumption: a threshold, chosen so single UI quads (4
 /// or 6 elements) stay on the exact path\]. A vertex program that
-/// addresses global memory runs on Metal whatever the draw's size: on the
-/// CPU each of its loads may wait for the GPU, which holds what pixel
-/// programs stored there.
+/// addresses global memory or samples textures runs on Metal whatever
+/// the draw's size: on the CPU each of its loads may wait for the GPU,
+/// which holds what pixel programs stored there and the render targets
+/// it may sample.
 const NATIVE_MINIMUM: usize = 7;
 
 thread_local! {
