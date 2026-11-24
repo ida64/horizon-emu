@@ -38,7 +38,7 @@
 //! performed [unverified].
 
 use super::super::exec::{bit, bits, fswzadd_factors, quad_shuffle_lane, sext};
-use super::{PT, RZ, SLOTS, TextureKind, Writer};
+use super::{PT, RZ, SLOTS, Stage, TextureKind, Writer};
 
 impl Writer<'_> {
     /// `IPA`: the attribute's value at the pixel center or, CENTROID, at
@@ -259,8 +259,12 @@ impl Writer<'_> {
     }
 
     /// Records, before a sample of texture `slot`, that an unbound slot
-    /// was sampled (see the module documentation).
+    /// was sampled (see the module documentation). A vertex program has
+    /// no fault words: its draw goes to the CPU when a slot is unbound.
     fn note_sample(&mut self, slot: usize) {
+        if self.stage == Stage::Vertex {
+            return;
+        }
         self.line(&format!(
             "if (atomic_load_explicit(&texture_faults[{}], memory_order_relaxed) != 0u) {{ atomic_store_explicit(&texture_faults[{}], 1u, memory_order_relaxed); }}",
             2 * slot,
@@ -311,7 +315,16 @@ impl Writer<'_> {
                 "unaligned second destination",
             )?;
         }
-        let implicit = matches!(encoding, 1 | 4 | 7 | 10 | 12);
+        // A vertex has no derivatives: implicit level of detail is the
+        // base level (`exec/tex.rs`).
+        let vertex = self.stage == Stage::Vertex;
+        if vertex {
+            self.require(
+                !matches!(encoding, 4 | 5 | 6 | 9),
+                "depth comparison in a vertex program",
+            )?;
+        }
+        let implicit = !vertex && matches!(encoding, 1 | 4 | 7 | 10 | 12);
         let slot = self.texture_slot(bits(w, 36, 13) * 4, implicit, kind);
         let float = |writer: &mut Self, register: u32| {
             format!("as_type<float>({})", writer.read(register))
@@ -330,7 +343,7 @@ impl Writer<'_> {
         };
         let layer = (kind == TextureKind::Array).then(|| format!("({} & 0xffffu)", self.read(a)));
         let option = match encoding {
-            1 | 7 | 10 | 12 => format!("bias(lod_bias[{slot}])"),
+            1 | 7 | 10 | 12 if !vertex => format!("bias(lod_bias[{slot}])"),
             3 => format!("level({})", float(self, b)),
             13 => format!("level({})", float(self, b + 1)),
             _ => "level(0.0f)".into(),

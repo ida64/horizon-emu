@@ -126,14 +126,15 @@ pub struct Program {
     /// One entry per 64-bit word after the header; scheduling words are
     /// stored as `None`.
     code: Vec<Option<exec::Inst>>,
-    /// [`Program::constant_buffer_extent`] of every slot and
-    /// [`Program::texture_handle_extent`], once asked for.
+    /// [`Program::constant_buffer_extent`] of every slot,
+    /// [`Program::texture_handle_extent`] and
+    /// [`Program::addresses_global_memory`], once asked for.
     extents: std::sync::OnceLock<Extents>,
 }
 
-/// Constant buffer extents by slot (the 32 an `LDC` slot field names) and
-/// the texture handle extent.
-type Extents = ([Option<usize>; 32], usize);
+/// Constant buffer extents by slot (the 32 an `LDC` slot field names),
+/// the texture handle extent, and whether global memory is addressed.
+type Extents = ([Option<usize>; 32], usize, bool);
 
 impl Program {
     /// `address`: GPU VA of the shader program header (SPH, 0x50 bytes);

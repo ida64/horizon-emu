@@ -11,17 +11,17 @@
 //! application load c\[0\]\[0x510 + 16 i\] and the word after it into
 //! an even register and the next, and the 12 bytes there are an address,
 //! a size and zero\]. [`candidates`] lists every place of a constant
-//! buffer the program loads into a register pair that way; the draw
-//! binds the memory each names, as far as it is a descriptor of mapped
-//! memory, in one buffer ([`GLOBAL_BUFFER`](super::GLOBAL_BUFFER) of the
-//! fragment function, [`VERTEX_GLOBAL_BUFFER`](super::VERTEX_GLOBAL_BUFFER)
-//! of the vertex function):
-//!
-//! * the fault word;
-//! * four words per candidate: the address (low, high), the size in
-//!   bytes (0: nothing bound) and the word index of its bytes in the
-//!   buffer;
-//! * then the bytes of each, padded to words.
+//! buffer the program loads into a register pair that way. The renderer
+//! keeps the memory such places name in one buffer every program is
+//! given ([`GLOBAL_BUFFER`](super::GLOBAL_BUFFER) of the fragment
+//! function, [`VERTEX_GLOBAL_BUFFER`](super::VERTEX_GLOBAL_BUFFER) of
+//! the vertex function), so what one program stores the next loads
+//! without the bytes leaving the GPU; its first word is the fault word.
+//! A draw gives its program a table of four words per candidate
+//! (`GT(i)`: a buffer of its own for a fragment function, words of the
+//! draw's for a vertex function): the address (low, high), the size in
+//! bytes (0: nothing bound) and the word index of its bytes in the
+//! buffer.
 //!
 //! An access finds the candidate its address falls in and reads or
 //! writes there. An access of a vertex or a covered fragment that falls
@@ -111,7 +111,7 @@ impl Writer<'_> {
     /// fault.
     fn global_words(&mut self, width: u32, body: &str) {
         self.line(&format!(
-            "for (uint k = 0u; k < {}u && (ad & {}ul) == 0ul; k++) {{ const ulong rel = ad - ((ulong(GM(4u * k + 2u)) << 32) | ulong(GM(4u * k + 1u))); const ulong size = ulong(GM(4u * k + 3u)); if (rel < size && size - rel >= {width}ul) {{ const uint at = GM(4u * k + 4u) + uint(rel >> 2); {body} hit = true; break; }} }}",
+            "for (uint k = 0u; k < {}u && (ad & {}ul) == 0ul; k++) {{ const ulong rel = ad - ((ulong(GT(4u * k + 1u)) << 32) | ulong(GT(4u * k))); const ulong size = ulong(GT(4u * k + 2u)); if (rel < size && size - rel >= {width}ul) {{ const uint at = GT(4u * k + 3u) + uint(rel >> 2); {body} hit = true; break; }} }}",
             self.globals.len(),
             width.max(4) - 1,
         ));
@@ -207,7 +207,7 @@ impl Writer<'_> {
             .map(|i| format!("g{i} = GM(at + {i}u); "))
             .collect();
         self.line(&format!(
-            "for (uint k = 0u; k < {}u && (ad & {}ul) == 0ul; k++) {{ const ulong rel = ad - ((ulong(GM(4u * k + 2u)) << 32) | ulong(GM(4u * k + 1u))); const ulong size = ulong(GM(4u * k + 3u)); if (rel < size && size - rel >= {width}ul) {{ const uint at = GM(4u * k + 4u) + uint(rel >> 2); {words}g0 >>= uint(rel & 3ul) * 8u; hit = true; break; }} }}",
+            "for (uint k = 0u; k < {}u && (ad & {}ul) == 0ul; k++) {{ const ulong rel = ad - ((ulong(GT(4u * k + 1u)) << 32) | ulong(GT(4u * k))); const ulong size = ulong(GT(4u * k + 2u)); if (rel < size && size - rel >= {width}ul) {{ const uint at = GT(4u * k + 3u) + uint(rel >> 2); {words}g0 >>= uint(rel & 3ul) * 8u; hit = true; break; }} }}",
             self.globals.len(),
             width - 1,
         ));

@@ -21,16 +21,32 @@ impl Program {
     pub fn texture_handle_extent(&self) -> usize {
         self.extents().1
     }
-    /// Both extents, found once per program (a draw asks for every bound
-    /// slot's): per slot `LDC` can name, and of the texture handles.
+    /// Whether the program addresses global memory (`LDG`, `LD`, `STG`,
+    /// `ST`, `RED`, `ATOM`).
+    pub fn addresses_global_memory(&self) -> bool {
+        self.extents().2
+    }
+    /// The extents and whether global memory is addressed, found once
+    /// per program (a draw asks for every bound slot's): per slot `LDC`
+    /// can name, and of the texture handles.
     fn extents(&self) -> &super::Extents {
         self.extents.get_or_init(|| {
             (
                 std::array::from_fn(|slot| constant_buffer_extent(&self.code, slot)),
                 texture_handle_extent(&self.code),
+                addresses_global_memory(&self.code),
             )
         })
     }
+}
+/// [`Program::addresses_global_memory`] of decoded code.
+fn addresses_global_memory(code: &[Option<Inst>]) -> bool {
+    code.iter().flatten().any(|inst| {
+        matches!(
+            inst.op,
+            Op::Ldg | Op::Ld | Op::Stg | Op::St | Op::Red | Op::Atom
+        )
+    })
 }
 /// [`Program::constant_buffer_extent`] of decoded code.
 pub(super) fn constant_buffer_extent(code: &[Option<Inst>], slot: usize) -> Option<usize> {
@@ -39,12 +55,7 @@ pub(super) fn constant_buffer_extent(code: &[Option<Inst>], slot: usize) -> Opti
     // buffer descriptors the driver keeps in constant buffers (a 64-bit
     // address, then a 32-bit size); the Metal renderer reads the size
     // of each address the program loads (`msl::Translated::globals`).
-    let global = code.iter().flatten().any(|inst| {
-        matches!(
-            inst.op,
-            Op::Ldg | Op::Ld | Op::Stg | Op::St | Op::Red | Op::Atom
-        )
-    });
+    let global = addresses_global_memory(code);
     for inst in code.iter().flatten() {
         let w = inst.word;
         if inst.op == Op::Ldc {

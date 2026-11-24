@@ -54,6 +54,10 @@ pub struct TranslatedVertex {
     pub constant_buffer_1: Option<Vec<u8>>,
     /// As [`super::Translated::globals`].
     pub globals: Vec<(u32, u32)>,
+    /// As [`super::Translated::textures`] and [`super::Translated::kinds`]
+    /// (every sample is of a level the program names, or the base one).
+    pub textures: Vec<u32>,
+    pub kinds: Vec<super::TextureKind>,
 }
 
 /// Translates a vertex program, or says why it cannot be.
@@ -138,6 +142,8 @@ pub fn translate_vertex(
         indirect: writer.indirect,
         constant_buffer_1: flow.jump_tables.then(|| constant_buffer_1.to_vec()),
         globals: writer.globals,
+        textures: writer.textures,
+        kinds: writer.kinds,
     })
 }
 
@@ -224,6 +230,10 @@ pub const STREAM_BUFFER: usize = 21;
 /// The word of the draw's words (buffer 29) that says what buffer 0
 /// holds, after the words of [`MAX_STREAMS`] streams.
 pub const INDEXED_WORD: usize = 2 + 3 * MAX_STREAMS;
+
+/// The word of the draw's words where a program's global memory table
+/// starts (`memory.rs`).
+pub const GLOBAL_TABLE_WORD: usize = INDEXED_WORD + 1;
 
 impl NativeVertex {
     /// The vertex function `vertex_native` of `vertex` for a draw that
@@ -329,9 +339,13 @@ impl NativeVertex {
                 return Err(format!("vertex stream slot {slot}"));
             }
             parameters.push(format!(
-                "const device uchar* s{slot} [[buffer({})]]",
+                "const device uchar* vs{slot} [[buffer({})]]",
                 STREAM_BUFFER + slot as usize
             ));
+        }
+        for (i, kind) in vertex.kinds.iter().enumerate() {
+            parameters.push(format!("{} t{i} [[texture({i})]]", kind.declaration()));
+            parameters.push(format!("sampler s{i} [[sampler({i})]]"));
         }
         if !vertex.globals.is_empty() {
             if kernel {
@@ -395,11 +409,14 @@ impl NativeVertex {
         }
         // Every vertex is the draw's (`memory.rs`).
         if !vertex.globals.is_empty() {
-            let _ = writeln!(s, "#define GM_LIVE true\n{GLOBAL_WORD}");
+            let _ = writeln!(
+                s,
+                "#define GM_LIVE true\n{GLOBAL_WORD}\n#define GT(i) draw[{GLOBAL_TABLE_WORD}u + (i)]"
+            );
         }
         s.push_str(&vertex.body);
         if !vertex.globals.is_empty() {
-            let _ = writeln!(s, "#undef GM_LIVE\n#undef GM");
+            let _ = writeln!(s, "#undef GM_LIVE\n#undef GM\n#undef GT");
         }
         if kernel {
             for &word in &outputs {
@@ -508,7 +525,7 @@ fn fetch_code(fetch: &Fetch) -> Result<String, String> {
         let length = (size - 4 * k).min(4);
         let _ = writeln!(
             s,
-            "      const uint w{k} = load_bytes(s{slot}, at + {}u, {length}u);",
+            "      const uint w{k} = load_bytes(vs{slot}, at + {}u, {length}u);",
             4 * k
         );
     }

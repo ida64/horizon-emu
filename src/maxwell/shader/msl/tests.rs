@@ -534,22 +534,21 @@ fn render(
         }
     }
     let biases = vec![0.0f32; 4 * t.textures.len() + 1];
-    // The global memory buffer as the renderer makes it (`memory.rs`):
-    // every place of the constants a descriptor of the run's region.
+    // Global memory as the renderer gives it (`memory.rs`): the fault
+    // word, then at word 4 the run's region; and the table, every place
+    // of the constants a descriptor of that region.
     let global = (!t.globals.is_empty()).then(|| {
         let (_, region) = input.memory.clone().expect("a region");
-        let table = 1 + 4 * t.globals.len();
-        let mut words = vec![0u32; table];
-        for (index, &(slot, offset)) in t.globals.iter().enumerate() {
+        let mut table = Vec::new();
+        for &(slot, offset) in &t.globals {
             let at = offset as usize;
             let descriptor = &input.buffers[slot as usize][at..at + 12];
             let word = |i: usize| u32::from_le_bytes(descriptor[4 * i..4 * i + 4].try_into().unwrap());
-            words[1 + 4 * index..5 + 4 * index]
-                .copy_from_slice(&[word(0), word(1), word(2), table as u32]);
+            table.extend([word(0), word(1), word(2), 4]);
         }
-        let mut content = bytes(&words);
+        let mut content = vec![0u8; 16];
         content.extend_from_slice(&region);
-        gpu.buffer(&content)
+        (gpu.buffer(&content), gpu.buffer(&bytes(&table)))
     });
     let sizes: Vec<u32> = input.buffers.iter().map(|b| b.len() as u32).collect();
     let usage = MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead;
@@ -660,8 +659,9 @@ fn render(
         encoder.setFragmentBuffer_offset_atIndex(Some(&buffers[21]), 0, 20);
         encoder.setFragmentBuffer_offset_atIndex(Some(&buffers[22]), 0, 21);
         encoder.setFragmentBuffer_offset_atIndex(Some(&buffers[23]), 0, 24);
-        if let Some(global) = &global {
+        if let Some((global, table)) = &global {
             encoder.setFragmentBuffer_offset_atIndex(Some(global), 0, super::GLOBAL_BUFFER);
+            encoder.setFragmentBuffer_offset_atIndex(Some(table), 0, super::GLOBAL_BUFFER + 1);
         }
         for (i, texture) in textures.iter().enumerate() {
             encoder.setFragmentTexture_atIndex(Some(texture), i);
@@ -672,18 +672,17 @@ fn render(
     encoder.endEncoding();
     command.commit();
     command.waitUntilCompleted();
-    if let (Some(global), Some((_, region))) = (&global, &input.memory) {
-        let table = 4 * (1 + 4 * t.globals.len());
-        // SAFETY: the buffer holds the table and the region; the GPU
-        // finished.
+    if let (Some((global, _)), Some((_, region))) = (&global, &input.memory) {
+        // SAFETY: the buffer holds the fault word's 16 bytes and the
+        // region; the GPU finished.
         let now = unsafe {
             std::slice::from_raw_parts(
                 global.contents().as_ptr().cast::<u8>(),
-                table + region.len(),
+                16 + region.len(),
             )
         };
         assert_eq!(now[..4], [0; 4], "global memory fault");
-        input.stored.borrow_mut()[1] = now[table..].to_vec();
+        input.stored.borrow_mut()[1] = now[16..].to_vec();
     }
     Ok(attachments
         .iter()

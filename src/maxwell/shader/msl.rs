@@ -72,8 +72,8 @@ mod texture;
 mod vertex;
 
 pub use vertex::{
-    Fetch, INDEXED_WORD, MAX_STREAMS, NativeVertex, STREAM_BUFFER, TranslatedVertex,
-    translate_vertex,
+    Fetch, GLOBAL_TABLE_WORD, INDEXED_WORD, MAX_STREAMS, NativeVertex, STREAM_BUFFER,
+    TranslatedVertex, translate_vertex,
 };
 
 use std::collections::BTreeSet;
@@ -192,13 +192,29 @@ pub struct Translated {
     pub atomics: bool,
 }
 
-/// The fragment buffer index of the global memory a program addresses
-/// (see `memory.rs`).
+impl Translated {
+    /// Whether the fragment function takes its samplers as one array of
+    /// [`SAMPLERS`], each slot's picked by an index the draw gives (after
+    /// the depth comparison words, as the bits of a float): a program
+    /// of more texture slots than a Metal function has samplers.
+    pub fn shared_samplers(&self) -> bool {
+        self.kinds.len() > SAMPLERS
+    }
+}
+
+/// The fragment buffer index of the global memory programs address
+/// (see `memory.rs`), followed by that of the program's table.
 pub const GLOBAL_BUFFER: usize = 28;
-/// The vertex buffer index of the same for a vertex program.
+/// The vertex buffer index of the same; a vertex program's table is in
+/// the draw's words ([`GLOBAL_TABLE_WORD`]).
 pub const VERTEX_GLOBAL_BUFFER: usize = 30;
-/// A word of the bound global memory, in a translated program's body.
+/// A word of the global memory, in a translated program's body.
 const GLOBAL_WORD: &str = "#define GM(i) atomic_load_explicit(&gm[i], memory_order_relaxed)";
+
+/// The sampler states a Metal function takes. A program of more texture
+/// slots takes its samplers as an array of this many, which the draw
+/// fills with the distinct ones among its slots' ([`Translated::shared_samplers`]).
+pub const SAMPLERS: usize = 16;
 
 /// Register value expressions.
 fn r(index: u32) -> String {
@@ -497,7 +513,7 @@ impl Writer<'_> {
             (Stage::Pixel, Op::Ipa) => self.ipa(),
             (Stage::Pixel, Op::Shfl) => self.shfl(),
             (Stage::Pixel, Op::Fswzadd) => self.fswzadd(),
-            (Stage::Pixel, Op::Texs) => self.texs(),
+            (_, Op::Texs) => self.texs(),
             (Stage::Pixel, Op::Tex) => self.tex(),
             (Stage::Pixel, Op::Tld4) => self.tld4(),
             (Stage::Pixel, Op::Tld4s) => self.tld4s(),
@@ -912,7 +928,12 @@ impl Translated {
         }
         for (i, kind) in self.kinds.iter().enumerate() {
             parameters.push(format!("{} t{i} [[texture({i})]]", kind.declaration()));
-            parameters.push(format!("sampler s{i} [[sampler({i})]]"));
+            if !self.shared_samplers() {
+                parameters.push(format!("sampler s{i} [[sampler({i})]]"));
+            }
+        }
+        if self.shared_samplers() {
+            parameters.push(format!("array<sampler, {SAMPLERS}> samplers [[sampler(0)]]"));
         }
         if !self.textures.is_empty() {
             parameters.push("device atomic_uint* texture_faults [[buffer(21)]]".to_string());
@@ -920,6 +941,10 @@ impl Translated {
         if !self.globals.is_empty() {
             parameters.push(format!(
                 "device atomic_uint* gm [[buffer({GLOBAL_BUFFER})]]"
+            ));
+            parameters.push(format!(
+                "const device uint* gt [[buffer({})]]",
+                GLOBAL_BUFFER + 1
             ));
         }
         if alpha_test {
@@ -1007,9 +1032,20 @@ impl Translated {
             2 * n + 1,
             3 * n + 1
         );
+        // Slot i's sampler among the shared ones.
+        if self.shared_samplers() {
+            for i in 0..n {
+                let _ = writeln!(
+                    s,
+                    "#define s{i} samplers[min(as_type<uint>(lod_bias[{}u]), {}u)]",
+                    4 * n + 1 + i,
+                    SAMPLERS - 1
+                );
+            }
+        }
         // GM_LIVE: whether this fragment is one of the primitive's (a
         // global memory access of any other reports and stores nothing);
-        // GM(i): word i of the bound memory.
+        // GM(i): word i of global memory; GT(i): word i of the table.
         let live = match (native, multisample) {
             (Some(_), _) => "!simd_is_helper_thread()",
             (None, Some(_)) => "(((coverage_mask >> layer) & 1u) != 0u)",
@@ -1017,7 +1053,7 @@ impl Translated {
         };
         let _ = writeln!(s, "#define GM_LIVE {live}");
         if !self.globals.is_empty() {
-            let _ = writeln!(s, "{GLOBAL_WORD}");
+            let _ = writeln!(s, "{GLOBAL_WORD}\n#define GT(i) gt[i]");
         }
         s.push_str(&self.body);
         for k in 0..self.ipa_words.len() {
@@ -1028,7 +1064,12 @@ impl Translated {
             "#undef GM_LIVE\n#undef CMP_CFG\n#undef CMP_MIN\n#undef CMP_MAX"
         );
         if !self.globals.is_empty() {
-            let _ = writeln!(s, "#undef GM");
+            let _ = writeln!(s, "#undef GM\n#undef GT");
+        }
+        if self.shared_samplers() {
+            for i in 0..n {
+                let _ = writeln!(s, "#undef s{i}");
+            }
         }
         let covered = match (native, multisample) {
             (Some(_), _) => "false",

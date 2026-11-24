@@ -175,7 +175,7 @@ use super::shader::Program;
 use super::shader::msl::{self, TextureKind, Translated};
 use super::surface::{Rect, Surface, Window};
 use super::sampling::Target;
-use super::texture::format::{ColorFormat, ComponentType, DepthFormat};
+use super::texture::format::{ColorFormat, DepthFormat};
 use super::texture::{Texture, Tic, Tsc};
 use super::{GpuMemory, Unmodeled};
 
@@ -380,7 +380,9 @@ struct State {
     composites: HashMap<[u32; 8], Composite>,
     /// Counts changes of residents' textures ([`Resident::version`]).
     versions: u64,
-    convert_pipeline: Option<Retained<ComputePipeline>>,
+    /// The kernels filling composites' levels, from color and from depth
+    /// residents.
+    convert_pipelines: [Option<Retained<ComputePipeline>>; 2],
     /// Counts uses of residents (`Resident::used`).
     clock: u64,
     fallbacks: HashMap<String, u64>,
@@ -395,18 +397,9 @@ struct State {
     placeholders: HashMap<TextureKind, (Retained<MetalTexture>, Retained<Sampler>)>,
     /// Buffer space for the frame's draw data.
     arena: Arena,
-    /// Global memory bound for pixel programs, by the regions it holds
-    /// ([`Renderer::global_memory`]).
-    globals: Lru<Vec<(u64, u32)>, GlobalMemory>,
-    /// Bytes of global memory uploaded since the last wait: buffers
-    /// replaced meanwhile live on until the work using them is done.
-    globals_pending: usize,
-    /// The global memory buffers pixel programs stored to since they
-    /// were last written back, by their regions.
-    dirty_globals: Vec<Vec<(u64, u32)>>,
-    /// The global memory buffers draws bound since their fault words
-    /// (the first word of each) were last looked at.
-    globals_bound: Vec<Retained<MetalBuffer>>,
+    /// The memory programs address through their constants
+    /// ([`Renderer::global_tables`]), made when first needed.
+    globals: Option<Globals>,
     /// The packing kernels (`State::pack`), plain and layered.
     pack_pipelines: HashMap<bool, Retained<ComputePipeline>>,
     /// The 2D blit kernel (`blit`), made once.
@@ -438,14 +431,11 @@ impl Default for State {
             native: HashMap::new(),
             texture_bytes: 0,
             arena: Arena::default(),
-            globals: Lru::new(GLOBAL_BUDGET),
-            globals_pending: 0,
-            dirty_globals: Vec::new(),
-            globals_bound: Vec::new(),
+            globals: None,
             pack_pipelines: HashMap::new(),
             composites: HashMap::new(),
             versions: 0,
-            convert_pipeline: None,
+            convert_pipelines: [None, None],
             blit_pipeline: None,
         }
     }
@@ -762,16 +752,18 @@ impl Renderer {
                     }
             })
             .collect();
-        let wanted_globals: Vec<Vec<(u64, u32)>> = state
-            .dirty_globals
+        let wanted_globals: Vec<(u64, u32)> = state
+            .globals
             .iter()
-            .filter(|key| match scope {
-                Scope::Range(start, end) => key.iter().any(|&(address, size)| {
-                    size != 0 && overlap((address, address + u64::from(size)), (start, end))
-                }),
-                _ => true,
+            .flat_map(|globals| &globals.regions)
+            .filter(|(key, region)| {
+                region.dirty
+                    && match scope {
+                        Scope::Range(start, end) => overlap(global_extent(**key), (start, end)),
+                        _ => true,
+                    }
             })
-            .cloned()
+            .map(|(key, _)| *key)
             .collect();
         if !wanted.contains(&true) && wanted_globals.is_empty() {
             // Nothing for guest memory: the GPU goes on with what is
@@ -847,59 +839,50 @@ impl Renderer {
                 }
             }
         }
-        for bound in std::mem::take(&mut state.globals_bound) {
-            let word = bound.contents().cast::<u32>();
-            // SAFETY: the buffer starts with the fault word; the GPU
-            // finished.
-            if unsafe { word.read() } != 0 {
-                // SAFETY: as above.
-                unsafe { word.write(0) };
-                self.writing_back.store(false, Ordering::Relaxed);
-                return Err(Unmodeled(
-                    "shader: global memory access outside the buffers the program's constants \
-                     name"
-                        .into(),
-                ));
-            }
-        }
-        // Global memory pixel programs stored to: what changed goes to
-        // guest memory, and the buffer is the copy of it from now on.
-        for key in &wanted_globals {
-            state.dirty_globals.retain(|k| k != key);
-            let Some(held) = state.globals.get_mut(key) else {
-                continue;
-            };
-            // SAFETY: the buffer holds `content.len()` bytes; the GPU
-            // finished.
-            let now = unsafe {
-                std::slice::from_raw_parts(
-                    held.buffer.contents().as_ptr().cast::<u8>(),
-                    held.content.len(),
-                )
-            };
-            for (index, &(address, size)) in key.iter().enumerate() {
-                let entry = 4 + 16 * index;
-                let word = |at: usize| {
-                    u32::from_le_bytes(held.content[at..at + 4].try_into().expect("4 bytes"))
-                };
-                // A region that was not mapped has no bytes.
-                if size == 0 || word(entry + 8) == 0 {
-                    continue;
-                }
-                let start = 4 * word(entry + 12) as usize;
-                let range = start..start + size as usize;
-                if now[range.clone()] != held.content[range.clone()]
-                    && memory.write(address, &now[range]).is_none()
-                {
+        if let Some(globals) = &mut state.globals {
+            if std::mem::take(&mut globals.bound) {
+                let word = globals.buffer.contents().cast::<u32>();
+                // SAFETY: the buffer starts with the fault word; the GPU
+                // finished.
+                if unsafe { word.read() } != 0 {
+                    // SAFETY: as above.
+                    unsafe { word.write(0) };
                     self.writing_back.store(false, Ordering::Relaxed);
-                    return Err(Unmodeled(format!(
-                        "Metal: global memory write-back to unmapped {address:#x}"
-                    )));
+                    return Err(Unmodeled(
+                        "shader: global memory access outside the buffers the program's \
+                         constants name"
+                            .into(),
+                    ));
                 }
             }
-            held.content = now.to_vec();
-            held.dirty = false;
-            held.stamp = writes.stamp();
+            // Regions programs may have stored to: what changed goes to
+            // guest memory, and the buffer's bytes are the copy of it
+            // from now on.
+            for key in &wanted_globals {
+                let (address, size) = *key;
+                let Some(region) = globals.regions.get_mut(key) else {
+                    continue;
+                };
+                // SAFETY: the region's bytes are in the buffer; the GPU
+                // finished.
+                let now = unsafe {
+                    std::slice::from_raw_parts(
+                        globals.buffer.contents().as_ptr().cast::<u8>().add(region.offset),
+                        size as usize,
+                    )
+                };
+                if now != region.content {
+                    if memory.write(address, now).is_none() {
+                        self.writing_back.store(false, Ordering::Relaxed);
+                        return Err(Unmodeled(format!(
+                            "Metal: global memory write-back to unmapped {address:#x}"
+                        )));
+                    }
+                    region.content.copy_from_slice(now);
+                }
+                region.dirty = false;
+                region.stamp = writes.stamp();
+            }
         }
         let mut result = Ok(());
         for ((resident, &wanted), pack) in state.residents.iter_mut().zip(&wanted).zip(packs) {
@@ -916,8 +899,11 @@ impl Renderer {
             }
         }
         self.writing_back.store(false, Ordering::Relaxed);
-        let any_dirty =
-            state.residents.iter().any(|r| r.dirty.is_some()) || !state.dirty_globals.is_empty();
+        let any_dirty = state.residents.iter().any(|r| r.dirty.is_some())
+            || state
+                .globals
+                .iter()
+                .any(|globals| globals.regions.values().any(|region| region.dirty));
         self.any_dirty.store(any_dirty, Ordering::Relaxed);
         let stamp = writes.stamp();
         for ((resident, current), wanted) in state.residents.iter_mut().zip(current).zip(wanted) {
@@ -949,8 +935,11 @@ impl Renderer {
                 .residents
                 .iter()
                 .any(|r| r.dirty.is_some() && overlap(r.extent(), range))
-                || state.dirty_globals.iter().flatten().any(|&(a, size)| {
-                    size != 0 && overlap((a, a + u64::from(size)), range)
+                || state.globals.iter().any(|globals| {
+                    globals
+                        .regions
+                        .iter()
+                        .any(|(key, region)| region.dirty && overlap(global_extent(*key), range))
                 })
         };
         if overlaps {
@@ -1153,36 +1142,16 @@ impl Renderer {
         let mut bound = Vec::new();
         let mut unbound = Vec::new();
         for (slot, &handle) in handles.iter().enumerate() {
-            let (tic, tsc) = match draw.textures.header(handle) {
-                Ok(header) => header,
-                Err(refusal) => {
-                    unbound.push((slot, refusal.0));
-                    bound.push(None);
-                    continue;
-                }
-            };
             let kind = translated.kinds[slot];
-            let sampled = match self.composite(memory, writes, &tic, &targets)? {
-                Some(texture) => Ok(Sampled::Composite(texture)),
-                None => match format::native_format(&tic, kind) {
-                    Some(pixel_format) => draw
-                        .textures
-                        .raw(handle)
-                        .map(|raw| Sampled::Native(raw, pixel_format)),
-                    None => draw
-                        .textures
-                        .resolve(handle)
-                        .map(|(texture, _)| Sampled::Decoded(texture)),
-                },
-            };
-            let sampled = match sampled {
-                Ok(sampled) => sampled,
-                Err(refusal) => {
-                    unbound.push((slot, refusal.0));
-                    bound.push(None);
-                    continue;
-                }
-            };
+            let (sampled, tic, tsc) =
+                match self.sampled(memory, writes, draw.textures, handle, kind)? {
+                    Ok(sampled) => sampled,
+                    Err(refusal) => {
+                        unbound.push((slot, refusal));
+                        bound.push(None);
+                        continue;
+                    }
+                };
             if let Err(reason) = format::check_texture(&tic, &tsc, kind) {
                 return self.fall_back(reason);
             }
@@ -1206,30 +1175,57 @@ impl Renderer {
             };
             bound.push(Some((sampled, tic, tsc, bias, kind)));
         }
+        // A vertex program's textures. It has no fault words: a slot
+        // naming no texture leaves the vertices to the CPU, which refuses
+        // the sample when it executes.
+        let mut vertex_bound = Vec::new();
+        if let Some((native, vertex, ..)) = &vertex {
+            for (slot, &offset) in vertex.textures.iter().enumerate() {
+                let kind = vertex.kinds[slot];
+                let handle = native
+                    .constants
+                    .get(draw.texture_buffer_index as usize)
+                    .and_then(|(data, _)| data.get(offset as usize..offset as usize + 4))
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("4 bytes")));
+                let sampled = match handle {
+                    Some(handle) => {
+                        self.sampled(memory, writes, draw.textures, handle, kind)?
+                    }
+                    None => Err("texture handle outside the constant buffer".into()),
+                };
+                let reason = match sampled {
+                    Ok((sampled, tic, tsc)) => match format::check_texture(&tic, &tsc, kind) {
+                        Ok(()) if matches!(sampled, Sampled::Composite(_))
+                            && kind != TextureKind::Flat =>
+                        {
+                            format!("rendered texture in a {kind:?} slot")
+                        }
+                        Ok(()) => {
+                            vertex_bound.push((sampled, tic, tsc, kind));
+                            continue;
+                        }
+                        Err(reason) => reason,
+                    },
+                    Err(_) => "a slot names no texture".into(),
+                };
+                self.note_cpu_vertices(&format!("vertex texture: {reason}"));
+                return Ok(false);
+            }
+        }
         if translated.atomics && !samples.is_single() {
             return self.fall_back("atomic update of global memory with several samples".into());
         }
-        let global_memory = if translated.globals.is_empty() {
-            None
-        } else {
-            Some(self.global_memory(
-                memory,
-                writes,
-                draw.constants,
-                &translated.globals,
-                translated.stores,
-            )?)
-        };
-        let vertex_memory = match &vertex {
-            Some((native, vertex, ..)) if !vertex.globals.is_empty() => Some(self.global_memory(
-                memory,
-                writes,
-                native.constants,
-                &vertex.globals,
-                false,
-            )?),
-            _ => None,
-        };
+        let [global_table, vertex_table] = self.global_tables(
+            memory,
+            writes,
+            [
+                (draw.constants, &translated.globals, translated.stores),
+                match &vertex {
+                    Some((native, vertex, ..)) => (native.constants, &vertex.globals, false),
+                    None => (&[], &[], false),
+                },
+            ],
+        )?;
         let residents = self.residents(memory, writes, &targets, samples.log2, false)?;
 
         let mut state = self.state.lock().unwrap();
@@ -1366,48 +1362,16 @@ impl Renderer {
         // Textures and samplers on the GPU.
         let mut gpu_textures = Vec::new();
         for (slot, entry) in bound.iter().enumerate() {
-            let Some((sampled, tic, tsc, _, kind)) = entry else {
-                gpu_textures.push(state.placeholder(gpu, translated.kinds[slot])?);
-                continue;
-            };
-            let metal = match sampled {
-                Sampled::Composite(texture) => texture.clone(),
-                Sampled::Decoded(texture) => {
-                    let id = (Arc::as_ptr(texture) as usize, *kind);
-                    match state.textures.get(&id) {
-                        Some((_, t)) => t.clone(),
-                        None => {
-                            let t = upload_texture(gpu, texture, *kind)?;
-                            state.texture_bytes += texture.bytes();
-                            state.textures.insert(id, (Arc::clone(texture), t.clone()));
-                            t
-                        }
-                    }
+            gpu_textures.push(match entry {
+                Some((sampled, tic, tsc, _, kind)) => {
+                    state.gpu_texture(gpu, sampled, tic, tsc, *kind)?
                 }
-                Sampled::Native(raw, pixel_format) => {
-                    let id = (Arc::as_ptr(raw) as usize, *kind);
-                    match state.native.get(&id) {
-                        Some((_, t)) => t.clone(),
-                        None => {
-                            let t = upload_native(gpu, raw, *kind, *pixel_format)?;
-                            state.texture_bytes += raw.bytes.len();
-                            state.native.insert(id, (Arc::clone(raw), t.clone()));
-                            t
-                        }
-                    }
-                }
-            };
-            let (min, max) = tic.lod_range(tsc);
-            let key = (tsc.words, [min.to_bits(), max.to_bits()]);
-            let sampler = match state.samplers.get(&key) {
-                Some(s) => s.clone(),
-                None => {
-                    let s = build_sampler(gpu, tsc, (min, max));
-                    state.samplers.insert(key, s.clone(), 1);
-                    s
-                }
-            };
-            gpu_textures.push((metal, sampler));
+                None => state.placeholder(gpu, translated.kinds[slot])?,
+            });
+        }
+        let mut vertex_textures = Vec::with_capacity(vertex_bound.len());
+        for (sampled, tic, tsc, kind) in &vertex_bound {
+            vertex_textures.push(state.gpu_texture(gpu, sampled, tic, tsc, *kind)?);
         }
         // Plane geometry: each triangle's pixel bounding box as two
         // triangles, in normalized device coordinates of a viewport
@@ -1450,7 +1414,7 @@ impl Renderer {
                 .map(|b| b.as_ref().map_or(0.0, |(_, tic, tsc, ..)| value(tic, tsc)))
                 .collect()
         };
-        let biases: Vec<f32> = bound
+        let mut biases: Vec<f32> = bound
             .iter()
             .map(|b| b.as_ref().map_or(0.0, |b| b.3))
             .chain([0.0])
@@ -1462,6 +1426,26 @@ impl Renderer {
             .chain(of(&|tic, tsc| tic.lod_range(tsc).0))
             .chain(of(&|tic, tsc| tic.lod_range(tsc).1))
             .collect();
+        // A program of more slots than a function has samplers is given
+        // the distinct samplers of its slots, and after the words above
+        // each slot's index among them (`Translated::shared_samplers`).
+        let mut shared: Vec<Retained<Sampler>> = Vec::new();
+        if translated.shared_samplers() {
+            for (_, sampler) in &gpu_textures {
+                let known = shared
+                    .iter()
+                    .position(|s| Retained::as_ptr(s) == Retained::as_ptr(sampler));
+                let index = known.unwrap_or_else(|| {
+                    shared.push(sampler.clone());
+                    shared.len() - 1
+                });
+                biases.push(f32::from_bits(index as u32));
+            }
+            if shared.len() > msl::SAMPLERS {
+                drop(state);
+                return self.fall_back(format!("{} distinct samplers", shared.len()));
+            }
+        }
         // Texture fault words: word 2i marks slot i unbound.
         let mut fault_words = vec![0u32; 2 * translated.textures.len()];
         for &(slot, _) in &unbound {
@@ -1595,6 +1579,7 @@ impl Renderer {
                     }
                     words[msl::INDEXED_WORD] =
                         u32::from(matches!(native.vertices, NativeVertices::Indexed { .. }));
+                    words.extend_from_slice(&vertex_table);
                     bind(
                         &mut state.arena,
                         &encoder,
@@ -1680,35 +1665,46 @@ impl Renderer {
                     25,
                 )?;
             }
+            for (i, (texture, sampler)) in vertex_textures.iter().enumerate() {
+                encoder.setVertexTexture_atIndex(Some(texture), i);
+                encoder.setVertexSamplerState_atIndex(Some(sampler), i);
+            }
             for (i, (texture, sampler)) in gpu_textures.iter().enumerate() {
                 encoder.setFragmentTexture_atIndex(Some(texture), i);
-                encoder.setFragmentSamplerState_atIndex(Some(sampler), i);
+                if shared.is_empty() {
+                    encoder.setFragmentSamplerState_atIndex(Some(sampler), i);
+                }
             }
-            for (bound, stage) in [
-                (&global_memory, Stage::Fragment),
-                (&vertex_memory, Stage::Vertex),
-            ] {
-                let Some(bound) = bound else {
-                    continue;
-                };
-                match stage {
-                    Stage::Fragment => encoder.setFragmentBuffer_offset_atIndex(
-                        Some(bound),
+            // Every sampler of the array is one Metal knows.
+            if let Some(last) = shared.last() {
+                for i in 0..msl::SAMPLERS {
+                    encoder.setFragmentSamplerState_atIndex(Some(shared.get(i).unwrap_or(last)), i);
+                }
+            }
+            if !global_table.is_empty() || !vertex_table.is_empty() {
+                let globals = state.globals.as_mut().expect("made for the tables");
+                globals.bound = true;
+                let buffer = globals.buffer.clone();
+                if !global_table.is_empty() {
+                    encoder.setFragmentBuffer_offset_atIndex(
+                        Some(&buffer),
                         0,
                         msl::GLOBAL_BUFFER,
-                    ),
-                    Stage::Vertex => encoder.setVertexBuffer_offset_atIndex(
-                        Some(bound),
+                    );
+                    bind(
+                        &mut state.arena,
+                        &encoder,
+                        Stage::Fragment,
+                        bytes_of_u32(&global_table),
+                        msl::GLOBAL_BUFFER + 1,
+                    )?;
+                }
+                if !vertex_table.is_empty() {
+                    encoder.setVertexBuffer_offset_atIndex(
+                        Some(&buffer),
                         0,
                         msl::VERTEX_GLOBAL_BUFFER,
-                    ),
-                }
-                if !state
-                    .globals_bound
-                    .iter()
-                    .any(|b| Retained::as_ptr(b) == Retained::as_ptr(bound))
-                {
-                    state.globals_bound.push(bound.clone());
+                    );
                 }
             }
             if !unbound.is_empty() {
@@ -2033,133 +2029,162 @@ impl Renderer {
         Ok(true)
     }
 
-    /// The memory a pixel program's constants name, as its global memory
-    /// buffer (`shader::msl` `memory.rs`): the table of `places` (where
-    /// `constants` hold descriptors) and the bytes of each. A place that
-    /// is no descriptor of mapped memory, or whose bytes would take the
-    /// buffer past [`GLOBAL_LIMIT`], binds nothing. The buffer is made
-    /// once and used until memory there changes: kept by its regions,
-    /// taken as it is while no write of the channel touched them in this
-    /// epoch, compared with memory otherwise.
-    fn global_memory(
+    /// The global memory tables of a draw's programs (`shader::msl`
+    /// `memory.rs`): for each request (a stage's constants, the places
+    /// of them its program takes descriptors from, and whether the
+    /// program stores) four words per place, saying where in the global
+    /// memory buffer the memory the place names is; zeros for a place
+    /// that is no descriptor of mapped memory of at most
+    /// [`GLOBAL_LIMIT`] bytes.
+    fn global_tables<const N: usize>(
         &self,
         memory: &dyn GpuMemory,
         writes: &Writes,
-        constants: &[(Vec<u8>, usize)],
-        places: &[(u32, u32)],
-        store: bool,
-    ) -> Result<Retained<MetalBuffer>, Unmodeled> {
-        use std::sync::atomic::Ordering;
-        let mut total = 0;
-        let regions: Vec<(u64, u32)> = places
-            .iter()
-            .map(|&(slot, offset)| {
-                let descriptor = constants
-                    .get(slot as usize)
-                    .and_then(|(data, _)| data.get(offset as usize..offset as usize + 12))?;
-                let address = u64::from_le_bytes(descriptor[..8].try_into().expect("8 bytes"));
-                let size = u32::from_le_bytes(descriptor[8..].try_into().expect("4 bytes"));
-                let fits = address >> 40 == 0
-                    && address.is_multiple_of(4)
-                    && size != 0
-                    && total + size as usize <= GLOBAL_LIMIT;
-                fits.then(|| {
-                    total += (size as usize).next_multiple_of(4);
-                    (address, size)
-                })
-            })
-            .map(|region| region.unwrap_or((0, 0)))
-            .collect();
-        let unchanged = |stamp: Stamp| {
-            regions
-                .iter()
-                .all(|&(address, size)| writes.unchanged(stamp, address, address + u64::from(size)))
-        };
-        {
-            let mut state = self.state.lock().unwrap();
-            // A buffer programs stored to holds what memory is to hold.
-            if let Some(held) = state.globals.get_mut(&regions)
-                && (held.dirty || unchanged(held.stamp))
-            {
-                let buffer = held.buffer.clone();
-                if store && !held.dirty {
-                    held.dirty = true;
-                    state.dirty_globals.push(regions);
-                    self.any_dirty.store(true, Ordering::Relaxed);
+        requests: [(&[(Vec<u8>, usize)], &[(u32, u32)], bool); N],
+    ) -> Result<[Vec<u32>; N], Unmodeled> {
+        if requests.iter().all(|(_, places, _)| places.is_empty()) {
+            return Ok(std::array::from_fn(|_| Vec::new()));
+        }
+        // A buffer that fills up is emptied, which forgets the places
+        // found before: they are found once more then.
+        for _ in 0..2 {
+            let generation = self.state.lock().unwrap().globals()?.generation;
+            let mut tables: [Vec<u32>; N] = std::array::from_fn(|_| Vec::new());
+            for (table, &(constants, places, store)) in tables.iter_mut().zip(&requests) {
+                for &(slot, offset) in places {
+                    let key = constants
+                        .get(slot as usize)
+                        .and_then(|(data, _)| data.get(offset as usize..offset as usize + 12))
+                        .map(|descriptor| {
+                            (
+                                u64::from_le_bytes(descriptor[..8].try_into().expect("8 bytes")),
+                                u32::from_le_bytes(descriptor[8..].try_into().expect("4 bytes")),
+                            )
+                        })
+                        .filter(|&(address, size)| {
+                            address >> 40 == 0
+                                && address.is_multiple_of(4)
+                                && size != 0
+                                && size as usize <= GLOBAL_LIMIT
+                        });
+                    let at = match key {
+                        Some(key) => self.global_region(memory, writes, key, store)?,
+                        None => None,
+                    };
+                    table.extend_from_slice(&match (key, at) {
+                        (Some((address, size)), Some(at)) => {
+                            [address as u32, (address >> 32) as u32, size, (at / 4) as u32]
+                        }
+                        _ => [0; 4],
+                    });
                 }
-                return Ok(buffer);
+            }
+            if self.state.lock().unwrap().globals()?.generation == generation {
+                return Ok(tables);
             }
         }
-        // Read outside the lock: a read may write residents back. The
-        // fault word comes first, then the table.
-        let table = 1 + 4 * regions.len();
-        let mut words = vec![0u32; table];
-        let mut bytes: Vec<u8> = Vec::with_capacity(total);
-        for (index, &(address, size)) in regions.iter().enumerate() {
-            if size == 0 {
-                continue;
-            }
-            let start = bytes.len();
-            bytes.resize(start + (size as usize).next_multiple_of(4), 0);
-            if memory
-                .probe(address, &mut bytes[start..start + size as usize])
-                .is_none()
+        Err(Unmodeled(
+            "Metal: the global memory of a draw does not fit the buffer".into(),
+        ))
+    }
+
+    /// Where in the global memory buffer the bytes of guest memory region
+    /// `key` (address, size) are, in bytes; `None` for memory that is not
+    /// mapped. A region is copied in once and used until memory there
+    /// changes: taken as it is while no write of the channel touched it
+    /// in this epoch, compared with memory otherwise, and copied in anew
+    /// when memory differs (work recorded earlier goes on reading the
+    /// copy it was given). With `store` the program may store to it:
+    /// the copy is then what memory is to hold, until it is written back
+    /// ([`Renderer::write_back`]). A region overlapping another that
+    /// programs may have stored to waits for that one's write-back.
+    fn global_region(
+        &self,
+        memory: &dyn GpuMemory,
+        writes: &Writes,
+        key: (u64, u32),
+        store: bool,
+    ) -> Result<Option<usize>, Unmodeled> {
+        use std::sync::atomic::Ordering;
+        let extent = global_extent(key);
+        loop {
             {
-                bytes.truncate(start);
-                continue;
+                let mut state = self.state.lock().unwrap();
+                let globals = state.globals()?;
+                let conflict = globals.regions.iter().any(|(other, region)| {
+                    region.dirty && *other != key && overlap(global_extent(*other), extent)
+                });
+                if !conflict {
+                    if let Some(region) = globals.regions.get_mut(&key)
+                        && (region.dirty || writes.unchanged(region.stamp, extent.0, extent.1))
+                    {
+                        if store {
+                            region.dirty = true;
+                            self.any_dirty.store(true, Ordering::Relaxed);
+                        }
+                        return Ok(Some(region.offset));
+                    }
+                    break;
+                }
             }
-            words[1 + 4 * index..5 + 4 * index].copy_from_slice(&[
-                address as u32,
-                (address >> 32) as u32,
-                size,
-                (table + start / 4) as u32,
-            ]);
+            self.write_back(memory, writes, Scope::Range(extent.0, extent.1))?;
         }
-        let mut content = bytes_of_u32(&words).to_vec();
-        content.extend_from_slice(&bytes);
+        // Read outside the lock: a read may write residents back.
+        let mut bytes = vec![0u8; key.1 as usize];
+        if memory.probe(key.0, &mut bytes).is_none() {
+            return Ok(None);
+        }
         let stamp = writes.stamp();
         let mut state = self.state.lock().unwrap();
-        let same = state
-            .globals
-            .get(&regions)
-            .is_some_and(|held| held.content == content);
-        if !same {
-            // What this replaces lives on until the work using it is
-            // done; a buffer stored to is not dropped before it is
-            // written back.
-            if state.globals_pending + content.len() > GLOBAL_PENDING {
-                state.wait();
+        let globals = state.globals()?;
+        if let Some(region) = globals.regions.get_mut(&key)
+            && region.content == bytes
+        {
+            region.stamp = stamp;
+            if store {
+                region.dirty = true;
+                self.any_dirty.store(true, Ordering::Relaxed);
             }
-            if !state.dirty_globals.is_empty()
-                && state.globals.cost() + content.len() > GLOBAL_BUDGET
-            {
-                drop(state);
-                self.settle(memory, writes)?;
-                state = self.state.lock().unwrap();
-            }
-            state.globals_pending += content.len();
-            let buffer = buffer(Self::gpu(), &content)?;
-            let cost = content.len();
-            state.globals.insert(
-                regions.clone(),
-                GlobalMemory {
-                    content,
-                    stamp,
-                    buffer,
-                    dirty: false,
-                },
-                cost,
+            return Ok(Some(region.offset));
+        }
+        let length = bytes.len().next_multiple_of(16);
+        if globals.next + length > GLOBAL_ARENA {
+            // Full: once guest memory holds what programs stored and the
+            // GPU is done with every copy, the buffer starts over.
+            drop(state);
+            self.settle(memory, writes)?;
+            state = self.state.lock().unwrap();
+            state.wait();
+            let globals = state.globals()?;
+            globals.regions.clear();
+            globals.next = GLOBAL_FIRST;
+            globals.generation += 1;
+        }
+        let globals = state.globals()?;
+        let offset = globals.next;
+        globals.next += length;
+        // SAFETY: the bytes fit the buffer at `offset` (checked above), and
+        // no work recorded or running was given that part of it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                globals.buffer.contents().as_ptr().cast::<u8>().add(offset),
+                bytes.len(),
             );
         }
-        let held = state.globals.get_mut(&regions).expect("held above");
-        held.stamp = stamp;
-        let buffer = held.buffer.clone();
+        globals.regions.insert(
+            key,
+            GlobalRegion {
+                offset,
+                content: bytes,
+                stamp,
+                dirty: store,
+            },
+        );
         if store {
-            held.dirty = true;
-            state.dirty_globals.push(regions);
             self.any_dirty.store(true, Ordering::Relaxed);
         }
-        Ok(buffer)
+        Ok(Some(offset))
     }
 
     /// The residents for `targets` of samples `log2` (see
@@ -2319,17 +2344,52 @@ impl Renderer {
         Ok(indices)
     }
 
+    /// What the texture `handle` names is sampled from in a slot of
+    /// `kind`, with its headers: the targets that are its levels
+    /// ([`Renderer::composite`]), else its bytes in its own format, else
+    /// what they decode to. The inner error is why the handle names no
+    /// texture.
+    #[allow(clippy::type_complexity)]
+    fn sampled(
+        &self,
+        memory: &dyn GpuMemory,
+        writes: &Writes,
+        textures: &DrawTextures<'_>,
+        handle: u32,
+        kind: TextureKind,
+    ) -> Result<Result<(Sampled, Tic, Tsc), String>, Unmodeled> {
+        let (tic, tsc) = match textures.header(handle) {
+            Ok(header) => header,
+            Err(refusal) => return Ok(Err(refusal.0)),
+        };
+        let composite = self.composite(memory, writes, &tic)?;
+        let sampled = match composite {
+            Some(texture) => Ok(Sampled::Composite(texture)),
+            None => match format::native_format(&tic, kind) {
+                Some(pixel_format) => textures
+                    .raw(handle)
+                    .map(|raw| Sampled::Native(raw, pixel_format)),
+                None => textures
+                    .resolve(handle)
+                    .map(|(texture, _)| Sampled::Decoded(texture)),
+            },
+        };
+        Ok(match sampled {
+            Ok(sampled) => Ok((sampled, tic, tsc)),
+            Err(refusal) => Err(refusal.0),
+        })
+    }
+
     /// The Metal texture to sample for the texture `tic` describes when
     /// levels of it are render targets held on the GPU and current
-    /// ([`Composite`]); `None` when none is (or the draw renders to one:
-    /// it then samples what memory holds once the target is written
-    /// back), and the texture is decoded from memory as any other.
+    /// ([`Composite`]); `None` when none is, and the texture is taken
+    /// from memory as any other. A level the draw itself renders to is
+    /// sampled as the target was before the draw.
     fn composite(
         &self,
         memory: &dyn GpuMemory,
         writes: &Writes,
         tic: &Tic,
-        targets: &[(Surface, Content)],
     ) -> Result<Option<Retained<MetalTexture>>, Unmodeled> {
         // Most textures have no level at a resident's address.
         {
@@ -2345,10 +2405,10 @@ impl Renderer {
         let Some(levels) = level_surfaces(tic) else {
             return Ok(None);
         };
-        // Which levels are residents: their content, how Metal's
-        // components of each give the header's, and whether they are
-        // known to hold what the channel's work so far makes of them.
-        let candidates: Vec<Option<(Content, [u32; 4], bool)>> = {
+        // Which levels are residents: their content, how Metal's read of
+        // each gives the header's components, and whether they are known
+        // to hold what the channel's work so far makes of them.
+        let candidates: Vec<Option<(Content, Reading, bool)>> = {
             let state = self.state.lock().unwrap();
             levels
                 .iter()
@@ -2357,23 +2417,15 @@ impl Renderer {
                         .residents
                         .iter()
                         .find(|r| r.surface == *surface && r.log2 == [0, 0])?;
-                    let Content::Color(format) = resident.format else {
-                        return None;
-                    };
-                    let components = shared_components(tic, format)?;
-                    Some((resident.format, components, resident.current(writes)))
+                    let reading = shared_components(tic, resident.format)?;
+                    Some((resident.format, reading, resident.current(writes)))
                 })
                 .collect()
         };
         let Some((_, components, _)) = candidates.iter().flatten().next().copied() else {
             return Ok(None);
         };
-        if candidates.iter().flatten().any(|c| c.1 != components)
-            || levels
-                .iter()
-                .zip(&candidates)
-                .any(|((surface, _), c)| c.is_some() && targets.iter().any(|t| t.0 == *surface))
-        {
+        if candidates.iter().flatten().any(|c| c.1 != components) {
             return Ok(None);
         }
         // A resident not rendered to since the channel last signaled is
@@ -2516,7 +2568,6 @@ impl State {
         }
         // Nothing recorded or running uses the arena's space any more.
         self.arena.reset();
-        self.globals_pending = 0;
     }
 
     /// Encodes, after the work recorded so far, a compute pass that writes
@@ -2794,22 +2845,23 @@ impl State {
         self.residents[index].version = self.versions;
     }
 
-    /// The kernel filling a composite's level from a resident
-    /// ([`CONVERT_SOURCE`]), made once.
-    fn convert_pipeline(&mut self) -> Result<Retained<ComputePipeline>, Unmodeled> {
-        if let Some(pipeline) = &self.convert_pipeline {
+    /// The kernel filling a composite's level from a color resident, or
+    /// from a depth one ([`CONVERT_SOURCE`]), made once.
+    fn convert_pipeline(&mut self, depth: bool) -> Result<Retained<ComputePipeline>, Unmodeled> {
+        if let Some(pipeline) = &self.convert_pipelines[usize::from(depth)] {
             return Ok(pipeline.clone());
         }
         let gpu = Renderer::gpu();
         let library = self.library(gpu, CONVERT_SOURCE.to_string())?;
+        let name = if depth { "convert_depth" } else { "convert_level" };
         let function = library
-            .newFunctionWithName(&NSString::from_str("convert_level"))
+            .newFunctionWithName(&NSString::from_str(name))
             .ok_or_else(|| Unmodeled("Metal: no conversion function".into()))?;
         let pipeline = gpu
             .device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|e| Unmodeled(format!("Metal: conversion pipeline: {e}")))?;
-        self.convert_pipeline = Some(pipeline.clone());
+        self.convert_pipelines[usize::from(depth)] = Some(pipeline.clone());
         Ok(pipeline)
     }
 
@@ -2842,7 +2894,7 @@ impl State {
             return Ok(());
         }
         let select = composite.select;
-        let pipeline = self.convert_pipeline()?;
+        let pipeline = self.convert_pipeline(select[4] >= READ_FLOAT_BITS)?;
         let command = self.command()?;
         let encoder = command
             .computeCommandEncoder()
@@ -2878,6 +2930,74 @@ impl State {
             }
         }
         Ok(())
+    }
+
+    /// The Metal texture and sampler of what a slot samples, uploaded and
+    /// built once while kept.
+    fn gpu_texture(
+        &mut self,
+        gpu: &Gpu,
+        sampled: &Sampled,
+        tic: &Tic,
+        tsc: &Tsc,
+        kind: TextureKind,
+    ) -> Result<(Retained<MetalTexture>, Retained<Sampler>), Unmodeled> {
+        let metal = match sampled {
+            Sampled::Composite(texture) => texture.clone(),
+            Sampled::Decoded(texture) => {
+                let id = (Arc::as_ptr(texture) as usize, kind);
+                match self.textures.get(&id) {
+                    Some((_, t)) => t.clone(),
+                    None => {
+                        let t = upload_texture(gpu, texture, kind)?;
+                        self.texture_bytes += texture.bytes();
+                        self.textures.insert(id, (Arc::clone(texture), t.clone()));
+                        t
+                    }
+                }
+            }
+            Sampled::Native(raw, pixel_format) => {
+                let id = (Arc::as_ptr(raw) as usize, kind);
+                match self.native.get(&id) {
+                    Some((_, t)) => t.clone(),
+                    None => {
+                        let t = upload_native(gpu, raw, kind, *pixel_format)?;
+                        self.texture_bytes += raw.bytes.len();
+                        self.native.insert(id, (Arc::clone(raw), t.clone()));
+                        t
+                    }
+                }
+            }
+        };
+        let (min, max) = tic.lod_range(tsc);
+        let key = (tsc.words, [min.to_bits(), max.to_bits()]);
+        let sampler = match self.samplers.get(&key) {
+            Some(s) => s.clone(),
+            None => {
+                let s = build_sampler(gpu, tsc, (min, max));
+                self.samplers.insert(key, s.clone(), 1);
+                s
+            }
+        };
+        Ok((metal, sampler))
+    }
+
+    /// The global memory buffer, made when first asked for.
+    fn globals(&mut self) -> Result<&mut Globals, Unmodeled> {
+        if self.globals.is_none() {
+            let buffer = Renderer::gpu()
+                .device
+                .newBufferWithLength_options(GLOBAL_ARENA, MTLResourceOptions::StorageModeShared)
+                .ok_or_else(|| Unmodeled("Metal: buffer allocation failed".into()))?;
+            self.globals = Some(Globals {
+                buffer,
+                next: GLOBAL_FIRST,
+                generation: 0,
+                regions: HashMap::new(),
+                bound: false,
+            });
+        }
+        Ok(self.globals.as_mut().expect("made above"))
     }
 
     /// What an unbound texture slot of `kind` is bound to (made once).
@@ -3679,37 +3799,78 @@ fn upload_native(
     Ok(metal)
 }
 
-/// Composites kept \[assumption: a guest renders into a handful of the
-/// textures it samples (a texture atlas); a dropped one is made
-/// again when next sampled\].
-const COMPOSITE_LIMIT: usize = 16;
+/// Composites kept \[assumption: a guest samples a few dozen of the
+/// targets it renders (the stages of its post-processing, an atlas); a
+/// dropped one is made again when next sampled\].
+const COMPOSITE_LIMIT: usize = 48;
 
-/// The most global memory bound for one pixel program \[assumption: what
-/// a constant names with a larger size is no buffer descriptor\].
+/// How Metal's read of a resident gives the components a texture header
+/// decodes from the same bytes: which of the read's red, green, blue and
+/// alpha (0-3) each is, and what is done to the read first (`READ_*`).
+type Reading = ([u32; 4], u32);
+
+/// The read as it is.
+const READ_PLAIN: u32 = 0;
+/// Red, green and blue decoded from sRGB.
+const READ_SRGB: u32 = 1;
+/// A depth resident's word as the bits of a float.
+const READ_FLOAT_BITS: u32 = 2;
+/// A depth resident's 16-bit word as a UNORM.
+const READ_UNORM16: u32 = 3;
+
+/// The largest region of global memory a program is given \[assumption:
+/// what a constant names with a larger size is no buffer descriptor\].
 const GLOBAL_LIMIT: usize = 16 << 20;
 
-/// Bytes of global memory buffers kept for reuse.
-const GLOBAL_BUDGET: usize = 128 << 20;
+/// Bytes of the global memory buffer ([`Globals`]): four of the largest
+/// regions.
+const GLOBAL_ARENA: usize = 4 * GLOBAL_LIMIT;
 
-/// Bytes of global memory uploaded before the renderer waits for the
-/// GPU, which frees the buffers those replaced.
-const GLOBAL_PENDING: usize = 128 << 20;
+/// Where the regions of the global memory buffer start: after the fault
+/// word, at a multiple of 16 bytes.
+const GLOBAL_FIRST: usize = 16;
 
 /// Arena chunks a frame's recorded work may fill before a draw waits
 /// for the GPU, which frees them all: bounds the draw data held at once
 /// (16 MiB a chunk).
 const ARENA_LIMIT: usize = 16;
 
-/// A pixel program's global memory as bound ([`Renderer::global_memory`]).
-struct GlobalMemory {
-    /// The buffer's bytes: the table, then the regions.
-    content: Vec<u8>,
-    /// When the regions were last known to equal guest memory.
-    stamp: Stamp,
+/// The memory programs address through their constants, on the GPU
+/// (`shader::msl` `memory.rs`): one buffer holding the fault word and a
+/// copy of every region a draw's program was given. Every program
+/// addresses the same copy of a region, so what one stores the next
+/// loads, in the order of the draws, without a write-back between them.
+struct Globals {
     buffer: Retained<MetalBuffer>,
-    /// A pixel program stored to the buffer since it was last equal to
-    /// guest memory: it is what memory is to hold, and is written back.
+    /// Bytes of the buffer handed out. Space is handed out once: a region
+    /// whose memory changed gets new space, and work recorded earlier
+    /// reads the old. A full buffer starts over
+    /// ([`Renderer::global_region`]).
+    next: usize,
+    /// Counts the times the buffer started over.
+    generation: u64,
+    /// The regions held, by address and size.
+    regions: HashMap<(u64, u32), GlobalRegion>,
+    /// A draw was given the buffer since its fault word was last looked
+    /// at.
+    bound: bool,
+}
+
+struct GlobalRegion {
+    /// Where its bytes are in the buffer.
+    offset: usize,
+    /// The bytes as guest memory held them when it and the copy were
+    /// last equal, and when that was last known to hold.
+    content: Vec<u8>,
+    stamp: Stamp,
+    /// A program that may store to the copy was given it since: the copy
+    /// is what memory is to hold, and is written back.
     dirty: bool,
+}
+
+/// The addresses of a global memory region (address, size).
+fn global_extent((address, size): (u64, u32)) -> (u64, u64) {
+    (address, address + u64::from(size))
 }
 
 /// A texture some of whose levels are render targets held on the GPU
@@ -3727,9 +3888,9 @@ struct Composite {
     /// The same levels.
     levels: Vec<CompositeLevel>,
     /// For each component the header's swizzle yields, which of the
-    /// resident's red, green, blue and alpha (0-3) as Metal reads them,
-    /// zero (4) or one (5) it is.
-    select: [u32; 4],
+    /// resident's red, green, blue and alpha (0-3) as read, zero (4) or
+    /// one (5) it is; then how the resident is read (`READ_*`).
+    select: [u32; 5],
     /// The bytes of the texture's footprint the levels from memory were
     /// decoded from (zeros where a resident's level lies), and when they
     /// were last known to equal memory.
@@ -3759,7 +3920,7 @@ impl Composite {
         tic: &Tic,
         levels: &[(Surface, std::ops::Range<usize>)],
         residents: &[bool],
-        components: [u32; 4],
+        (components, read): Reading,
         decoded: Option<&Texture>,
         raw: Vec<u8>,
         stamp: Stamp,
@@ -3824,11 +3985,12 @@ impl Composite {
             });
         }
         // As `Texture::decode` applies the swizzle.
-        let select = tic.swizzle.map(|s| match s {
+        let swizzled = tic.swizzle.map(|s| match s {
             2..=5 => components[usize::from(s - 2)],
             6 | 7 => 5,
             _ => 4,
         });
+        let select = [swizzled[0], swizzled[1], swizzled[2], swizzled[3], read];
         Ok(Composite {
             texture,
             levels: made,
@@ -3843,8 +4005,7 @@ impl Composite {
 /// The levels of `tic` from its base level to its maximum level as the
 /// surfaces a render target at each would be, with the bytes of each in
 /// the texture's footprint; `None` for a texture that is not a plain 2D
-/// one of one layer and uncompressed one-texel blocks without sRGB
-/// decoding.
+/// one of one layer and uncompressed one-texel blocks.
 fn level_surfaces(tic: &Tic) -> Option<Vec<(Surface, std::ops::Range<usize>)>> {
     use super::surface::Layout;
     use super::texture::format::Encoding;
@@ -3853,7 +4014,7 @@ fn level_surfaces(tic: &Tic) -> Option<Vec<(Surface, std::ops::Range<usize>)>> {
         || tic.array
         || tic.shape.layers != 1
         || tic.shape.depth != 1
-        || tic.srgb
+        || (tic.srgb && format.raw != 0x08)
         || !matches!(format.encoding, Encoding::Packed(_))
         || (format.block_width, format.block_height) != (1, 1)
         || tic.max_level < tic.base_level
@@ -3896,38 +4057,80 @@ fn level_surfaces(tic: &Tic) -> Option<Vec<(Surface, std::ops::Range<usize>)>> {
     )
 }
 
-/// For each of the red, green, blue and alpha a texture header `tic`
-/// decodes from a texel's bytes, which of the red, green, blue and alpha
-/// (0-3) Metal reads from a resident of color format `format` holding the
-/// same bytes is the same value; `None` unless that holds for every
-/// texel. A8B8G8R8 UNORM headers over the four 8-bit UNORM target
-/// layouts: both sides are the byte / 255 (`texture::format::unorm_to_f32`;
+/// How Metal's read of a resident holding `content` gives what the
+/// texture header `tic` decodes from the same bytes ([`Reading`]); `None`
+/// unless there is a way that holds for every texel. A color target
+/// whose Metal format is the one that samples the header's bytes as the
+/// header says ([`format::native_format`]) reads the same values; an
+/// A8B8G8R8 header reads a B8G8R8A8 target's with red and blue exchanged
+/// (both sides are the byte / 255: `texture::format::unorm_to_f32`;
 /// Metal's conversion of normalized formats [public: Apple, Metal Shading
 /// Language Specification, "Conversion rules for normalized integer
 /// pixel data types"]). An sRGB target's resident holds its bytes in the
-/// linear format ([`format::pixel_format`]), so a header without sRGB
-/// decoding reads them raw there too.
-fn shared_components(tic: &Tic, format: ColorFormat) -> Option<[u32; 4]> {
-    if tic.format.raw != 0x08 || tic.types != [ComponentType::Unorm; 4] || tic.srgb {
-        return None;
-    }
-    match format {
-        ColorFormat::Rgba8Unorm | ColorFormat::Rgba8Srgb => Some([0, 1, 2, 3]),
-        ColorFormat::Bgra8Unorm | ColorFormat::Bgra8Srgb => Some([2, 1, 0, 3]),
-        _ => None,
+/// linear format ([`format::pixel_format`]), so a header reads them raw
+/// there, and one with sRGB decoding decodes them. A depth buffer's
+/// resident holds its words ([`format::depth_pixel_format`]): a ZF32
+/// header reads Z32Float's as floats, a Z16 header Z16Unorm's as UNORM.
+fn shared_components(tic: &Tic, content: Content) -> Option<Reading> {
+    let linear = Tic {
+        srgb: false,
+        ..tic.clone()
+    };
+    let native = format::native_format(&linear, TextureKind::Flat)?;
+    match content {
+        Content::Color(format) => {
+            let held = format::pixel_format(format)?;
+            let components = if native == held {
+                [0, 1, 2, 3]
+            } else if (native, held) == (MTLPixelFormat::RGBA8Unorm, MTLPixelFormat::BGRA8Unorm) {
+                [2, 1, 0, 3]
+            } else {
+                return None;
+            };
+            Some((components, if tic.srgb { READ_SRGB } else { READ_PLAIN }))
+        }
+        Content::Depth(DepthFormat::Z32Float)
+            if native == MTLPixelFormat::R32Float && !tic.srgb =>
+        {
+            Some(([0, 1, 2, 3], READ_FLOAT_BITS))
+        }
+        Content::Depth(DepthFormat::Z16Unorm)
+            if native == MTLPixelFormat::R16Unorm && !tic.srgb =>
+        {
+            Some(([0, 1, 2, 3], READ_UNORM16))
+        }
+        Content::Depth(_) => None,
     }
 }
 
-/// The kernel filling a level of a [`Composite`] from the resident that
-/// is the level: each texel as Metal reads it from the resident, its
-/// components selected by `select` ([`Composite::select`]).
+/// The kernels filling a level of a [`Composite`] from the resident that
+/// is the level: each texel as Metal reads it from the resident (a
+/// depth resident's as the red of a texel whose green and blue are 0
+/// and alpha 1), read as `select[4]` says and its components selected
+/// by the rest of `select` ([`Composite::select`]). sRGB decoding is the
+/// transfer function's inverse computed in floats, which can differ
+/// from `texture::format`'s in the last bit [known difference].
 const CONVERT_SOURCE: &str = r#"#include <metal_stdlib>
 using namespace metal;
-kernel void convert_level(texture2d<float, access::read> source [[texture(0)]], texture2d<float, access::write> level [[texture(1)]], constant uint* select [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {
-    if (g.x >= level.get_width() || g.y >= level.get_height()) { return; }
-    const float4 c = source.read(g);
+static float4 selected(float4 c, constant uint* how) {
     const float v[6] = { c.x, c.y, c.z, c.w, 0.0f, 1.0f };
-    level.write(float4(v[select[0]], v[select[1]], v[select[2]], v[select[3]]), g);
+    return float4(v[how[0]], v[how[1]], v[how[2]], v[how[3]]);
+}
+kernel void convert_level(texture2d<float, access::read> source [[texture(0)]], texture2d<float, access::write> level [[texture(1)]], constant uint* how [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {
+    if (g.x >= level.get_width() || g.y >= level.get_height()) { return; }
+    float4 c = source.read(g);
+    if (how[4] == 1u) {
+        const float3 low = c.xyz / 12.92f;
+        const float3 high = pow((c.xyz + 0.055f) / 1.055f, float3(2.4f));
+        c.xyz = select(high, low, c.xyz <= 0.04045f);
+    }
+    level.write(selected(c, how), g);
+}
+kernel void convert_depth(texture2d<uint, access::read> source [[texture(0)]], texture2d<float, access::write> level [[texture(1)]], constant uint* how [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {
+    if (g.x >= level.get_width() || g.y >= level.get_height()) { return; }
+    const uint word = source.read(g).x;
+    const float depth = how[4] == 2u ? as_type<float>(word) : float(word) / 65535.0f;
+    level.write(selected(float4(depth, 0.0f, 0.0f, 1.0f), how), g);
 }
 "#;
 
