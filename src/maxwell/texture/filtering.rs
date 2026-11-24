@@ -2,7 +2,7 @@
 //! Depth comparison occurs at each tap before interpolation. Gather order is
 //! (lower-left, lower-right, upper-right, upper-left) in increasing texture Y
 //! [public: GLSL 4.60 textureGather].
-use super::{Level, Texture, Tsc, Unmodeled, unsupported};
+use super::{Level, Texture, Tic, Tsc, Unmodeled, unsupported};
 use crate::maxwell::sampling::{FetchRequest, GatherRequest, Lod, Query, SampleRequest, Target};
 
 impl Texture {
@@ -380,24 +380,31 @@ impl Texture {
     /// TXQ dimensions and visible mip count. Non-dimension modes are refused:
     /// the other returned fields are not established.
     pub fn query(&self, query: Query) -> Result<[u32; 4], Unmodeled> {
-        match query {
-            Query::Dimension { level } => {
-                let count = self.tic.max_level - self.tic.base_level + 1;
-                if level >= count {
-                    return Ok([0, 0, 0, count]);
-                }
-                let m = &self.levels[(self.tic.base_level + level) as usize];
-                let d = if self.tic.target == Target::Cube {
-                    self.tic.shape.layers / 6
-                } else if self.tic.array {
-                    self.tic.shape.layers
-                } else {
-                    m.depth
-                };
-                Ok([m.width, m.height, d, count])
+        query_header(&self.tic, query)
+    }
+}
+
+/// [`Texture::query`] of the texture a header describes: it asks nothing
+/// of the texture's contents (a level's dimensions are the header's
+/// halved level by level, `layout::block_linear_image`).
+pub fn query_header(tic: &Tic, query: Query) -> Result<[u32; 4], Unmodeled> {
+    match query {
+        Query::Dimension { level } => {
+            let count = tic.max_level.saturating_sub(tic.base_level) + 1;
+            if level >= count {
+                return Ok([0, 0, 0, count]);
             }
-            _ => Err(unsupported("TXQ mode", format_args!("{query:?}"))),
+            let of = |size: u32| size.checked_shr(tic.base_level + level).unwrap_or(0).max(1);
+            let d = if tic.target == Target::Cube {
+                tic.shape.layers / 6
+            } else if tic.array {
+                tic.shape.layers
+            } else {
+                of(tic.shape.depth)
+            };
+            Ok([of(tic.shape.width), of(tic.shape.height), d, count])
         }
+        _ => Err(unsupported("TXQ mode", format_args!("{query:?}"))),
     }
 }
 

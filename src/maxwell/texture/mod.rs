@@ -11,6 +11,7 @@
 mod astc;
 mod bc;
 mod filtering;
+pub use filtering::query_header;
 pub mod format;
 pub mod layout;
 

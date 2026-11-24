@@ -58,6 +58,9 @@ pub struct TranslatedVertex {
     /// (every sample is of a level the program names, or the base one).
     pub textures: Vec<u32>,
     pub kinds: Vec<super::TextureKind>,
+    /// As [`super::Translated::queries`]; the answers follow the global
+    /// memory table in the draw's words.
+    pub queries: Vec<u32>,
 }
 
 /// Translates a vertex program, or says why it cannot be.
@@ -84,6 +87,7 @@ pub fn translate_vertex(
         constants: BTreeSet::new(),
         indirect: BTreeSet::new(),
         globals: memory::candidates(program, &flow.pcs),
+        queries: Vec::new(),
         inputs: BTreeSet::new(),
         outputs: BTreeSet::new(),
         word: 0,
@@ -144,6 +148,7 @@ pub fn translate_vertex(
         globals: writer.globals,
         textures: writer.textures,
         kinds: writer.kinds,
+        queries: writer.queries,
     })
 }
 
@@ -419,7 +424,13 @@ impl NativeVertex {
                 "#define GM_LIVE true\n{GLOBAL_WORD}\n#define GT(i) draw[{GLOBAL_TABLE_WORD}u + (i)]"
             );
         }
+        let _ = writeln!(
+            s,
+            "#define TQ(i) draw[{}u + (i)]",
+            GLOBAL_TABLE_WORD + 4 * vertex.globals.len()
+        );
         s.push_str(&vertex.body);
+        let _ = writeln!(s, "#undef TQ");
         if !vertex.globals.is_empty() {
             let _ = writeln!(s, "#undef GM_LIVE\n#undef GM\n#undef GT");
         }

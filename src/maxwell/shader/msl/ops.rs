@@ -28,6 +28,13 @@ fn flush(value: &str, enabled: bool) -> String {
     }
 }
 
+/// [`flush`] of an operand or the result of a product, a sum, a fused
+/// multiply-add or a comparison: nothing where the host's operation
+/// makes the flush itself (`super::host_flushes`).
+fn flush_operation(value: &str, enabled: bool) -> String {
+    flush(value, enabled && !super::host_flushes())
+}
+
 fn saturate(value: &str, enabled: bool) -> String {
     if enabled {
         format!("sat({value})")
@@ -286,7 +293,7 @@ impl Writer<'_> {
             "FADD" | "FADD32I" => {
                 let ftz = bit(w, if wide { 55 } else { 44 });
                 let sat = !wide && bit(w, 50);
-                let x = flush(
+                let x = flush_operation(
                     &modify(
                         "af",
                         bit(w, if wide { 54 } else { 46 }),
@@ -294,7 +301,7 @@ impl Writer<'_> {
                     ),
                     ftz,
                 );
-                let y = flush(
+                let y = flush_operation(
                     &modify(
                         "bf",
                         bit(w, if wide { 57 } else { 49 }),
@@ -303,7 +310,7 @@ impl Writer<'_> {
                     ftz,
                 );
                 self.line(&format!("float x = {x}; float y = {y};"));
-                let v = saturate(&flush("(x + y)", ftz), sat);
+                let v = saturate(&flush_operation("(x + y)", ftz), sat);
                 self.line(&format!("uint v = as_type<uint>({v});"));
                 cc = bit(w, if wide { 52 } else { 47 }).then_some(true);
             }
@@ -312,6 +319,13 @@ impl Writer<'_> {
                 let mode = bits(w, if wide { 53 } else { 44 }, 2);
                 let scale = if wide { 0 } else { bits(w, 41, 3) };
                 let sat = bit(w, if wide { 55 } else { 50 });
+                // The scaled and directed products are more than one
+                // operation: their flushes stay written out.
+                let flush = if round == 0 && scale == 0 {
+                    flush_operation
+                } else {
+                    flush
+                };
                 let x = flush(&modify("af", false, !wide && bit(w, 48)), mode == 1);
                 let y = flush("bf", mode == 1);
                 self.line(&format!("float x = {x}; float y = {y};"));
@@ -342,12 +356,12 @@ impl Writer<'_> {
                 let mode = bits(w, 53, 2);
                 let sat = bit(w, if wide { 55 } else { 50 });
                 let c = if wide { self.read(rd) } else { self.c(form)? };
-                let x = flush(
+                let x = flush_operation(
                     &modify("af", false, bit(w, if wide { 56 } else { 48 })),
                     mode == 1,
                 );
-                let y = flush("bf", mode == 1);
-                let z = flush(
+                let y = flush_operation("bf", mode == 1);
+                let z = flush_operation(
                     &modify(
                         &format!("as_type<float>({c})"),
                         false,
@@ -361,7 +375,7 @@ impl Writer<'_> {
                 } else {
                     "fma(x, y, z)"
                 };
-                let v = saturate(&flush(v, mode == 1), sat);
+                let v = saturate(&flush_operation(v, mode == 1), sat);
                 self.line(&format!("uint v = as_type<uint>({v});"));
                 cc = bit(w, if wide { 52 } else { 47 }).then_some(true);
             }
@@ -404,8 +418,8 @@ impl Writer<'_> {
                     let ftz = bit(w, if predicate { 47 } else { 55 });
                     self.line(&format!(
                         "float x = {}; float y = {};",
-                        flush(&x, ftz),
-                        flush(&y, ftz)
+                        flush_operation(&x, ftz),
+                        flush_operation(&y, ftz)
                     ));
                     float_compare(bits(w, 48, 4)).to_string()
                 } else if bit(w, 48) {
@@ -1008,7 +1022,7 @@ impl Writer<'_> {
             }
             Op::FcmpR | Op::FcmpI | Op::FcmpC | Op::FcmpRc => {
                 // Bit 47 is FTZ here, not a condition code write.
-                let x = flush("as_type<float>(c)", cc);
+                let x = flush_operation("as_type<float>(c)", cc);
                 cc = false;
                 self.line(&format!(
                     "float x = {x}; float y = 0.0f; uint v = {} ? a : b;",

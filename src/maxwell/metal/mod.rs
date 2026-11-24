@@ -104,14 +104,27 @@
 //!
 //! # Sampling render targets
 //!
-//! A texture whose levels (some or all) are current residents of a color
-//! format with the header's bytes is sampled from a [`Composite`]: a
-//! Metal texture whose levels are filled from those residents on the GPU
-//! each time they were rendered to, and from guest memory for the other
-//! levels. Guest memory is not involved: no write-back, decode or upload
-//! of the rendered levels (a guest may draw level 0 of a texture atlas
-//! every frame). A draw that renders to a level it samples reads guest
-//! memory instead, after the write-back of what was rendered before it.
+//! A texture whose levels (some or all) are current residents whose
+//! Metal texture gives the header's values ([`shared_components`]: a
+//! color target of the format that samples the header's bytes, read
+//! through sRGB decoding where the header asks, or a ZF32 or Z16 depth
+//! buffer) is sampled from a [`Composite`]: a Metal texture whose levels
+//! are filled from those residents on the GPU each time they were
+//! rendered to, and from guest memory for the other levels. Guest memory
+//! is not involved: no write-back, decode or upload of the rendered
+//! levels (a guest draws the stages of its post-processing from one
+//! another's targets every frame). A draw that renders to a level it
+//! samples samples what the target held before the draw.
+//!
+//! # Global memory
+//!
+//! The memory programs address with `LDG`, `STG` and `RED` lives in one
+//! Metal buffer ([`Globals`]) that every draw's program is given, with a
+//! table of where the regions its constants name are in it: what a
+//! program stores, a later draw's program loads without the bytes
+//! leaving the GPU. A region programs may have stored to is written
+//! back to guest memory as a render target is: at a signal, or before an
+//! engine of the channel accesses it ([`Coherent`]).
 
 //!
 //! # Multisampled targets
@@ -224,6 +237,96 @@ static GPU: LazyLock<Option<Gpu>> = LazyLock::new(|| {
 /// Whether a Metal device is present.
 pub fn available() -> bool {
     GPU.is_some()
+}
+
+/// What [`flushes_subnormals`] runs: products, sums and a fused
+/// multiply-add with subnormal operands (`v[2]`, `v[6]`) or a subnormal
+/// result (`v[0] * v[1]`), and comparisons of subnormals.
+const SUBNORMAL_PROBE: &str = r#"#include <metal_stdlib>
+using namespace metal;
+#pragma METAL fp math_mode(safe)
+#pragma METAL fp contract(off)
+kernel void probe(const device float* v [[buffer(0)]], device uint* out [[buffer(1)]], uint g [[thread_position_in_grid]]) {
+    out[0] = as_type<uint>(v[0] * v[1]);
+    out[1] = as_type<uint>(v[2] * v[3]);
+    out[2] = as_type<uint>(v[2] + v[4]);
+    out[3] = as_type<uint>(fma(v[2], v[5], v[4]));
+    out[4] = as_type<uint>((-v[0]) * v[1]);
+    out[5] = as_type<uint>(v[6] * v[3]);
+    out[6] = as_type<uint>(v[6] + v[6]);
+    out[7] = v[2] == v[4] ? 1u : 0u;
+    out[8] = v[2] > v[4] ? 1u : 0u;
+    out[9] = v[6] < v[4] ? 1u : 0u;
+    out[10] = v[2] != v[6] ? 1u : 0u;
+    out[11] = as_type<uint>(v[2] * v[5]);
+    out[12] = as_type<uint>(v[0] * v[1] + v[5]);
+}
+"#;
+
+/// Whether the host GPU's float arithmetic flushes to zero as an FTZ
+/// instruction of GM20B does (`shader::exec` `alu::flush`): a subnormal
+/// operand of a product, a sum or a fused multiply-add counts as the
+/// zero of its sign, a subnormal result is returned as the zero of its
+/// sign, and comparisons take subnormals as zeros. Measured once, by
+/// running [`SUBNORMAL_PROBE`] \[observed: an Apple M5 does; the Metal
+/// Shading Language leaves it to the implementation\]. `false` where
+/// the probe cannot run.
+pub fn flushes_subnormals() -> bool {
+    static FLUSHES: LazyLock<bool> = LazyLock::new(|| {
+        let Some(gpu) = GPU.as_ref() else {
+            return false;
+        };
+        let subnormal = f32::from_bits(0x0001_16c2);
+        let inputs = [1e-30f32, 1e-10, subnormal, 1e10, 0.0, 1.0, -subnormal];
+        let expected = [
+            0,
+            0,
+            0,
+            0,
+            0x8000_0000,
+            0x8000_0000,
+            0x8000_0000,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1.0f32.to_bits(),
+        ];
+        let run = || -> Option<Vec<u32>> {
+            let library = compile_library(gpu, SUBNORMAL_PROBE).ok()?;
+            let function = library.newFunctionWithName(&NSString::from_str("probe"))?;
+            let pipeline = gpu
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .ok()?;
+            let values = buffer(gpu, bytes_of(&inputs)).ok()?;
+            let results = buffer(gpu, &[0xFF; 4 * 13]).ok()?;
+            let command = gpu.queue.commandBuffer()?;
+            let encoder = command.computeCommandEncoder()?;
+            encoder.setComputePipelineState(&pipeline);
+            // SAFETY: the kernel's two buffers, each of the size it
+            // reads or writes.
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(&values), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&results), 0, 1);
+            }
+            let one = MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            };
+            encoder.dispatchThreads_threadsPerThreadgroup(one, one);
+            encoder.endEncoding();
+            command.commit();
+            command.waitUntilCompleted();
+            let words = results.contents().cast::<u32>();
+            // SAFETY: the buffer holds 13 words; the GPU finished.
+            Some((0..13).map(|i| unsafe { words.add(i).read() }).collect())
+        };
+        run().is_some_and(|results| results == expected)
+    });
+    *FLUSHES
 }
 
 /// What a resident holds: a color target, or a depth buffer as its raw
@@ -391,6 +494,10 @@ struct State {
     /// that bound placeholders, with each unbound slot and the refusal a
     /// sample of it is (see `shader::msl` `texture.rs`).
     faults: Vec<Faults>,
+    /// The trap word of fragment functions (`msl::Translated::traps`),
+    /// made when first bound, and whether a draw was given it since it
+    /// was last looked at.
+    trap: Option<(Retained<MetalBuffer>, bool)>,
     /// What an unbound texture slot of each kind is bound to: a 1x1
     /// texture and a sampler, never read into a result that reaches
     /// guest memory.
@@ -427,6 +534,7 @@ impl Default for State {
             software_time: HashMap::new(),
             draws: 0,
             faults: Vec::new(),
+            trap: None,
             placeholders: HashMap::new(),
             native: HashMap::new(),
             texture_bytes: 0,
@@ -829,6 +937,29 @@ impl Renderer {
             });
         }
         state.wait();
+        // An executed instruction neither renderer models is the
+        // interpreter's refusal.
+        if let Some((trap, bound)) = &mut state.trap
+            && std::mem::take(bound)
+        {
+            let word = trap.contents().cast::<u32>();
+            // SAFETY: the buffer holds the word; the GPU finished.
+            let trapped = unsafe { word.read() };
+            if trapped != 0 {
+                // SAFETY: as above.
+                unsafe { word.write(0) };
+                self.writing_back.store(false, Ordering::Relaxed);
+                let what = if trapped & 0x4000_0000 != 0 {
+                    "a query of a texture slot that names no texture"
+                } else {
+                    "an instruction that is not modeled"
+                };
+                return Err(Unmodeled(format!(
+                    "pixel program: {what} was executed at {:#x}",
+                    trapped & 0x3fff_ffff
+                )));
+            }
+        }
         // An executed sample of an unbound texture is the interpreter's
         // refusal; nothing of the work is written back.
         for (buffer, slots) in std::mem::take(&mut state.faults) {
@@ -1215,6 +1346,28 @@ impl Renderer {
                 return Ok(false);
             }
         }
+        // The answers to the programs' texture queries. A vertex program
+        // that asks about a handle naming no texture runs on the CPU,
+        // which refuses the query when it executes.
+        let queries = query_words(
+            draw.textures,
+            draw.constants,
+            draw.texture_buffer_index,
+            &translated.queries,
+        );
+        let vertex_queries = match &vertex {
+            Some((native, vertex, ..)) => query_words(
+                draw.textures,
+                native.constants,
+                draw.texture_buffer_index,
+                &vertex.queries,
+            ),
+            None => Vec::new(),
+        };
+        if vertex_queries.chunks(5).any(|answer| answer[4] == 0) {
+            self.note_cpu_vertices("vertex texture query: a slot names no texture");
+            return Ok(false);
+        }
         if translated.atomics && !samples.is_single() {
             return self.fall_back("atomic update of global memory with several samples".into());
         }
@@ -1449,6 +1602,8 @@ impl Renderer {
                 return self.fall_back(format!("{} distinct samplers", shared.len()));
             }
         }
+        // Then the answers to its texture queries.
+        biases.extend(queries.iter().map(|&word| f32::from_bits(word)));
         // Texture fault words: word 2i marks slot i unbound.
         let mut fault_words = vec![0u32; 2 * translated.textures.len()];
         for &(slot, _) in &unbound {
@@ -1583,6 +1738,7 @@ impl Renderer {
                     words[msl::INDEXED_WORD] =
                         u32::from(matches!(native.vertices, NativeVertices::Indexed { .. }));
                     words.extend_from_slice(&vertex_table);
+                    words.extend_from_slice(&vertex_queries);
                     bind(
                         &mut state.arena,
                         &encoder,
@@ -1667,6 +1823,20 @@ impl Renderer {
                     bytes_of_u32(&words),
                     25,
                 )?;
+            }
+            if translated.traps {
+                let trap = match &mut state.trap {
+                    Some((trap, bound)) => {
+                        *bound = true;
+                        trap.clone()
+                    }
+                    None => {
+                        let trap = buffer(gpu, &[0; 4])?;
+                        state.trap = Some((trap.clone(), true));
+                        trap
+                    }
+                };
+                encoder.setFragmentBuffer_offset_atIndex(Some(&trap), 0, msl::TRAP_BUFFER);
             }
             for (i, (texture, sampler)) in vertex_textures.iter().enumerate() {
                 encoder.setVertexTexture_atIndex(Some(texture), i);
@@ -4458,4 +4628,46 @@ impl GpuMemory for Coherent<'_> {
         self.before(address, buffer.len())?;
         self.memory.probe(address, buffer)
     }
+}
+
+/// The answers to a program's texture queries (`shader::msl`
+/// `texture.rs` `txq`), five words per handle of `queries` (offsets in
+/// constant buffer `buffer`, the bound-texture handles): what
+/// `texture::query_header` takes from the header, for the program to
+/// take a level's from. All zeros for a handle that names no header.
+fn query_words(
+    textures: &DrawTextures<'_>,
+    constants: &[(Vec<u8>, usize)],
+    buffer: u32,
+    queries: &[u32],
+) -> Vec<u32> {
+    let mut words = Vec::with_capacity(5 * queries.len());
+    for &offset in queries {
+        let header = constants
+            .get(buffer as usize)
+            .and_then(|(data, _)| data.get(offset as usize..offset as usize + 4))
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("4 bytes")))
+            .and_then(|handle| textures.header(handle).ok());
+        words.extend(match header {
+            Some((tic, _)) => {
+                let base = |size: u32| size.checked_shr(tic.base_level).unwrap_or(0);
+                let (third, flags) = if tic.target == Target::Cube {
+                    (tic.shape.layers / 6, 1)
+                } else if tic.array {
+                    (tic.shape.layers, 1)
+                } else {
+                    (base(tic.shape.depth), 3)
+                };
+                [
+                    base(tic.shape.width),
+                    base(tic.shape.height),
+                    third,
+                    tic.max_level.saturating_sub(tic.base_level) + 1,
+                    flags,
+                ]
+            }
+            None => [0; 5],
+        });
+    }
+    words
 }

@@ -15,6 +15,13 @@
 //!   no multiply-add contraction, no reassociation, NaN and signed-zero
 //!   semantics kept. `FFMA` uses `fma` (fused, one rounding, like the
 //!   interpreter's `mul_add`); `FMUL`/`FADD` are single IEEE operations.
+//! * FTZ (an instruction's flush of subnormal operands and results to
+//!   zero) is written out as `ftz()`, except where the host's arithmetic
+//!   makes the same flushes itself ([`host_flushes`]): `FADD`, plain
+//!   `FMUL`, `FFMA` and the float comparisons are then the bare
+//!   operation. An Apple GPU evaluates `ftz()`'s own comparison of a
+//!   subnormal with zero as equal, so there the function changes
+//!   nothing either way; what flushes is the operation.
 //! * `FMUL` rounding modes and scales: the interpreter rounds the exact
 //!   binary64 product once in the requested direction. The translation
 //!   rounds to nearest and corrects by one ulp using the sign of the exact
@@ -190,7 +197,21 @@ pub struct Translated {
     /// The program updates that memory with `RED`, once per fragment:
     /// not to be run once per sample.
     pub atomics: bool,
+    /// The program has instructions the interpreter refuses when they
+    /// are executed (`VOTE`, `S2R` of a register a fragment has not, a
+    /// `TXQ` of a handle that names no texture): the function takes the
+    /// trap word ([`TRAP_BUFFER`]) and stores the instruction's address
+    /// in it, with bit 31 (and bit 30 for the `TXQ`), when one is
+    /// executed, which the renderer refuses then.
+    pub traps: bool,
+    /// Bound-texture handle offsets `TXQ` asks about: the draw gives
+    /// five words for each (`texture.rs` `txq`), after the words of
+    /// [`Translated::shared_samplers`].
+    pub queries: Vec<u32>,
 }
+
+/// The fragment buffer index of the trap word ([`Translated::traps`]).
+pub const TRAP_BUFFER: usize = 30;
 
 impl Translated {
     /// Whether the fragment function takes its samplers as one array of
@@ -215,6 +236,13 @@ const GLOBAL_WORD: &str = "#define GM(i) atomic_load_explicit(&gm[i], memory_ord
 /// slots takes its samplers as an array of this many, which the draw
 /// fills with the distinct ones among its slots' ([`Translated::shared_samplers`]).
 pub const SAMPLERS: usize = 16;
+
+/// Whether the host GPU's products, sums, fused multiply-adds and
+/// comparisons flush subnormals as FTZ does
+/// (`metal::flushes_subnormals`, measured on the device).
+pub(crate) fn host_flushes() -> bool {
+    crate::maxwell::metal::flushes_subnormals()
+}
 
 /// Register value expressions.
 fn r(index: u32) -> String {
@@ -278,6 +306,8 @@ struct Writer<'a> {
     constants: BTreeSet<(u32, u32)>,
     indirect: BTreeSet<u32>,
     globals: Vec<(u32, u32)>,
+    /// Bound-texture handle offsets `TXQ` asks about.
+    queries: Vec<u32>,
     /// Vertex programs: input attribute words `ALD` reads (`i{word}`).
     inputs: BTreeSet<u32>,
     /// Vertex programs: output attribute words `AST` writes or `ALD.O`
@@ -517,8 +547,9 @@ impl Writer<'_> {
             (Stage::Pixel, Op::Tex) => self.tex(),
             (Stage::Pixel, Op::Tld4) => self.tld4(),
             (Stage::Pixel, Op::Tld4s) => self.tld4s(),
-            (Stage::Pixel, Op::Tlds) => self.tlds(),
-            (Stage::Pixel, Op::Tld) => self.tld(),
+            (_, Op::Tlds) => self.tlds(),
+            (_, Op::Tld) => self.tld(),
+            (_, Op::Txq) => self.txq(),
             (_, Op::Ldg) => self.ldg(),
             (Stage::Pixel, Op::Stg) => self.stg(),
             (Stage::Pixel, Op::Red) => self.red(),
@@ -542,6 +573,16 @@ impl Writer<'_> {
             (_, Op::Ldc) => self.ldc(),
             (_, Op::TexB | Op::TldB | Op::Tld4B | Op::TmmlB | Op::TxdB | Op::TxqB) => {
                 self.refuse("bindless texture (handle in a register)")
+            }
+            // What the interpreter refuses when it is executed
+            // (`exec::Machine::special_register` has no other register
+            // for a fragment) is refused when it is executed here.
+            (Stage::Pixel, Op::Vote | Op::Votevtg | Op::S2r) => {
+                self.line(&format!(
+                    "atomic_store_explicit(&trap[0], {:#x}u, memory_order_relaxed);",
+                    self.pc | 0x8000_0000
+                ));
+                Ok(())
             }
             _ => self.refuse("not translated"),
         }
@@ -947,6 +988,9 @@ impl Translated {
                 GLOBAL_BUFFER + 1
             ));
         }
+        if self.traps {
+            parameters.push(format!("device atomic_uint* trap [[buffer({TRAP_BUFFER})]]"));
+        }
         if alpha_test {
             parameters.push("constant uint* alpha_test [[buffer(22)]]".to_string());
         }
@@ -1043,6 +1087,12 @@ impl Translated {
                 );
             }
         }
+        // TQ(i): word i of the texture queries' answers.
+        let _ = writeln!(
+            s,
+            "#define TQ(i) as_type<uint>(lod_bias[{}u + (i)])",
+            4 * n + 1 + if self.shared_samplers() { n } else { 0 }
+        );
         // GM_LIVE: whether this fragment is one of the primitive's (a
         // global memory access of any other reports and stores nothing);
         // GM(i): word i of global memory; GT(i): word i of the table.
@@ -1093,7 +1143,7 @@ impl Translated {
         }
         let _ = writeln!(
             s,
-            "#undef GM_LIVE\n#undef CMP_CFG\n#undef CMP_MIN\n#undef CMP_MAX"
+            "#undef GM_LIVE\n#undef CMP_CFG\n#undef CMP_MIN\n#undef CMP_MAX\n#undef TQ"
         );
         if !self.globals.is_empty() {
             let _ = writeln!(s, "#undef GM\n#undef GT");
@@ -1247,6 +1297,7 @@ pub fn translate(program: &Program, constant_buffer_1: &[u8]) -> Result<Translat
         constants: BTreeSet::new(),
         indirect: BTreeSet::new(),
         globals: memory::candidates(program, &flow.pcs),
+        queries: Vec::new(),
         word: 0,
         pc: 8,
     };
@@ -1326,5 +1377,7 @@ pub fn translate(program: &Program, constant_buffer_1: &[u8]) -> Result<Translat
         implicit_lod: writer.implicit_lod,
         compare: writer.compare,
         constant_buffer_1: flow.jump_tables.then(|| constant_buffer_1.to_vec()),
+        traps: writer.out.contains("&trap[0]"),
+        queries: writer.queries,
     })
 }

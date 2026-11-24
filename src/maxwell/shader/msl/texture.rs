@@ -505,6 +505,58 @@ impl Writer<'_> {
         Ok(())
     }
 
+    /// `TXQ` (bound handle) of dimensions: the width, the height, the
+    /// depth or the layers and the count of levels of a level, zeros for
+    /// a level the texture has not (`texture/filtering.rs`
+    /// `query_header`). The instruction does not say what kind of texture
+    /// it asks about, and the answer is the header's alone, so the draw
+    /// gives it: five words per queried handle (`TQ(i)`; the handles in
+    /// `queries`), the dimensions of the base level, the count of levels
+    /// and flags: bit 0 the handle names a header, bit 1 the third
+    /// dimension is a depth, halved from level to level. A query of a
+    /// handle that names none is the interpreter's refusal: a pixel
+    /// program stores its address, with bits 31 and 30, in the trap
+    /// word; a vertex program's draw goes to the CPU.
+    pub(super) fn txq(&mut self) -> Result<(), String> {
+        let w = self.word;
+        self.require(bits(w, 22, 6) == 1, "query other than of dimensions")?;
+        let (a, d) = (bits(w, 8, 8), bits(w, 0, 8));
+        let mask = bits(w, 31, 4);
+        let handle = bits(w, 36, 13) * 4;
+        let found = self.queries.iter().position(|&h| h == handle);
+        let index = found.unwrap_or_else(|| {
+            self.queries.push(handle);
+            self.queries.len() - 1
+        });
+        let level = self.read(a);
+        let at = 5 * index;
+        self.line(&format!(
+            "{{ const uint level = {level}; const uint4 base = uint4(TQ({at}u), TQ({}u), TQ({}u), TQ({}u)); const uint flags = TQ({}u);",
+            at + 1,
+            at + 2,
+            at + 3,
+            at + 4
+        ));
+        if self.stage == Stage::Pixel {
+            self.line(&format!(
+                "if ((flags & 1u) == 0u) {{ atomic_store_explicit(&trap[0], {:#x}u, memory_order_relaxed); }}",
+                self.pc | 0xc000_0000
+            ));
+        }
+        self.line(
+            "const uint4 q = level >= base.w ? uint4(0u, 0u, 0u, base.w) : uint4(max(base.x >> level, 1u), max(base.y >> level, 1u), (flags & 2u) != 0u ? max(base.z >> level, 1u) : base.z, base.w);",
+        );
+        let mut index = 0;
+        for (c, component) in ["x", "y", "z", "w"].into_iter().enumerate() {
+            if mask & (1 << c) != 0 {
+                self.set(d + index, &format!("q.{component}"));
+                index += 1;
+            }
+        }
+        self.line("}");
+        Ok(())
+    }
+
     /// Stores the components of `float4 v` that `mask` selects: to the
     /// registers from `d` on, or, with the second destination of the
     /// scalar forms, two to `d` and the rest to `e`.

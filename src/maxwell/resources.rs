@@ -658,8 +658,10 @@ impl TextureUnit for ThreadTextures<'_> {
         self.with(handle, |texture, sampler| texture.gather(sampler, request))?
     }
 
+    /// From the header: a query reads nothing of the texture.
     fn query(&self, handle: u32, query: Query) -> Result<[u32; 4], Unmodeled> {
-        self.with(handle, |texture, _| texture.query(query))?
+        let (tic, _) = self.draw.header(handle)?;
+        super::texture::query_header(&tic, query)
     }
 
     fn lod(
