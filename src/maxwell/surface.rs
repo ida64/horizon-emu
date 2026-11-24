@@ -311,8 +311,13 @@ impl Window {
         let data = &mut self.data;
         let mut scratch = Vec::new();
         in_runs(&pieces, |address, run| {
-            let done = if let [(_, range)] = run {
-                let piece = &mut data[range.clone()];
+            let first = &run[0].1;
+            let last = &run[run.len() - 1].1;
+            // A run whose bytes lie together in the window too is copied
+            // in one piece.
+            let together = run.windows(2).all(|pair| pair[0].1.end == pair[1].1.start);
+            let done = if together {
+                let piece = &mut data[first.start..last.end];
                 if write {
                     memory.write(address, piece)
                 } else {
