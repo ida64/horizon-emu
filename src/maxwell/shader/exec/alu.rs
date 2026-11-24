@@ -18,7 +18,7 @@ fn modify(v: f32, abs: bool, neg: bool) -> f32 {
 }
 /// A binary32 product is exact in binary64, so directed conversion can
 /// compare the rounded result to the exact product without approximation.
-fn round_f64(v: f64, mode: u32) -> f32 {
+pub(super) fn round_f64(v: f64, mode: u32) -> f32 {
     let r = v as f32;
     if mode == 0 || v.is_nan() {
         return r;

@@ -126,6 +126,7 @@
 //! change values in a model without caches.
 
 mod alu;
+mod double;
 mod integer;
 mod tex;
 mod texture_vector;
@@ -859,6 +860,9 @@ impl<'a, const L: usize> Machine<'a, L> {
             }
         }
         if active == 0 {
+            return Ok(());
+        }
+        if self.execute_double(active)? {
             return Ok(());
         }
         if self.execute_alu(active)? {
