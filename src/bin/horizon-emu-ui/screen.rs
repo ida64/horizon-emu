@@ -1,8 +1,9 @@
 //! A machine's screen: the picture the display controller sends, with the
 //! machine's state over it and a toolbar for what is done to the console.
 //! The mouse on the picture is a finger on the touchscreen; the keyboard
-//! is the pair of Joy-Con (J slides them on or off the rails, P is the
-//! console's power button), as in the emulator's own window.
+//! is the pair of Joy-Con (WASD and IJKL push the sticks, backquote slides
+//! them on or off the rails, P is the console's power button), as in the
+//! emulator's own window.
 
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use crate::{
 
 /// Which key holds which button (the emulator's `window.rs` mapping).
 const KEYS: [(Key, &str); 19] = [
-    (Key::A, "a"),
+    (Key::Space, "a"),
     (Key::B, "b"),
     (Key::X, "x"),
     (Key::Y, "y"),
@@ -41,6 +42,15 @@ const KEYS: [(Key, &str); 19] = [
     (Key::Period, "rstick"),
     (Key::P, "power"),
 ];
+
+/// Which keys push which stick: up, down, left, right (`window.rs`).
+const STICK_KEYS: [(&str, [Key; 4]); 2] = [
+    ("left", [Key::W, Key::S, Key::A, Key::D]),
+    ("right", [Key::I, Key::K, Key::J, Key::L]),
+];
+
+/// The key that slides the Joy-Con onto the rails or off.
+const RAILS_KEY: Key = Key::Backtick;
 
 /// Lines of output the overlay shows.
 const OVERLAY_LINES: usize = 6;
@@ -62,8 +72,14 @@ pub fn release(app: &mut App, index: usize) {
         if app.touching.take().is_some() {
             child.input(Input::Touch(None));
         }
+        for ((stick, _), pushed) in STICK_KEYS.iter().zip(&app.sticks) {
+            if *pushed != (0, 0) {
+                child.input(Input::Stick { stick, x: 0.0, y: 0.0 });
+            }
+        }
     }
     app.touching = None;
+    app.sticks = [(0, 0); 2];
 }
 
 /// Holds `button` while `down`, telling the machine of changes only.
@@ -185,15 +201,28 @@ fn keyboard(app: &mut App, ctx: &egui::Context, index: usize) {
     if ctx.memory(|memory| memory.focused().is_some()) || app.dialog.is_some() {
         return;
     }
-    let (toggle_rails, back, down): (bool, bool, Vec<bool>) = ctx.input(|input| {
+    let (toggle_rails, back, down, sticks) = ctx.input(|input| {
+        let axis = |positive: Key, negative: Key| {
+            i8::from(input.key_down(positive)) - i8::from(input.key_down(negative))
+        };
         (
-            input.key_pressed(Key::J),
+            input.key_pressed(RAILS_KEY),
             input.key_pressed(Key::Escape),
-            KEYS.iter().map(|(key, _)| input.key_down(*key)).collect(),
+            KEYS.iter().map(|(key, _)| input.key_down(*key)).collect::<Vec<_>>(),
+            STICK_KEYS.map(|(_, [up, down, left, right])| (axis(right, left), axis(up, down))),
         )
     });
     for ((_, button), down) in KEYS.iter().zip(down) {
         hold(app, index, button, down);
+    }
+    for ((stick, _), now) in STICK_KEYS.iter().zip(sticks) {
+        let slot = if *stick == "left" { 0 } else { 1 };
+        if now != app.sticks[slot] {
+            app.sticks[slot] = now;
+            if let Some(child) = &app.entries[index].child {
+                child.input(Input::Stick { stick, x: f32::from(now.0), y: f32::from(now.1) });
+            }
+        }
     }
     if toggle_rails {
         toggle_joycons(app, index);
@@ -414,13 +443,13 @@ fn toolbar(app: &mut App, ctx: &egui::Context, index: usize) {
                     .inner_margin(Margin::symmetric(12, 4));
                 hint.show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            for (key, what) in [("J", "rails"), ("P", "power"), ("H", "home"), ("Esc", "back")] {
+                            for (key, what) in [("WASD", "move"), ("IJKL", "look"), ("`", "rails"), ("P", "power"), ("H", "home"), ("Esc", "back")] {
                                 ui.label(RichText::new(key).monospace().background_color(white(30)));
                                 ui.label(RichText::new(what).size(13.0));
                             }
                             ui.label(RichText::new("mouse on picture = touch").size(13.0).color(MUTED))
                                 .on_hover_text(
-                                    "A B X Y, L R, Q E (ZL ZR), arrows (D-pad), = and - (+ and -), \
+                                    "Space (A), B X Y, L R, Q E (ZL ZR), arrows (D-pad), = and - (+ and -), \
                                      H (HOME), C (Capture), comma and period (stick clicks).",
                                 );
                         });

@@ -218,6 +218,9 @@ fn capture(
 /// What the UI does to a running machine.
 pub enum Input {
     Press { button: &'static str, held: bool },
+    /// The left or right stick pushed to x, y (-1 to 1, right and up
+    /// positive).
+    Stick { stick: &'static str, x: f32, y: f32 },
     Touch(Option<(u16, u16)>),
     Joycons(bool),
     Amiibo(Option<(PathBuf, bool)>),
@@ -227,6 +230,7 @@ impl Input {
     fn request(&self) -> Value {
         match self {
             Self::Press { button, held } => json!({"op": "press", "button": button, "held": held}),
+            Self::Stick { stick, x, y } => json!({"op": "stick", "stick": stick, "x": x, "y": y}),
             Self::Touch(Some((x, y))) => json!({"op": "touch", "x": x, "y": y}),
             Self::Touch(None) => json!({"op": "touch"}),
             Self::Joycons(seated) => json!({"op": "joycons", "seated": seated}),

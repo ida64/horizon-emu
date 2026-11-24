@@ -67,7 +67,7 @@ const KEYS: [(Key, Button); 18] = [
 const POWER_KEY: Key = Key::P;
 
 /// The key that slides the Joy-Con onto the rails or off.
-const RAILS_KEY: Key = Key::Tab;
+const RAILS_KEY: Key = Key::Backquote;
 
 /// Which keys push which stick: up, down, left, right.
 const STICK_KEYS: [(Stick, [Key; 4]); 2] = [

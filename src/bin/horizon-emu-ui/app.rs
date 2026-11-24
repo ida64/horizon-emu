@@ -163,6 +163,9 @@ pub struct App {
     pub texture: Option<TextureHandle>,
     pub texture_serial: u64,
     pub held: HashSet<&'static str>,
+    /// Where the keys last pushed the left and right stick, as the machine
+    /// was told.
+    pub sticks: [(i8, i8); 2],
     pub touching: Option<(u16, u16)>,
     pub log_overlay: bool,
     /// Whether the window's glass backdrop is in place.
@@ -190,6 +193,7 @@ impl App {
             texture: None,
             texture_serial: 0,
             held: HashSet::new(),
+            sticks: [(0, 0); 2],
             touching: None,
             log_overlay: true,
             glass_tried: false,
