@@ -369,10 +369,12 @@ taken as it is, such as one inside a process):
                       which slows the guest
   --list-threads      when the machine stops, list every thread of the
                       guest's processes as the kernel's own objects describe
-                      it: its state, the supervisor call it is in, and for a
-                      request the port its session came from, the processes
-                      serving it and the message; for a lock its owner; for
-                      the objects waited for who holds or signals them.
+                      it: its state, the supervisor call it is in with the
+                      return addresses from the frame records on its stack,
+                      and for a request the port its session came from, the
+                      processes serving it and the message; for a lock its
+                      owner; for the objects waited for who holds or
+                      signals them.
                       Read from memory after the stop, so it does not slow
                       the guest (kernel 23.5.0 only)
   --crash-dump DIR    each time a process takes an exception the firmware
@@ -2764,12 +2766,13 @@ fn describe_thread(thread: &GuestThread) -> String {
     };
     let _ = write!(
         line,
-        ", in {:#04x} {} {:x?} from {:#x}, lr {:#x}",
+        ", in {:#04x} {} {:x?} from {:#x}, lr {:#x}, callers {:x?}",
         call.id,
         svc::name(call.id).unwrap_or("?"),
         call.arguments,
         call.pc,
-        call.lr
+        call.lr,
+        call.callers
     );
     let names = |processes: &[Process]| {
         let names: Vec<&str> = processes.iter().map(Process::name).collect();

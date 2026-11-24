@@ -153,8 +153,9 @@ pub struct ThreadCall {
     pub pc: u64,
     /// `X30` at the call.
     pub lr: u64,
-    /// `X29` at the call.
-    pub fp: u64,
+    /// Return addresses from the frame records on the thread's stack,
+    /// from its `X29` at the call.
+    pub callers: Vec<u64>,
     /// The request a request-sending call sends, as far as it could be
     /// read: the thread's message buffer or the call's user buffer.
     pub message: Vec<u8>,
@@ -488,7 +489,9 @@ impl Machine {
             arguments,
             pc: kernel.u64(saved + layout::SAVED_ELR)?.wrapping_sub(4),
             lr: kernel.u64(saved + layout::SAVED_X29 + 8)?,
-            fp: kernel.u64(saved + layout::SAVED_X29)?,
+            callers: user.map_or_else(Vec::new, |user| {
+                self.frame_chain(&user, kernel.u64(saved + layout::SAVED_X29).unwrap_or(0))
+            }),
             message,
             objects,
         })
