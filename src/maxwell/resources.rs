@@ -39,7 +39,7 @@ use super::lru::Lru;
 use super::sampling::{FetchRequest, GatherRequest, Query, SampleRequest, Target, TextureUnit};
 use super::shader::Program;
 use super::texture::{Texture, Tic, Tsc};
-use super::{GpuMemory, Unmodeled};
+use super::{GpuMemory, Unmodeled, WatchMark};
 
 /// The guest memory a channel's engines wrote in the current epoch: since
 /// the channel last synchronized ([`Writes::synchronize`]). Caches of
@@ -57,11 +57,24 @@ struct WriteLog {
     stamped: bool,
 }
 
-/// When a copy of guest memory was last known to be equal to it.
+/// When a copy of guest memory was last known to be equal to it: in which
+/// epoch, and since which mark of the DRAM write watch
+/// ([`GpuMemory::watch`]) if memory was watched before it was read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stamp {
     epoch: u64,
     writes: usize,
+    watched: Option<WatchMark>,
+}
+
+impl Stamp {
+    /// The stamp, for a copy read after memory was watched with `mark`.
+    pub fn watched(self, mark: Option<WatchMark>) -> Self {
+        Self {
+            watched: mark,
+            ..self
+        }
+    }
 }
 
 /// Ranges an epoch holds before it is ended early (everything is compared
@@ -109,7 +122,23 @@ impl Writes {
         Stamp {
             epoch: log.epoch,
             writes: log.ranges.len(),
+            watched: None,
         }
+    }
+
+    /// Whether `start..end` of `memory` may be taken as unchanged since
+    /// `stamp`: [`unchanged`](Self::unchanged), or written by no agent
+    /// since the copy's watch mark, in a later epoch. The stamp to keep
+    /// then: one of this epoch where the watch told, so that the copy's
+    /// next use in it need not ask the watch again.
+    pub fn kept(&self, memory: &dyn GpuMemory, stamp: Stamp, start: u64, end: u64) -> Option<Stamp> {
+        if self.unchanged(stamp, start, end) {
+            return Some(stamp);
+        }
+        let mark = stamp.watched?;
+        memory
+            .unwritten_since(start, end.saturating_sub(start) as usize, mark)
+            .then(|| self.stamp().watched(Some(mark)))
     }
 
     /// Whether `start..end` may be taken as unchanged since `stamp`: same
@@ -145,6 +174,14 @@ impl GpuMemory for Tracked<'_> {
 
     fn equals(&self, address: u64, expected: &[u8]) -> Option<bool> {
         self.memory.equals(address, expected)
+    }
+
+    fn watch(&self, address: u64, len: usize) -> Option<WatchMark> {
+        self.memory.watch(address, len)
+    }
+
+    fn unwritten_since(&self, address: u64, len: usize, mark: WatchMark) -> bool {
+        self.memory.unwritten_since(address, len, mark)
     }
 }
 
@@ -183,16 +220,17 @@ fn equals(memory: &dyn GpuMemory, address: u64, expected: &[u8]) -> Result<bool,
 }
 
 /// `None` if memory at `address` holds `expected`, else the `length` bytes
-/// it holds, read once: compared a piece at a time while equal, the rest
-/// read after the first difference. Refuses as [`read`] would.
+/// it holds; with the mark of the write watch taken before either (see
+/// [`Stamp::watched`]). Refuses as [`read`] would.
 fn read_unless_equal(
     memory: &dyn GpuMemory,
     address: u64,
     length: usize,
     expected: Option<&[u8]>,
-) -> Result<Option<Vec<u8>>, Unmodeled> {
+) -> Result<(Option<Vec<u8>>, Option<WatchMark>), Unmodeled> {
+    let mark = memory.watch(address, length);
     let Some(expected) = expected.filter(|expected| expected.len() == length) else {
-        return read(memory, address, length).map(Some);
+        return Ok((Some(read(memory, address, length)?), mark));
     };
     // Compared in place, in one piece: every access of engine memory may
     // look for pending write-backs over it (`metal::Coherent`).
@@ -200,9 +238,9 @@ fn read_unless_equal(
         .equals(address, expected)
         .ok_or_else(|| unmapped(address, length))?
     {
-        return Ok(None);
+        return Ok((None, mark));
     }
-    read(memory, address, length).map(Some)
+    Ok((Some(read(memory, address, length)?), mark))
 }
 
 /// Host memory the decoded programs of one channel may take, with the
@@ -351,7 +389,7 @@ impl TextureCache {
         words: [u32; 8],
         tic: &Tic,
         raw: Vec<u8>,
-        writes: &Writes,
+        stamp: Stamp,
     ) -> Result<Arc<Texture>, Unmodeled> {
         let hash = content_hash(&raw);
         let kept = self
@@ -383,7 +421,7 @@ impl TextureCache {
         let binding = Binding {
             hash,
             serial: decoded.serial,
-            stamp: writes.stamp(),
+            stamp,
         };
         self.entries
             .lock()
@@ -498,16 +536,27 @@ impl<'a> DrawTextures<'a> {
                     .map(|decoded| (binding, decoded.clone()))
             })
         };
+        let kept = bound.as_ref().and_then(|(binding, _)| {
+            self.writes.kept(self.memory, binding.stamp, address, end)
+        });
         let texture = match bound {
-            Some((binding, decoded)) if self.writes.unchanged(binding.stamp, address, end) => {
+            Some((binding, decoded)) if let Some(stamp) = kept => {
+                if stamp != binding.stamp
+                    && let Some(kept) = self.cache.entries.lock().unwrap().bindings.get_mut(&words)
+                    && kept.serial == binding.serial
+                {
+                    kept.stamp = stamp;
+                }
                 decoded.texture.clone()
             }
             bound => {
                 let expected = bound.as_ref().map(|(_, decoded)| &*decoded.raw);
-                match read_unless_equal(self.memory, address, length as usize, expected)? {
+                let (read, mark) =
+                    read_unless_equal(self.memory, address, length as usize, expected)?;
+                let stamp = self.writes.stamp().watched(mark);
+                match read {
                     None => {
                         let (binding, decoded) = bound.expect("compared with a kept decode");
-                        let stamp = self.writes.stamp();
                         if let Some(kept) =
                             self.cache.entries.lock().unwrap().bindings.get_mut(&words)
                             && kept.serial == binding.serial
@@ -516,7 +565,7 @@ impl<'a> DrawTextures<'a> {
                         }
                         decoded.texture.clone()
                     }
-                    Some(raw) => self.cache.contents(words, &tic, raw, self.writes)?,
+                    Some(raw) => self.cache.contents(words, &tic, raw, stamp)?,
                 }
             }
         };
@@ -535,19 +584,26 @@ impl<'a> DrawTextures<'a> {
         let end = address.saturating_add(length);
         let kept = self.cache.entries.lock().unwrap().raw.get(&words).cloned();
         if let Some((raw, stamp)) = &kept
-            && self.writes.unchanged(*stamp, address, end)
+            && let Some(now) = self.writes.kept(self.memory, *stamp, address, end)
         {
+            if now != *stamp
+                && let Some(entry) = self.cache.entries.lock().unwrap().raw.get_mut(&words)
+                && Arc::ptr_eq(&entry.0, raw)
+            {
+                entry.1 = now;
+            }
             return Ok(raw.clone());
         }
         let expected = kept.as_ref().map(|(raw, _)| &*raw.bytes);
-        let raw = match read_unless_equal(self.memory, address, length as usize, expected)? {
+        let (read, mark) = read_unless_equal(self.memory, address, length as usize, expected)?;
+        let raw = match read {
             None => kept.expect("compared with kept bytes").0,
             Some(bytes) => Arc::new(RawTexture {
                 tic,
                 bytes: bytes.into(),
             }),
         };
-        let stamp = self.writes.stamp();
+        let stamp = self.writes.stamp().watched(mark);
         let dropped = self.cache.entries.lock().unwrap().raw.insert(
             words,
             (raw.clone(), stamp),

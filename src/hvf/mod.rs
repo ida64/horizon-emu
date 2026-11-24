@@ -114,6 +114,26 @@ impl Vm {
     }
 }
 
+/// Sets the stage-2 permissions of `size` bytes of mapped guest-physical
+/// memory at `ipa` (aligned to the host page size): read and execute, and
+/// write if `writable`; whether Hypervisor.framework took it. A guest
+/// write to memory without the write permission exits as a data abort
+/// (see [`crate::memory::GuestRam::write_fault`]).
+pub fn protect(ipa: u64, size: usize, writable: bool) -> bool {
+    let mut flags = sys::HV_MEMORY_READ | sys::HV_MEMORY_EXEC;
+    if writable {
+        flags |= sys::HV_MEMORY_WRITE;
+    }
+    // SAFETY: changes permissions of the VM's own mapping only.
+    unsafe { sys::hv_vm_protect(ipa, size, flags) == sys::HV_SUCCESS }
+}
+
+/// The host's page size: the granule of [`protect`].
+pub fn page_size() -> u64 {
+    // SAFETY: sysconf with a valid name.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+}
+
 impl Drop for Vm {
     fn drop(&mut self) {
         // SAFETY: the VM exists; all vCPUs borrow it and are already gone.

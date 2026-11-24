@@ -212,7 +212,7 @@ use super::surface::{Rect, Surface, Window};
 use super::sampling::Target;
 use super::texture::format::{ColorFormat, DepthFormat};
 use super::texture::{Texture, Tic, Tsc};
-use super::{GpuMemory, Release, Unmodeled};
+use super::{GpuMemory, Release, Unmodeled, WatchMark};
 
 type Device = ProtocolObject<dyn MTLDevice>;
 type Queue = ProtocolObject<dyn MTLCommandQueue>;
@@ -5697,6 +5697,16 @@ impl GpuMemory for Coherent<'_> {
     fn equals(&self, address: u64, expected: &[u8]) -> Option<bool> {
         self.before(address, expected.len())?;
         self.memory.equals(address, expected)
+    }
+
+    fn watch(&self, address: u64, len: usize) -> Option<WatchMark> {
+        self.memory.watch(address, len)
+    }
+
+    /// A write-back over the bytes still to come lands first, and counts
+    /// as a write.
+    fn unwritten_since(&self, address: u64, len: usize, mark: WatchMark) -> bool {
+        self.before(address, len).is_some() && self.memory.unwritten_since(address, len, mark)
     }
 }
 

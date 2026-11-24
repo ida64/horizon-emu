@@ -856,6 +856,7 @@ impl Machine {
         let vm = Vm::new()?;
         // SAFETY: `ram` is a page-aligned mmap that outlives `vm`.
         unsafe { vm.map(ram.host_ptr(), ram.base(), ram.size())? };
+        ram.watch_writes(crate::hvf::page_size(), crate::hvf::protect);
 
         let signals = Arc::new(CoreSignals::default());
         let gic = Arc::new(Gic::new(CORE_COUNT, {
@@ -2432,6 +2433,11 @@ impl<'env> Session<'env> {
                 self.system_register(core, vcpu, debug, SysRegAccess::from_syndrome(syndrome))
             }
             exception_class::DATA_ABORT_LOWER => {
+                // A write to DRAM whose write permission the write watch
+                // took is retried once it is given back.
+                if self.machine.ram.write_fault(physical_address) {
+                    return Ok(None);
+                }
                 self.device_access(core, vcpu, syndrome, physical_address, virtual_address)
             }
             exception_class::WFX => {

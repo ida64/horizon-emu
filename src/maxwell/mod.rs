@@ -59,7 +59,7 @@ use crate::snapshot::{SnapshotError, decode, encode};
 ///
 /// A failed [`read`](Self::read) or [`write`](Self::write) may leave its
 /// reason behind for the refusal it causes (the pushbuffer executor's
-/// `ChannelMemory` does). A memory that wraps another forwards all three
+/// `ChannelMemory` does). A memory that wraps another forwards all its
 /// methods to it.
 pub trait GpuMemory: Sync {
     fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()>;
@@ -79,6 +79,31 @@ pub trait GpuMemory: Sync {
         self.read(address, &mut held)?;
         Some(held == expected)
     }
+    /// Watches `len` bytes at `address` for writes of any agent (the
+    /// DRAM write watch, [`crate::memory`]) and gives a mark for
+    /// [`unwritten_since`]; to be taken before the bytes are read. `None`
+    /// where memory cannot be watched.
+    ///
+    /// [`unwritten_since`]: GpuMemory::unwritten_since
+    fn watch(&self, _address: u64, _len: usize) -> Option<WatchMark> {
+        None
+    }
+    /// Whether nothing wrote `len` bytes at `address` since `mark`, given
+    /// by [`watch`](GpuMemory::watch) for them, and they still translate
+    /// to the same DRAM: what was read after the mark is what they hold.
+    /// `false` when that is not known.
+    fn unwritten_since(&self, _address: u64, _len: usize, _mark: WatchMark) -> bool {
+        false
+    }
+}
+
+/// When engine memory was watched for writes ([`GpuMemory::watch`]): the
+/// DRAM write watch's mark, with a fingerprint of where in DRAM the bytes
+/// lay then (bytes that translate anew may lie elsewhere).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchMark {
+    pub dram: u64,
+    pub placement: u64,
 }
 
 /// What a method did not model.

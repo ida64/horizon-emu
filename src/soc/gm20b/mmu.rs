@@ -47,8 +47,8 @@ use std::sync::{
 
 use serde::{Deserialize, Serialize};
 
-use super::super::mc::DeviceMemory;
-use crate::maxwell::{GpuMemory, Unmodeled};
+use super::super::mc::{DeviceMemory, PLACEMENT_SEED, place_piece};
+use crate::maxwell::{GpuMemory, Unmodeled, WatchMark};
 
 /// Bus address bit that sends an access through the SMMU.
 pub const SMMU_BIT: u64 = 1 << 34;
@@ -89,6 +89,18 @@ pub trait BusMemory: Send + Sync {
         let mut held = vec![0; expected.len()];
         self.read(address, &mut held)?;
         Some(held == expected)
+    }
+
+    /// The DRAM write watch through this bus (`GpuMemory::watch`): the
+    /// mark, and a fingerprint of where in DRAM the bytes lie.
+    fn watch(&self, _address: u64, _len: usize) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// The fingerprint of where in DRAM the bytes lie, if nothing wrote
+    /// them since `mark` (see `GpuMemory::unwritten_since`).
+    fn unwritten_since(&self, _address: u64, _len: usize, _mark: u64) -> Option<u64> {
+        None
     }
 
     /// The TLB walks through this bus may keep, if any, and the count of
@@ -165,6 +177,15 @@ impl BusMemory for SmmuBus {
     fn equals(&self, address: u64, expected: &[u8]) -> Option<bool> {
         self.memory
             .equals(smmu_address(address, expected.len())?, expected)
+    }
+
+    fn watch(&self, address: u64, len: usize) -> Option<(u64, u64)> {
+        self.memory.watch(smmu_address(address, len)?, len)
+    }
+
+    fn unwritten_since(&self, address: u64, len: usize, mark: u64) -> Option<u64> {
+        self.memory
+            .unwritten_since(smmu_address(address, len)?, len, mark)
     }
 
     /// Both counts only grow, so their sum stays the same only while
@@ -546,6 +567,53 @@ impl AddressSpace {
         })?;
         Ok(same)
     }
+
+    /// The write watch over the pages `len` bytes at `address` lie in:
+    /// the first page's mark (the earliest), with a fingerprint of where
+    /// in DRAM they all lie; `None` if any page has none.
+    pub fn watch(&self, bus: &dyn BusMemory, address: u64, len: usize) -> Option<WatchMark> {
+        let mut first = None;
+        let mut all = true;
+        let mut placement = PLACEMENT_SEED;
+        self.pieces(bus, address, len, false, |at, _, len| {
+            match bus.watch(at, len) {
+                Some((mark, piece)) => {
+                    first.get_or_insert(mark);
+                    placement = place_piece(placement, piece, len);
+                }
+                None => all = false,
+            }
+            Ok(())
+        })
+        .ok()?;
+        Some(WatchMark {
+            dram: first.filter(|_| all)?,
+            placement,
+        })
+    }
+
+    /// Whether nothing wrote the bytes since `mark` and they lie where
+    /// they did then.
+    pub fn unwritten_since(
+        &self,
+        bus: &dyn BusMemory,
+        address: u64,
+        len: usize,
+        mark: WatchMark,
+    ) -> bool {
+        let mut unwritten = true;
+        let mut placement = PLACEMENT_SEED;
+        let walked = self.pieces(bus, address, len, false, |at, _, len| {
+            if unwritten {
+                match bus.unwritten_since(at, len, mark.dram) {
+                    Some(piece) => placement = place_piece(placement, piece, len),
+                    None => unwritten = false,
+                }
+            }
+            Ok(())
+        });
+        walked.is_ok() && unwritten && placement == mark.placement
+    }
 }
 
 /// One address space as the engines of a channel use it. A refused access
@@ -598,6 +666,14 @@ impl GpuMemory for ChannelMemory<'_> {
                 None
             }
         }
+    }
+
+    fn watch(&self, address: u64, len: usize) -> Option<WatchMark> {
+        self.space.watch(self.bus, address, len)
+    }
+
+    fn unwritten_since(&self, address: u64, len: usize, mark: WatchMark) -> bool {
+        self.space.unwritten_since(self.bus, address, len, mark)
     }
 }
 

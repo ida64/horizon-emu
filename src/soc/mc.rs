@@ -469,6 +469,18 @@ fn frame_address(entry: u32) -> u64 {
     u64::from(entry & ENTRY_FRAME) << 12
 }
 
+/// The start of a placement fingerprint (see [`place_piece`]).
+pub const PLACEMENT_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// A fingerprint of where in DRAM a range lies, the piece of `len` bytes
+/// at `physical` added: equal for equal sequences of pieces, and with
+/// overwhelming likelihood different otherwise (FNV-1a over the words).
+pub fn place_piece(fingerprint: u64, physical: u64, len: usize) -> u64 {
+    [physical, len as u64].into_iter().fold(fingerprint, |hash, word| {
+        (hash ^ word).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// Guest memory as one memory client sees it: what a device that masters
 /// the bus reads and writes, through the SMMU if its ASID register enables
 /// translation, and through the AHB redirect aperture to IRAM.
@@ -658,6 +670,47 @@ impl DeviceMemory {
             Some(())
         })?;
         Some(same)
+    }
+
+    /// The DRAM write watch over the range (`GuestRam::watch`): the first
+    /// piece's mark (the earliest), with a fingerprint of where in DRAM
+    /// the range lies; `None` unless all of it is DRAM.
+    pub fn watch(&self, address: u64, len: usize) -> Option<(u64, u64)> {
+        let mut first = None;
+        let mut all = true;
+        let mut placement = PLACEMENT_SEED;
+        self.pieces(address, len, false, |place, _, len| {
+            match place {
+                Place::Dram(physical) => match self.ram.watch(physical, len) {
+                    Some(mark) => {
+                        first.get_or_insert(mark);
+                        placement = place_piece(placement, physical, len);
+                    }
+                    None => all = false,
+                },
+                Place::Iram(..) | Place::Blocked => all = false,
+            }
+            Some(())
+        })?;
+        Some((first.filter(|_| all)?, placement))
+    }
+
+    /// The fingerprint of where in DRAM the range lies (as
+    /// [`watch`](Self::watch) gives it), if all of it is DRAM written
+    /// since `mark` by no one.
+    pub fn unwritten_since(&self, address: u64, len: usize, mark: u64) -> Option<u64> {
+        let mut unwritten = true;
+        let mut placement = PLACEMENT_SEED;
+        self.pieces(address, len, false, |place, _, len| {
+            match place {
+                Place::Dram(physical) if self.ram.unwritten_since(physical, len, mark) => {
+                    placement = place_piece(placement, physical, len);
+                }
+                _ => unwritten = false,
+            }
+            Some(())
+        })?;
+        unwritten.then_some(placement)
     }
 
     /// `None` if any of the range is unmapped or outside DRAM and IRAM;
