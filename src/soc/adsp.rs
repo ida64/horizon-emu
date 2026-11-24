@@ -111,8 +111,9 @@
 //!   returns without an exit report (the OS started it, `0x805245B4`).
 //!   `audio` sends it when the system goes to sleep and waits at most a
 //!   second for the 12 (text `0x96220`), else it fails with 2111-0259.
-//!   Decoding itself (messages 22 onwards) is not modeled and refuses.
+//!   Decoding (messages 22 to 30) is libopus's ([`opus`]).
 
+mod opus;
 mod renderer;
 
 use std::{
@@ -254,16 +255,10 @@ const OPUS_STOP: u32 = 2;
 const OPUS_STOPPED: u32 = 12;
 const OPUS_WORK_SIZE: u32 = 21;
 const OPUS_WORK_SIZE_DONE: u32 = 41;
+/// Decoding requests, each answered with its number plus 20 ([`opus`]).
+const OPUS_REQUESTS: std::ops::RangeInclusive<u32> = 22..=30;
 /// Where in the shared buffer the decoder leaves its results.
-const OPUS_RESULT: u32 = 0xFC0;
-
-/// Work buffer bytes of an Opus decoder of `channels` channels, as the
-/// image computes it (see the module documentation).
-fn opus_work_size(channels: u32) -> u32 {
-    let silk = 0x2168;
-    let celt = (0x2030 + 4 * 120) * channels + 16 * 21 + 0x58;
-    silk + celt + 0x50 + 0x14
-}
+const OPUS_RESULT: u32 = opus::RESULT;
 
 /// Where the Opus decoder's conversation with `audio` stands.
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -338,6 +333,9 @@ struct Inner {
     notes: Arc<Notes>,
     /// Guest time, which renderer frames and the speaker's periods follow.
     clock: Arc<GuestClock>,
+    /// The Opus decoder's libopus decoders: host state, not saved (see
+    /// [`opus`]).
+    decoders: Mutex<opus::Decoders>,
 }
 
 /// The DSP and its AMISC block, as mapped at [`AMISC_BASE`].
@@ -380,6 +378,7 @@ impl Adsp {
             monitor: RegisterFile::strict(MONITOR.map(|offset| (offset, 0))),
             notes,
             clock: Arc::clone(clock),
+            decoders: Mutex::default(),
         });
         let weak = Arc::downgrade(&inner);
         thread::Builder::new()
@@ -468,28 +467,52 @@ impl Shared for GmixMemory<'_> {
 
 type Result<T, E = String> = std::result::Result<T, E>;
 
-impl Inner {
+/// Memory as the DSP's applications see it: DSP addresses.
+trait DspMemory {
+    fn read(&self, address: u32, bytes: &mut [u8]) -> Result<()>;
+    fn write(&self, address: u32, bytes: &[u8]) -> Result<()>;
+
     fn read_word(&self, address: u32) -> Result<u32> {
         let mut bytes = [0; 4];
-        self.memory
-            .read(u64::from(address), &mut bytes)
-            .ok_or_else(|| format!("DSP address {address:#x} is not mapped"))?;
+        self.read(address, &mut bytes)?;
         Ok(u32::from_le_bytes(bytes))
     }
 
     fn write_word(&self, address: u32, value: u32) -> Result<()> {
-        self.memory
-            .write(u64::from(address), &value.to_le_bytes())
-            .ok_or_else(|| format!("DSP address {address:#x} is not mapped"))
+        self.write(address, &value.to_le_bytes())
     }
 
     fn write_words(&self, address: u32, words: &[u32]) -> Result<()> {
         let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
-        self.memory
-            .write(u64::from(address), &bytes)
-            .ok_or_else(|| format!("DSP addresses from {address:#x} are not mapped"))
+        self.write(address, &bytes)
+    }
+}
+
+/// Sparse DSP memory for tests: bytes never written read as 0.
+#[cfg(test)]
+#[derive(Default)]
+struct ByteMemory(std::cell::RefCell<std::collections::HashMap<u32, u8>>);
+
+#[cfg(test)]
+impl DspMemory for ByteMemory {
+    fn read(&self, address: u32, bytes: &mut [u8]) -> Result<()> {
+        let memory = self.0.borrow();
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = *memory.get(&(address + i as u32)).unwrap_or(&0);
+        }
+        Ok(())
     }
 
+    fn write(&self, address: u32, bytes: &[u8]) -> Result<()> {
+        let mut memory = self.0.borrow_mut();
+        for (i, &byte) in bytes.iter().enumerate() {
+            memory.insert(address + i as u32, byte);
+        }
+        Ok(())
+    }
+}
+
+impl Inner {
     /// `msgq_init`: an empty queue of `capacity` words.
     fn queue_init(&self, queue: u32, capacity: u32) -> Result<()> {
         self.write_words(queue, &[capacity, 0, 0])
@@ -742,8 +765,13 @@ impl Inner {
                 self.send(state, OPUS, OPUS_STOPPED);
                 Opus::Stopped
             }
+            (Opus::Ready(buffer), message) if OPUS_REQUESTS.contains(&message) => {
+                self.decoders.lock().unwrap().serve(self, buffer, message)?;
+                self.send(state, OPUS, message + 20);
+                Opus::Ready(buffer)
+            }
             (Opus::WorkSize(buffer), channels @ (1 | 2)) => {
-                self.write_word(buffer + OPUS_RESULT, opus_work_size(channels))?;
+                self.write_word(buffer + OPUS_RESULT, opus::work_size(channels))?;
                 self.send(state, OPUS, OPUS_WORK_SIZE_DONE);
                 Opus::Ready(buffer)
             }
@@ -806,7 +834,7 @@ impl Inner {
     }
 }
 
-impl renderer::DspMemory for Inner {
+impl DspMemory for Inner {
     fn read(&self, address: u32, bytes: &mut [u8]) -> Result<()> {
         self.memory
             .read(u64::from(address), bytes)

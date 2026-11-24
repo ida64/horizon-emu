@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 aes = "0.8"
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+audiopus_sys = "0.2"
 bincode = "1.3.3"
 eframe = "0.37"
 egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }

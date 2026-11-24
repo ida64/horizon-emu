@@ -46,11 +46,7 @@
 //! (ADPCM: nor of one whose data is shorter than its end sample needs).
 //! Only the counts are modeled here: no sample is decoded or mixed.
 
-/// The renderer's view of memory: DSP addresses.
-pub(super) trait DspMemory {
-    fn read(&self, address: u32, bytes: &mut [u8]) -> Result<(), String>;
-    fn write(&self, address: u32, bytes: &[u8]) -> Result<(), String>;
-}
+use super::DspMemory;
 
 const HEADER_BYTES: usize = 24;
 const WAVE_BUFFERS: u32 = 4;
@@ -330,32 +326,8 @@ fn consume(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::collections::HashMap;
-
     use super::*;
-
-    /// DSP memory as bytes by address.
-    #[derive(Default)]
-    struct Memory(RefCell<HashMap<u32, u8>>);
-
-    impl DspMemory for Memory {
-        fn read(&self, address: u32, bytes: &mut [u8]) -> Result<(), String> {
-            let memory = self.0.borrow();
-            for (i, byte) in bytes.iter_mut().enumerate() {
-                *byte = *memory.get(&(address + i as u32)).unwrap_or(&0);
-            }
-            Ok(())
-        }
-
-        fn write(&self, address: u32, bytes: &[u8]) -> Result<(), String> {
-            let mut memory = self.0.borrow_mut();
-            for (i, &byte) in bytes.iter().enumerate() {
-                memory.insert(address + i as u32, byte);
-            }
-            Ok(())
-        }
-    }
+    use crate::soc::adsp::ByteMemory as Memory;
 
     impl Memory {
         fn words(&self, address: u32, words: &[u32]) {
