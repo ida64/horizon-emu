@@ -1126,14 +1126,18 @@ impl Renderer {
                 if resident.dirty.is_none() {
                     continue;
                 }
-                let (start, end) = resident.extent();
-                (resident.on_demand()
-                    && !resident
-                        .stamp
-                        .is_some_and(|stamp| writes.unchanged(stamp, start, end)))
-                .then_some(resident.surface)
+                resident
+                    .on_demand()
+                    .then_some((resident.surface, resident.stamp, resident.extent()))
             };
-            if let Some(surface) = check {
+            // Unchanged in this epoch, or unwritten since its watch mark.
+            let check = check.filter(|&(_, stamp, (start, end))| {
+                self.writing_back.store(true, Ordering::Relaxed);
+                let kept = stamp.and_then(|stamp| writes.kept(memory, stamp, start, end));
+                self.writing_back.store(false, Ordering::Relaxed);
+                kept.is_none()
+            });
+            if let Some((surface, ..)) = check {
                 let mirror = std::mem::replace(
                     &mut self.state.lock().unwrap().residents[index].mirror,
                     Window::empty(surface),
@@ -1364,20 +1368,21 @@ impl Renderer {
                 return Ok(());
             }
         }
+        // Reads and writes of this function pass `Coherent` unchecked.
+        self.writing_back.store(true, Ordering::Relaxed);
         // Residents whose mirror is known to equal memory still (nothing
         // of the channel wrote there since they were compared, in this
-        // epoch): they do after their own write-back too (residents do
-        // not overlap).
+        // epoch, or nothing at all since their watch mark): they do after
+        // their own write-back too (residents do not overlap).
         let mut current: Vec<bool> = state
             .residents
             .iter()
             .map(|r| {
                 let (start, end) = r.extent();
-                r.stamp.is_some_and(|s| writes.unchanged(s, start, end))
+                r.stamp
+                    .is_some_and(|s| writes.kept(memory, s, start, end).is_some())
             })
             .collect();
-        // Reads and writes of this function pass `Coherent` unchecked.
-        self.writing_back.store(true, Ordering::Relaxed);
         // On-demand targets: has the guest reused the memory?
         for (index, resident) in state.residents.iter_mut().enumerate() {
             if !(wanted[index] && resident.on_demand()) || current[index] {
@@ -3075,16 +3080,27 @@ impl Renderer {
                 x1: surface.width,
                 y1: surface.height,
             };
+            // A target replaced whole, watched for the guest's reuse of its
+            // memory from here on.
+            let watched = overwrite
+                .then(|| {
+                    let (start, end) = extent(&surface);
+                    memory.watch(start, (end - start) as usize)
+                })
+                .flatten();
             match found {
                 Some((index, true)) => indices.push(index),
                 // A target the caller replaces whole needs no look at
                 // memory: what it held does not matter. (One held on demand
-                // keeps a mirror equal to memory, which tells a reuse of
-                // the memory later.)
+                // tells a reuse of the memory later by the watch, or else
+                // keeps a mirror equal to memory.)
                 Some((index, false))
-                    if overwrite && !self.state.lock().unwrap().residents[index].on_demand() =>
+                    if overwrite
+                        && (watched.is_some()
+                            || !self.state.lock().unwrap().residents[index].on_demand()) =>
                 {
-                    self.state.lock().unwrap().residents[index].stamp = Some(writes.stamp());
+                    self.state.lock().unwrap().residents[index].stamp =
+                        Some(writes.stamp().watched(watched));
                     indices.push(index);
                 }
                 Some((index, false)) => {
@@ -3144,9 +3160,11 @@ impl Renderer {
                     // write-back stores where its GOBs (pitch rows) reach
                     // past the surface \[assumption: those bytes are the
                     // surface's padding, which nothing reads\]. (One held
-                    // on demand needs a mirror equal to memory, as above.)
-                    let (window, stamp) = if overwrite && !on_demand {
-                        (Window::blank(surface, texels), None)
+                    // on demand needs the watch, as above, or a mirror
+                    // equal to memory.)
+                    let (window, stamp) = if overwrite && (!on_demand || watched.is_some()) {
+                        let stamp = on_demand.then(|| writes.stamp().watched(watched));
+                        (Window::blank(surface, texels), stamp)
                     } else {
                         let (start, end) = extent(&surface);
                         let mark = memory.watch(start, (end - start) as usize);
