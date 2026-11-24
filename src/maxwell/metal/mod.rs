@@ -3436,7 +3436,15 @@ impl Renderer {
             composite.stamp = stamp;
         } else {
             let decoded = if candidates.iter().any(Option::is_none) {
-                match Texture::decode(&raw, tic) {
+                // Only the levels memory holds (`Composite::new`'s order:
+                // layer after layer, each's levels).
+                let count = (levels.len() / composite_layers(tic) as usize).max(1);
+                let memory_level = |level: u32| {
+                    candidates.iter().enumerate().any(|(index, c)| {
+                        c.is_none() && tic.base_level + (index % count) as u32 == level
+                    })
+                };
+                match Texture::decode_levels(&raw, tic, memory_level) {
                     Ok(decoded) => Some(decoded),
                     Err(_) => return Ok(None),
                 }
@@ -4776,6 +4784,10 @@ const READ_SRGB: u32 = 1;
 const READ_FLOAT_BITS: u32 = 2;
 /// A depth resident's 16-bit word as a UNORM.
 const READ_UNORM16: u32 = 3;
+/// A depth resident's word's bits 8-31 as a UNORM (Z24S8).
+const READ_UNORM24_HIGH: u32 = 4;
+/// A depth resident's word's bits 0-23 as a UNORM (S8Z24, X8Z24).
+const READ_UNORM24_LOW: u32 = 5;
 
 /// The largest region of global memory a program is given \[assumption:
 /// what a constant names with a larger size is no buffer descriptor\].
@@ -5374,8 +5386,33 @@ fn holds_level(resident: &Surface, level: &Surface) -> bool {
 /// linear format ([`format::pixel_format`]), so a header reads them raw
 /// there, and one with sRGB decoding decodes them. A depth buffer's
 /// resident holds its words ([`format::depth_pixel_format`]): a ZF32
-/// header reads Z32Float's as floats, a Z16 header Z16Unorm's as UNORM.
+/// header reads Z32Float's as floats, a Z16 header Z16Unorm's as UNORM,
+/// and a header of a 24-bit depth format the depth bits of Z24S8's,
+/// S8Z24's or X8Z24's words laid out as it says (`texture::format`
+/// 0x29-0x2b) as UNORM, where it selects no stencil bits and declares the
+/// depth UNORM (absent components 0, alpha 1, as `Texture::decode`).
 fn shared_components(tic: &Tic, content: Content) -> Option<Reading> {
+    use super::texture::format::ComponentType;
+    if let Content::Depth(depth) = content {
+        // (read, the header's depth component, its stencil component).
+        let (read, depth_component, stencil) = match (depth, tic.format.raw) {
+            (DepthFormat::Z24S8, 0x29) => (READ_UNORM24_HIGH, 1, Some(0)),
+            (DepthFormat::S8Z24 | DepthFormat::X8Z24, 0x2a) => (READ_UNORM24_LOW, 0, None),
+            (DepthFormat::S8Z24 | DepthFormat::X8Z24, 0x2b) => (READ_UNORM24_LOW, 0, Some(1)),
+            _ => (0, 0, None),
+        };
+        if read != 0 {
+            let stencil_selected = stencil.is_some_and(|s| tic.swizzle.contains(&(2 + s)));
+            if tic.srgb || stencil_selected || tic.types[depth_component] != ComponentType::Unorm {
+                return None;
+            }
+            // The depth in the read's red; the stencil never selected;
+            // absent components as constants.
+            let mut components = [4, 4, 4, 5];
+            components[depth_component] = 0;
+            return Some((components, read));
+        }
+    }
     let linear = Tic {
         srgb: false,
         ..tic.clone()
@@ -5433,7 +5470,11 @@ kernel void convert_level(texture2d<float, access::read> source [[texture(0)]], 
 kernel void convert_depth(texture2d<uint, access::read> source [[texture(0)]], texture2d<float, access::write> level [[texture(1)]], constant uint* how [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {
     if (g.x >= level.get_width() || g.y >= level.get_height()) { return; }
     const uint word = source.read(g).x;
-    const float depth = how[4] == 2u ? as_type<float>(word) : float(word) / 65535.0f;
+    const uint read = how[4];
+    const float depth = read == 2u ? as_type<float>(word)
+        : read == 3u ? float(word) / 65535.0f
+        : read == 4u ? float(word >> 8) / 16777215.0f
+        : float(word & 0xffffffu) / 16777215.0f;
     level.write(selected(float4(depth, 0.0f, 0.0f, 1.0f), how), g);
 }
 "#;

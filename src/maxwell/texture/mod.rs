@@ -388,6 +388,16 @@ impl Texture {
     /// component of a packed format is converted once per code (by
     /// table).
     pub fn decode(raw: &[u8], tic: &Tic) -> Result<Self, Unmodeled> {
+        Self::decode_levels(raw, tic, |_| true)
+    }
+
+    /// [`decode`](Self::decode) of the levels `wanted` names; the others
+    /// keep their size but no texels.
+    pub fn decode_levels(
+        raw: &[u8],
+        tic: &Tic,
+        wanted: impl Fn(u32) -> bool,
+    ) -> Result<Self, Unmodeled> {
         let (_, size) = Self::footprint(tic)?;
         let raw = usize::try_from(size)
             .ok()
@@ -448,6 +458,15 @@ impl Texture {
             let width = (tic.shape.width >> level).max(1);
             let height = (tic.shape.height >> level).max(1);
             let depth = (tic.shape.depth >> level).max(1);
+            if !wanted(level) {
+                levels.push(Level {
+                    width,
+                    height,
+                    depth,
+                    texels: Vec::new(),
+                });
+                continue;
+            }
             let count = u64::from(width)
                 * u64::from(height)
                 * u64::from(depth)

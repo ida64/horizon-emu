@@ -18,14 +18,28 @@ const TEXELS: u32 = 16;
 const LEVEL_1: u64 = TEXTURE + 1024;
 const POOLS: u64 = 0x68_0000;
 
+/// [`TEXTURE`]'s header: A8B8G8R8 UNORM, RGBA, block linear in blocks of
+/// two GOBs, both levels in view.
+const TEXTURE_TIC: [u32; 8] = [
+    8 | 2 << 7 | 2 << 10 | 2 << 13 | 2 << 16 | 2 << 19 | 3 << 22 | 4 << 25 | 5 << 28,
+    TEXTURE as u32,
+    (TEXTURE >> 32) as u32 | 3 << 21,
+    1 << 3 | 1 << 28,
+    (TEXELS - 1) | 1 << 23 | 7 << 29,
+    (TEXELS - 1) | 1 << 31,
+    0,
+    1 << 4,
+];
+
 fn level_1_texel(x: u32, y: u32) -> [u8; 4] {
     [(30 * x) as u8, (30 * y) as u8, 99, 255]
 }
 
 /// Binds the firmware's textured ui2d shader pair with texture slot 0 on
-/// [`TEXTURE`] (TIC 3: both levels in view; TSC 5: nearest texels of the
-/// nearest level, clamped to the edge) and its quad's corners.
-fn bind_textured(frame: &mut Frame, elf: &[u8]) {
+/// TIC 3 (by default [`TEXTURE_TIC`]: [`TEXTURE`] with both levels in
+/// view; TSC 5: nearest texels of the nearest level, clamped to the edge)
+/// and its quad's corners.
+fn bind_textured(frame: &mut Frame, elf: &[u8], tic: [u32; 8]) {
     frame.program(1, 0, starter_program(elf, 0x4be500));
     frame.program(5, 0x800, starter_program(elf, 0x4beb00));
     frame.constants(
@@ -39,16 +53,6 @@ fn bind_textured(frame: &mut Frame, elf: &[u8]) {
     let mut handles = vec![0u8; 0x40];
     handles[0x20..0x24].copy_from_slice(&(3u32 | 5 << 20).to_le_bytes());
     frame.constants(4, 2, 0x30_4000, &handles);
-    let tic: [u32; 8] = [
-        8 | 2 << 7 | 2 << 10 | 2 << 13 | 2 << 16 | 2 << 19 | 3 << 22 | 4 << 25 | 5 << 28,
-        TEXTURE as u32,
-        (TEXTURE >> 32) as u32 | 3 << 21,
-        1 << 3 | 1 << 28,
-        (TEXELS - 1) | 1 << 23 | 7 << 29,
-        (TEXELS - 1) | 1 << 31,
-        0,
-        1 << 4,
-    ];
     let tsc: [u32; 8] = [
         2 | 2 << 3 | 2 << 6,
         1 | 1 << 4 | 2 << 6,
@@ -125,7 +129,7 @@ fn clear_rect(frame: &mut Frame, [x0, x1, y0, y1]: [u32; 4], color: [f32; 4]) {
 fn sampled_target_frame(kind: RendererKind, rounds: u32) -> (Vec<u8>, Vec<u8>, usize) {
     let elf = std::fs::read(STARTER).expect("starter ELF (fw_elf) must be present");
     let mut frame = Frame::sized_with(SIZE, SIZE, kind);
-    bind_textured(&mut frame, &elf);
+    bind_textured(&mut frame, &elf, TEXTURE_TIC);
     for y in 0..TEXELS / 2 {
         for x in 0..TEXELS / 2 {
             frame.ram.put(
@@ -374,6 +378,48 @@ fn depth_held_on_demand_is_dropped_when_its_memory_is_reused() {
     metal.channel.settle(&metal.ram).unwrap();
     assert!(metal.ram.bytes(DEPTH, DEPTH_BYTES) == reused);
     assert!(copy_depth(&mut metal) == expected);
+}
+
+/// The Z24S8 depth buffer of [`depth_frame`], held on the GPU, sampled as
+/// a texture of the same bytes (header format 0x29: stencil R, depth G,
+/// here G in red, green and blue) by a quad over the whole target: read
+/// on the GPU from the held buffer, with the software renderer's result
+/// bit for bit.
+#[test]
+fn held_depth_buffer_sampled_as_a_texture_matches_software() {
+    let elf = std::fs::read(STARTER).expect("starter ELF (fw_elf) must be present");
+    let draw = |kind: RendererKind| {
+        let mut frame = depth_frame(kind);
+        // Depth tests and writes off: the buffer is only sampled.
+        frame.method(0x12cc, 0);
+        frame.method(0x12e8, 0);
+        let tic: [u32; 8] = [
+            0x29 | 4 << 7 | 2 << 10 | 2 << 13 | 2 << 16 | 3 << 19 | 3 << 22 | 3 << 25 | 7 << 28,
+            DEPTH as u32,
+            (DEPTH >> 32) as u32 | 3 << 21,
+            0,
+            (SIZE - 1) | 1 << 23 | 7 << 29,
+            (SIZE - 1) | 1 << 31,
+            0,
+            0,
+        ];
+        bind_textured(&mut frame, &elf, tic);
+        textured_quad(&mut frame, [2.0, 2.0], [-1.0, 1.0]);
+        frame.channel.flush(&frame.ram).unwrap();
+        let composites = frame.channel.hooks.metal.as_ref().map_or(0, |metal| {
+            assert_eq!(metal.fallbacks().1, vec![], "Metal drew everything");
+            metal.composites()
+        });
+        (frame.ram.bytes(TARGET, (SIZE * SIZE * 4) as usize), composites)
+    };
+    let (software, _) = draw(Software);
+    let (metal, composites) = draw(Metal);
+    let shades: std::collections::HashSet<u8> = software.chunks(4).map(|p| p[0]).collect();
+    assert!(shades.len() > 8, "the depths sampled vary: {shades:?}");
+    assert!(software == metal, "targets differ");
+    if super::super::metal::available() {
+        assert_eq!(composites, 1, "sampled from the held buffer");
+    }
 }
 
 /// A mesh of 8x8 quads over the target (each corner at its own depth
