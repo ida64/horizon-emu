@@ -35,6 +35,16 @@ impl Program {
 /// [`Program::constant_buffer_extent`] of decoded code.
 pub(super) fn constant_buffer_extent(code: &[Option<Inst>], slot: usize) -> Option<usize> {
     let mut extent = 0;
+    // A program that reads global memory takes addresses from the
+    // buffer descriptors the driver keeps in constant buffers (a 64-bit
+    // address, then a 32-bit size); the Metal renderer reads the size
+    // of each address the program loads (`msl::Translated::globals`).
+    let global = code.iter().flatten().any(|inst| {
+        matches!(
+            inst.op,
+            Op::Ldg | Op::Ld | Op::Stg | Op::St | Op::Red | Op::Atom
+        )
+    });
     for inst in code.iter().flatten() {
         let w = inst.word;
         if inst.op == Op::Ldc {
@@ -128,7 +138,11 @@ pub(super) fn constant_buffer_extent(code: &[Option<Inst>], slot: usize) -> Opti
             _ => continue,
         };
         if bits(w, 34, 5) as usize == slot {
-            extent = extent.max(bits(w, 20, 14) as usize * 4 + width);
+            let offset = bits(w, 20, 14) as usize * 4;
+            extent = extent.max(offset + width);
+            if global && matches!(inst.op, Op::MovC | Op::IaddC) && offset.is_multiple_of(8) {
+                extent = extent.max(offset + 12);
+            }
         }
     }
     Some(extent)

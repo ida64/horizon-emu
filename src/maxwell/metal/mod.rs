@@ -162,16 +162,17 @@ use objc2_metal::{
     MTLRenderPipelineState, MTLResourceOptions, MTLSamplerAddressMode,
     MTLSamplerBorderColor, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
     MTLSamplerState, MTLScissorRect, MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture,
-    MTLTextureDescriptor, MTLTextureType, MTLTextureUsage, MTLViewport, MTLWinding,
+    MTLTextureDescriptor, MTLTextureSwizzle, MTLTextureSwizzleChannels, MTLTextureType,
+    MTLTextureUsage, MTLViewport, MTLWinding,
 };
 
 use super::blend::{Blend, Factor, Operation};
 use super::lru::Lru;
 use super::multisample::Samples;
 use super::raster::{ColorOutput, Compare, DepthOutput, StencilFace, StencilOp, Triangle};
-use super::resources::{DrawTextures, Stamp, Writes};
+use super::resources::{DrawTextures, RawTexture, Stamp, Writes};
 use super::shader::Program;
-use super::shader::msl::{self, Translated};
+use super::shader::msl::{self, TextureKind, Translated};
 use super::surface::{Rect, Surface, Window};
 use super::sampling::Target;
 use super::texture::format::{ColorFormat, ComponentType, DepthFormat};
@@ -358,9 +359,15 @@ struct State {
     libraries: Lru<String, Retained<Library>>,
     pipelines: Lru<PipelineKey, Retained<Pipeline>>,
     clear_pipelines: HashMap<(usize, u8, bool), Retained<Pipeline>>,
-    /// Uploaded textures by decoded texture (kept alive with it while the
-    /// texture cache holds it too).
-    textures: HashMap<usize, (Arc<Texture>, Retained<MetalTexture>)>,
+    /// Uploaded textures by decoded texture and kind (kept alive with
+    /// the texture while the texture cache holds it too).
+    textures: HashMap<(usize, TextureKind), (Arc<Texture>, Retained<MetalTexture>)>,
+    /// Textures uploaded in their own format, by the bytes they were
+    /// made of and kind (kept as the decoded ones are).
+    native: HashMap<(usize, TextureKind), (Arc<RawTexture>, Retained<MetalTexture>)>,
+    /// Bytes of guest textures uploaded and not known to be dropped
+    /// (`trim_textures` counts them anew).
+    texture_bytes: usize,
     /// By TSC words and the level-of-detail range the texture's header
     /// leaves ([`Tic::lod_range`]).
     samplers: Lru<([u32; 8], [u32; 2]), Retained<Sampler>>,
@@ -377,11 +384,21 @@ struct State {
     /// that bound placeholders, with each unbound slot and the refusal a
     /// sample of it is (see `shader::msl` `texture.rs`).
     faults: Vec<Faults>,
-    /// What an unbound texture slot is bound to: a 1x1 texture and a
-    /// sampler, never read into a result that reaches guest memory.
-    placeholder: Option<(Retained<MetalTexture>, Retained<Sampler>)>,
+    /// What an unbound texture slot of each kind is bound to: a 1x1
+    /// texture and a sampler, never read into a result that reaches
+    /// guest memory.
+    placeholders: HashMap<TextureKind, (Retained<MetalTexture>, Retained<Sampler>)>,
     /// Buffer space for the frame's draw data.
     arena: Arena,
+    /// Global memory bound for pixel programs, by the regions it holds
+    /// ([`Renderer::global_memory`]).
+    globals: Lru<Vec<(u64, u32)>, GlobalMemory>,
+    /// Bytes of global memory uploaded since the last wait: buffers
+    /// replaced meanwhile live on until the work using them is done.
+    globals_pending: usize,
+    /// The word a global memory load outside the bound memory sets (made
+    /// once, looked at after every wait).
+    global_fault: Option<Retained<MetalBuffer>>,
     /// The packing kernels (`State::pack`), plain and layered.
     pack_pipelines: HashMap<bool, Retained<ComputePipeline>>,
     /// The 2D blit kernel (`blit`), made once.
@@ -407,8 +424,13 @@ impl Default for State {
             fallbacks: HashMap::new(),
             draws: 0,
             faults: Vec::new(),
-            placeholder: None,
+            placeholders: HashMap::new(),
+            native: HashMap::new(),
+            texture_bytes: 0,
             arena: Arena::default(),
+            globals: Lru::new(GLOBAL_BUDGET),
+            globals_pending: 0,
+            global_fault: None,
             pack_pipelines: HashMap::new(),
             composites: HashMap::new(),
             versions: 0,
@@ -785,6 +807,19 @@ impl Renderer {
                 }
             }
         }
+        if let Some(fault) = &state.global_fault {
+            let word = fault.contents().cast::<u32>();
+            // SAFETY: the buffer holds the word; the GPU finished.
+            if unsafe { word.read() } != 0 {
+                // SAFETY: as above.
+                unsafe { word.write(0) };
+                self.writing_back.store(false, Ordering::Relaxed);
+                return Err(Unmodeled(
+                    "pixel program: global memory load outside the buffers its constants name"
+                        .into(),
+                ));
+            }
+        }
         let mut result = Ok(());
         for ((resident, &wanted), pack) in state.residents.iter_mut().zip(&wanted).zip(packs) {
             if !wanted {
@@ -1041,31 +1076,62 @@ impl Renderer {
                     continue;
                 }
             };
+            let kind = translated.kinds[slot];
             let sampled = match self.composite(memory, writes, &tic, &targets)? {
-                Some(texture) => Sampled::Composite(texture),
-                None => match draw.textures.resolve(handle) {
-                    Ok((texture, _)) => Sampled::Decoded(texture),
-                    Err(refusal) => {
-                        unbound.push((slot, refusal.0));
-                        bound.push(None);
-                        continue;
-                    }
+                Some(texture) => Ok(Sampled::Composite(texture)),
+                None => match format::native_format(&tic, kind) {
+                    Some(pixel_format) => draw
+                        .textures
+                        .raw(handle)
+                        .map(|raw| Sampled::Native(raw, pixel_format)),
+                    None => draw
+                        .textures
+                        .resolve(handle)
+                        .map(|(texture, _)| Sampled::Decoded(texture)),
                 },
             };
-            if let Err(reason) = format::check_texture(&tic, &tsc) {
+            let sampled = match sampled {
+                Ok(sampled) => sampled,
+                Err(refusal) => {
+                    unbound.push((slot, refusal.0));
+                    bound.push(None);
+                    continue;
+                }
+            };
+            if let Err(reason) = format::check_texture(&tic, &tsc, kind) {
                 return self.fall_back(reason);
+            }
+            if matches!(sampled, Sampled::Composite(_)) && kind != TextureKind::Flat {
+                return self.fall_back(format!("rendered texture in a {kind:?} slot"));
             }
             let bias = if translated.implicit_lod[slot] {
                 tsc.lod_bias
             } else {
                 0.0
             };
-            bound.push(Some((sampled, tic, tsc, bias)));
+            bound.push(Some((sampled, tic, tsc, bias, kind)));
         }
+        let global_memory = if translated.globals.is_empty() {
+            None
+        } else {
+            Some(self.global_memory(memory, writes, draw.constants, &translated.globals)?)
+        };
         let residents = self.residents(memory, writes, &targets, samples.log2, false)?;
 
         let mut state = self.state.lock().unwrap();
         let gpu = Self::gpu();
+        // Draw data is held until the GPU has done the work using it: a
+        // frame of more than this waits for the GPU here.
+        if state.arena.chunks_in_use() > ARENA_LIMIT {
+            state.wait();
+        }
+        // Uploads live as long as the caches hold what they were made of,
+        // which is looked at when a frame ends: within a frame that
+        // uploads more than this, here too.
+        if state.texture_bytes > UPLOAD_LIMIT {
+            state.wait();
+            state.trim_textures();
+        }
         // Pipeline.
         let key = PipelineKey {
             program: Arc::as_ptr(draw.program) as usize,
@@ -1185,20 +1251,33 @@ impl Renderer {
         };
         // Textures and samplers on the GPU.
         let mut gpu_textures = Vec::new();
-        for entry in &bound {
-            let Some((sampled, tic, tsc, _)) = entry else {
-                gpu_textures.push(state.placeholder(gpu)?);
+        for (slot, entry) in bound.iter().enumerate() {
+            let Some((sampled, tic, tsc, _, kind)) = entry else {
+                gpu_textures.push(state.placeholder(gpu, translated.kinds[slot])?);
                 continue;
             };
             let metal = match sampled {
                 Sampled::Composite(texture) => texture.clone(),
                 Sampled::Decoded(texture) => {
-                    let id = Arc::as_ptr(texture) as usize;
+                    let id = (Arc::as_ptr(texture) as usize, *kind);
                     match state.textures.get(&id) {
                         Some((_, t)) => t.clone(),
                         None => {
-                            let t = upload_texture(gpu, texture)?;
+                            let t = upload_texture(gpu, texture, *kind)?;
+                            state.texture_bytes += texture.bytes();
                             state.textures.insert(id, (Arc::clone(texture), t.clone()));
+                            t
+                        }
+                    }
+                }
+                Sampled::Native(raw, pixel_format) => {
+                    let id = (Arc::as_ptr(raw) as usize, *kind);
+                    match state.native.get(&id) {
+                        Some((_, t)) => t.clone(),
+                        None => {
+                            let t = upload_native(gpu, raw, *kind, *pixel_format)?;
+                            state.texture_bytes += raw.bytes.len();
+                            state.native.insert(id, (Arc::clone(raw), t.clone()));
                             t
                         }
                     }
@@ -1473,6 +1552,26 @@ impl Renderer {
             for (i, (texture, sampler)) in gpu_textures.iter().enumerate() {
                 encoder.setFragmentTexture_atIndex(Some(texture), i);
                 encoder.setFragmentSamplerState_atIndex(Some(sampler), i);
+            }
+            if let Some(global_memory) = &global_memory {
+                let fault = match &state.global_fault {
+                    Some(fault) => fault.clone(),
+                    None => {
+                        let fault = buffer(gpu, &[0; 4])?;
+                        state.global_fault = Some(fault.clone());
+                        fault
+                    }
+                };
+                encoder.setFragmentBuffer_offset_atIndex(
+                    Some(global_memory),
+                    0,
+                    msl::GLOBAL_BUFFER,
+                );
+                encoder.setFragmentBuffer_offset_atIndex(
+                    Some(&fault),
+                    0,
+                    msl::GLOBAL_BUFFER + 1,
+                );
             }
             if !unbound.is_empty() {
                 let faults = buffer(gpu, bytes_of_u32(&fault_words))?;
@@ -1794,6 +1893,104 @@ impl Renderer {
         self.any_dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
+    }
+
+    /// The memory a pixel program's constants name, as its global memory
+    /// buffer (`shader::msl` `memory.rs`): the table of `places` (where
+    /// `constants` hold descriptors) and the bytes of each. A place that
+    /// is no descriptor of mapped memory, or whose bytes would take the
+    /// buffer past [`GLOBAL_LIMIT`], binds nothing. The buffer is made
+    /// once and used until memory there changes: kept by its regions,
+    /// taken as it is while no write of the channel touched them in this
+    /// epoch, compared with memory otherwise.
+    fn global_memory(
+        &self,
+        memory: &dyn GpuMemory,
+        writes: &Writes,
+        constants: &[(Vec<u8>, usize)],
+        places: &[(u32, u32)],
+    ) -> Result<Retained<MetalBuffer>, Unmodeled> {
+        let mut total = 0;
+        let regions: Vec<(u64, u32)> = places
+            .iter()
+            .map(|&(slot, offset)| {
+                let descriptor = constants
+                    .get(slot as usize)
+                    .and_then(|(data, _)| data.get(offset as usize..offset as usize + 12))?;
+                let address = u64::from_le_bytes(descriptor[..8].try_into().expect("8 bytes"));
+                let size = u32::from_le_bytes(descriptor[8..].try_into().expect("4 bytes"));
+                let fits = address >> 40 == 0
+                    && address.is_multiple_of(4)
+                    && size != 0
+                    && total + size as usize <= GLOBAL_LIMIT;
+                fits.then(|| {
+                    total += (size as usize).next_multiple_of(4);
+                    (address, size)
+                })
+            })
+            .map(|region| region.unwrap_or((0, 0)))
+            .collect();
+        let unchanged = |stamp: Stamp| {
+            regions
+                .iter()
+                .all(|&(address, size)| writes.unchanged(stamp, address, address + u64::from(size)))
+        };
+        if let Some(held) = self.state.lock().unwrap().globals.get(&regions)
+            && unchanged(held.stamp)
+        {
+            return Ok(held.buffer.clone());
+        }
+        // Read outside the lock: a read may write residents back.
+        let table = 4 * regions.len();
+        let mut words = vec![0u32; table];
+        let mut bytes: Vec<u8> = Vec::with_capacity(total);
+        for (index, &(address, size)) in regions.iter().enumerate() {
+            if size == 0 {
+                continue;
+            }
+            let start = bytes.len();
+            bytes.resize(start + (size as usize).next_multiple_of(4), 0);
+            if memory
+                .probe(address, &mut bytes[start..start + size as usize])
+                .is_none()
+            {
+                bytes.truncate(start);
+                continue;
+            }
+            words[4 * index..4 * index + 4].copy_from_slice(&[
+                address as u32,
+                (address >> 32) as u32,
+                size,
+                (table + start / 4) as u32,
+            ]);
+        }
+        let mut content = bytes_of_u32(&words).to_vec();
+        content.extend_from_slice(&bytes);
+        let stamp = writes.stamp();
+        let mut state = self.state.lock().unwrap();
+        if let Some(held) = state.globals.get_mut(&regions)
+            && held.content == content
+        {
+            held.stamp = stamp;
+            return Ok(held.buffer.clone());
+        }
+        // What this replaces lives on until the work using it is done.
+        if state.globals_pending + content.len() > GLOBAL_PENDING {
+            state.wait();
+        }
+        state.globals_pending += content.len();
+        let buffer = buffer(Self::gpu(), &content)?;
+        let cost = content.len();
+        state.globals.insert(
+            regions,
+            GlobalMemory {
+                content,
+                stamp,
+                buffer: buffer.clone(),
+            },
+            cost,
+        );
+        Ok(buffer)
     }
 
     /// The residents for `targets` of samples `log2` (see
@@ -2150,6 +2347,7 @@ impl State {
         }
         // Nothing recorded or running uses the arena's space any more.
         self.arena.reset();
+        self.globals_pending = 0;
     }
 
     /// Encodes, after the work recorded so far, a compute pass that writes
@@ -2312,14 +2510,28 @@ impl State {
         Ok(pipeline)
     }
 
+    /// Drops the uploads of textures the texture cache no longer holds
+    /// (and no draw: a draw holds what it samples), and counts the
+    /// bytes of the others.
+    fn trim_textures(&mut self) {
+        self.textures
+            .retain(|_, (texture, _)| Arc::strong_count(texture) > 1);
+        self.native.retain(|_, (raw, _)| Arc::strong_count(raw) > 1);
+        self.texture_bytes = self
+            .textures
+            .values()
+            .map(|(texture, _)| texture.bytes())
+            .chain(self.native.values().map(|(raw, _)| raw.bytes.len()))
+            .sum();
+    }
+
     /// Drops what the software caches no longer hold: uploads of textures
     /// the texture cache dropped, and translations of programs the program
     /// cache dropped, with every pipeline made from them (a pipeline is
     /// keyed by the program's address, which may be reused once the
     /// program is freed). Run after a flush, when no draw holds either.
     fn trim(&mut self) {
-        self.textures
-            .retain(|_, (texture, _)| Arc::strong_count(texture) > 1);
+        self.trim_textures();
         // Composites none of whose levels is a resident any more, and the
         // least recently used beyond the limit.
         let residents = &self.residents;
@@ -2499,25 +2711,16 @@ impl State {
         Ok(())
     }
 
-    /// What an unbound texture slot is bound to (made once).
+    /// What an unbound texture slot of `kind` is bound to (made once).
     fn placeholder(
         &mut self,
         gpu: &Gpu,
+        kind: TextureKind,
     ) -> Result<(Retained<MetalTexture>, Retained<Sampler>), Unmodeled> {
-        if let Some(placeholder) = &self.placeholder {
+        if let Some(placeholder) = self.placeholders.get(&kind) {
             return Ok(placeholder.clone());
         }
-        // SAFETY: plain descriptor construction.
-        let descriptor = unsafe {
-            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-                MTLPixelFormat::RGBA32Float,
-                1,
-                1,
-                false,
-            )
-        };
-        descriptor.setStorageMode(MTLStorageMode::Shared);
-        descriptor.setUsage(MTLTextureUsage::ShaderRead);
+        let descriptor = texture_descriptor(kind, [1, 1, 1], 1, 1);
         let texture = gpu
             .device
             .newTextureWithDescriptor(&descriptor)
@@ -2526,7 +2729,8 @@ impl State {
             .device
             .newSamplerStateWithDescriptor(&MTLSamplerDescriptor::new())
             .expect("sampler state");
-        self.placeholder = Some((texture.clone(), sampler.clone()));
+        self.placeholders
+            .insert(kind, (texture.clone(), sampler.clone()));
         Ok((texture, sampler))
     }
 
@@ -3111,50 +3315,104 @@ fn upload_surface(texture: &MetalTexture, window: &mut Window, rect: Rect, log2:
     }
 }
 
-/// A sampled texture: the decoded levels from the base level to the
-/// maximum level as RGBA32Float.
-fn upload_texture(gpu: &Gpu, texture: &Texture) -> Result<Retained<MetalTexture>, Unmodeled> {
-    let tic = texture.tic();
-    let levels = tic.max_level - tic.base_level + 1;
-    let (width, height, _, _) = texture
-        .level(tic.base_level)
-        .ok_or_else(|| Unmodeled("Metal: texture base level".into()))?;
+/// The descriptor of a sampled RGBA32Float texture of `kind`: `size`
+/// texels (width, height and, for a volume, depth) at its first level,
+/// `layers` layers (an array's; a cube has its six faces).
+fn texture_descriptor(
+    kind: TextureKind,
+    size: [u32; 3],
+    layers: u32,
+    levels: u32,
+) -> Retained<MTLTextureDescriptor> {
     // SAFETY: plain descriptor construction.
     let descriptor = unsafe {
         MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
             MTLPixelFormat::RGBA32Float,
-            width as usize,
-            height as usize,
+            size[0] as usize,
+            size[1] as usize,
             levels > 1,
         )
     };
-    // SAFETY: the level count fits the base level's dimensions (the TIC
-    // was validated by the decoder).
+    match kind {
+        TextureKind::Flat => {}
+        TextureKind::Array => {
+            descriptor.setTextureType(MTLTextureType::Type2DArray);
+            // SAFETY: a TIC's layer count, within Metal's array limit.
+            unsafe { descriptor.setArrayLength(layers as usize) };
+        }
+        TextureKind::Cube => descriptor.setTextureType(MTLTextureType::TypeCube),
+        TextureKind::Volume => {
+            descriptor.setTextureType(MTLTextureType::Type3D);
+            // SAFETY: a TIC's depth, within Metal's limit.
+            unsafe { descriptor.setDepth(size[2] as usize) };
+        }
+    }
+    // SAFETY: the level count fits the first level's dimensions (the
+    // TIC was validated by the decoder).
     unsafe { descriptor.setMipmapLevelCount(levels as usize) };
     descriptor.setStorageMode(MTLStorageMode::Shared);
     descriptor.setUsage(MTLTextureUsage::ShaderRead);
+    descriptor
+}
+
+/// A sampled texture: the decoded levels from the base level to the
+/// maximum level as RGBA32Float, as a Metal texture of `kind` (which
+/// `format::check_texture` found the texture to fit).
+fn upload_texture(
+    gpu: &Gpu,
+    texture: &Texture,
+    kind: TextureKind,
+) -> Result<Retained<MetalTexture>, Unmodeled> {
+    let tic = texture.tic();
+    let levels = tic.max_level - tic.base_level + 1;
+    let (width, height, depth, _) = texture
+        .level(tic.base_level)
+        .ok_or_else(|| Unmodeled("Metal: texture base level".into()))?;
+    let layers = tic.shape.layers;
+    let descriptor = texture_descriptor(kind, [width, height, depth], layers, levels);
     let metal = gpu
         .device
         .newTextureWithDescriptor(&descriptor)
         .ok_or_else(|| Unmodeled("Metal: texture allocation failed".into()))?;
     for level in 0..levels {
-        let (w, h, _, texels) = texture
+        let (w, h, d, texels) = texture
             .level(tic.base_level + level)
             .ok_or_else(|| Unmodeled("Metal: texture level".into()))?;
-        // SAFETY: `texels` holds the level's w*h RGBA32F texels (2D, one
-        // layer: checked by `format::check_texture`).
-        unsafe {
-            metal.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
-                region(Rect {
-                    x0: 0,
-                    y0: 0,
-                    x1: w,
-                    y1: h,
-                }),
-                level as usize,
-                NonNull::new(texels.as_ptr() as *mut _).expect("non-null"),
-                w as usize * 16,
-            );
+        let image = w as usize * h as usize;
+        let whole = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize {
+                width: w as usize,
+                height: h as usize,
+                depth: if kind == TextureKind::Volume {
+                    d as usize
+                } else {
+                    1
+                },
+            },
+        };
+        // A volume's slices go in one image block; an array's layers and
+        // a cube's faces are slices of the texture.
+        let (slices, bytes_per_image) = if kind == TextureKind::Volume {
+            (1, image * 16)
+        } else {
+            (layers as usize, 0)
+        };
+        for slice in 0..slices {
+            let from = &texels[slice * image..];
+            // SAFETY: `texels` holds the level's RGBA32F texels, layers
+            // then slices, rows and columns (`Texture::level`): `image`
+            // texels a layer or slice from `from` on.
+            unsafe {
+                metal.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(
+                    whole,
+                    level as usize,
+                    slice,
+                    NonNull::new(from.as_ptr() as *mut _).expect("non-null"),
+                    w as usize * 16,
+                    bytes_per_image,
+                );
+            }
         }
     }
     Ok(metal)
@@ -3166,12 +3424,121 @@ enum Sampled {
     Decoded(Arc<Texture>),
     /// A texture with levels held as render targets ([`Composite`]).
     Composite(Retained<MetalTexture>),
+    /// A texture in its own format, made of its bytes
+    /// (`resources::RawTexture`).
+    Native(Arc<RawTexture>, MTLPixelFormat),
+}
+
+/// Bytes of guest textures uploaded before a draw waits for the GPU and
+/// drops the uploads of textures the caches no longer hold.
+const UPLOAD_LIMIT: usize = 1 << 30;
+
+/// A sampled texture in its own format `pixel_format`
+/// (`format::native_format`): the levels from the base level to the
+/// maximum level, the header's swizzle as the texture's.
+fn upload_native(
+    gpu: &Gpu,
+    raw: &RawTexture,
+    kind: TextureKind,
+    pixel_format: MTLPixelFormat,
+) -> Result<Retained<MetalTexture>, Unmodeled> {
+    let tic = &raw.tic;
+    let levels = Texture::linear(&raw.bytes, tic)?;
+    let levels = levels
+        .get(tic.base_level as usize..=tic.max_level as usize)
+        .ok_or_else(|| Unmodeled("Metal: texture levels".into()))?;
+    let base = &levels[0];
+    let layers = tic.shape.layers;
+    let descriptor = texture_descriptor(
+        kind,
+        [base.width, base.height, base.depth],
+        layers,
+        levels.len() as u32,
+    );
+    descriptor.setPixelFormat(pixel_format);
+    let source = |s: u8| match s {
+        0 => MTLTextureSwizzle::Zero,
+        2 => MTLTextureSwizzle::Red,
+        3 => MTLTextureSwizzle::Green,
+        4 => MTLTextureSwizzle::Blue,
+        5 => MTLTextureSwizzle::Alpha,
+        _ => MTLTextureSwizzle::One,
+    };
+    descriptor.setSwizzle(MTLTextureSwizzleChannels {
+        red: source(tic.swizzle[0]),
+        green: source(tic.swizzle[1]),
+        blue: source(tic.swizzle[2]),
+        alpha: source(tic.swizzle[3]),
+    });
+    let metal = gpu
+        .device
+        .newTextureWithDescriptor(&descriptor)
+        .ok_or_else(|| Unmodeled("Metal: texture allocation failed".into()))?;
+    for (index, level) in levels.iter().enumerate() {
+        let volume = kind == TextureKind::Volume;
+        let whole = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize {
+                width: level.width as usize,
+                height: level.height as usize,
+                depth: if volume { level.depth as usize } else { 1 },
+            },
+        };
+        let image = level.row_bytes * level.rows;
+        let (slices, bytes_per_image) = if volume {
+            (1, image)
+        } else {
+            (layers as usize, 0)
+        };
+        for slice in 0..slices {
+            let from = &level.bytes[slice * image..];
+            // SAFETY: `level.bytes` holds the level's blocks, layers
+            // then slices and rows (`Texture::linear`): `image` bytes a
+            // layer or slice from `from` on.
+            unsafe {
+                metal.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(
+                    whole,
+                    index,
+                    slice,
+                    NonNull::new(from.as_ptr() as *mut _).expect("non-null"),
+                    level.row_bytes,
+                    bytes_per_image,
+                );
+            }
+        }
+    }
+    Ok(metal)
 }
 
 /// Composites kept \[assumption: a guest renders into a handful of the
 /// textures it samples (a texture atlas); a dropped one is made
 /// again when next sampled\].
 const COMPOSITE_LIMIT: usize = 16;
+
+/// The most global memory bound for one pixel program \[assumption: what
+/// a constant names with a larger size is no buffer descriptor\].
+const GLOBAL_LIMIT: usize = 16 << 20;
+
+/// Bytes of global memory buffers kept for reuse.
+const GLOBAL_BUDGET: usize = 128 << 20;
+
+/// Bytes of global memory uploaded before the renderer waits for the
+/// GPU, which frees the buffers those replaced.
+const GLOBAL_PENDING: usize = 128 << 20;
+
+/// Arena chunks a frame's recorded work may fill before a draw waits
+/// for the GPU, which frees them all: bounds the draw data held at once
+/// (16 MiB a chunk).
+const ARENA_LIMIT: usize = 16;
+
+/// A pixel program's global memory as bound ([`Renderer::global_memory`]).
+struct GlobalMemory {
+    /// The buffer's bytes: the table, then the regions.
+    content: Vec<u8>,
+    /// When the regions were last known to equal guest memory.
+    stamp: Stamp,
+    buffer: Retained<MetalBuffer>,
+}
 
 /// A texture some of whose levels are render targets held on the GPU
 /// (a guest may draw level 0 of a four-level atlas every frame and
@@ -3417,6 +3784,10 @@ fn build_sampler(gpu: &Gpu, tsc: &Tsc, (min, max): (f32, f32)) -> Retained<Sampl
     };
     descriptor.setSAddressMode(address(tsc.wrap[0]));
     descriptor.setTAddressMode(address(tsc.wrap[1]));
+    descriptor.setRAddressMode(address(tsc.wrap[2]));
+    if tsc.min_filter == 3 {
+        descriptor.setMaxAnisotropy(tsc.anisotropy as usize);
+    }
     descriptor.setBorderColor(
         format::border_color(tsc).unwrap_or(MTLSamplerBorderColor::TransparentBlack),
     );

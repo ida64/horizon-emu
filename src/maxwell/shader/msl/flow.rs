@@ -111,6 +111,8 @@ fn may_write(inst: super::super::exec::Inst, reg: u32) -> bool {
         | Op::TxqB
         | Op::Ald
         | Op::Ldg
+        | Op::Ldl
+        | Op::Lds
         | Op::Ld => within(d, 4),
         Op::Ldc => within(d, 2),
         _ => d == reg,

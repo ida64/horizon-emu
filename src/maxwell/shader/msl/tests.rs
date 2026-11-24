@@ -18,7 +18,7 @@ use objc2_metal::{
     MTLRenderPassDescriptor, MTLRenderPipelineDescriptor, MTLRenderPipelineState,
     MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerDescriptor, MTLSamplerMinMagFilter,
     MTLSamplerState, MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
-    MTLTextureUsage,
+    MTLTextureType, MTLTextureUsage,
 };
 
 use super::super::super::sampling::{
@@ -27,7 +27,7 @@ use super::super::super::sampling::{
 use super::super::super::{GpuMemory, Unmodeled};
 use super::super::tests::{ROOT, TITLE, elf, members, stages, yaz0};
 use super::super::{ConstantBuffer, Env, FragmentOutput, Plane, Program, Quad, ShaderType};
-use super::{Translated, translate};
+use super::{TextureKind, Translated, translate};
 
 /// The corpus: (name, program) for every distinct pixel program.
 fn corpus() -> Vec<(String, Program)> {
@@ -310,21 +310,35 @@ impl Random {
 }
 
 /// 1x1 textures: every sample of handle `h` is texel `texels[h - 1]`, as
-/// with nearest filtering on the GPU whatever the coordinates and level.
+/// with nearest filtering on the GPU whatever the coordinates and level;
+/// so are the four texels of a gather, and a fetch of texel (0, 0) of
+/// level 0 (any other is outside the texture: zeros).
 struct Texels(Vec<[f32; 4]>);
 
-impl TextureUnit for Texels {
-    fn sample(&self, handle: u32, _: &SampleRequest) -> Result<[f32; 4], Unmodeled> {
+impl Texels {
+    fn texel(&self, handle: u32) -> Result<[f32; 4], Unmodeled> {
         self.0
             .get(handle.wrapping_sub(1) as usize)
             .copied()
             .ok_or_else(|| Unmodeled(format!("test: handle {handle}")))
     }
-    fn fetch(&self, _: u32, _: &FetchRequest) -> Result<[f32; 4], Unmodeled> {
-        Err(Unmodeled("test: fetch".into()))
+}
+
+impl TextureUnit for Texels {
+    fn sample(&self, handle: u32, _: &SampleRequest) -> Result<[f32; 4], Unmodeled> {
+        self.texel(handle)
     }
-    fn gather(&self, _: u32, _: &GatherRequest) -> Result<[f32; 4], Unmodeled> {
-        Err(Unmodeled("test: gather".into()))
+    fn fetch(&self, handle: u32, request: &FetchRequest) -> Result<[f32; 4], Unmodeled> {
+        let texel = self.texel(handle)?;
+        let at: [i32; 2] = std::array::from_fn(|i| request.coords[i] + request.offset[i]);
+        Ok(if at == [0, 0] && request.level == 0 {
+            texel
+        } else {
+            [0.0; 4]
+        })
+    }
+    fn gather(&self, handle: u32, request: &GatherRequest) -> Result<[f32; 4], Unmodeled> {
+        Ok([self.texel(handle)?[usize::from(request.component)]; 4])
     }
     fn query(&self, _: u32, _: Query) -> Result<[u32; 4], Unmodeled> {
         Err(Unmodeled("test: query".into()))
@@ -494,19 +508,47 @@ fn render(
         .iter()
         .map(|_| gpu.texture(WIDTH, HEIGHT, usage))
         .collect();
+    // One texel per slot, in a texture of the slot's kind (a cube's six
+    // faces all hold it).
     let textures: Vec<_> = input
         .texels
         .iter()
-        .map(|texel| {
-            let texture = gpu.texture(1, 1, MTLTextureUsage::ShaderRead);
-            // SAFETY: one RGBA32F texel.
-            unsafe {
-                texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
-                    region(1, 1),
-                    0,
-                    NonNull::new(texel.as_ptr() as *mut _).expect("non-null"),
-                    16,
-                );
+        .zip(&t.kinds)
+        .map(|(texel, kind)| {
+            // SAFETY: plain descriptor construction.
+            let descriptor = unsafe {
+                MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                    MTLPixelFormat::RGBA32Float,
+                    1,
+                    1,
+                    false,
+                )
+            };
+            descriptor.setTextureType(match kind {
+                TextureKind::Flat => MTLTextureType::Type2D,
+                TextureKind::Array => MTLTextureType::Type2DArray,
+                TextureKind::Cube => MTLTextureType::TypeCube,
+                TextureKind::Volume => MTLTextureType::Type3D,
+            });
+            descriptor.setStorageMode(MTLStorageMode::Shared);
+            descriptor.setUsage(MTLTextureUsage::ShaderRead);
+            let texture = gpu
+                .device
+                .newTextureWithDescriptor(&descriptor)
+                .expect("texture");
+            let slices = if *kind == TextureKind::Cube { 6 } else { 1 };
+            for slice in 0..slices {
+                // SAFETY: one RGBA32F texel.
+                unsafe {
+                    texture.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(
+                        region(1, 1),
+                        0,
+                        slice,
+                        NonNull::new(texel.as_ptr() as *mut _).expect("non-null"),
+                        16,
+                        if *kind == TextureKind::Volume { 16 } else { 0 },
+                    );
+                }
             }
             texture
         })
@@ -925,6 +967,82 @@ fn integer_and_flag_instructions_match_interpreter() {
         let expected = interpret(program, &input).expect("interprets")[0].colors[0].map(f32::to_bits);
         if let Some(words) = words {
             assert_eq!(expected, *words, "program {index}");
+        }
+        let Some(gpu) = &gpu else {
+            continue;
+        };
+        let colors = render(gpu, program, &t, &input).expect("renders");
+        for pixel in &colors[0] {
+            assert_eq!(pixel.map(f32::to_bits), expected, "program {index}");
+        }
+    }
+}
+
+/// `TLD4`, `TLD4S`, `TLDS` and `TLD` take their operands from the
+/// registers the interpreter reads and store to the ones it writes:
+/// gathered components, fetches inside and outside a one-texel texture,
+/// texel offsets and levels.
+#[test]
+fn gathers_and_fetches_match_interpreter() {
+    let exit = 0xe30000000007000f;
+    let tlds = |d: u64, a: u64, b: u64, e: u64, encoding: u64| {
+        0xda00_0000_0007_0000 | d | a << 8 | b << 20 | e << 28 | 4 << 50 | encoding << 53
+    };
+    let programs = [
+        // TLD4 of component 1 to three registers.
+        assembled(&[
+            mov(4, 0.25f32.to_bits()),
+            mov(5, 0.75f32.to_bits()),
+            mov(3, 9f32.to_bits()),
+            0xc838_0000_0007_0000 | 4 << 8 | 0xff << 20 | 2 << 28 | 0b1101 << 31 | 1 << 56,
+            exit,
+        ]),
+        // TLD4S of component 2 with offsets.
+        assembled(&[
+            mov(4, 0.25f32.to_bits()),
+            mov(5, 0.75f32.to_bits()),
+            mov(6, 0x0103),
+            0xdf00_0000_0007_0000 | 4 << 8 | 6 << 20 | 2 << 28 | 1 << 51 | 2 << 52,
+            exit,
+        ]),
+        // TLDS of texel (0, 0), and of (1, 0) outside the texture.
+        assembled(&[mov(4, 0), mov(5, 0), tlds(0, 4, 5, 2, 2), exit]),
+        assembled(&[mov(4, 1), mov(5, 0), tlds(0, 4, 5, 2, 2), exit]),
+        // TLDS of (1, -1) offset by (-1, 1).
+        assembled(&[
+            mov(4, 1),
+            mov(5, 0xffff_ffff),
+            mov(6, 0x1f),
+            tlds(0, 4, 6, 2, 4),
+            exit,
+        ]),
+        // TLD of level 1, which the texture does not have, then level 0.
+        assembled(&[
+            mov(4, 0),
+            mov(5, 0),
+            mov(6, 1),
+            0xdc38_0000_0007_0000 | 4 << 8 | 6 << 20 | 2 << 28 | 15 << 31 | 1 << 55,
+            exit,
+        ]),
+        assembled(&[
+            mov(4, 0),
+            mov(5, 0),
+            mov(6, 0),
+            0xdc38_0000_0007_0000 | 4 << 8 | 6 << 20 | 2 << 28 | 15 << 31 | 1 << 55,
+            exit,
+        ]),
+    ];
+    let gpu = Gpu::new();
+    for (index, program) in programs.iter().enumerate() {
+        let t = translate(program, &[]).unwrap_or_else(|e| panic!("program {index}: {e}"));
+        let input = inputs(&t, 3);
+        let expected = interpret(program, &input).expect("interprets")[0].colors[0].map(f32::to_bits);
+        let texel = input.texels[0].map(f32::to_bits);
+        match index {
+            0 => assert_eq!(expected, [texel[1], texel[1], texel[1], 9f32.to_bits()]),
+            1 => assert_eq!(expected, [texel[2]; 4]),
+            2 | 4 | 6 => assert_eq!(expected, texel, "program {index}"),
+            _ => assert_eq!(expected, [0; 4], "program {index}"),
         }
         let Some(gpu) = &gpu else {
             continue;

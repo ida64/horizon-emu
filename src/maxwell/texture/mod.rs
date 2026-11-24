@@ -547,6 +547,93 @@ impl Texture {
         }
         Ok(Self { tic: *tic, levels })
     }
+
+    /// The blocks of every level of the texture `tic` describes, taken
+    /// from `raw` (the bytes of its footprint) into rows: for a renderer
+    /// that samples the format itself.
+    pub fn linear(raw: &[u8], tic: &Tic) -> Result<Vec<LinearLevel>, Unmodeled> {
+        let tiled = if tic.pitch.is_none() {
+            Some(layout::block_linear_image(&tic.shape, tic.block)?)
+        } else {
+            None
+        };
+        let f = tic.format;
+        let bytes_per_block = f.bytes_per_block as usize;
+        let gather = tiled.is_some() && !f.bytes_per_block.is_power_of_two();
+        let mut levels = Vec::with_capacity(tic.shape.levels as usize);
+        for level in 0..tic.shape.levels {
+            let width = (tic.shape.width >> level).max(1);
+            let height = (tic.shape.height >> level).max(1);
+            let depth = (tic.shape.depth >> level).max(1);
+            let blocks_wide = width.div_ceil(f.block_width);
+            let blocks_high = height.div_ceil(f.block_height);
+            let surface = tiled.as_ref().map(|image| &image.levels[level as usize]);
+            let blocks = Blocks {
+                raw,
+                columns: (0..blocks_wide)
+                    .map(|bx| match surface {
+                        Some(m) => m.surface.offset(bx * f.bytes_per_block, 0, 0) as usize,
+                        None => bx as usize * bytes_per_block,
+                    })
+                    .collect(),
+                gather: surface.filter(|_| gather).map(|m| &m.surface),
+                bytes_per_block: f.bytes_per_block,
+            };
+            let row_bytes = blocks_wide as usize * bytes_per_block;
+            let size = row_bytes as u64
+                * u64::from(blocks_high)
+                * u64::from(depth)
+                * u64::from(tic.shape.layers);
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(
+                    usize::try_from(size).map_err(|_| unsupported("texture extent", size))?,
+                )
+                .map_err(|e| unsupported("texture allocation", e))?;
+            let mut split = [0u8; 16];
+            for layer in 0..tic.shape.layers {
+                for z in 0..depth {
+                    for by in 0..blocks_high {
+                        let row = match (&tiled, surface) {
+                            (Some(image), Some(m)) => {
+                                u64::from(layer) * image.layer_stride
+                                    + m.offset
+                                    + m.surface.offset(0, by, z)
+                            }
+                            _ => {
+                                u64::from(tic.pitch.unwrap())
+                                    * (u64::from(layer * depth + z) * u64::from(blocks_high)
+                                        + u64::from(by))
+                            }
+                        } as usize;
+                        for bx in 0..blocks_wide {
+                            bytes.extend_from_slice(blocks.get(row, bx, &mut split)?);
+                        }
+                    }
+                }
+            }
+            levels.push(LinearLevel {
+                width,
+                height,
+                depth,
+                row_bytes,
+                rows: blocks_high as usize,
+                bytes,
+            });
+        }
+        Ok(levels)
+    }
+}
+
+/// One level of a texture as rows of blocks ([`Texture::linear`]):
+/// layers, then slices, then `rows` rows of `row_bytes` bytes each.
+pub struct LinearLevel {
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub row_bytes: usize,
+    pub rows: usize,
+    pub bytes: Vec<u8>,
 }
 
 /// The blocks of one level in the footprint's bytes.

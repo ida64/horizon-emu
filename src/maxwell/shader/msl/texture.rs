@@ -9,13 +9,17 @@
 //! constant buffer (`TEXTURE_BUFFER_INDEX`); the draw reads the handle
 //! there, as the interpreter does, and binds the texture and sampler it
 //! names at the slot [`Translated::textures`](super::Translated) lists the
-//! offset in. Only 2D, non-compare samples are translated: the renderer
-//! binds `texture2d<float>` slots, single-layer 2D textures only
-//! (`metal::format::check_texture`). Array-target instructions are
-//! translated for them: the interpreter's texture unit clamps the layer
-//! to the texture's last one (`texture/filtering.rs` `coordinates`, which
-//! views a 2D texture as a one-layer array), so the layer operand cannot
-//! matter.
+//! offset in, of the kind the instruction samples
+//! ([`TextureKind`](super::TextureKind): 2D, 2D array, 3D or cube; a
+//! handle sampled as two kinds takes two slots). Depth-compare samples
+//! are not translated. The renderer binds a texture of that type or
+//! leaves the draw to the software renderer
+//! (`metal::format::check_texture`).
+//!
+//! A cube is sampled as Metal samples cubes, filtering across the faces'
+//! edges; the interpreter does so only for the sampler's seamless cube
+//! filter and clamps to the face otherwise, so texels within half a
+//! texel of an edge can differ [known difference].
 //!
 //! A handle that names no texture (an unset slot of an uber-shader, whose
 //! sample sits on a branch the draw may not take) is not refused when the
@@ -34,7 +38,7 @@
 //! performed [unverified].
 
 use super::super::exec::{bit, bits, fswzadd_factors, quad_shuffle_lane, sext};
-use super::{PT, RZ, SLOTS, Writer};
+use super::{PT, RZ, SLOTS, TextureKind, Writer};
 
 impl Writer<'_> {
     /// `IPA`: the attribute's value at the pixel center or, CENTROID, at
@@ -198,18 +202,34 @@ impl Writer<'_> {
     }
 
     /// The texture/sampler slot of the handle at `handle` (byte offset in
-    /// the bound-texture buffer).
-    fn texture_slot(&mut self, handle: u32, implicit: bool) -> usize {
-        let slot = match self.textures.iter().position(|&h| h == handle) {
+    /// the bound-texture buffer) sampled as `kind`.
+    fn texture_slot(&mut self, handle: u32, implicit: bool, kind: TextureKind) -> usize {
+        let found = (0..self.textures.len())
+            .find(|&slot| self.textures[slot] == handle && self.kinds[slot] == kind);
+        let slot = match found {
             Some(slot) => slot,
             None => {
                 self.textures.push(handle);
+                self.kinds.push(kind);
                 self.implicit_lod.push(false);
                 self.textures.len() - 1
             }
         };
         self.implicit_lod[slot] |= implicit;
         slot
+    }
+
+    /// The sample of texture `slot` at `coordinates` (two components, or
+    /// three for a cube or a volume), of layer `layer` of an array
+    /// (clamped to its last, as the interpreter's texture unit does),
+    /// with the level-of-detail option `option`.
+    fn sample_call(slot: usize, coordinates: &str, layer: Option<&str>, option: &str) -> String {
+        match layer {
+            Some(layer) => format!(
+                "t{slot}.sample(s{slot}, {coordinates}, min({layer}, uint(t{slot}.get_array_size()) - 1u), {option})"
+            ),
+            None => format!("t{slot}.sample(s{slot}, {coordinates}, {option})"),
+        }
     }
 
     /// Records, before a sample of texture `slot`, that an unbound slot
@@ -223,23 +243,21 @@ impl Writer<'_> {
     }
 
     /// `TEXS`: 2D with implicit LOD (encoding 1), level zero (2) or an
-    /// explicit level (3), and the array forms of the first two (7, 8;
-    /// layer operand without effect, see the module documentation);
-    /// destinations as `exec/tex.rs`.
+    /// explicit level (3), the array forms of the first two (7, 8), 3D
+    /// with implicit LOD or level zero (10, 11) and cube with implicit
+    /// LOD or an explicit level (12, 13); destinations as `exec/tex.rs`.
     pub(super) fn texs(&mut self) -> Result<(), String> {
         let w = self.word;
         let encoding = bits(w, 53, 4);
-        let refusal = match encoding {
-            1..=3 | 7 | 8 => None,
-            0 => Some("1D target"),
-            4..=6 | 9 => Some("depth compare"),
-            10 | 11 => Some("3D target"),
-            12 | 13 => Some("cube target"),
-            _ => Some("target encoding"),
+        let kind = match encoding {
+            1..=3 => TextureKind::Flat,
+            7 | 8 => TextureKind::Array,
+            10 | 11 => TextureKind::Volume,
+            12 | 13 => TextureKind::Cube,
+            0 => return self.refuse("1D target"),
+            4..=6 | 9 => return self.refuse("depth compare"),
+            _ => return self.refuse("target encoding"),
         };
-        if let Some(what) = refusal {
-            return self.refuse(what);
-        }
         let a = bits(w, 8, 8);
         let b = bits(w, 20, 8);
         let d = bits(w, 0, 8);
@@ -268,23 +286,31 @@ impl Writer<'_> {
                 "unaligned second destination",
             )?;
         }
-        let implicit = matches!(encoding, 1 | 7);
-        let slot = self.texture_slot(bits(w, 36, 13) * 4, implicit);
-        let (s, t) = match encoding {
-            1 | 2 => (self.read(a), self.read(b)),
+        let implicit = matches!(encoding, 1 | 7 | 10 | 12);
+        let slot = self.texture_slot(bits(w, 36, 13) * 4, implicit, kind);
+        let float = |writer: &mut Self, register: u32| {
+            format!("as_type<float>({})", writer.read(register))
+        };
+        let coordinates = match encoding {
+            1 | 2 => format!("float2({}, {})", float(self, a), float(self, b)),
+            3 => format!("float2({}, {})", float(self, a), float(self, a + 1)),
             // Array: layer in `a`, coordinates in `a + 1` and `b`.
-            7 | 8 => (self.read(a + 1), self.read(b)),
-            _ => (self.read(a), self.read(a + 1)),
+            7 | 8 => format!("float2({}, {})", float(self, a + 1), float(self, b)),
+            _ => format!(
+                "float3({}, {}, {})",
+                float(self, a),
+                float(self, a + 1),
+                float(self, b)
+            ),
         };
-        let coordinates = format!("float2(as_type<float>({s}), as_type<float>({t}))");
-        let sample = match encoding {
-            1 | 7 => format!("t{slot}.sample(s{slot}, {coordinates}, bias(lod_bias[{slot}]))"),
-            2 | 8 => format!("t{slot}.sample(s{slot}, {coordinates}, level(0.0f))"),
-            _ => {
-                let lod = self.read(b);
-                format!("t{slot}.sample(s{slot}, {coordinates}, level(as_type<float>({lod})))")
-            }
+        let layer = (kind == TextureKind::Array).then(|| format!("({} & 0xffffu)", self.read(a)));
+        let option = match encoding {
+            1 | 7 | 10 | 12 => format!("bias(lod_bias[{slot}])"),
+            3 => format!("level({})", float(self, b)),
+            13 => format!("level({})", float(self, b + 1)),
+            _ => "level(0.0f)".into(),
         };
+        let sample = Self::sample_call(slot, &coordinates, layer.as_deref(), &option);
         self.note_sample(slot);
         self.line(&format!("{{ float4 v = {sample};"));
         let mut index = 0;
@@ -307,22 +333,21 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// `TEX` (bound handle) on a 2D texture (array target included, see
-    /// the module documentation): implicit LOD (LOD mode 0), level zero
-    /// (1), implicit with a bias register (2, 6) or an explicit level
-    /// register (3, 7).
+    /// `TEX` (bound handle) on a 2D, 2D array, 3D or cube texture:
+    /// implicit LOD (LOD mode 0), level zero (1), implicit with a bias
+    /// register (2, 6) or an explicit level register (3, 7).
     pub(super) fn tex(&mut self) -> Result<(), String> {
         let w = self.word;
         let dim = bits(w, 28, 3);
-        let target = match dim {
-            2 | 3 => None,
-            0 | 1 => Some("1D target"),
-            4 | 5 => Some("3D target"),
-            _ => Some("cube target"),
+        let kind = match dim {
+            2 => TextureKind::Flat,
+            3 => TextureKind::Array,
+            4 => TextureKind::Volume,
+            6 => TextureKind::Cube,
+            0 | 1 => return self.refuse("1D target"),
+            5 => return self.refuse("3D array"),
+            _ => return self.refuse("cube array target"),
         };
-        if let Some(what) = target {
-            return self.refuse(what);
-        }
         self.require(bits(w, 51, 3) == PT, "residency predicate")?;
         self.require(!bit(w, 58), "LOD clamp")?;
         let lod_mode = bits(w, 55, 3);
@@ -331,26 +356,25 @@ impl Writer<'_> {
         self.require(!bit(w, 50), "depth compare")?;
         let (a, b, d) = (bits(w, 8, 8), bits(w, 20, 8), bits(w, 0, 8));
         let mask = bits(w, 31, 4);
-        let slot = self.texture_slot(bits(w, 36, 13) * 4, matches!(lod_mode, 0 | 2 | 6));
+        let slot = self.texture_slot(bits(w, 36, 13) * 4, matches!(lod_mode, 0 | 2 | 6), kind);
         // Array: the layer register comes first.
-        let first = a + u32::from(dim == 3);
+        let first = a + u32::from(kind == TextureKind::Array);
         let s = self.read(first);
         let t = self.read(first + 1);
-        let coordinates = format!("float2(as_type<float>({s}), as_type<float>({t}))");
-        let sample = match lod_mode {
-            0 => format!("t{slot}.sample(s{slot}, {coordinates}, bias(lod_bias[{slot}]))"),
-            1 => format!("t{slot}.sample(s{slot}, {coordinates}, level(0.0f))"),
-            2 | 6 => {
-                let bias = self.read(b);
-                format!(
-                    "t{slot}.sample(s{slot}, {coordinates}, bias(lod_bias[{slot}] + as_type<float>({bias})))"
-                )
-            }
-            _ => {
-                let lod = self.read(b);
-                format!("t{slot}.sample(s{slot}, {coordinates}, level(as_type<float>({lod})))")
-            }
+        let coordinates = if matches!(kind, TextureKind::Volume | TextureKind::Cube) {
+            let r = self.read(first + 2);
+            format!("float3(as_type<float>({s}), as_type<float>({t}), as_type<float>({r}))")
+        } else {
+            format!("float2(as_type<float>({s}), as_type<float>({t}))")
         };
+        let layer = (kind == TextureKind::Array).then(|| self.read(a));
+        let option = match lod_mode {
+            0 => format!("bias(lod_bias[{slot}])"),
+            1 => "level(0.0f)".into(),
+            2 | 6 => format!("bias(lod_bias[{slot}] + as_type<float>({}))", self.read(b)),
+            _ => format!("level(as_type<float>({}))", self.read(b)),
+        };
+        let sample = Self::sample_call(slot, &coordinates, layer.as_deref(), &option);
         self.note_sample(slot);
         self.line(&format!("{{ float4 v = {sample};"));
         let mut index = 0;
@@ -361,6 +385,167 @@ impl Writer<'_> {
                 index += 1;
             }
         }
+        self.line("}");
+        Ok(())
+    }
+
+    /// Stores the components of `float4 v` that `mask` selects: to the
+    /// registers from `d` on, or, with the second destination of the
+    /// scalar forms, two to `d` and the rest to `e`.
+    fn store_sample(&mut self, mask: u32, d: u32, e: Option<u32>) {
+        let mut index = 0;
+        for c in 0..4 {
+            if mask & (1 << c) == 0 {
+                continue;
+            }
+            let dest = match e {
+                None => d + index,
+                Some(_) if index < 2 => {
+                    if d == RZ {
+                        RZ
+                    } else {
+                        d + index
+                    }
+                }
+                Some(e) if e == RZ => RZ,
+                Some(e) => e + index - 2,
+            };
+            let component = ["x", "y", "z", "w"][c];
+            self.set(dest, &format!("as_type<uint>(v.{component})"));
+            index += 1;
+        }
+    }
+
+    /// The four texels of a gather: `float4 v` from texture `slot` at
+    /// the coordinates in registers `s` and `t`, moved by the offsets
+    /// packed in `packed` (6 bits each, at 0 and 8; none: no offset).
+    /// Metal returns them in the interpreter's order
+    /// (`texture/filtering.rs` `gather`).
+    fn gather(&mut self, slot: usize, s: u32, t: u32, packed: Option<u32>, component: u32) {
+        let (s, t) = (self.read(s), self.read(t));
+        let offset = match packed {
+            Some(register) => {
+                let p = self.read(register);
+                format!("int2(as_type<int>({p} << 26) >> 26, as_type<int>({p} << 18) >> 26)")
+            }
+            None => "int2(0)".into(),
+        };
+        self.note_sample(slot);
+        self.line(&format!(
+            "{{ float4 v = t{slot}.gather(s{slot}, float2(as_type<float>({s}), as_type<float>({t})), {offset}, component::{});",
+            ["x", "y", "z", "w"][component as usize]
+        ));
+    }
+
+    /// `TLD4` (bound handle) on a 2D texture, with or without offsets
+    /// in a register; no depth compare (`exec/texture_vector.rs`).
+    pub(super) fn tld4(&mut self) -> Result<(), String> {
+        let w = self.word;
+        let dim = bits(w, 28, 3);
+        self.require(dim == 2, "target other than 2D")?;
+        self.require(bits(w, 51, 3) == PT, "residency predicate")?;
+        self.require(!bit(w, 58), "LOD clamp")?;
+        let offset_mode = bits(w, 54, 2);
+        self.require(offset_mode <= 1, "per-texel gather offsets")?;
+        self.require(!bit(w, 50), "depth compare")?;
+        let (a, b, d) = (bits(w, 8, 8), bits(w, 20, 8), bits(w, 0, 8));
+        let slot = self.texture_slot(bits(w, 36, 13) * 4, false, TextureKind::Flat);
+        let first = a;
+        self.gather(
+            slot,
+            first,
+            first + 1,
+            (offset_mode == 1).then_some(b),
+            bits(w, 56, 2),
+        );
+        self.store_sample(bits(w, 31, 4), d, None);
+        self.line("}");
+        Ok(())
+    }
+
+    /// `TLD4S`: the scalar form, all four texels to two register pairs.
+    pub(super) fn tld4s(&mut self) -> Result<(), String> {
+        let w = self.word;
+        self.require(!bit(w, 50), "depth compare")?;
+        let (a, b, d, e) = (bits(w, 8, 8), bits(w, 20, 8), bits(w, 0, 8), bits(w, 28, 8));
+        let slot = self.texture_slot(bits(w, 36, 13) * 4, false, TextureKind::Flat);
+        let offset = bit(w, 51);
+        let t = if offset { a + 1 } else { b };
+        self.gather(slot, a, t, offset.then_some(b), bits(w, 52, 2));
+        self.store_sample(15, d, Some(e));
+        self.line("}");
+        Ok(())
+    }
+
+    /// A texel fetch: `float4 v` from texture `slot` at the integer
+    /// coordinates in registers `x` and `y` plus the offsets packed in
+    /// `packed` (4 bits each, at 0 and 4), of the level in `level`
+    /// (none: the base level). Zeros outside the texture or its levels,
+    /// as the interpreter's `fetch` gives.
+    fn fetch(&mut self, slot: usize, x: u32, y: u32, level: Option<u32>, packed: Option<u32>) {
+        let (x, y) = (self.read(x), self.read(y));
+        let level = level.map_or("0u".to_string(), |register| self.read(register));
+        let offset = match packed {
+            Some(register) => {
+                let p = self.read(register);
+                format!("int2(as_type<int>({p} << 28) >> 28, as_type<int>({p} << 24) >> 28)")
+            }
+            None => "int2(0)".into(),
+        };
+        self.note_sample(slot);
+        self.line(&format!(
+            "{{ const uint level = {level}; const int2 p = int2(as_type<int>({x}), as_type<int>({y})) + {offset}; float4 v = float4(0.0f);"
+        ));
+        self.line(&format!(
+            "if (level < t{slot}.get_num_mip_levels() && p.x >= 0 && p.y >= 0 && uint(p.x) < t{slot}.get_width(level) && uint(p.y) < t{slot}.get_height(level)) {{ v = t{slot}.read(uint2(p), level); }}"
+        ));
+    }
+
+    /// `TLDS` on a 2D texture: coordinates in two registers (encoding
+    /// 2), or in a pair with texel offsets (4), a level (5) or both (12).
+    pub(super) fn tlds(&mut self) -> Result<(), String> {
+        let w = self.word;
+        let encoding = bits(w, 53, 4);
+        let (a, b, d, e) = (bits(w, 8, 8), bits(w, 20, 8), bits(w, 0, 8), bits(w, 28, 8));
+        let (y, level, packed) = match encoding {
+            2 => (b, None, None),
+            4 => (a + 1, None, Some(b)),
+            5 => (a + 1, Some(b), None),
+            12 => (a + 1, Some(b), Some(b + 1)),
+            _ => return self.refuse("target other than 2D"),
+        };
+        let code = bits(w, 50, 3) as usize;
+        let mask = if e == RZ {
+            [1, 2, 4, 8, 3, 9, 10, 12][code]
+        } else {
+            match [7, 11, 13, 14, 15].get(code) {
+                Some(&mask) => mask,
+                None => return self.refuse("component mask"),
+            }
+        };
+        let slot = self.texture_slot(bits(w, 36, 13) * 4, false, TextureKind::Flat);
+        self.fetch(slot, a, y, level, packed);
+        self.store_sample(mask, d, Some(e));
+        self.line("}");
+        Ok(())
+    }
+
+    /// `TLD` (bound handle) on a 2D texture: the base level or the level
+    /// in a register, with or without texel offsets.
+    pub(super) fn tld(&mut self) -> Result<(), String> {
+        let w = self.word;
+        let dim = bits(w, 28, 3);
+        self.require(dim == 2, "target other than 2D")?;
+        self.require(bits(w, 51, 3) == PT, "residency predicate")?;
+        self.require(!bit(w, 50), "multisample")?;
+        self.require(!bit(w, 54), "CL")?;
+        let (a, b, d) = (bits(w, 8, 8), bits(w, 20, 8), bits(w, 0, 8));
+        let first = a;
+        let level = bit(w, 55).then_some(b);
+        let packed = bit(w, 35).then_some(b + u32::from(level.is_some()));
+        let slot = self.texture_slot(bits(w, 36, 13) * 4, false, TextureKind::Flat);
+        self.fetch(slot, first, first + 1, level, packed);
+        self.store_sample(bits(w, 31, 4), d, None);
         self.line("}");
         Ok(())
     }

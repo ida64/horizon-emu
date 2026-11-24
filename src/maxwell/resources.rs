@@ -225,6 +225,19 @@ pub const PROGRAM_BUDGET: usize = 64 << 20;
 /// browser samples; a dropped texture is decoded again when sampled\].
 pub const TEXTURE_BUDGET: usize = 512 << 20;
 
+/// Host memory the textures of one channel kept as their guest bytes
+/// may take ([`RawTexture`]) \[assumption: sized so that what an
+/// application samples in a frame stays; a dropped texture is read
+/// again when sampled\].
+pub const RAW_TEXTURE_BUDGET: usize = 768 << 20;
+
+/// A texture as guest memory holds it: its header and the bytes of its
+/// footprint, for a renderer that samples the format itself.
+pub struct RawTexture {
+    pub tic: Tic,
+    pub bytes: Box<[u8]>,
+}
+
 /// Decoded shader programs by address, the least recently used dropped
 /// beyond [`PROGRAM_BUDGET`].
 pub struct ProgramCache {
@@ -293,6 +306,9 @@ struct Entries {
     /// bytes.
     decoded: Lru<([u32; 8], u64), Arc<Decoded>>,
     serials: u64,
+    /// Textures kept as their bytes, by TIC contents, with when memory
+    /// was last known to hold those bytes.
+    raw: Lru<[u32; 8], (Arc<RawTexture>, Stamp)>,
 }
 
 /// Decoded textures by TIC contents and memory contents, kept across
@@ -323,6 +339,7 @@ impl TextureCache {
                 bindings: Lru::new(BINDING_LIMIT),
                 decoded: Lru::new(budget),
                 serials: 0,
+                raw: Lru::new(RAW_TEXTURE_BUDGET),
             }),
         }
     }
@@ -511,6 +528,40 @@ impl<'a> DrawTextures<'a> {
         };
         self.resolved.lock().unwrap().insert(index, texture.clone());
         Ok(texture)
+    }
+
+    /// The texture of a bound-texture handle as its bytes: kept while
+    /// memory holds them (taken as unchanged while no write of the
+    /// channel touched them in this epoch, compared otherwise), read
+    /// anew when it does not.
+    pub fn raw(&self, handle: u32) -> Result<Arc<RawTexture>, Unmodeled> {
+        let tic = self.tic(self.indices(handle).0)?;
+        let words = tic.words;
+        let (address, length) = Texture::footprint(&tic)?;
+        let end = address.saturating_add(length);
+        let kept = self.cache.entries.lock().unwrap().raw.get(&words).cloned();
+        if let Some((raw, stamp)) = &kept
+            && self.writes.unchanged(*stamp, address, end)
+        {
+            return Ok(raw.clone());
+        }
+        let expected = kept.as_ref().map(|(raw, _)| &*raw.bytes);
+        let raw = match read_unless_equal(self.memory, address, length as usize, expected)? {
+            None => kept.expect("compared with kept bytes").0,
+            Some(bytes) => Arc::new(RawTexture {
+                tic,
+                bytes: bytes.into(),
+            }),
+        };
+        let stamp = self.writes.stamp();
+        let dropped = self.cache.entries.lock().unwrap().raw.insert(
+            words,
+            (raw.clone(), stamp),
+            raw.bytes.len(),
+        );
+        // Dropped textures are freed outside the lock.
+        drop(dropped);
+        Ok(raw)
     }
 
     fn sampler(&self, index: u32) -> Result<Tsc, Unmodeled> {

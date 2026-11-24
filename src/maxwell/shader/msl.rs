@@ -64,6 +64,7 @@
 //! and the draw is left to the interpreter.
 
 mod flow;
+mod memory;
 mod ops;
 #[cfg(test)]
 mod tests;
@@ -119,6 +120,31 @@ pub struct MultisampleStage {
     pub center_depth: bool,
 }
 
+/// What a texture slot of a translated program is: the Metal texture
+/// type the draw must bind there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TextureKind {
+    /// `texture2d`: one layer.
+    Flat,
+    /// `texture2d_array`: sampled with a layer.
+    Array,
+    /// `texturecube`.
+    Cube,
+    /// `texture3d`.
+    Volume,
+}
+
+impl TextureKind {
+    fn declaration(self) -> &'static str {
+        match self {
+            TextureKind::Flat => "texture2d<float>",
+            TextureKind::Array => "texture2d_array<float>",
+            TextureKind::Cube => "texturecube<float>",
+            TextureKind::Volume => "texture3d<float>",
+        }
+    }
+}
+
 /// A pixel program in MSL, and what a draw must supply for it.
 #[derive(Debug, Clone)]
 pub struct Translated {
@@ -131,8 +157,11 @@ pub struct Translated {
     pub ipa_words: Vec<u32>,
     /// Bound-texture handle offsets (bytes in the texture-handle constant
     /// buffer, `TEXTURE_BUFFER_INDEX`) the program samples, in
-    /// texture/sampler slot order. All are 2D textures.
+    /// texture/sampler slot order (a handle sampled as two kinds has two
+    /// slots).
     pub textures: Vec<u32>,
+    /// What each slot is.
+    pub kinds: Vec<TextureKind>,
     /// Constant buffer words read with static offsets: (slot, byte offset).
     pub constants: BTreeSet<(u32, u32)>,
     /// Constant buffer slots read at register-dependent offsets (`LDC`):
@@ -146,7 +175,17 @@ pub struct Translated {
     /// program has none. The translation is valid only for draws whose
     /// constant buffer 1 has this content.
     pub constant_buffer_1: Option<Vec<u8>>,
+    /// Where the buffers `LDG` reads may be named: (constant buffer slot,
+    /// byte offset) of each 64-bit address the program loads into a
+    /// register pair (see `memory.rs`). The draw binds the memory each
+    /// names, in this order, at [`GLOBAL_BUFFER`].
+    pub globals: Vec<(u32, u32)>,
 }
+
+/// The fragment buffer index of the global memory a program reads (see
+/// `memory.rs`); the one after it holds the word a load outside that
+/// memory sets.
+pub const GLOBAL_BUFFER: usize = 28;
 
 /// Register value expressions.
 fn r(index: u32) -> String {
@@ -204,9 +243,11 @@ struct Writer<'a> {
     cc: bool,
     ipa_words: Vec<u32>,
     textures: Vec<u32>,
+    kinds: Vec<TextureKind>,
     implicit_lod: Vec<bool>,
     constants: BTreeSet<(u32, u32)>,
     indirect: BTreeSet<u32>,
+    globals: Vec<(u32, u32)>,
     /// Vertex programs: input attribute words `ALD` reads (`i{word}`).
     inputs: BTreeSet<u32>,
     /// Vertex programs: output attribute words `AST` writes or `ALD.O`
@@ -444,6 +485,11 @@ impl Writer<'_> {
             (Stage::Pixel, Op::Fswzadd) => self.fswzadd(),
             (Stage::Pixel, Op::Texs) => self.texs(),
             (Stage::Pixel, Op::Tex) => self.tex(),
+            (Stage::Pixel, Op::Tld4) => self.tld4(),
+            (Stage::Pixel, Op::Tld4s) => self.tld4s(),
+            (Stage::Pixel, Op::Tlds) => self.tlds(),
+            (Stage::Pixel, Op::Tld) => self.tld(),
+            (Stage::Pixel, Op::Ldg) => self.ldg(),
             (Stage::Vertex, Op::Ald) => self.ald(),
             (Stage::Vertex, Op::Ast) => self.ast(),
             (_, Op::Ldc) => self.ldc(),
@@ -790,12 +836,21 @@ impl Translated {
         if !self.indirect.is_empty() {
             parameters.push("const device uint* cb_size [[buffer(20)]]".to_string());
         }
-        for i in 0..self.textures.len() {
-            parameters.push(format!("texture2d<float> t{i} [[texture({i})]]"));
+        for (i, kind) in self.kinds.iter().enumerate() {
+            parameters.push(format!("{} t{i} [[texture({i})]]", kind.declaration()));
             parameters.push(format!("sampler s{i} [[sampler({i})]]"));
         }
         if !self.textures.is_empty() {
             parameters.push("device atomic_uint* texture_faults [[buffer(21)]]".to_string());
+        }
+        if !self.globals.is_empty() {
+            parameters.push(format!(
+                "const device uint* gm [[buffer({GLOBAL_BUFFER})]]"
+            ));
+            parameters.push(format!(
+                "device atomic_uint* gm_fault [[buffer({})]]",
+                GLOBAL_BUFFER + 1
+            ));
         }
         if alpha_test {
             parameters.push("constant uint* alpha_test [[buffer(22)]]".to_string());
@@ -872,9 +927,22 @@ impl Translated {
             };
             let _ = writeln!(s, "#define IPA{k} {center}\n#define IPAC{k} {centroid}");
         }
+        // GM_LIVE: whether this fragment is one of the primitive's (a
+        // global memory access of any other reports nothing).
+        if !self.globals.is_empty() {
+            let live = match (native, multisample) {
+                (Some(_), _) => "!simd_is_helper_thread()",
+                (None, Some(_)) => "(((coverage_mask >> layer) & 1u) != 0u)",
+                (None, None) => "covers(tri, px, py)",
+            };
+            let _ = writeln!(s, "#define GM_LIVE {live}");
+        }
         s.push_str(&self.body);
         for k in 0..self.ipa_words.len() {
             let _ = writeln!(s, "#undef IPA{k}\n#undef IPAC{k}");
+        }
+        if !self.globals.is_empty() {
+            let _ = writeln!(s, "#undef GM_LIVE");
         }
         let covered = match (native, multisample) {
             (Some(_), _) => "false",
@@ -1019,9 +1087,11 @@ pub fn translate(program: &Program, constant_buffer_1: &[u8]) -> Result<Translat
         cc: false,
         ipa_words: Vec::new(),
         textures: Vec::new(),
+        kinds: Vec::new(),
         implicit_lod: Vec::new(),
         constants: BTreeSet::new(),
         indirect: BTreeSet::new(),
+        globals: memory::candidates(program, &flow.pcs),
         word: 0,
         pc: 8,
     };
@@ -1082,8 +1152,10 @@ pub fn translate(program: &Program, constant_buffer_1: &[u8]) -> Result<Translat
         body,
         ipa_words: writer.ipa_words,
         textures: writer.textures,
+        kinds: writer.kinds,
         constants: writer.constants,
         indirect: writer.indirect,
+        globals: writer.globals,
         implicit_lod: writer.implicit_lod,
         constant_buffer_1: flow.jump_tables.then(|| constant_buffer_1.to_vec()),
     })
