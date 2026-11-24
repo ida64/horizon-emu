@@ -269,7 +269,7 @@ impl TwoD {
         // The loaded source texels, row-major, as stored.
         let source_bpp = source_format.bytes_per_pixel() as usize;
         let mut texels = vec![0u8; (sx1 - sx0) as usize * (sy1 - sy0) as usize * source_bpp];
-        Window::load(memory, source, loaded)?.read_pixels(loaded, &mut texels);
+        Window::read_rect(memory, source, loaded, &mut texels)?;
         let taps = |range: std::ops::Range<u32>, start: u32, origin: f64, step: f64, low, high| {
             range
                 .map(|i| Tap::new(position(i, start, origin, step), bilinear, low, high))
@@ -282,8 +282,7 @@ impl TwoD {
             span_width: (sx1 - sx0) as usize,
         };
         let destination_bpp = destination_format.bytes_per_pixel() as usize;
-        let mut pixels =
-            vec![0u8; sampling.columns.len() * sampling.rows.len() * destination_bpp];
+        let mut pixels = vec![0u8; sampling.columns.len() * sampling.rows.len() * destination_bpp];
         resample(
             &texels,
             source_format,
@@ -291,7 +290,8 @@ impl TwoD {
             &sampling,
             &mut pixels,
         );
-        let mut destination_window = Window::load(memory, destination, rect)?;
+        // Every pixel of `rect` is written: what it covers whole is not read.
+        let mut destination_window = Window::load_to_overwrite(memory, destination, rect)?;
         destination_window.write_pixels(rect, &pixels);
         destination_window.store(memory)
     }
@@ -380,7 +380,10 @@ fn resample(
     let span_bytes = sampling.span_width * source_bpp;
     if point {
         in_rows(pixels, row_bytes, |first, band| {
-            for (row, out) in sampling.rows[first..].iter().zip(band.chunks_exact_mut(row_bytes)) {
+            for (row, out) in sampling.rows[first..]
+                .iter()
+                .zip(band.chunks_exact_mut(row_bytes))
+            {
                 let line = &texels[row.first * span_bytes..][..span_bytes];
                 let columns = sampling.columns.iter();
                 for (column, out) in columns.zip(out.chunks_exact_mut(destination_bpp)) {
@@ -400,7 +403,10 @@ fn resample(
         }
     });
     in_rows(pixels, row_bytes, |first, band| {
-        for (row, out) in sampling.rows[first..].iter().zip(band.chunks_exact_mut(row_bytes)) {
+        for (row, out) in sampling.rows[first..]
+            .iter()
+            .zip(band.chunks_exact_mut(row_bytes))
+        {
             let top = &decoded[row.first * span_width..][..span_width];
             let bottom = &decoded[row.second * span_width..][..span_width];
             let columns = sampling.columns.iter();
@@ -429,7 +435,10 @@ fn gather<const N: usize>(texels: &[u8], sampling: &Sampling, pixels: &mut [u8])
         .windows(2)
         .all(|pair| pair[1].first == pair[0].first + 1);
     in_rows(pixels, row_bytes, |first, band| {
-        for (row, out) in sampling.rows[first..].iter().zip(band.chunks_exact_mut(row_bytes)) {
+        for (row, out) in sampling.rows[first..]
+            .iter()
+            .zip(band.chunks_exact_mut(row_bytes))
+        {
             let line = &texels[row.first * span_bytes..][..span_bytes];
             if consecutive {
                 out.copy_from_slice(&line[columns[0].first * N..][..row_bytes]);
@@ -906,14 +915,26 @@ mod tests {
             let outcome = two_d.blit(&fast);
             let expected = reference_blit(&two_d, &reference);
             assert_eq!(outcome, expected, "case {case}");
-            let (fast, reference) = (fast.0.into_inner().unwrap(), reference.0.into_inner().unwrap());
+            let (fast, reference) = (
+                fast.0.into_inner().unwrap(),
+                reference.0.into_inner().unwrap(),
+            );
             if fast != reference {
-                let at = fast.iter().zip(&reference).position(|(a, b)| a != b).unwrap();
+                let at = fast
+                    .iter()
+                    .zip(&reference)
+                    .position(|(a, b)| a != b)
+                    .unwrap();
                 panic!(
                     "case {case}: byte {at:#x} is {:#x}, the per-pixel blit wrote {:#x}; registers {:?}",
                     fast[at],
                     reference[at],
-                    two_d.registers.iter().enumerate().filter(|(_, v)| **v != 0).collect::<Vec<_>>()
+                    two_d
+                        .registers
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, v)| **v != 0)
+                        .collect::<Vec<_>>()
                 );
             }
             written += usize::from(fast != bytes);
@@ -948,10 +969,7 @@ mod tests {
         let mut two_d = TwoD::default();
         let r = &mut two_d.registers;
         r[SET_OPERATION] = 3;
-        for (base, address, width) in [
-            (SET_SRC_FORMAT, 0, 2560),
-            (SET_DST_FORMAT, 8 << 20, 1280),
-        ] {
+        for (base, address, width) in [(SET_SRC_FORMAT, 0, 2560), (SET_DST_FORMAT, 8 << 20, 1280)] {
             for (offset, value) in [
                 (0x00, 0xcf),
                 (0x04, 0),
@@ -1041,7 +1059,11 @@ mod tests {
             for _ in 0..50_000 {
                 let texel = random.bytes(bytes);
                 let (read, expected) = (codec.read(&texel), format.read(&texel));
-                assert_eq!(read.map(f32::to_bits), expected.map(f32::to_bits), "{format:?}");
+                assert_eq!(
+                    read.map(f32::to_bits),
+                    expected.map(f32::to_bits),
+                    "{format:?}"
+                );
                 let value: [f32; 4] = std::array::from_fn(|_| match random.below(3) {
                     0 => random.pick(&specials),
                     1 => (random.below(1 << 20) as f32) / (1 << 20) as f32,

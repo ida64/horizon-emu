@@ -1157,7 +1157,10 @@ fn random_output(random: &mut Random) -> ([u64; 2], (u32, u32)) {
         | u64::from(width - 1) << 32
         | u64::from(height - 1) << 46;
     let pad = |random: &mut Random, size: u32| u64::from(size + random.below(3) as u32 * 4);
-    let chroma = [width.div_ceil(subsampling[0] as u32), height.div_ceil(subsampling[1] as u32)];
+    let chroma = [
+        width.div_ceil(subsampling[0] as u32),
+        height.div_ceil(subsampling[1] as u32),
+    ];
     let w1 = (pad(random, width) - 1)
         | (u64::from(height) - 1) << 14
         | (pad(random, chroma[0]) - 1) << 32
@@ -1183,11 +1186,11 @@ fn random_rect(random: &mut Random, (width, height): (u32, u32), align: u64) -> 
 fn random_composition(random: &mut Random) -> (Config, [u32; method::COUNT]) {
     let mut config = Config([0; CONFIG_SIZE / 8]);
     let mut set = |offset: usize, value: u64| config.0[offset / 8] = value;
-    let background = (0..4).fold(0u64, |word, n| word | random.below(1024) << [16, 26, 36, 6][n]);
-    let output = random.pick(&[0u64, 1, 4])
-        | background
-        | random.below(2) << 46
-        | random.below(4) << 48;
+    let background = (0..4).fold(0u64, |word, n| {
+        word | random.below(1024) << [16, 26, 36, 6][n]
+    });
+    let output =
+        random.pick(&[0u64, 1, 4]) | background | random.below(2) << 46 | random.below(4) << 48;
     let (words, size) = random_output(random);
     let planar = yuv_input(field(words[0], 0, 7)).is_some();
     let transpose = !planar && field(words[0], 11, 4) == 0 && random.chance(6);
@@ -1196,17 +1199,32 @@ fn random_composition(random: &mut Random) -> (Config, [u32; method::COUNT]) {
     set(0x20, words[0]);
     set(0x28, words[1]);
     if planar || random.chance(2) {
-        for (offset, word) in [0x30, 0x38, 0x40, 0x48].into_iter().zip(random_matrix(random)) {
+        for (offset, word) in [0x30, 0x38, 0x40, 0x48]
+            .into_iter()
+            .zip(random_matrix(random))
+        {
             set(offset, word);
         }
     }
     let slots = if random.chance(6) { 2 } else { 1 };
     for slot in 0..slots {
         let base = SLOT_BASE + slot * SLOT_SIZE;
-        let filter = if random.chance(4) { random.below(16) << 20 } else { 0 };
+        let filter = if random.chance(4) {
+            random.below(16) << 20
+        } else {
+            0
+        };
         set(base, 1 | 1 << 8 | filter);
-        let clamp_low = if random.chance(2) { 0 } else { random.below(300) };
-        let clamp_high = if random.chance(2) { 1023 } else { 700 + random.below(324) };
+        let clamp_low = if random.chance(2) {
+            0
+        } else {
+            random.below(300)
+        };
+        let clamp_high = if random.chance(2) {
+            1023
+        } else {
+            700 + random.below(324)
+        };
         set(
             base + 0x10,
             clamp_low
@@ -1217,8 +1235,14 @@ fn random_composition(random: &mut Random) -> (Config, [u32; method::COUNT]) {
         );
         let surface_size = (8 + random.below(80) as u32, 8 + random.below(60) as u32);
         let source = random_rect(random, surface_size, 1);
-        let (left, right) = (field(source, 0, 14), field(source, 16, 14).min(surface_size.0 - 1));
-        let (top, bottom) = (field(source, 32, 14), field(source, 48, 14).min(surface_size.1 - 1));
+        let (left, right) = (
+            field(source, 0, 14),
+            field(source, 16, 14).min(surface_size.0 - 1),
+        );
+        let (top, bottom) = (
+            field(source, 32, 14),
+            field(source, 48, 14).min(surface_size.1 - 1),
+        );
         let destination = if random.chance(5) {
             random_rect(random, size, 1)
         } else {
@@ -1232,13 +1256,23 @@ fn random_composition(random: &mut Random) -> (Config, [u32; method::COUNT]) {
         set(base + 0x30, destination);
         let block = random.chance(2).then(|| random.below(5));
         let format = 31 + random.below(8);
-        set(base + 0x40, surface_word(format, block, (u64::from(surface_size.0), u64::from(surface_size.1))));
+        set(
+            base + 0x40,
+            surface_word(
+                format,
+                block,
+                (u64::from(surface_size.0), u64::from(surface_size.1)),
+            ),
+        );
         set(
             base + 0x48,
             u64::from(surface_size.0 - 1) | u64::from(surface_size.1 - 1) << 14,
         );
         if random.chance(5) {
-            for (offset, word) in [0x60, 0x68, 0x70, 0x78].into_iter().zip(random_matrix(random)) {
+            for (offset, word) in [0x60, 0x68, 0x70, 0x78]
+                .into_iter()
+                .zip(random_matrix(random))
+            {
                 set(base + offset, word);
             }
         }
@@ -1257,7 +1291,8 @@ fn random_composition(random: &mut Random) -> (Config, [u32; method::COUNT]) {
     }
     let mut methods = [0; method::COUNT];
     for slot in 0..slots {
-        methods[method::SURFACES.start + slot * 24] = ((SOURCE_AT + slot as u64 * 0x4_0000) >> 8) as u32;
+        methods[method::SURFACES.start + slot * 24] =
+            ((SOURCE_AT + slot as u64 * 0x4_0000) >> 8) as u32;
     }
     for (method, address) in method::SET_OUTPUT_SURFACE.zip(PLANES_AT) {
         methods[method] = (address >> 8) as u32;
@@ -1288,8 +1323,15 @@ fn fused_compositions_match_the_per_pixel_path() {
         let outcome = compose_config(&memory(&fused), &methods, &config, true);
         let expected = compose_config(&memory(&general), &methods, &config, false);
         assert_eq!(outcome, expected, "case {case}");
-        let (after, reference) = (fused.peek_bytes(0, 0x40_0000), general.peek_bytes(0, 0x40_0000));
-        assert!(after == reference, "case {case}: {}", dump(&methods, &config));
+        let (after, reference) = (
+            fused.peek_bytes(0, 0x40_0000),
+            general.peek_bytes(0, 0x40_0000),
+        );
+        assert!(
+            after == reference,
+            "case {case}: {}",
+            dump(&methods, &config)
+        );
         composed += usize::from(outcome.is_ok());
         differing += usize::from(outcome.is_ok() && after != general.peek_bytes(0, 0));
     }
@@ -1375,7 +1417,11 @@ fn reference_planar_write(
         }
         bytes
     };
-    let mut planes = vec![(planar.luma, area, fill(area, 1, &|x, y| unorm8(at(x, y)[0])))];
+    let mut planes = vec![(
+        planar.luma,
+        area,
+        fill(area, 1, &|x, y| unorm8(at(x, y)[0])),
+    )];
     match planar.chroma {
         ChromaPlanes::Interleaved { plane, u_first } => {
             let value = move |x: u32, y: u32| {

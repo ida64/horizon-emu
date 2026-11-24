@@ -42,7 +42,7 @@
 
 use std::sync::{
     Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering, fence},
 };
 
 use serde::{Deserialize, Serialize};
@@ -170,36 +170,125 @@ impl BusMemory for SmmuBus {
     }
 }
 
-/// Page table entries walked by virtual page, kept while the count of
-/// invalidations stays at `invalidations`.
-pub struct Tlb(Mutex<TlbEntries>);
+/// Page table entries walked by virtual page, each kept with the count of
+/// invalidations it was walked under and used only while the count stays
+/// there, so none outlives an invalidate.
+///
+/// Lookups take no lock: each slot is a sequence lock, its count odd while
+/// a walk's result is being stored, and a lookup that sees the count odd or
+/// changed across its reads of the slot takes it as a miss and walks. A
+/// store that finds the slot being stored by another thread leaves it to
+/// that one. So a hit is always a whole entry some walk stored.
+pub struct Tlb(Box<[Slot]>);
 
 /// Translations a [`Tlb`] keeps (4 KiB pages, direct-mapped).
 const TLB_ENTRIES: usize = 4096;
 
-struct TlbEntries {
-    invalidations: u64,
-    entries: Box<[Option<TlbEntry>; TLB_ENTRIES]>,
+/// One entry: what a walk found for one 4 KiB virtual page of one address
+/// space, and the invalidations count it was walked under.
+#[derive(Default)]
+struct Slot {
+    sequence: AtomicU64,
+    invalidations: AtomicU64,
+    page: AtomicU64,
+    directory: AtomicU64,
+    /// PTE word 0, word 1 << 32.
+    pte: AtomicU64,
+    /// Page shift, the big-page geometry (bit 8: 128 KiB), whether the
+    /// slot holds an entry (bit 9).
+    shape: AtomicU64,
 }
 
-/// What a walk found for one 4 KiB virtual page of one address space.
-#[derive(Clone, Copy)]
-struct TlbEntry {
-    directory: u64,
-    big_page: BigPage,
-    page: u64,
-    pte: Pte,
-}
+const SHAPE_K128: u64 = 1 << 8;
+const SHAPE_FILLED: u64 = 1 << 9;
 
 impl Default for Tlb {
     fn default() -> Self {
-        Self(Mutex::new(TlbEntries {
-            invalidations: u64::MAX,
-            entries: vec![None; TLB_ENTRIES]
-                .into_boxed_slice()
-                .try_into()
-                .unwrap_or_else(|_| unreachable!("TLB_ENTRIES entries")),
-        }))
+        Self((0..TLB_ENTRIES).map(|_| Slot::default()).collect())
+    }
+}
+
+impl Tlb {
+    /// The entry of `page` in the address space with page directory
+    /// `directory` and big pages `big_page`, if walked under
+    /// `invalidations`.
+    fn find(
+        &self,
+        slot: usize,
+        invalidations: u64,
+        page: u64,
+        directory: u64,
+        big_page: BigPage,
+    ) -> Option<Pte> {
+        let slot = &self.0[slot];
+        let before = slot.sequence.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            return None;
+        }
+        let kept = (
+            slot.invalidations.load(Ordering::Relaxed),
+            slot.page.load(Ordering::Relaxed),
+            slot.directory.load(Ordering::Relaxed),
+            slot.pte.load(Ordering::Relaxed),
+            slot.shape.load(Ordering::Relaxed),
+        );
+        fence(Ordering::Acquire);
+        if slot.sequence.load(Ordering::Relaxed) != before {
+            return None;
+        }
+        let (kept_invalidations, kept_page, kept_directory, pte, shape) = kept;
+        let k128 = big_page == BigPage::K128;
+        (shape & SHAPE_FILLED != 0
+            && (shape & SHAPE_K128 != 0) == k128
+            && kept_invalidations == invalidations
+            && kept_page == page
+            && kept_directory == directory)
+            .then_some(Pte {
+                low: pte as u32,
+                high: (pte >> 32) as u32,
+                page_shift: (shape & 0xFF) as u32,
+            })
+    }
+
+    /// Keeps `pte` for [`Tlb::find`], unless another thread is storing
+    /// into the slot.
+    fn keep(
+        &self,
+        slot: usize,
+        invalidations: u64,
+        page: u64,
+        directory: u64,
+        big_page: BigPage,
+        pte: Pte,
+    ) {
+        let slot = &self.0[slot];
+        let before = slot.sequence.load(Ordering::Relaxed);
+        if before & 1 != 0
+            || slot
+                .sequence
+                .compare_exchange(before, before + 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        fence(Ordering::Release);
+        slot.invalidations.store(invalidations, Ordering::Relaxed);
+        slot.page.store(page, Ordering::Relaxed);
+        slot.directory.store(directory, Ordering::Relaxed);
+        slot.pte.store(
+            u64::from(pte.high) << 32 | u64::from(pte.low),
+            Ordering::Relaxed,
+        );
+        let k128 = if big_page == BigPage::K128 {
+            SHAPE_K128
+        } else {
+            0
+        };
+        slot.shape.store(
+            SHAPE_FILLED | k128 | u64::from(pte.page_shift),
+            Ordering::Relaxed,
+        );
+        slot.sequence.store(before + 2, Ordering::Release);
     }
 }
 
@@ -287,32 +376,22 @@ impl AddressSpace {
             return self.access(self.walk(bus, address)?, address, write);
         };
         let page = address >> SMALL_PAGE_SHIFT;
-        let mut tlb = tlb.0.lock().unwrap();
-        if tlb.invalidations != invalidations {
-            tlb.entries.fill(None);
-            tlb.invalidations = invalidations;
-        }
         let slot = (page ^ self.directory >> SMALL_PAGE_SHIFT) as usize % TLB_ENTRIES;
-        let pte = match tlb.entries[slot] {
-            Some(entry)
-                if entry.page == page
-                    && entry.directory == self.directory
-                    && entry.big_page == self.big_page =>
-            {
-                entry.pte
-            }
-            _ => {
+        let pte = match tlb.find(slot, invalidations, page, self.directory, self.big_page) {
+            Some(pte) => pte,
+            None => {
                 let pte = self.walk(bus, address)?;
-                tlb.entries[slot] = Some(TlbEntry {
-                    directory: self.directory,
-                    big_page: self.big_page,
+                tlb.keep(
+                    slot,
+                    invalidations,
                     page,
+                    self.directory,
+                    self.big_page,
                     pte,
-                });
+                );
                 pte
             }
         };
-        drop(tlb);
         self.access(pte, address, write)
     }
 
@@ -832,5 +911,58 @@ pub(super) mod tests {
             space.translate(&cached, 0x3010, false).unwrap().address,
             IOVA | 0x8_0010
         );
+    }
+
+    /// Threads looking pages up and storing walks into the same slots at
+    /// once only ever get whole entries: every translation equals a fresh
+    /// walk, also across invalidates (the tables do not change).
+    #[test]
+    fn concurrent_lookups_get_whole_entries() {
+        let bus = TestBus::default();
+        let cached = CachedBus {
+            bus: &bus,
+            tlb: Tlb::default(),
+            invalidations: AtomicU64::new(0),
+        };
+        let instance = IOVA | 0x1000;
+        let directory = IOVA | 0x2000;
+        bus.instance(instance, directory, BigPage::K128, 1 << 37);
+        let space = AddressSpace::from_instance(&bus, instance).unwrap();
+        // 64 small pages in each of 4 directory entries.
+        for entry in 0..4u64 {
+            let table = IOVA | (0x10_0000 + entry * 0x1000);
+            bus.small_table(directory + entry * 8, table);
+            for page in 0..64u64 {
+                bus.page(
+                    table + page * 8,
+                    IOVA | (0x80_0000 + (entry * 64 + page) * 0x1000),
+                );
+            }
+        }
+        // Pages whose slots collide (one TLB's worth apart) and pages that do not.
+        let addresses: Vec<u64> = (0..4u64)
+            .flat_map(|entry| (0..64u64).map(move |page| entry << 27 | page << 12 | 0x10))
+            .collect();
+        let expected: Vec<_> = addresses
+            .iter()
+            .map(|&address| space.translate(&bus, address, false).unwrap())
+            .collect();
+        std::thread::scope(|scope| {
+            for thread in 0..4usize {
+                let (cached, addresses, expected) = (&cached, &addresses, &expected);
+                scope.spawn(move || {
+                    for round in 0..20_000usize {
+                        let at = (round * 7 + thread * 13) % addresses.len();
+                        if round % 997 == thread {
+                            cached.invalidate();
+                        }
+                        assert_eq!(
+                            space.translate(cached, addresses[at], false).unwrap(),
+                            expected[at]
+                        );
+                    }
+                });
+            }
+        });
     }
 }

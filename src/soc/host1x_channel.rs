@@ -795,7 +795,11 @@ mod tests {
                 Arc::new(move |class, offset, value| {
                     record.lock().unwrap().push((class, offset, value));
                     let (open, signal) = &*held;
-                    drop(signal.wait_while(open.lock().unwrap(), |open| !*open).unwrap());
+                    drop(
+                        signal
+                            .wait_while(open.lock().unwrap(), |open| !*open)
+                            .unwrap(),
+                    );
                     Some(())
                 }),
                 Arc::clone(&notes),
@@ -911,7 +915,10 @@ mod tests {
             std::thread::spawn(move || bench.channel.save().unwrap())
         };
         std::thread::sleep(Duration::from_millis(50));
-        assert!(!saver.is_finished(), "a snapshot taken inside an engine method");
+        assert!(
+            !saver.is_finished(),
+            "a snapshot taken inside an engine method"
+        );
         assert_eq!(bench.calls.lock().unwrap().len(), 1);
         *bench.gate.0.lock().unwrap() = true;
         bench.gate.1.notify_all();
@@ -927,7 +934,10 @@ mod tests {
         );
         assert!(bench.idle());
         let saved: State = snapshot::decode("host1x channel", &saver.join().unwrap()).unwrap();
-        assert!(saved.idle(), "the snapshot holds the stream where its run ended");
+        assert!(
+            saved.idle(),
+            "the snapshot holds the stream where its run ended"
+        );
         assert!(bench.notes.take().is_empty());
     }
 

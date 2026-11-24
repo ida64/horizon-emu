@@ -633,26 +633,41 @@ impl Surface {
 
     /// Copies `out.len()` bytes of row `y` from pixel `left` out of `rows`.
     fn read_row(&self, rows: &Rows, left: u32, y: u32, out: &mut [u8]) {
-        row_runs(self.layout, left * BYTES_PER_PIXEL, y, out.len(), |at, run| {
-            let at = (at - rows.start) as usize;
-            out[run.clone()].copy_from_slice(&rows.bytes[at..at + run.len()]);
-        });
+        row_runs(
+            self.layout,
+            left * BYTES_PER_PIXEL,
+            y,
+            out.len(),
+            |at, run| {
+                let at = (at - rows.start) as usize;
+                out[run.clone()].copy_from_slice(&rows.bytes[at..at + run.len()]);
+            },
+        );
     }
 
     /// Stores `line` (pixels as stored) at pixel `left` of row `y` in
     /// `bytes`, which hold the surface from byte `start`.
     fn write_row(&self, bytes: &mut [u8], start: u64, left: u32, y: u32, line: &[u8]) {
-        row_runs(self.layout, left * BYTES_PER_PIXEL, y, line.len(), |at, run| {
-            let at = (at - start) as usize;
-            bytes[at..at + run.len()].copy_from_slice(&line[run]);
-        });
+        row_runs(
+            self.layout,
+            left * BYTES_PER_PIXEL,
+            y,
+            line.len(),
+            |at, run| {
+                let at = (at - start) as usize;
+                bytes[at..at + run.len()].copy_from_slice(&line[run]);
+            },
+        );
     }
 
     /// `colors` as stored, a pixel after another. X formats store the
     /// alpha too (Ryujinx writes 35 as 31).
     fn encode_row(&self, colors: &[[f32; 4]], line: &mut [u8]) {
         let ([r, g, b], a) = (self.format.rgb, self.format.alpha);
-        for (color, pixel) in colors.iter().zip(line.chunks_exact_mut(BYTES_PER_PIXEL as usize)) {
+        for (color, pixel) in colors
+            .iter()
+            .zip(line.chunks_exact_mut(BYTES_PER_PIXEL as usize))
+        {
             pixel[r] = unorm8(color[0]);
             pixel[g] = unorm8(color[1]);
             pixel[b] = unorm8(color[2]);
@@ -1970,7 +1985,10 @@ fn compose_config(
         color
     };
     let mut colors = vec![[0.0; 4]; width * height];
-    if let Some(lone) = fused.then(|| Fused::new(&drawn, background, regamma_mode)).flatten() {
+    if let Some(lone) = fused
+        .then(|| Fused::new(&drawn, background, regamma_mode))
+        .flatten()
+    {
         let drawn = &drawn[0];
         let outside = encode(lone.outside);
         in_bands(&mut colors, width, width * height, |first, band| {
@@ -1989,7 +2007,8 @@ fn compose_config(
                 (0..start).chain(end..width).for_each(|x| put(x, outside));
                 let source_row = drawn.lines[(row - drawn.rect.top) as usize][0].0;
                 let left = drawn.columns[0][0].0;
-                lone.surface.read_row(lone.rows, left, source_row, &mut line);
+                lone.surface
+                    .read_row(lone.rows, left, source_row, &mut line);
                 for (x, pixel) in (start..).zip(line.chunks_exact(BYTES_PER_PIXEL as usize)) {
                     put(x, encode(lone.color(pixel)));
                 }
@@ -2126,7 +2145,11 @@ impl<'a> Fused<'a> {
         for code in 0..=255u8 {
             // As `Surface::pixel` reads the code in each component.
             let value = f32::from(code) / 255.0;
-            let stored_alpha = if surface.format.stored_alpha { value } else { 1.0 };
+            let stored_alpha = if surface.format.stored_alpha {
+                value
+            } else {
+                1.0
+            };
             let color = slot.color([value, value, value, stored_alpha], &mut degamma);
             let blended = slot.blend.apply(color, background);
             for (table, component) in tables.iter_mut().zip(blended) {
