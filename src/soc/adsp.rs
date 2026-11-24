@@ -90,9 +90,10 @@
 //!   command list address and size at words 0 and 1, the DSP's count of
 //!   commands left at word 3 and its render time in microseconds at word 8.
 //!   Here a frame takes 5 ms (240 samples at 48 kHz, the frame the DSP
-//!   renders at `0x80504140`) and leaves no command undone in no time; the
-//!   commands themselves are not executed, so voices play nothing and
-//!   their state is not updated.
+//!   renders at `0x80504140`) and leaves no command undone in no time.
+//!   Of the commands only what the wave buffer data sources do to their
+//!   voices' state is modeled ([`renderer`]): voices play nothing, but
+//!   their buffers are consumed as the frames' samples take them.
 //! * `OpusDecoder` (started by the OS, channel 70) decodes for `hwopus`.
 //!   `audio` starts it at start-up (text `0x95b60`): message 1 (start),
 //!   then the DSP address of a 4096-byte buffer it shares, high and low 16
@@ -111,6 +112,9 @@
 //!   `audio` sends it when the system goes to sleep and waits at most a
 //!   second for the 12 (text `0x96220`), else it fails with 2111-0259.
 //!   Decoding itself (messages 22 onwards) is not modeled and refuses.
+
+mod renderer;
+
 use std::{
     collections::VecDeque,
     sync::{Arc, Condvar, Mutex, MutexGuard, Weak},
@@ -786,13 +790,33 @@ impl Inner {
         };
         for session in 0..SESSIONS {
             let descriptor = base + session * SESSION_BYTES;
-            if self.read_word(descriptor)? != 0 {
+            let list = self.read_word(descriptor)?;
+            if list != 0 {
+                let size = self.read_word(descriptor + 4)?;
+                // A list that cannot be walked still finishes the frame.
+                if let Err(what) = renderer::run(self, list, size) {
+                    self.notes.add(format!("ADSP: renderer session {session}: {what}"));
+                }
                 self.write_word(descriptor + 3 * 4, 0)?;
                 self.write_word(descriptor + 8 * 4, 0)?;
             }
         }
         self.send(state, RENDERER, RENDER_DONE);
         Ok(())
+    }
+}
+
+impl renderer::DspMemory for Inner {
+    fn read(&self, address: u32, bytes: &mut [u8]) -> Result<()> {
+        self.memory
+            .read(u64::from(address), bytes)
+            .ok_or_else(|| format!("DSP addresses from {address:#x} are not mapped"))
+    }
+
+    fn write(&self, address: u32, bytes: &[u8]) -> Result<()> {
+        self.memory
+            .write(u64::from(address), bytes)
+            .ok_or_else(|| format!("DSP addresses from {address:#x} are not mapped"))
     }
 }
 
