@@ -18,6 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use horizon_emu::soc::joycon::{Button, Pad};
 use serde_json::{Value, json};
 
 /// Lines of output kept per machine.
@@ -224,6 +225,8 @@ pub enum Input {
     Touch(Option<(u16, u16)>),
     Joycons(bool),
     Amiibo(Option<(PathBuf, bool)>),
+    /// What the Mac's gamepad does to the Joy-Con, all of it.
+    Pad(Pad),
 }
 
 impl Input {
@@ -238,6 +241,15 @@ impl Input {
                 json!({"op": "amiibo", "path": path, "writable": writable})
             }
             Self::Amiibo(None) => json!({"op": "amiibo"}),
+            Self::Pad(Pad {
+                buttons,
+                sticks: [left, right],
+            }) => json!({
+                "op": "pad",
+                "buttons": Button::names(*buttons).collect::<Vec<_>>(),
+                "left": [left.0, left.1],
+                "right": [right.0, right.1],
+            }),
         }
     }
 }

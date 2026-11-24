@@ -46,6 +46,12 @@
 //! {"op":"stick","stick":"left","x":0.0,"y":1.0}
 //!     pushes the left or right stick to x, y (each -1 to 1, right and up
 //!     positive) and leaves it there; 0, 0 lets go
+//! {"op":"pad","buttons":["a","zl"],"left":[0.0,1.0],"right":[0.0,0.0]}
+//!     what a gamepad of the client's does to the Joy-Con from now on, all
+//!     of it at once: the Joy-Con buttons it holds (none when left out)
+//!     and where it pushes each stick, x then y (at rest when left out).
+//!     Beside "press" and "stick": a button either holds is held, and a
+//!     stick "stick" has let go of is where the pad pushes it
 //! {"op":"amiibo","path":"/tmp/tag.bin","writable":false}
 //!     holds the NTAG215 dumped in that file over the right Joy-Con's
 //!     reader (with "writable", what is written to it goes back to the
@@ -75,7 +81,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use horizon_emu::soc::ntag::Ntag215;
+use horizon_emu::soc::{
+    joycon::{Button, Pad},
+    ntag::Ntag215,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -125,6 +134,14 @@ enum Request {
         stick: String,
         x: f32,
         y: f32,
+    },
+    Pad {
+        #[serde(default)]
+        buttons: Vec<String>,
+        #[serde(default)]
+        left: [f32; 2],
+        #[serde(default)]
+        right: [f32; 2],
     },
     Amiibo {
         path: Option<String>,
@@ -404,6 +421,33 @@ fn answer(request: Request, controlled: &Controlled) -> Result<Value, String> {
             }
             console
                 .with(|machine| machine.set_stick(which, x, y))
+                .ok_or(RESTARTING)?;
+            Ok(json!({}))
+        }
+        Request::Pad {
+            buttons,
+            left,
+            right,
+        } => {
+            let mut held = 0;
+            for name in &buttons {
+                held |= Button::named(name)
+                    .ok_or_else(|| format!("pad: {name:?} is not a button of the Joy-Con"))?
+                    .bits();
+            }
+            let sticks = [left, right].map(|[x, y]| (x, y));
+            if sticks
+                .iter()
+                .any(|(x, y)| !((-1.0..=1.0).contains(x) && (-1.0..=1.0).contains(y)))
+            {
+                return Err("pad: x and y from -1 to 1".into());
+            }
+            let pad = Pad {
+                buttons: held,
+                sticks,
+            };
+            console
+                .with(|machine| machine.set_pad(pad))
                 .ok_or(RESTARTING)?;
             Ok(json!({}))
         }

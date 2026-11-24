@@ -13,7 +13,7 @@ use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, RichText, Sense, Stroke,
     TextureHandle, Ui, Vec2,
 };
-use horizon_emu::{keys::KeySet, nand::system_version};
+use horizon_emu::{host_pad::HostPads, keys::KeySet, nand::system_version, soc::joycon::Pad};
 use serde_json::json;
 
 use crate::{
@@ -167,6 +167,11 @@ pub struct App {
     /// was told.
     pub sticks: [(i8, i8); 2],
     pub touching: Option<(u16, u16)>,
+    /// The Mac's gamepads, whether they play the Joy-Con, and what they
+    /// last did, as the machine was told.
+    pub pads: HostPads,
+    pub pad_on: bool,
+    pub pad: Pad,
     pub log_overlay: bool,
     /// Whether the window's glass backdrop is in place.
     glass_tried: bool,
@@ -195,6 +200,9 @@ impl App {
             held: HashSet::new(),
             sticks: [(0, 0); 2],
             touching: None,
+            pads: HostPads::new(std::env::var_os("HORIZON_EMU_TRACE_HOST_GAMEPAD").is_some()),
+            pad_on: true,
+            pad: Pad::default(),
             log_overlay: true,
             glass_tried: false,
             glass: None,

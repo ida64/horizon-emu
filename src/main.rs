@@ -26,6 +26,7 @@ use horizon_emu::{
     },
     boot::{BootParams, DramSize},
     bootrom, cdn,
+    host_pad::HostPads,
     image::KernelImage,
     ipc::{self, Client, ResultCode, Tracker},
     keys::KeySet,
@@ -238,7 +239,19 @@ options:
   --window            show the console's screen in a window. Closing it
                       stops the machine and ends the program; when the
                       machine stops by itself, the window stays, showing
-                      the screen as it was left, until it is closed
+                      the screen as it was left, until it is closed. A
+                      gamepad connected to the Mac plays the console's
+                      Joy-Con in it, beside the keys, while the program is
+                      the one in front: both Joy-Con paired over Bluetooth
+                      or a Pro Controller as labelled, another maker's pad
+                      with A B X Y by place (A is the right-hand button);
+                      one Joy-Con alone is its half, its rail buttons
+                      standing in for L and ZL or R and ZR
+  --no-host-gamepad   with --window, leave the host's gamepads alone
+  --trace-host-gamepad
+                      with --window, print what each host gamepad reads
+                      (the GameController framework's element names) and
+                      what that does to the Joy-Con, whenever it changes
   --screenshot FILE   when the machine stops, save what its screen shows as
                       a PNG
   --screenshot-at SECONDS:FILE
@@ -1087,6 +1100,7 @@ fn boot(
     let mut params = BootParams::default();
     let mut timeout = None;
     let mut show_window = false;
+    let (mut host_gamepad, mut trace_host_gamepad) = (true, false);
     let mut symbols = SymbolTable::default();
     let mut keys = KeySet::default();
     let (mut trace_smc, mut trace_svc, mut trace_devices) = (false, false, false);
@@ -1207,6 +1221,8 @@ fn boot(
                 timed_screenshots.push((at, path.to_string()));
             }
             "--window" => show_window = true,
+            "--no-host-gamepad" => host_gamepad = false,
+            "--trace-host-gamepad" => trace_host_gamepad = true,
             "--touch" => inputs.extend(parse_touch(value()?)?),
             "--joycons" => {
                 let value = value()?;
@@ -1575,7 +1591,9 @@ fn boot(
     }
     place_amiibo(&machine)?;
     let console = Console(RwLock::new(Some(machine)));
-    let mut window = show_window.then(ScreenWindow::open).transpose()?;
+    let mut window = show_window
+        .then(|| ScreenWindow::open(host_gamepad.then(|| HostPads::new(trace_host_gamepad))))
+        .transpose()?;
     let stop = AtomicBool::new(false);
     let log = LogOverlay::default();
     let tracing = Tracing {

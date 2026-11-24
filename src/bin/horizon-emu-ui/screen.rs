@@ -3,7 +3,11 @@
 //! The mouse on the picture is a finger on the touchscreen; the keyboard
 //! is the pair of Joy-Con (WASD and IJKL push the sticks, backquote slides
 //! them on or off the rails, P is the console's power button), as in the
-//! emulator's own window.
+//! emulator's own window. A gamepad connected to the Mac plays the
+//! Joy-Con too ([`horizon_emu::host_pad`]): the UI reads it and tells the
+//! machine shown what it does, the machine's process having no window to
+//! be in front with. With `HORIZON_EMU_TRACE_HOST_GAMEPAD` set, what the
+//! gamepad reads goes to the machine's output, each time it changes.
 
 use std::time::Duration;
 
@@ -12,9 +16,11 @@ use eframe::egui::{
     RichText, Sense, Stroke, TextureOptions, Ui, Vec2,
 };
 
+use horizon_emu::soc::joycon::Pad;
+
 use crate::{
     app::{App, View, state_of},
-    child::Input,
+    child::{Input, Stream},
     model::CpuSpeed,
     tabs::{self, line_color},
     theme::{self, AMBER, MUTED, RED, white},
@@ -77,9 +83,13 @@ pub fn release(app: &mut App, index: usize) {
                 child.input(Input::Stick { stick, x: 0.0, y: 0.0 });
             }
         }
+        if app.pad != Pad::default() {
+            child.input(Input::Pad(Pad::default()));
+        }
     }
     app.touching = None;
     app.sticks = [(0, 0); 2];
+    app.pad = Pad::default();
 }
 
 /// Holds `button` while `down`, telling the machine of changes only.
@@ -169,11 +179,30 @@ pub fn show(app: &mut App, ui: &mut Ui, index: usize) {
 
     keyboard(app, &ctx, index);
     top_left(app, &ctx, index);
+    gamepad(app, &ctx, index);
     top_right(app, &ctx, index);
     toolbar(app, &ctx, index);
 
     if app.entries[index].running() {
         ctx.request_repaint_after(Duration::from_millis(16));
+    }
+}
+
+/// The Mac's gamepads at the Joy-Con: what they do is the machine's while
+/// the window is in front and no dialog is, as with the keys; changes only
+/// are passed on.
+fn gamepad(app: &mut App, ctx: &egui::Context, index: usize) {
+    let child = app.entries[index].child.as_ref();
+    let plays = app.pad_on && app.dialog.is_none() && ctx.input(|input| input.focused);
+    let pad = app.pads.poll(plays, |line| match child {
+        Some(child) => child.log.lock().unwrap().push(Stream::Ui, line),
+        None => eprintln!("{line}"),
+    });
+    if pad != app.pad {
+        app.pad = pad;
+        if let Some(child) = child {
+            child.input(Input::Pad(pad));
+        }
     }
 }
 
@@ -373,6 +402,7 @@ fn toolbar(app: &mut App, ctx: &egui::Context, index: usize) {
     let has_pro = entry.machine().pro_controller.is_some();
     let amiibo = entry.amiibo_held();
     let log_overlay = app.log_overlay;
+    let (pads, pad_on) = (app.pads.names().collect::<Vec<_>>().join(", "), app.pad_on);
     egui::Area::new(egui::Id::unique("screen-toolbar"))
         .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -20.0))
         .order(egui::Order::Foreground)
@@ -452,6 +482,16 @@ fn toolbar(app: &mut App, ctx: &egui::Context, index: usize) {
                                     "Space (A), B X Y, L R, Q E (ZL ZR), arrows (D-pad), = and - (+ and -), \
                                      H (HOME), C (Capture), comma and period (stick clicks).",
                                 );
+                            if !pads.is_empty() {
+                                actions.pad = ui
+                                    .selectable_label(pad_on, RichText::new(format!("🎮 {pads}")).size(13.0))
+                                    .on_hover_text(
+                                        "This gamepad plays the Joy-Con while the window is in front; click to \
+                                         leave it alone. Two Joy-Con paired to the Mac are the whole pad but for \
+                                         Capture; another maker's pad gives A B X Y by place (A on the right).",
+                                    )
+                                    .clicked();
+                            }
                         });
                     });
             });
@@ -470,6 +510,7 @@ struct Actions {
     log: bool,
     stop: bool,
     start: bool,
+    pad: bool,
 }
 
 fn apply(app: &mut App, ctx: &egui::Context, index: usize, actions: Actions) {
@@ -518,6 +559,9 @@ fn apply(app: &mut App, ctx: &egui::Context, index: usize, actions: Actions) {
     }
     if actions.log {
         app.log_overlay = !app.log_overlay;
+    }
+    if actions.pad {
+        app.pad_on = !app.pad_on;
     }
     if actions.stop {
         release(app, index);

@@ -125,29 +125,42 @@ impl Button {
         Self(self.0 | other.0)
     }
 
+    /// What each button is called on the command line.
+    const NAMES: [(&'static str, Self); 18] = [
+        ("a", Self::A),
+        ("b", Self::B),
+        ("x", Self::X),
+        ("y", Self::Y),
+        ("l", Self::L),
+        ("r", Self::R),
+        ("zl", Self::ZL),
+        ("zr", Self::ZR),
+        ("plus", Self::PLUS),
+        ("minus", Self::MINUS),
+        ("home", Self::HOME),
+        ("capture", Self::CAPTURE),
+        ("up", Self::UP),
+        ("down", Self::DOWN),
+        ("left", Self::LEFT),
+        ("right", Self::RIGHT),
+        ("lstick", Self::LEFT_STICK),
+        ("rstick", Self::RIGHT_STICK),
+    ];
+
     /// The button called `name` on the command line, in any case.
     pub fn named(name: &str) -> Option<Self> {
-        Some(match name.to_ascii_lowercase().as_str() {
-            "a" => Self::A,
-            "b" => Self::B,
-            "x" => Self::X,
-            "y" => Self::Y,
-            "l" => Self::L,
-            "r" => Self::R,
-            "zl" => Self::ZL,
-            "zr" => Self::ZR,
-            "plus" => Self::PLUS,
-            "minus" => Self::MINUS,
-            "home" => Self::HOME,
-            "capture" => Self::CAPTURE,
-            "up" => Self::UP,
-            "down" => Self::DOWN,
-            "left" => Self::LEFT,
-            "right" => Self::RIGHT,
-            "lstick" => Self::LEFT_STICK,
-            "rstick" => Self::RIGHT_STICK,
-            _ => return None,
-        })
+        Self::NAMES
+            .iter()
+            .find(|(known, _)| known.eq_ignore_ascii_case(name))
+            .map(|&(_, button)| button)
+    }
+
+    /// What the buttons of `held`, a mask of button bits, are called.
+    pub fn names(held: u32) -> impl Iterator<Item = &'static str> {
+        Self::NAMES
+            .iter()
+            .filter(move |(_, button)| held & button.0 != 0)
+            .map(|&(name, _)| name)
     }
 }
 
@@ -182,6 +195,13 @@ pub struct Controls {
     /// positive) in the high half, as two `i16`. Centred by default; not
     /// kept in a snapshot (a restored machine's sticks are let go).
     sticks: [AtomicU32; 2],
+    /// What a gamepad of the host holds and where it pushes the sticks
+    /// ([`Controls::set_pad`]), kept apart from `buttons` and `sticks`,
+    /// the hands of everything else (keys, scripts, the control socket),
+    /// so that one letting go of a button leaves the other's hold on it.
+    /// Not kept in a snapshot: the pad says again what it does.
+    pad_buttons: AtomicU32,
+    pad_sticks: [AtomicU32; 2],
 }
 
 /// One of the two analog sticks: the left Joy-Con's or the right one's
@@ -203,8 +223,29 @@ impl Stick {
     }
 }
 
+/// What a gamepad of the host does to the pair, all of it at once: a
+/// second pair of hands at the controls ([`Controls::set_pad`]). The
+/// default holds and pushes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Pad {
+    /// The buttons it holds, a mask of [`Button`] bits.
+    pub buttons: u32,
+    /// Where it pushes each stick ([`Stick`] as an index): x and y, each
+    /// from -1 to 1, right and up positive.
+    pub sticks: [(f32, f32); 2],
+}
+
 /// The rails' CTS lines: the rail, and whether its line is high.
 type CtsLines = Box<dyn Fn(Side, bool) + Send + Sync>;
+
+/// A stick pushed to `x`, `y` (each from -1 to 1) as [`Controls`] keeps
+/// it: the offsets from its centre in 12-bit units, as two `i16`, x low.
+fn pack_stick(x: f32, y: f32) -> u32 {
+    let units = |value: f32| {
+        (value.clamp(-1.0, 1.0) * f32::from(Identity::STICK_TRAVEL)).round() as i16 as u16
+    };
+    u32::from(units(x)) | u32::from(units(y)) << 16
+}
 
 impl Controls {
     /// Whether both Joy-Con are on their rails.
@@ -218,39 +259,64 @@ impl Controls {
         }
     }
 
-    /// Holds or lets go of `button`.
+    /// Holds or lets go of `button`. A button the host's gamepad holds
+    /// too ([`Controls::set_pad`]) stays held.
     pub fn press(&self, button: Button, held: bool) {
-        let before = match held {
-            true => self.buttons.fetch_or(button.0, Ordering::SeqCst),
-            false => self.buttons.fetch_and(!button.0, Ordering::SeqCst),
+        let (before, now) = match held {
+            true => {
+                let before = self.buttons.fetch_or(button.0, Ordering::SeqCst);
+                (before, before | button.0)
+            }
+            false => {
+                let before = self.buttons.fetch_and(!button.0, Ordering::SeqCst);
+                (before, before & !button.0)
+            }
         };
-        if (before & button.0 != 0) != held {
-            if held && button.0 & Button::HOME.0 != 0 && self.asleep(Side::Right) {
+        let pad = self.pad_buttons.load(Ordering::SeqCst);
+        self.held_changed(before | pad, now | pad);
+    }
+
+    /// What the host's gamepad does now, in place of what it did: the
+    /// buttons it holds are held with those [`Controls::press`] holds, and
+    /// it pushes each stick that [`Controls::set_stick`] leaves let go.
+    pub fn set_pad(&self, pad: Pad) {
+        for (stick, (x, y)) in self.pad_sticks.iter().zip(pad.sticks) {
+            stick.store(pack_stick(x, y), Ordering::SeqCst);
+        }
+        let before = self.pad_buttons.swap(pad.buttons, Ordering::SeqCst);
+        let others = self.buttons.load(Ordering::SeqCst);
+        self.held_changed(before | others, pad.buttons | others);
+    }
+
+    /// The buttons held went from `before` to `now`.
+    fn held_changed(&self, before: u32, now: u32) {
+        if before != now {
+            if now & !before & Button::HOME.0 != 0 && self.asleep(Side::Right) {
                 self.home_woke.store(true, Ordering::SeqCst);
             }
             self.drive_cts();
         }
     }
 
-    /// The buttons held, as a mask of [`Button`] bits.
+    /// The buttons held, by anyone, as a mask of [`Button`] bits.
     pub fn held(&self) -> u32 {
-        self.buttons.load(Ordering::SeqCst)
+        self.buttons.load(Ordering::SeqCst) | self.pad_buttons.load(Ordering::SeqCst)
     }
 
     /// Pushes `stick` to `x`, `y`, each from -1 to 1 (right and up
     /// positive; 0, 0 lets go), as a fraction of the travel the stick's
     /// calibration data gives ([`Identity::STICK_TRAVEL`]).
     pub fn set_stick(&self, stick: Stick, x: f32, y: f32) {
-        let units = |value: f32| {
-            (value.clamp(-1.0, 1.0) * f32::from(Identity::STICK_TRAVEL)).round() as i16 as u16
-        };
-        let packed = u32::from(units(x)) | u32::from(units(y)) << 16;
-        self.sticks[stick as usize].store(packed, Ordering::SeqCst);
+        self.sticks[stick as usize].store(pack_stick(x, y), Ordering::SeqCst);
     }
 
     /// The 12-bit raw position of `stick` as a report carries it.
     fn stick_raw(&self, stick: Stick) -> [u16; 2] {
-        let packed = self.sticks[stick as usize].load(Ordering::SeqCst);
+        // A stick let go here is the host gamepad's to push.
+        let packed = match self.sticks[stick as usize].load(Ordering::SeqCst) {
+            0 => self.pad_sticks[stick as usize].load(Ordering::SeqCst),
+            pushed => pushed,
+        };
         let axis = |offset: u16| {
             (i32::from(Identity::STICK_CENTER) + i32::from(offset as i16)).clamp(0, 0xFFF) as u16
         };
@@ -311,12 +377,15 @@ impl Controls {
 /// tag on the reader, with what has been written to it, so that a restored
 /// console has them where the saved one had them. The detect and CTS pins
 /// they drive are GPIO inputs, which the GPIO saves, so a restore drives
-/// nothing.
+/// nothing. What the host's gamepad holds is not saved: a restored
+/// machine has no gamepad until one says what it holds, and a hold saved
+/// for it would be nobody's to let go of.
 impl Snapshot for Controls {
     fn save(&self) -> Result<Vec<u8>, SnapshotError> {
         let asleep = [Side::Left, Side::Right, Side::Pro].map(|side| self.asleep(side));
         let woke = self.home_woke.load(Ordering::SeqCst);
-        encode(&(self.seated(), self.held(), asleep, woke, &*self.tag()))
+        let held = self.buttons.load(Ordering::SeqCst);
+        encode(&(self.seated(), held, asleep, woke, &*self.tag()))
     }
 
     fn restore(&self, state: &[u8]) -> Result<(), SnapshotError> {
@@ -780,7 +849,7 @@ impl JoyCon {
     pub(super) fn report(&mut self, output: &[u8]) -> Result<Vec<u8>, ()> {
         let side = self.side.index();
         let own = [LEFT_BUTTONS, RIGHT_BUTTONS, PRO_BUTTONS][side];
-        let buttons = self.controls.buttons.load(Ordering::SeqCst) & own;
+        let buttons = self.controls.held() & own;
         // Each Joy-Con reports its own stick; the other side's is not there.
         let left = pack12(&self.controls.stick_raw(Stick::Left));
         let right = pack12(&self.controls.stick_raw(Stick::Right));
@@ -1239,6 +1308,50 @@ mod tests {
             assert_eq!(report[stick..stick + 3], [0x00, 0x08, 0x80]);
             assert_eq!(report[15 - stick..18 - stick], [0, 0, 0]);
         }
+    }
+
+    #[test]
+    fn the_host_gamepad_holds_with_the_keys_and_pushes_sticks_let_go() {
+        let (mut rail, controls) = connected(Side::Right);
+        let buttons = |rail: &mut Rail| {
+            let report = send(rail, &STATUS).split_off(12);
+            u32::from_le_bytes([report[3], report[4], report[5], 0])
+        };
+        controls.press(Button::A, true);
+        controls.set_pad(Pad {
+            buttons: Button::A.0 | Button::B.0,
+            sticks: [(0.0, 0.0), (1.0, -0.5)],
+        });
+        assert_eq!(buttons(&mut rail), Button::A.0 | Button::B.0);
+        let travel = i32::from(Identity::STICK_TRAVEL);
+        let centre = i32::from(Identity::STICK_CENTER);
+        let pushed = [(centre + travel) as u16, (centre - travel / 2) as u16];
+        assert_eq!(controls.stick_raw(Stick::Right), pushed);
+        // Either letting go of A leaves the other's hold on it.
+        controls.press(Button::A, false);
+        assert_eq!(buttons(&mut rail), Button::A.0 | Button::B.0);
+        controls.press(Button::A, true);
+        controls.set_pad(Pad {
+            buttons: 0,
+            sticks: [(0.0, 0.0), (1.0, -0.5)],
+        });
+        assert_eq!(buttons(&mut rail), Button::A.0);
+        // A stick pushed by a key is the key's; let go, the gamepad's.
+        controls.set_stick(Stick::Right, 0.0, 1.0);
+        assert_eq!(
+            controls.stick_raw(Stick::Right),
+            [centre as u16, (centre + travel) as u16]
+        );
+        controls.set_stick(Stick::Right, 0.0, 0.0);
+        assert_eq!(controls.stick_raw(Stick::Right), pushed);
+        // The gamepad's hold is not a snapshot's.
+        controls.set_pad(Pad {
+            buttons: Button::X.0,
+            ..Pad::default()
+        });
+        let restored = Controls::default();
+        restored.restore(&controls.save().unwrap()).unwrap();
+        assert_eq!(restored.held(), Button::A.0);
     }
 
     fn subcommand(rail: &mut Rail, subcommand: u8, arguments: &[u8]) -> Result<Vec<u8>, String> {

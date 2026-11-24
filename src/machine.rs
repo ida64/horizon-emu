@@ -999,6 +999,13 @@ impl Machine {
         self.soc.joycons.set_stick(stick, x, y);
     }
 
+    /// What a gamepad of the host does to the Joy-Con now, beside the
+    /// buttons and sticks held through [`Machine::press`] and
+    /// [`Machine::set_stick`]; see [`crate::soc::joycon::Controls::set_pad`].
+    pub fn set_pad(&self, pad: crate::soc::joycon::Pad) {
+        self.soc.joycons.set_pad(pad);
+    }
+
     /// Holds an NFC tag over the right Joy-Con's reader, or takes it away.
     pub fn place_tag(&self, tag: Option<crate::soc::ntag::Ntag215>) {
         self.soc.joycons.place_tag(tag);

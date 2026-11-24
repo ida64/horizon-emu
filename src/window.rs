@@ -8,7 +8,10 @@
 //! The keyboard is the pair of Joy-Con: [`RAILS_KEY`] slides them onto the
 //! rails or off, [`KEYS`] are their buttons and [`STICK_KEYS`] push their
 //! sticks (WASD the left one, IJKL the right one, all the way).
-//! [`POWER_KEY`] is the console's power button.
+//! [`POWER_KEY`] is the console's power button. A gamepad of the host (the
+//! user's own Joy-Con, a Pro Controller, another pad: see
+//! [`horizon_emu::host_pad`]) holds the Joy-Con's buttons and pushes their
+//! sticks too, beside the keys, while the program is the one in front.
 //!
 //! AppKit only lets a process's first thread own windows, so the window
 //! belongs to the thread that called `main` and the machine runs on others.
@@ -17,13 +20,16 @@ use std::{collections::VecDeque, sync::Mutex};
 
 use font8x8::legacy::BASIC_LEGACY;
 use horizon_emu::{
+    host_pad::HostPads,
     machine::Machine,
     soc::{
         dc::NoFrame,
-        joycon::{Button, Stick},
+        joycon::{Button, Pad, Stick},
     },
 };
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
+use objc2::MainThreadMarker;
+use objc2_app_kit::NSApplication;
 
 const TITLE: &str = "horizon-emu";
 /// Size of the console's screen, used until the machine has a picture.
@@ -147,10 +153,15 @@ pub struct ScreenWindow {
     power_held: bool,
     /// Where the keys last pushed each stick, as the machine was told.
     sticks: [(i8, i8); 2],
+    /// The host's gamepads, unless they are left alone, and what they
+    /// last did, as the machine was told.
+    pads: Option<HostPads>,
+    pad: Pad,
 }
 
 impl ScreenWindow {
-    pub fn open() -> Result<Self, String> {
+    /// `pads` is what reads the host's gamepads, if they are to play.
+    pub fn open(pads: Option<HostPads>) -> Result<Self, String> {
         let options = WindowOptions {
             resize: true,
             scale_mode: ScaleMode::AspectRatioStretch,
@@ -169,6 +180,8 @@ impl ScreenWindow {
             held: [false; KEYS.len()],
             power_held: false,
             sticks: [(0, 0); 2],
+            pads,
+            pad: Pad::default(),
         })
     }
 
@@ -245,6 +258,20 @@ impl ScreenWindow {
             if now != *last {
                 machine.set_stick(stick, f32::from(now.0), f32::from(now.1));
                 *last = now;
+            }
+        }
+        if let Some(pads) = &mut self.pads {
+            // As with the keys, the program in front is the one played.
+            // The window belongs to the main thread, which this is.
+            let front = MainThreadMarker::new()
+                .is_some_and(|main| NSApplication::sharedApplication(main).isActive());
+            let pad = pads.poll(front, |line| {
+                eprintln!("{line}");
+                log.push(&line);
+            });
+            if pad != self.pad {
+                machine.set_pad(pad);
+                self.pad = pad;
             }
         }
         true

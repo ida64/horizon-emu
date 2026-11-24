@@ -20,7 +20,8 @@
 //!   firmware from Nintendo as the console it is for, and [`sdcard`] makes
 //!   the image of a microSD card with files on it; [`homebrew`] runs
 //!   programs Nintendo did not sign on it.
-//! * [`machine`] ties these into a console and executes it.
+//! * [`machine`] ties these into a console and executes it; [`host_pad`]
+//!   reads a gamepad of the host for its Joy-Con.
 //! * [`symbols`] and [`svc`] name things for traces, [`ipc`] decodes the
 //!   messages processes send each other, and [`log_manager`] the log
 //!   packets they send the log manager.
@@ -39,6 +40,7 @@ pub mod clock;
 pub mod falcon;
 pub mod gic;
 pub mod homebrew;
+pub mod host_pad;
 pub mod hvf;
 pub mod image;
 pub mod ipc;
