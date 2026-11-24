@@ -220,6 +220,17 @@ impl Batch {
             self.elements = run.elements();
         }
     }
+
+    /// The batch with the elements of its `run` listed, if it is one.
+    fn listed(&self) -> Option<Batch> {
+        self.run.as_ref().map(|run| Batch {
+            topology: self.topology,
+            instance: self.instance,
+            base_instance: self.base_instance,
+            elements: run.elements(),
+            run: None,
+        })
+    }
 }
 
 /// A [`Batch`] as machine snapshots hold it: its elements listed.
@@ -1164,16 +1175,6 @@ fn clip_polygon(polygon: Vec<ClipVertex>, plane: ClipPlane) -> Vec<ClipVertex> {
 pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result<(), Unmodeled> {
     let r = context.registers;
     check_unmodeled_state(r)?;
-    // The elements listed, for the stages that take them one by one.
-    let listed;
-    let batch = if batch.run.is_some() {
-        let mut batch = batch.clone();
-        batch.settle();
-        listed = batch;
-        &listed
-    } else {
-        batch
-    };
     let vertex = program(context, caches, VERTEX_PIPELINE)?.ok_or_else(|| {
         refuse(
             "draw without a vertex shader",
@@ -1207,7 +1208,7 @@ pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result
     // it to matter and Metal can run it (see `native`).
     if let (Some(metal), Some(pixel), None) = (context.metal, &pixel, &geometry)
         && r.get(SET_RASTER_ENABLE) & 1 != 0
-        && batch.elements.len() >= NATIVE_MINIMUM
+        && batch.len() >= NATIVE_MINIMUM
     {
         let fragments = fragments(context, pixel)?;
         if native(
@@ -1216,6 +1217,15 @@ pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result
             return Ok(());
         }
     }
+    // The elements listed, for the stages that take them one by one.
+    let listed;
+    let batch = match batch.listed() {
+        Some(batch) => {
+            listed = batch;
+            &listed
+        }
+        None => batch,
+    };
 
     // Vertex shading, once per distinct vertex of the batch.
     let vertex_buffers = constant_buffers(context, VERTEX_PIPELINE, &vertex)?;
@@ -1282,6 +1292,100 @@ pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result
 /// do not\].
 const NATIVE_MINIMUM: usize = 7;
 
+/// Buffers the vertex streams of native draws are read into, kept from
+/// draw to draw by the thread drawing (a chunk mesh's stream is megabytes:
+/// allocated afresh, each takes its pages from the system and gives them
+/// back).
+const STREAM_BUFFERS_KEPT: usize = 2 * super::shader::msl::MAX_STREAMS;
+
+thread_local! {
+    static STREAM_BUFFERS: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// What [`indexed_geometry`] gives: how Metal's vertex ID names a vertex,
+/// the triangles' Metal indices, and the least and greatest fetch index.
+type IndexedGeometry<'a> = (
+    super::metal::NativeVertices,
+    super::metal::NativeIndices<'a>,
+    u32,
+    u32,
+);
+
+/// The vertices and triangles of a native draw of `run` as `topology`,
+/// straight from the index buffer's bytes: Metal draws with the guest's
+/// indices (its vertex ID is an index, to which the vertex function adds
+/// the run's bases), so nothing is listed per element. With `rotate` each
+/// triangle's last vertex comes first (the provoking vertex of a draw
+/// with flat inputs whose provoking vertex is the last). `None` where the
+/// elements are listed instead: a topology other than triangles,
+/// primitive restart, one-byte indices (Metal has none), or a fetch index
+/// past 2^32.
+fn indexed_geometry(topology: Topology, run: &IndexRun, rotate: bool) -> Option<IndexedGeometry<'_>> {
+    use super::metal::{NativeIndices, NativeVertices};
+    if !matches!(topology, Topology::Triangles) || run.restart.is_some() {
+        return None;
+    }
+    // The least and greatest index (16-bit ones in their own width, which
+    // the compiler vectorizes).
+    let (low, high) = match run.size {
+        2 => {
+            let (low, high) = run
+                .bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&v| u16::from_le_bytes(v))
+                .fold((u16::MAX, 0), |(low, high), v| (low.min(v), high.max(v)));
+            if low > high {
+                (u32::MAX, 0)
+            } else {
+                (u32::from(low), u32::from(high))
+            }
+        }
+        4 => run
+            .bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&v| u32::from_le_bytes(v))
+            .fold((u32::MAX, 0), |(low, high), v| (low.min(v), high.max(v))),
+        _ => return None,
+    };
+    let (low, high) = if low > high {
+        (low, high)
+    } else {
+        (
+            low.checked_add(run.base_vertex)?,
+            high.checked_add(run.base_vertex)?,
+        )
+    };
+    let size = run.size as usize;
+    // Whole triangles.
+    let bytes = &run.bytes[..run.len() / 3 * 3 * size];
+    let bytes = if rotate {
+        let mut rotated = Vec::with_capacity(bytes.len());
+        for triangle in bytes.chunks_exact(3 * size) {
+            rotated.extend_from_slice(&triangle[2 * size..]);
+            rotated.extend_from_slice(&triangle[..2 * size]);
+        }
+        std::borrow::Cow::Owned(rotated)
+    } else {
+        std::borrow::Cow::Borrowed(bytes)
+    };
+    Some((
+        NativeVertices::Indexed {
+            base_vertex: run.base_vertex,
+            id_base: run.id_base,
+        },
+        NativeIndices::Buffer {
+            bytes,
+            wide: size == 4,
+        },
+        low,
+        high,
+    ))
+}
+
 /// A draw with its vertex stage on the host GPU (`metal::Geometry::Native`):
 /// the vertex program translated to a vertex function that fetches the
 /// attributes itself, Metal's clipping and rasterization, the pixel
@@ -1304,15 +1408,71 @@ fn native(
     batch: &Batch,
     fragments: &Fragments,
 ) -> Result<bool, Unmodeled> {
-    use super::metal::{Geometry, NativeDraw, NativeStream};
+    use super::metal::{Geometry, NativeDraw, NativeIndices, NativeStream, NativeVertices};
     use super::shader::msl::{Fetch, MAX_STREAMS};
     let r = context.registers;
     let fall_back = |reason: &str| {
         metal.note_cpu_vertices(reason);
         Ok(false)
     };
-    let Primitives::Triangles(list) = assemble(batch.topology, &batch.elements) else {
-        return fall_back("points or lines");
+    // The batch's vertices and triangles for Metal: from the index
+    // buffer's bytes where the batch is a run of them drawn as triangles
+    // (`indexed_geometry`), else from its elements, listed: (fetch index,
+    // vertex ID) by batch position, and the triangles by batch position
+    // with the provoking vertex first (Metal's flat inputs take the first
+    // vertex's), the winding kept. With them, the least and greatest
+    // fetch index.
+    let provoking_last = r.get(SET_PROVOKING_VERTEX) & 1 != 0;
+    let flat = fragments
+        .varyings
+        .iter()
+        .any(|(_, mode)| matches!(mode, Interpolation::Flat));
+    let listed;
+    let indexed = batch
+        .run
+        .as_ref()
+        .and_then(|run| indexed_geometry(batch.topology, run, provoking_last && flat));
+    let (vertices, indices, low, high) = match indexed {
+        Some(geometry) => geometry,
+        None => {
+            let batch = match batch.listed() {
+                Some(batch) => {
+                    listed = batch;
+                    &listed
+                }
+                None => batch,
+            };
+            let Primitives::Triangles(list) = assemble(batch.topology, &batch.elements) else {
+                return fall_back("points or lines");
+            };
+            let (mut low, mut high) = (u32::MAX, 0);
+            let mut elements = Vec::with_capacity(2 * batch.elements.len());
+            for element in &batch.elements {
+                match *element {
+                    Element::Vertex { fetch, id } => {
+                        low = low.min(fetch);
+                        high = high.max(fetch);
+                        elements.extend([fetch, id]);
+                    }
+                    Element::Restart => elements.extend([0, 0]),
+                }
+            }
+            let indices: Vec<u32> = list
+                .iter()
+                .flat_map(
+                    |&[a, b, c]| {
+                        if provoking_last { [c, a, b] } else { [a, b, c] }
+                    },
+                )
+                .map(|i| i as u32)
+                .collect();
+            (
+                NativeVertices::Listed(elements),
+                NativeIndices::Positions(indices),
+                low,
+                high,
+            )
+        }
     };
     // Culling and facing, as `setup_triangles` decides them.
     let cull = if r.enabled(OGL_SET_CULL) {
@@ -1374,13 +1534,6 @@ fn native(
     if slots.len() > MAX_STREAMS {
         return fall_back("more vertex streams than bindings");
     }
-    let (mut low, mut high) = (u32::MAX, 0);
-    for element in &batch.elements {
-        if let Element::Vertex { fetch, .. } = *element {
-            low = low.min(fetch);
-            high = high.max(fetch);
-        }
-    }
     if low > high {
         return Ok(true);
     }
@@ -1409,7 +1562,17 @@ fn native(
         if stop == start || stop - 1 > stream.limit {
             return fall_back("vertex fetch beyond the stream limit");
         }
-        let mut bytes = vec![0; (stop - start) as usize];
+        // In a buffer of an earlier draw, if one is kept: its length is
+        // set without clearing what the read replaces.
+        let length = (stop - start) as usize;
+        let mut bytes = STREAM_BUFFERS
+            .with(|kept| kept.borrow_mut().pop())
+            .unwrap_or_default();
+        if bytes.len() < length {
+            bytes.resize(length, 0);
+        } else {
+            bytes.truncate(length);
+        }
         if context.memory.read(start, &mut bytes).is_none() {
             return fall_back("vertex fetch from unmapped memory");
         }
@@ -1429,27 +1592,6 @@ fn native(
             slot: slots.iter().position(|&s| s == stream).expect("listed") as u32,
         })
         .collect();
-    // Elements (fetch index, vertex ID) by batch position, and the
-    // triangles by batch position with the provoking vertex first (Metal's
-    // flat inputs take the first vertex's), the winding kept.
-    let elements: Vec<u32> = batch
-        .elements
-        .iter()
-        .flat_map(|element| match *element {
-            Element::Vertex { fetch, id } => [fetch, id],
-            Element::Restart => [0, 0],
-        })
-        .collect();
-    let provoking_last = r.get(SET_PROVOKING_VERTEX) & 1 != 0;
-    let indices: Vec<u32> = list
-        .iter()
-        .flat_map(
-            |&[a, b, c]| {
-                if provoking_last { [c, a, b] } else { [a, b, c] }
-            },
-        )
-        .map(|i| i as u32)
-        .collect();
     let depth_bias = depth
         .as_ref()
         .and_then(|(_, d)| depth_bias_parameters(r, batch.topology, d.format))
@@ -1465,7 +1607,7 @@ fn native(
         inactive: fetch.inactive,
         fetches,
         streams,
-        elements,
+        vertices,
         indices,
         view: [
             clip.scale[0],
@@ -1502,7 +1644,16 @@ fn native(
         depth: *depth,
         multisample: *multisample,
     };
-    metal.draw(context.memory, context.writes, &draw)
+    let drawn = metal.draw(context.memory, context.writes, &draw);
+    STREAM_BUFFERS.with(|kept| {
+        let mut kept = kept.borrow_mut();
+        for stream in native.streams {
+            if kept.len() < STREAM_BUFFERS_KEPT {
+                kept.push(stream.bytes);
+            }
+        }
+    });
+    drawn
 }
 
 /// The geometry shader stage: one thread per input primitive of the

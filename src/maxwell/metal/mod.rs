@@ -125,6 +125,22 @@
 //! values are those of whole pixels while coverage, depth, stencil and
 //! blending are per sample. Write-back and loading interleave the layers'
 //! pixels into the texels holding them and back.
+//!
+//! A draw is issued once per layer. Rendering into a Metal multisample
+//! texture with the guest's sample positions
+//! (`MTLRenderPassDescriptor::setSamplePositions`) would issue it once
+//! and run the vertex stage and the rasterizer once; that is not done.
+//! \[measurement, Minecraft in-world (2X1_D3D targets) on an M5, `sample`
+//! of the channel's thread: with the frame committed pass by pass, the
+//! thread waits for the GPU at the frame's last signal only, 0.9 ms a
+//! frame at 47 fps on a loaded host and 2.7 ms at the guest's 60 fps,
+//! where it is idle half of the time; the draw calls of both layers
+//! together are about 1% of its samples (61 of 5165). A multisample
+//! texture takes no `replaceRegion`, `getBytes` or write from a compute
+//! kernel (RECALLED from Apple's `MTLTexture` documentation, not tried
+//! here), so loading, the packing kernel ([`State::pack`]) and the blit
+//! kernel ([`blit`]) would each need a second form, and both fragment
+//! generators a per-sample one.\]
 pub mod blit;
 mod format;
 
@@ -308,21 +324,13 @@ const RESIDENT_BUDGET: usize = 512 << 20;
 /// Draws and clears one render pass takes before it is ended and
 /// committed, to be continued in another with the same attachments: the
 /// GPU starts on a pass only once it is committed, so a frame drawn in
-/// one long pass would leave it idle until the frame is recorded
-/// \[assumption: a pass boundary costs the GPU a store and a load of the
-/// attachments, a fraction of a millisecond at 720p; tuned on Minecraft's
-/// world pass\].
+/// one long pass would leave it idle until the frame is recorded, while
+/// each pass boundary costs it a store and a load of the attachments.
+/// \[measurement, Minecraft in-world at the guest's 60 fps on an M5,
+/// share of the channel's thread spent waiting for the GPU in `sample`
+/// runs of 8 s: 52% at 16 draws a pass, 33-37% at 32, 29-32% at 64 (three
+/// runs), 28-44% at 128, 42-55% at 256, 45% with passes never split\]
 const PASS_DRAWS: u32 = 64;
-
-fn pass_draws_limit() -> u32 {
-    static LIMIT: LazyLock<u32> = LazyLock::new(|| {
-        std::env::var("HEMU_PASS_DRAWS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(PASS_DRAWS)
-    });
-    *LIMIT
-}
 
 /// The renderer's host objects. Every cache is bounded: by
 /// least-recent use (`maxwell::lru`) for libraries, pipelines and
@@ -464,10 +472,11 @@ pub struct NativeDraw<'a> {
     pub fetches: Vec<msl::Fetch>,
     /// By stream slot.
     pub streams: Vec<NativeStream>,
-    /// (fetch index, vertex ID) per batch position.
-    pub elements: Vec<u32>,
-    /// Triangles by batch position, the provoking vertex first.
-    pub indices: Vec<u32>,
+    /// How Metal's vertex ID names a vertex.
+    pub vertices: NativeVertices,
+    /// The triangles' vertices as Metal's indices, the provoking vertex
+    /// first.
+    pub indices: NativeIndices<'a>,
     /// The viewport words of `msl::NativeVertex::new` (without the layer).
     pub view: [f32; 9],
     /// The instance ID and the instance per-instance streams step by.
@@ -483,6 +492,24 @@ pub struct NativeDraw<'a> {
     pub depth_clip: bool,
     /// The polygon offset words of `native_depth_bias` (MSL prelude).
     pub depth_bias: [f32; 4],
+}
+
+/// How Metal's vertex ID gives a vertex's fetch index and vertex ID.
+pub enum NativeVertices {
+    /// It is the batch position: (fetch index, vertex ID) pairs by it.
+    Listed(Vec<u32>),
+    /// It is an index of the guest's index buffer: the fetch index is it
+    /// plus `base_vertex`, the vertex ID it plus `id_base` (modulo 2^32).
+    Indexed { base_vertex: u32, id_base: u32 },
+}
+
+/// The Metal indices of a native draw's triangles.
+pub enum NativeIndices<'a> {
+    /// Batch positions.
+    Positions(Vec<u32>),
+    /// Indices of the guest's index buffer as it holds them: two bytes
+    /// each, or four (`wide`), little-endian.
+    Buffer { bytes: Cow<'a, [u8]>, wide: bool },
 }
 
 /// A vertex stream's bytes from its first fetched element on.
@@ -1313,11 +1340,22 @@ impl Renderer {
                     )?;
                 }
                 Some((native, _, vertex_constants, vertex_sizes)) => {
+                    let bases;
+                    let elements = match &native.vertices {
+                        NativeVertices::Listed(elements) => &elements[..],
+                        NativeVertices::Indexed {
+                            base_vertex,
+                            id_base,
+                        } => {
+                            bases = [*base_vertex, *id_base];
+                            &bases[..]
+                        }
+                    };
                     bind(
                         &mut state.arena,
                         &encoder,
                         Stage::Vertex,
-                        bytes_of_u32(&native.elements),
+                        bytes_of_u32(elements),
                         0,
                     )?;
                     for (slot, data) in vertex_constants.iter().enumerate() {
@@ -1332,10 +1370,18 @@ impl Renderer {
                         bytes_of_u32(vertex_sizes),
                         20,
                     )?;
-                    let mut words = vec![native.instance, native.fetch_instance];
-                    for stream in &native.streams {
-                        words.extend([stream.first, stream.stride, stream.divisor]);
+                    let mut words = vec![0; msl::INDEXED_WORD + 1];
+                    words[0] = native.instance;
+                    words[1] = native.fetch_instance;
+                    for (slot, stream) in native.streams.iter().enumerate() {
+                        words[2 + 3 * slot..][..3].copy_from_slice(&[
+                            stream.first,
+                            stream.stride,
+                            stream.divisor,
+                        ]);
                     }
+                    words[msl::INDEXED_WORD] =
+                        u32::from(matches!(native.vertices, NativeVertices::Indexed { .. }));
                     bind(
                         &mut state.arena,
                         &encoder,
@@ -1454,14 +1500,26 @@ impl Renderer {
                 )?;
             }
             let index_buffer = match &vertex {
-                Some((native, ..)) => Some(state.arena.alloc(bytes_of_u32(&native.indices))?),
+                Some((native, ..)) => Some(match &native.indices {
+                    NativeIndices::Positions(positions) => (
+                        state.arena.alloc(bytes_of_u32(positions))?,
+                        positions.len(),
+                        MTLIndexType::UInt32,
+                    ),
+                    NativeIndices::Buffer { bytes, wide: true } => {
+                        (state.arena.alloc(bytes)?, bytes.len() / 4, MTLIndexType::UInt32)
+                    }
+                    NativeIndices::Buffer { bytes, wide: false } => {
+                        (state.arena.alloc(bytes)?, bytes.len() / 2, MTLIndexType::UInt16)
+                    }
+                }),
                 None => None,
             };
             // One draw per sample of multisampled targets, each into its
             // layer (see `Translated::source`).
             for layer in 0..samples.count() as u32 {
                 match (&vertex, &index_buffer) {
-                    (Some((native, ..)), Some((indices, offset))) => {
+                    (Some((native, ..)), Some(((indices, offset), count, index_type))) => {
                         // Metal samples each pixel at its center: shifted so
                         // that it lands on the layer's sample.
                         let [dx, dy] = if samples.is_single() {
@@ -1485,8 +1543,8 @@ impl Renderer {
                         encoder
                             .drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset(
                                 MTLPrimitiveType::Triangle,
-                                native.indices.len(),
-                                MTLIndexType::UInt32,
+                                *count,
+                                *index_type,
                                 indices,
                                 *offset,
                             );
@@ -1962,7 +2020,8 @@ impl Renderer {
         if !unchecked.is_empty() {
             self.residents(memory, writes, &unchecked, [0, 0], false)?;
         }
-        let from_memory = |composite: &Composite| {
+        // Whether a composite's levels come from where they do now.
+        let same_sources = |composite: &Composite| {
             composite
                 .levels
                 .iter()
@@ -1979,7 +2038,7 @@ impl Renderer {
             // unchanged.
             let ready = state.composites.get_mut(&tic.words).is_some_and(|composite| {
                 composite.used = now;
-                from_memory(composite)
+                same_sources(composite)
                     && composite.levels.iter().all(|level| {
                         level.resident.is_some()
                             || writes.unchanged(
@@ -2020,7 +2079,7 @@ impl Renderer {
         let stamp = writes.stamp();
         let mut state = self.state.lock().unwrap();
         let unchanged = state.composites.get(&tic.words).is_some_and(|composite| {
-            from_memory(composite)
+            same_sources(composite)
                 && memory_levels().all(|range| composite.raw[range.clone()] == raw[range])
         });
         if unchanged {
@@ -2494,7 +2553,7 @@ impl State {
         if let Some(frame) = &self.frame
             && let Some((encoder, attachments)) = &frame.pass
             && *attachments == wanted
-            && self.pass_draws < pass_draws_limit()
+            && self.pass_draws < PASS_DRAWS
         {
             self.pass_draws += 1;
             return Ok(encoder.clone());

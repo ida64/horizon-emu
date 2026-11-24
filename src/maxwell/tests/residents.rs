@@ -1,6 +1,7 @@
 //! Render targets the Metal renderer keeps on the host GPU (`metal`):
 //! a texture sampled from the targets that are its levels, and depth
-//! buffers held on demand, against the software renderer.
+//! buffers held on demand, against the software renderer; and draws
+//! taken from the index buffer's bytes against the same vertices listed.
 
 use super::super::Engines;
 use super::super::RendererKind::{self, Metal, Software};
@@ -370,4 +371,114 @@ fn depth_held_on_demand_is_dropped_when_its_memory_is_reused() {
     metal.channel.settle(&metal.ram).unwrap();
     assert!(metal.ram.bytes(DEPTH, DEPTH_BYTES) == reused);
     assert!(copy_depth(&mut metal) == expected);
+}
+
+/// A mesh of 8x8 quads over the target (each corner at its own depth
+/// value, unused: no depth buffer) drawn by `kind` with the firmware's
+/// solid ui2d shaders: from the index buffer with indices of `size`
+/// bytes over 256 vertices that follow `base` others in the stream
+/// (`SET_GLOBAL_BASE_VERTEX_INDEX`), with primitive restart enabled if
+/// `restart` (no index is the restart index); or, with `size` 0, as the
+/// same triangles' vertices in order. The target.
+fn mesh_frame(kind: RendererKind, size: u32, base: u32, restart: bool) -> Vec<u8> {
+    let elf = std::fs::read(STARTER).expect("starter ELF (fw_elf) must be present");
+    let mut frame = Frame::sized_with(SIZE, SIZE, kind);
+    frame.program(1, 0, starter_program(&elf, 0x4c0e00));
+    frame.program(5, 0x800, starter_program(&elf, 0x4be400));
+    frame.constants(0, 3, 0x30_0000, &ui2d_vertex_constants(&[]));
+    frame.constants(4, 3, 0x30_1000, &floats(&[1.0, 0.25, 0.0, 1.0]));
+    let mut corners: Vec<[f32; 3]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    for qy in 0..8u32 {
+        for qx in 0..8u32 {
+            let (x0, y0) = (qx as f32 / 4.0 - 1.0, qy as f32 / 4.0 - 1.0);
+            let (x1, y1) = (x0 + 0.25, y0 + 0.25);
+            let first = corners.len() as u32;
+            corners.extend([[x0, y0, 0.1], [x1, y0, 0.2], [x1, y1, 0.3], [x0, y1, 0.4]]);
+            // Every other quad wound the other way, and left out of some.
+            let order: [u32; 6] = if (qx + qy) % 2 == 0 {
+                [0, 1, 2, 0, 2, 3]
+            } else {
+                [0, 2, 1, 0, 3, 2]
+            };
+            if (qx + 2 * qy) % 5 != 0 {
+                indices.extend(order.map(|i| first + i));
+            }
+        }
+    }
+    frame.method(0x1618, 4); // BEGIN TRIANGLES
+    if size == 0 {
+        let vertices: Vec<f32> = indices
+            .iter()
+            .flat_map(|&i| corners[i as usize])
+            .collect();
+        frame.vertices(0x40_0000, 12, &vertices, &[(0, 0x02)]);
+        frame.method(0x0d74, 0);
+        frame.method(0x0d78, indices.len() as u32);
+    } else {
+        let vertices: Vec<f32> = std::iter::repeat_n([9.0, 9.0, 9.0], base as usize)
+            .chain(corners.iter().copied())
+            .flatten()
+            .collect();
+        frame.vertices(0x40_0000, 12, &vertices, &[(0, 0x02)]);
+        // The run starts at the buffer's third index.
+        let bytes: Vec<u8> = [0xdead, 0xbeef]
+            .iter()
+            .chain(&indices)
+            .flat_map(|i| i.to_le_bytes()[..size as usize].to_vec())
+            .collect();
+        const INDICES: u64 = 0x48_0000;
+        frame.ram.put(INDICES, &bytes);
+        for (offset, value) in [
+            (0x17c8, 0),
+            (0x17cc, INDICES as u32),
+            (0x17d0, 0),
+            (0x17d4, INDICES as u32 + bytes.len() as u32 - 1),
+            (0x17d8, size.trailing_zeros()),
+            (0x17dc, 2),
+            (0x1434, base),
+            (0x1644, u32::from(restart)),
+            (0x1648, 0xffff_ffff),
+            (0x17e0, indices.len() as u32),
+        ] {
+            frame.method(offset, value);
+        }
+    }
+    frame.method(0x1614, 0);
+    frame.channel.flush(&frame.ram).unwrap();
+    if let Some(metal) = &frame.channel.hooks.metal {
+        assert_eq!(metal.fallbacks(), (1, vec![]), "Metal drew the mesh");
+        assert_eq!(metal.cpu_vertices(), vec![], "on the native path");
+    }
+    frame.ram.bytes(TARGET, (SIZE * SIZE * 4) as usize)
+}
+
+/// A native draw taken straight from the index buffer's bytes
+/// (`pipeline::indexed_geometry`: 16- and 32-bit indices, with a base
+/// vertex) covers what the draw of the same triangles' vertices listed in
+/// order does, bit for bit; so does one whose elements are listed from
+/// the run (primitive restart enabled). The software renderer agrees with
+/// itself likewise.
+#[test]
+fn indexed_draws_match_listed_ones() {
+    for kind in [Software, Metal] {
+        let listed = mesh_frame(kind, 0, 0, false);
+        assert!(
+            listed.chunks(4).filter(|p| p[0] == 255).count() > 1500,
+            "{kind:?}: the mesh was drawn"
+        );
+        for (size, base, restart) in [
+            (2, 0, false),
+            (2, 5, false),
+            (4, 0, false),
+            (4, 3, false),
+            (2, 0, true),
+            (2, 7, true),
+        ] {
+            assert!(
+                mesh_frame(kind, size, base, restart) == listed,
+                "{kind:?}: {size}-byte indices, base {base}, restart {restart}"
+            );
+        }
+    }
 }

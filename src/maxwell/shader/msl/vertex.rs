@@ -213,6 +213,9 @@ pub struct NativeVertex {
 /// [`STREAM_BUFFER`].
 pub const MAX_STREAMS: usize = 8;
 pub const STREAM_BUFFER: usize = 21;
+/// The word of the draw's words (buffer 29) that says what buffer 0
+/// holds, after the words of [`MAX_STREAMS`] streams.
+pub const INDEXED_WORD: usize = 2 + 3 * MAX_STREAMS;
 
 impl NativeVertex {
     /// The vertex function `vertex_native` of `vertex` for a draw that
@@ -224,7 +227,12 @@ impl NativeVertex {
     /// word]` (buffer 30), for tests.
     ///
     /// Bindings: buffer 0 the draw's elements as (fetch index, vertex ID)
-    /// pairs, indexed by Metal's vertex ID; buffer 1 the viewport as ten
+    /// pairs, indexed by Metal's vertex ID, or, for a draw whose Metal
+    /// vertex IDs are the guest's index buffer values (word
+    /// [`INDEXED_WORD`] of buffer 29 not 0), what to add to one for the
+    /// fetch index and for the vertex ID (`SET_GLOBAL_BASE_VERTEX_INDEX`,
+    /// `SET_VERTEX_ID_BASE`; modulo 2^32 as `pipeline::indexed_element`);
+    /// buffer 1 the viewport as ten
     /// floats (scale x, y, z, offset x, y, z, 2 / target width, 2 / target
     /// height, 1 for clipping z to -w..w rather than 0..w, and the layer as
     /// a `uint`); `2 + slot` the vertex stage's constant buffers and 20
@@ -232,7 +240,8 @@ impl NativeVertex {
     /// words: the instance ID, the instance per-instance streams step by
     /// (with `SET_GLOBAL_BASE_INSTANCE_INDEX`), then per stream slot the
     /// first element of its uploaded range, its stride and its divisor (0:
-    /// per vertex); [`STREAM_BUFFER`] + slot the streams' bytes.
+    /// per vertex), and at [`INDEXED_WORD`] the elements' form;
+    /// [`STREAM_BUFFER`] + slot the streams' bytes.
     ///
     /// The position is mapped so Metal's viewport (the whole target) puts
     /// the vertex where the draw's viewport transform does: window x =
@@ -328,7 +337,7 @@ impl NativeVertex {
         }
         let _ = writeln!(
             s,
-            "    const uint fetch = elements[2u * vid]; const uint vertex_id = elements[2u * vid + 1u]; (void)fetch; (void)vertex_id;"
+            "    const bool indexed = draw[{INDEXED_WORD}u] != 0u;\n    const uint fetch = indexed ? vid + elements[0] : elements[2u * vid]; const uint vertex_id = indexed ? vid + elements[1] : elements[2u * vid + 1u]; (void)fetch; (void)vertex_id;"
         );
         // Inputs.
         let mut fetched = BTreeSet::new();

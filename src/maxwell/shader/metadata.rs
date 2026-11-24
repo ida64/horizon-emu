@@ -12,12 +12,25 @@ impl Program {
     /// [`Self::texture_handle_extent`], since their cbuf slot is an Env value.
     /// No read gives `Some(0)`. This is conservative across all control paths.
     pub fn constant_buffer_extent(&self, slot: usize) -> Option<usize> {
-        constant_buffer_extent(&self.code, slot)
+        match self.extents().0.get(slot) {
+            Some(extent) => *extent,
+            None => constant_buffer_extent(&self.code, slot),
+        }
     }
     /// Leading bytes required from Env's texture-handle buffer. Bindless
     /// instructions read handles from registers and do not contribute.
     pub fn texture_handle_extent(&self) -> usize {
-        texture_handle_extent(&self.code)
+        self.extents().1
+    }
+    /// Both extents, found once per program (a draw asks for every bound
+    /// slot's): per slot `LDC` can name, and of the texture handles.
+    fn extents(&self) -> &super::Extents {
+        self.extents.get_or_init(|| {
+            (
+                std::array::from_fn(|slot| constant_buffer_extent(&self.code, slot)),
+                texture_handle_extent(&self.code),
+            )
+        })
     }
 }
 /// [`Program::constant_buffer_extent`] of decoded code.

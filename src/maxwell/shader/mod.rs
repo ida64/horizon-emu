@@ -128,7 +128,14 @@ pub struct Program {
     /// One entry per 64-bit word after the header; scheduling words are
     /// stored as `None`.
     code: Vec<Option<exec::Inst>>,
+    /// [`Program::constant_buffer_extent`] of every slot and
+    /// [`Program::texture_handle_extent`], once asked for.
+    extents: std::sync::OnceLock<Extents>,
 }
+
+/// Constant buffer extents by slot (the 32 an `LDC` slot field names) and
+/// the texture handle extent.
+type Extents = ([Option<usize>; 32], usize);
 
 impl Program {
     /// `address`: GPU VA of the shader program header (SPH, 0x50 bytes);
@@ -157,6 +164,7 @@ impl Program {
                 return Ok(Program {
                     header,
                     code: builder.code,
+                    extents: Default::default(),
                 });
             }
         }
@@ -170,7 +178,11 @@ impl Program {
             .ok_or_else(|| Unmodeled("shader: shorter than a program header".into()))?;
         let header = Header::parse(sph)?;
         let code = Builder::from_bytes(&bytes[SPH_SIZE..], SPH_SIZE)?;
-        Ok(Program { header, code })
+        Ok(Program {
+            header,
+            code,
+            extents: Default::default(),
+        })
     }
 
     pub fn header(&self) -> &Header {

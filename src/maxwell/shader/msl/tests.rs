@@ -1138,7 +1138,9 @@ fn vertex_programs_match_the_interpreter() {
             .newComputePipelineStateWithFunction_error(&function)
             .expect("compute pipeline");
         let elements: Vec<u32> = (0..VERTICES as u32).flat_map(|v| [v, 3 * v + 1]).collect();
-        let draw = [instance, instance, 0, stride, 0];
+        // The elements are listed (`INDEXED_WORD` 0).
+        let mut draw = [0u32; super::vertex::INDEXED_WORD + 1];
+        draw[..5].copy_from_slice(&[instance, instance, 0, stride, 0]);
         let result = gpu.buffer(&vec![0u8; VERTICES * 256 * 4]);
         let command = gpu.queue.commandBuffer().expect("command buffer");
         let encoder = command.computeCommandEncoder().expect("encoder");

@@ -71,7 +71,8 @@ mod texture;
 mod vertex;
 
 pub use vertex::{
-    Fetch, MAX_STREAMS, NativeVertex, STREAM_BUFFER, TranslatedVertex, translate_vertex,
+    Fetch, INDEXED_WORD, MAX_STREAMS, NativeVertex, STREAM_BUFFER, TranslatedVertex,
+    translate_vertex,
 };
 
 use std::collections::BTreeSet;
