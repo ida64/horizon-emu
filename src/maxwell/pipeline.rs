@@ -678,7 +678,7 @@ fn env<'a>(
 /// Vertex attribute formats (`SET_VERTEX_ATTRIBUTE_A` `COMPONENT_BIT_WIDTHS`):
 /// component sizes in bits, in memory order: component 0 in the lowest
 /// bits of the little-endian attribute.
-fn component_widths(code: u32) -> Option<&'static [u32]> {
+pub(crate) fn component_widths(code: u32) -> Option<&'static [u32]> {
     Some(match code {
         0x01 => &[32, 32, 32, 32],
         0x02 => &[32, 32, 32],
@@ -706,7 +706,7 @@ fn component_widths(code: u32) -> Option<&'static [u32]> {
 
 /// Fetches the attribute `attribute` of a vertex: four words as the
 /// vertex shader reads them (floats, or integers for SINT/UINT).
-fn fetch_attribute(raw: u32, bytes: &[u8]) -> Result<[u32; 4], Unmodeled> {
+pub(crate) fn fetch_attribute(raw: u32, bytes: &[u8]) -> Result<[u32; 4], Unmodeled> {
     let code = (raw >> 21) & 0x3F;
     let kind = (raw >> 27) & 7;
     let widths = component_widths(code)
@@ -1073,6 +1073,20 @@ pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result
     };
     let textures = DrawTextures::new(context.memory, pools, &caches.textures, context.writes);
 
+    // The vertex stage on the host GPU, when the draw is large enough for
+    // it to matter and Metal can run it (see `native`).
+    if let (Some(metal), Some(pixel), None) = (context.metal, &pixel, &geometry)
+        && r.get(SET_RASTER_ENABLE) & 1 != 0
+        && batch.elements.len() >= NATIVE_MINIMUM
+    {
+        let fragments = fragments(context, pixel)?;
+        if native(
+            context, metal, &vertex, &fetch, pixel, &textures, batch, &fragments,
+        )? {
+            return Ok(());
+        }
+    }
+
     // Vertex shading, once per distinct vertex of the batch.
     let vertex_buffers = constant_buffers(context, VERTEX_PIPELINE, &vertex)?;
     let vertex_unit = textures.unit();
@@ -1125,7 +1139,240 @@ pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result
             0,
         ));
     };
-    rasterize(context, last, &pixel, &textures, batch, vertices)
+    let fragments = fragments(context, &pixel)?;
+    rasterize(context, last, &pixel, &textures, batch, vertices, fragments)
+}
+
+/// Draws of fewer elements shade their vertices on the CPU and draw the
+/// set-up triangles ([`rasterize`]): the reference path, exact to the
+/// software renderer, costs little for a quad or two, while the CPU
+/// vertex stage and per-triangle setup of anything larger cost more than
+/// a native draw \[assumption: a threshold, chosen so single UI quads (4
+/// or 6 elements) stay on the exact path; Minecraft's HUD and chunk draws
+/// do not\].
+const NATIVE_MINIMUM: usize = 7;
+
+/// A draw with its vertex stage on the host GPU (`metal::Geometry::Native`):
+/// the vertex program translated to a vertex function that fetches the
+/// attributes itself, Metal's clipping and rasterization, the pixel
+/// program reading what Metal interpolates. `Ok(false)` when this draw
+/// needs the CPU vertex stage (a reason is noted once).
+///
+/// What differs from the software pipeline: Metal clips and rasterizes
+/// (its own fill rule and snapping, interpolation in its own arithmetic;
+/// the pixel program, depth, stencil and blending are as on the plane
+/// path), the guard band is Metal's, and in a multisampled layer the
+/// pixel's inputs are taken at the layer's sample position.
+#[allow(clippy::too_many_arguments)]
+fn native(
+    context: &Context<'_>,
+    metal: &super::metal::Renderer,
+    vertex: &Arc<Program>,
+    fetch: &VertexFetch,
+    pixel: &Arc<Program>,
+    textures: &DrawTextures<'_>,
+    batch: &Batch,
+    fragments: &Fragments,
+) -> Result<bool, Unmodeled> {
+    use super::metal::{Geometry, NativeDraw, NativeStream};
+    use super::shader::msl::{Fetch, MAX_STREAMS};
+    let r = context.registers;
+    let fall_back = |reason: &str| {
+        metal.note_cpu_vertices(reason);
+        Ok(false)
+    };
+    let Primitives::Triangles(list) = assemble(batch.topology, &batch.elements) else {
+        return fall_back("points or lines");
+    };
+    // Culling and facing, as `setup_triangles` decides them.
+    let cull = if r.enabled(OGL_SET_CULL) {
+        match r.get(OGL_SET_CULL_FACE) {
+            0x404 => 1,
+            0x405 => 2,
+            0x408 => return Ok(true),
+            other => return Err(refuse("cull face", OGL_SET_CULL_FACE, other)),
+        }
+    } else {
+        0
+    };
+    let front_ccw = match r.get(OGL_SET_FRONT_FACE) {
+        0x900 => false,
+        0x901 => true,
+        other => return Err(refuse("front face", OGL_SET_FRONT_FACE, other)),
+    };
+    let flip = r.get(SET_WINDOW_ORIGIN) & 0x10 != 0;
+    let clip = Clip::new(r, vertex)?;
+    let depth_clip = (r.get(SET_VIEWPORT_CLIP_CONTROL) >> 11) & 7 != 2;
+    let zero_to_w = r.get(SET_VIEWPORT_Z_CLIP) & 1 != 0;
+    let Fragments {
+        colors,
+        targets,
+        clip: area,
+        blend_constant,
+        depth,
+        alpha_test,
+        multisample,
+        ..
+    } = fragments;
+    if colors.is_empty() && depth.is_none() {
+        return Ok(true);
+    }
+    let samples = multisample.samples;
+    let surfaces: Vec<Surface> = targets.iter().map(|(surface, _)| *surface).collect();
+    let mut bounds = *area;
+    for surface in surfaces.iter().chain(depth.iter().map(|(s, _)| s)) {
+        bounds = bounds.intersect(&samples.pixels(surface));
+    }
+    if bounds.is_empty() {
+        return Ok(true);
+    }
+    let size = samples.pixels(
+        surfaces
+            .first()
+            .or(depth.as_ref().map(|(s, _)| s))
+            .expect("a target"),
+    );
+
+    // Streams: per slot, the bytes of the elements the draw fetches.
+    let fetch_instance = batch.instance.wrapping_add(batch.base_instance);
+    let mut slots: Vec<usize> = Vec::new();
+    for &(_, _, stream) in &fetch.attributes {
+        if !slots.contains(&stream) {
+            slots.push(stream);
+        }
+    }
+    if slots.len() > MAX_STREAMS {
+        return fall_back("more vertex streams than bindings");
+    }
+    let (mut low, mut high) = (u32::MAX, 0);
+    for element in &batch.elements {
+        if let Element::Vertex { fetch, .. } = *element {
+            low = low.min(fetch);
+            high = high.max(fetch);
+        }
+    }
+    if low > high {
+        return Ok(true);
+    }
+    let mut streams = Vec::with_capacity(slots.len());
+    for &index in &slots {
+        let stream = fetch.streams[index];
+        let (first, last) = match fetch_instance.checked_div(stream.divisor) {
+            Some(element) => (element, element),
+            None => (low, high),
+        };
+        let end = fetch
+            .attributes
+            .iter()
+            .filter(|&&(_, _, s)| s == index)
+            .map(|&(_, raw, _)| {
+                let size: u32 = component_widths((raw >> 21) & 0x3F)
+                    .map_or(0, |widths| widths.iter().sum::<u32>() / 8);
+                u64::from((raw >> 7) & 0x3FFF) + u64::from(size)
+            })
+            .max()
+            .unwrap_or(0);
+        let stride = u64::from(stream.stride);
+        let start = stream.address + u64::from(first) * stride;
+        let stop = stream.address + u64::from(last) * stride + end;
+        // A fetch past the limit is the CPU stage's refusal.
+        if stop == start || stop - 1 > stream.limit {
+            return fall_back("vertex fetch beyond the stream limit");
+        }
+        let mut bytes = vec![0; (stop - start) as usize];
+        if context.memory.read(start, &mut bytes).is_none() {
+            return fall_back("vertex fetch from unmapped memory");
+        }
+        streams.push(NativeStream {
+            bytes,
+            first,
+            stride: stream.stride,
+            divisor: stream.divisor,
+        });
+    }
+    let fetches: Vec<Fetch> = fetch
+        .attributes
+        .iter()
+        .map(|&(attribute, raw, stream)| Fetch {
+            attribute: attribute as u32,
+            raw,
+            slot: slots.iter().position(|&s| s == stream).expect("listed") as u32,
+        })
+        .collect();
+    // Elements (fetch index, vertex ID) by batch position, and the
+    // triangles by batch position with the provoking vertex first (Metal's
+    // flat inputs take the first vertex's), the winding kept.
+    let elements: Vec<u32> = batch
+        .elements
+        .iter()
+        .flat_map(|element| match *element {
+            Element::Vertex { fetch, id } => [fetch, id],
+            Element::Restart => [0, 0],
+        })
+        .collect();
+    let provoking_last = r.get(SET_PROVOKING_VERTEX) & 1 != 0;
+    let indices: Vec<u32> = list
+        .iter()
+        .flat_map(
+            |&[a, b, c]| {
+                if provoking_last { [c, a, b] } else { [a, b, c] }
+            },
+        )
+        .map(|i| i as u32)
+        .collect();
+    let depth_bias = depth
+        .as_ref()
+        .and_then(|(_, d)| depth_bias_parameters(r, batch.topology, d.format))
+        .map_or([0.0; 4], |(constant, slope, clamp, unit)| match unit {
+            Some(unit) => [constant * unit, slope, clamp, 0.0],
+            None => [0.0, slope, clamp, constant],
+        });
+    let vertex_constants = constant_buffers(context, VERTEX_PIPELINE, vertex)?;
+    let pixel_constants = constant_buffers(context, PIXEL_PIPELINE, pixel)?;
+    let native = NativeDraw {
+        program: vertex,
+        constants: &vertex_constants,
+        inactive: fetch.inactive,
+        fetches,
+        streams,
+        elements,
+        indices,
+        view: [
+            clip.scale[0],
+            clip.scale[1],
+            clip.scale[2],
+            clip.offset[0],
+            clip.offset[1],
+            clip.offset[2],
+            2.0 / size.x1 as f32,
+            2.0 / size.y1 as f32,
+            if depth_clip && !zero_to_w { 1.0 } else { 0.0 },
+        ],
+        instance: batch.instance,
+        fetch_instance,
+        clip_words: clip.user.iter().map(|&i| 0x2C0 / 4 + i as u32).collect(),
+        cull,
+        // Metal's winding is as seen in its framebuffer, rows down like
+        // the window here (see `setup_triangles`).
+        front_clockwise: flip == front_ccw,
+        depth_clip,
+        depth_bias,
+    };
+    let draw = super::metal::Draw {
+        program: pixel,
+        geometry: Geometry::Native(&native),
+        colors,
+        surfaces: &surfaces,
+        bounds,
+        blend_constant: *blend_constant,
+        constants: &pixel_constants,
+        textures,
+        texture_buffer_index: r.get(SET_BINDLESS_TEXTURE) & 0x1F,
+        alpha_test: *alpha_test,
+        depth: *depth,
+        multisample: *multisample,
+    };
+    metal.draw(context.memory, context.writes, &draw)
 }
 
 /// The geometry shader stage: one thread per input primitive of the
@@ -1236,14 +1483,23 @@ fn varyings(pixel: &Program) -> Vec<(usize, Interpolation)> {
         .collect()
 }
 
-fn rasterize(
-    context: &Context<'_>,
-    vertex: &Program,
-    pixel: &Arc<Program>,
-    textures: &DrawTextures<'_>,
-    batch: &Batch,
-    vertices: &[Option<Shaded>],
-) -> Result<(), Unmodeled> {
+/// What a draw's fragments go through and into: the inputs the pixel
+/// program interpolates, its color targets, the scissor and surface clip,
+/// the depth/stencil stage, the alpha test and the samples.
+pub(crate) struct Fragments {
+    varyings: Vec<(usize, Interpolation)>,
+    colors: Vec<ColorOutput>,
+    /// Per color output: its target and program output.
+    targets: Vec<(Surface, u32)>,
+    clip: Rect,
+    blend_constant: [f32; 4],
+    depth: Option<(Surface, DepthOutput)>,
+    alpha_test: Option<(Compare, f32)>,
+    multisample: Multisample,
+}
+
+/// The fragment state of a draw with pixel program `pixel`.
+fn fragments(context: &Context<'_>, pixel: &Arc<Program>) -> Result<Fragments, Unmodeled> {
     let r = context.registers;
     let varyings = varyings(pixel);
     for &(word, _) in &varyings {
@@ -1258,7 +1514,6 @@ fn rasterize(
     // Outputs and targets.
     let select = r.get(SET_CT_SELECT);
     let count = (select & 0xF).min(8);
-    let mut windows = Vec::new();
     let mut colors = Vec::new();
     let mut clip = surface_clip(r);
     if let Some(scissor) = scissor(r) {
@@ -1411,6 +1666,39 @@ fn rasterize(
             r.get(SET_ANTI_ALIAS_ALPHA_CONTROL),
         ));
     }
+    Ok(Fragments {
+        varyings,
+        colors,
+        targets,
+        clip,
+        blend_constant,
+        depth,
+        alpha_test,
+        multisample,
+    })
+}
+
+fn rasterize(
+    context: &Context<'_>,
+    vertex: &Program,
+    pixel: &Arc<Program>,
+    textures: &DrawTextures<'_>,
+    batch: &Batch,
+    vertices: &[Option<Shaded>],
+    fragments: Fragments,
+) -> Result<(), Unmodeled> {
+    let r = context.registers;
+    let Fragments {
+        varyings,
+        colors,
+        targets,
+        clip,
+        blend_constant,
+        depth,
+        alpha_test,
+        multisample,
+    } = fragments;
+    let mut windows = Vec::new();
     let samples = multisample.samples;
     // Clipping, viewport transform and primitive setup.
     let mut triangles = setup(r, batch, vertices, &varyings, vertex, pixel, clip)?;
@@ -1458,7 +1746,7 @@ fn rasterize(
         let surfaces: Vec<Surface> = targets.iter().map(|(surface, _)| *surface).collect();
         let draw = super::metal::Draw {
             program: pixel,
-            triangles: &triangles,
+            geometry: super::metal::Geometry::Triangles(&triangles),
             colors: &colors,
             surfaces: &surfaces,
             bounds,
@@ -1594,25 +1882,7 @@ fn depth_bias(
     topology: Topology,
     format: DepthFormat,
 ) -> Option<impl Fn(&Plane, f32) -> f32> {
-    let enable = match topology {
-        Topology::Points => SET_POLY_OFFSET_POINT,
-        Topology::Lines | Topology::LineLoop | Topology::LineStrip => SET_POLY_OFFSET_LINE,
-        _ => SET_POLY_OFFSET_FILL,
-    };
-    if !r.enabled(enable) {
-        return None;
-    }
-    let constant = r.float(SET_DEPTH_BIAS);
-    let slope = r.float(SET_SLOPE_SCALE_DEPTH_BIAS);
-    let clamp = r.float(SET_DEPTH_BIAS_CLAMP);
-    let format_dependent = r.enabled(SET_DEPTH_BIAS_CONTROL);
-    let unit = match format {
-        DepthFormat::Z16Unorm => Some(2f32.powi(-16)),
-        DepthFormat::Z24S8 | DepthFormat::X8Z24 | DepthFormat::S8Z24 => Some(2f32.powi(-24)),
-        DepthFormat::Z32Float | DepthFormat::Z32FloatX24S8 => {
-            (!format_dependent).then(|| 2f32.powi(-24))
-        }
-    };
+    let (constant, slope, clamp, unit) = depth_bias_parameters(r, topology, format)?;
     Some(move |plane: &Plane, max_depth: f32| {
         let r = unit.unwrap_or_else(|| {
             // 2^(exponent of the largest depth - 23); 0 for a zero or
@@ -1633,6 +1903,38 @@ fn depth_bias(
             bias
         }
     })
+}
+
+/// The polygon offset of [`depth_bias`] as the constant factor, slope
+/// factor, clamp and the least representable value r (`None`: from the
+/// depth, for float depth with DEPTH_FORMAT_DEPENDENT).
+fn depth_bias_parameters(
+    r: Registers<'_>,
+    topology: Topology,
+    format: DepthFormat,
+) -> Option<(f32, f32, f32, Option<f32>)> {
+    let enable = match topology {
+        Topology::Points => SET_POLY_OFFSET_POINT,
+        Topology::Lines | Topology::LineLoop | Topology::LineStrip => SET_POLY_OFFSET_LINE,
+        _ => SET_POLY_OFFSET_FILL,
+    };
+    if !r.enabled(enable) {
+        return None;
+    }
+    let format_dependent = r.enabled(SET_DEPTH_BIAS_CONTROL);
+    let unit = match format {
+        DepthFormat::Z16Unorm => Some(2f32.powi(-16)),
+        DepthFormat::Z24S8 | DepthFormat::X8Z24 | DepthFormat::S8Z24 => Some(2f32.powi(-24)),
+        DepthFormat::Z32Float | DepthFormat::Z32FloatX24S8 => {
+            (!format_dependent).then(|| 2f32.powi(-24))
+        }
+    };
+    Some((
+        r.float(SET_DEPTH_BIAS),
+        r.float(SET_SLOPE_SCALE_DEPTH_BIAS),
+        r.float(SET_DEPTH_BIAS_CLAMP),
+        unit,
+    ))
 }
 
 /// The stencil test state. Front: `SET_STENCIL_OP_FAIL` / `ZFAIL` /

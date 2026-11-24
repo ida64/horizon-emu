@@ -31,12 +31,17 @@ use super::{Translated, translate};
 
 /// The corpus: (name, program) for every distinct pixel program.
 fn corpus() -> Vec<(String, Program)> {
+    corpus_of(ShaderType::Pixel)
+}
+
+/// Every distinct program of type `kind` in the corpus archives.
+fn corpus_of(kind: ShaderType) -> Vec<(String, Program)> {
     let mut seen = HashSet::new();
     let mut programs = Vec::new();
     let mut add = |source: &str, data: &[u8]| {
         for (offset, p) in stages(data) {
             let code = data[offset + 0x80..offset + 0x30 + p.len()].to_vec();
-            if seen.insert(code) && p.header().shader_type() == ShaderType::Pixel {
+            if seen.insert(code) && p.header().shader_type() == kind {
                 programs.push((format!("{source}@{offset:#x}"), p));
             }
         }
@@ -224,7 +229,7 @@ fn corpus_translates_and_compiles() {
             Ok(t) => {
                 if let Some(gpu) = &gpu {
                     let outputs = targets(program);
-                    let source = t.source(program, &outputs, false, None, None);
+                    let source = t.source(program, &outputs, false, None, None, None);
                     let start = std::time::Instant::now();
                     if let Err(e) = gpu.pipeline(&source, outputs.len()) {
                         panic!("{name}: {e}\n{source}");
@@ -461,7 +466,7 @@ fn render(
 ) -> Result<Vec<Vec<[f32; 4]>>, String> {
     let outputs = targets(program);
     let pipeline = gpu.pipeline(
-        &t.source(program, &outputs, false, None, None),
+        &t.source(program, &outputs, false, None, None, None),
         outputs.len(),
     )?;
     let positions: [[f32; 4]; 6] = [
@@ -949,4 +954,259 @@ fn shfl_matches_interpreter() {
     let plain = assembled(&[IPA_X, 0xe30000000007000f]);
     let input = inputs(&translate(&plain, &[]).unwrap(), 1);
     assert!(interpret(&across, &input).is_err());
+}
+
+/// Attribute formats the vertex test cycles through: (component sizes,
+/// numerical type) of `SET_VERTEX_ATTRIBUTE_A`, covering every
+/// conversion `vertex::fetch_code` emits.
+const VERTEX_FORMATS: [(u32, u32); 12] = [
+    (0x0A, 2), // A8B8G8R8 UNORM
+    (0x03, 7), // R16G16B16A16 FLOAT
+    (0x0F, 2), // R16G16 UNORM
+    (0x0A, 1), // A8B8G8R8 SNORM
+    (0x01, 7), // R32G32B32A32 FLOAT
+    (0x02, 7), // R32G32B32 FLOAT
+    (0x30, 1), // A2B10G10R10 SNORM
+    (0x18, 4), // G8R8 UINT
+    (0x0F, 3), // R16G16 SINT
+    (0x05, 5), // R16G16B16 USCALED
+    (0x13, 6), // B8G8R8 SSCALED
+    (0x1B, 2), // R16 UNORM
+];
+
+/// Every corpus vertex program translates or is refused with a reason,
+/// and every translation computes on the GPU, from attributes fetched
+/// out of a vertex stream by the vertex function itself, exactly the
+/// output words the interpreter computes from `pipeline::fetch_attribute`'s
+/// inputs: 48 vertices per program, attributes of every format of
+/// [`VERTEX_FORMATS`] (each attribute its own, some with R and B
+/// swapped), random constant buffers.
+#[test]
+fn vertex_programs_match_the_interpreter() {
+    use super::{Fetch, NativeVertex, STREAM_BUFFER, translate_vertex};
+    use crate::maxwell::pipeline::fetch_attribute;
+    use crate::maxwell::shader::Attributes;
+    use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState};
+    const VERTICES: usize = 48;
+    let programs = corpus_of(ShaderType::Vertex);
+    let gpu = Gpu::new();
+    let (mut checked, mut refused) = (0, BTreeMap::<String, usize>::new());
+    for (index, (name, program)) in programs.iter().enumerate() {
+        let t = match translate_vertex(program, &jump_table(program)) {
+            Ok(t) => t,
+            Err(reason) => {
+                let key = reason
+                    .rsplit_once(" at 0x")
+                    .map_or(reason.clone(), |(h, _)| h.to_string());
+                *refused.entry(key).or_default() += 1;
+                continue;
+            }
+        };
+        let Some(gpu) = &gpu else { continue };
+        let mut random = Random(index as u64 * 0x9e37_79b9 + 7);
+        // One stream: the attributes the header names, each in a format of
+        // the list, packed one after the other.
+        let mut fetches = Vec::new();
+        let mut offset = 0u32;
+        for attribute in 0..32u32 {
+            if !(0..4).any(|c| {
+                program
+                    .header()
+                    .vtg_input_used(0x20 + attribute as usize * 4 + c)
+            }) {
+                continue;
+            }
+            let (code, kind) = VERTEX_FORMATS[(attribute as usize + index) % VERTEX_FORMATS.len()];
+            let swap = u32::from(random.next() % 4 == 0) << 31;
+            let raw = swap | kind << 27 | code << 21 | offset << 7;
+            let size: u32 = crate::maxwell::pipeline::component_widths(code)
+                .expect("listed")
+                .iter()
+                .sum::<u32>()
+                / 8;
+            offset += size;
+            fetches.push(Fetch {
+                attribute,
+                raw,
+                slot: 0,
+            });
+        }
+        let stride = offset.next_multiple_of(4).max(4);
+        let mut stream: Vec<u8> = (0..stride as usize * VERTICES)
+            .map(|_| random.next() as u8)
+            .collect();
+        // Float attributes and constants hold no NaN or infinity: NaN
+        // payloads are where the interpreter's host arithmetic and the GPU
+        // part (the GPU's are canonical).
+        for fetch in &fetches {
+            let (code, kind) = ((fetch.raw >> 21) & 0x3F, (fetch.raw >> 27) & 7);
+            if kind != 7 {
+                continue;
+            }
+            let widths = crate::maxwell::pipeline::component_widths(code).expect("listed");
+            for vertex in 0..VERTICES {
+                let mut at = vertex * stride as usize + ((fetch.raw >> 7) & 0x3FFF) as usize;
+                for &width in widths {
+                    if width == 32 {
+                        stream[at..at + 4].copy_from_slice(&random.float(-4.0, 4.0).to_le_bytes());
+                    } else {
+                        // Exponent below all ones.
+                        let half = (random.next() as u16) & !0x4000;
+                        stream[at..at + 2].copy_from_slice(&half.to_le_bytes());
+                    }
+                    at += width as usize / 8;
+                }
+            }
+        }
+        // Constant buffers as the program reads them.
+        let mut buffers = vec![Vec::new(); 18];
+        let mut sizes = [0usize; 18];
+        for &(slot, offset) in &t.constants {
+            sizes[slot as usize] = sizes[slot as usize].max(offset as usize + 4);
+        }
+        for &slot in &t.indirect {
+            sizes[slot as usize] = sizes[slot as usize].max(0x400);
+        }
+        for (buffer, &size) in buffers.iter_mut().zip(&sizes) {
+            *buffer = (0..size.div_ceil(4))
+                .map(|_| random.word())
+                .map(|w| {
+                    if (w >> 23) & 0xFF == 0xFF {
+                        w & !(1 << 30)
+                    } else {
+                        w
+                    }
+                })
+                .flat_map(u32::to_le_bytes)
+                .collect();
+        }
+        if let Some(table) = &t.constant_buffer_1 {
+            buffers[1].clone_from(table);
+        }
+        // The interpreter, vertex by vertex: vertex i fetches element i, its
+        // ID 3i + 1, instance 2.
+        let instance = 2u32;
+        let mut const_buffers = [ConstantBuffer::default(); 18];
+        for (slot, data) in buffers.iter().enumerate() {
+            const_buffers[slot] = ConstantBuffer::whole(data);
+        }
+        let unit = Texels(Vec::new());
+        let env = Env {
+            const_buffers,
+            textures: &unit,
+            texture_buffer_index: TEXTURE_SLOT,
+            memory: &NoMemory,
+            y_direction: 1.0,
+        };
+        let mut expected = Vec::with_capacity(VERTICES);
+        let mut runs = true;
+        for vertex in 0..VERTICES {
+            let mut inputs = Attributes([0; 256]);
+            for fetch in &fetches {
+                let at = vertex * stride as usize + ((fetch.raw >> 7) & 0x3FFF) as usize;
+                let words = fetch_attribute(fetch.raw, &stream[at..]).expect("format");
+                let base = 0x20 + fetch.attribute as usize * 4;
+                inputs.0[base..base + 4].copy_from_slice(&words);
+            }
+            inputs.0[0x2F8 / 4] = instance;
+            inputs.0[0x2FC / 4] = 3 * vertex as u32 + 1;
+            let mut outputs = Attributes::vertex_outputs();
+            if program.run_vertex(&env, &inputs, 0, &mut outputs).is_err() {
+                runs = false;
+                break;
+            }
+            expected.push(outputs);
+        }
+        if !runs {
+            continue;
+        }
+        // The GPU.
+        let native = NativeVertex::new(&t, &fetches, &[], &[], false, true)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let source = format!("{}{}", super::PRELUDE, native.source);
+        let options = MTLCompileOptions::new();
+        options.setMathMode(MTLMathMode::Safe);
+        let library = gpu
+            .device
+            .newLibraryWithSource_options_error(&NSString::from_str(&source), Some(&options))
+            .unwrap_or_else(|e| panic!("{name}: {e}\n{source}"));
+        let function = library
+            .newFunctionWithName(&NSString::from_str("vertex_kernel"))
+            .expect("kernel");
+        let pipeline = gpu
+            .device
+            .newComputePipelineStateWithFunction_error(&function)
+            .expect("compute pipeline");
+        let elements: Vec<u32> = (0..VERTICES as u32).flat_map(|v| [v, 3 * v + 1]).collect();
+        let draw = [instance, instance, 0, stride, 0];
+        let result = gpu.buffer(&vec![0u8; VERTICES * 256 * 4]);
+        let command = gpu.queue.commandBuffer().expect("command buffer");
+        let encoder = command.computeCommandEncoder().expect("encoder");
+        encoder.setComputePipelineState(&pipeline);
+        let mut keep = Vec::new();
+        let mut bind = |data: &[u8], index: usize| {
+            let buffer = gpu.buffer(data);
+            // SAFETY: indices within the kernel's bindings.
+            unsafe { encoder.setBuffer_offset_atIndex(Some(&buffer), 0, index) };
+            keep.push(buffer);
+        };
+        bind(&bytes(&elements), 0);
+        bind(&[0u8; 64], 1);
+        bind(&bytes(&draw), 29);
+        bind(&stream, STREAM_BUFFER);
+        for (slot, data) in buffers.iter().enumerate() {
+            if !data.is_empty() {
+                bind(data, 2 + slot);
+            }
+        }
+        let sizes_words: Vec<u32> = buffers.iter().map(|b| b.len() as u32).collect();
+        bind(&bytes(&sizes_words), 20);
+        // SAFETY: the result buffer holds every vertex's 256 words.
+        unsafe { encoder.setBuffer_offset_atIndex(Some(&result), 0, 30) };
+        let width = pipeline.maxTotalThreadsPerThreadgroup().min(VERTICES);
+        encoder.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: VERTICES,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        let words = result.contents().cast::<u32>();
+        // Every output word the kernel writes: what the program writes or
+        // reads and the position. Two NaNs are equal whatever their
+        // payloads: an integer attribute a program reads as a float can be
+        // a NaN, whose payload the interpreter's host arithmetic keeps and
+        // the GPU replaces by its canonical NaN (GM20B's own is canonical
+        // too: neither is the hardware's).
+        let nan = |w: u32| f32::from_bits(w).is_nan();
+        let outputs: Vec<u32> = t.outputs.iter().copied().chain(0x1C..0x20).collect();
+        for (vertex, outputs_expected) in expected.iter().enumerate() {
+            for &word in &outputs {
+                // SAFETY: inside the result buffer, written by the GPU.
+                let got = unsafe { words.add(vertex * 256 + word as usize).read() };
+                let want = outputs_expected.0[word as usize];
+                assert!(
+                    got == want || (nan(got) && nan(want)),
+                    "{name}: vertex {vertex} a[{:#x}]: GPU {got:#x}, interpreter {want:#x}",
+                    word * 4
+                );
+            }
+        }
+        checked += 1;
+    }
+    println!(
+        "{} vertex programs: {checked} checked on the GPU; refused {refused:?}",
+        programs.len()
+    );
+    if gpu.is_some() {
+        assert!(checked > 0, "no vertex program checked");
+    }
 }

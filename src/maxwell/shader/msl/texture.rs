@@ -37,10 +37,11 @@ use super::super::exec::{bit, bits, fswzadd_factors, quad_shuffle_lane, sext};
 use super::{PT, RZ, SLOTS, Writer};
 
 impl Writer<'_> {
-    /// `IPA`: the attribute's plane at the pixel center (`position.xy`)
-    /// or, CENTROID, at the centroid (`cpx`, `cpy`, see
-    /// `Translated::source` and `exec::Machine::ipa`), optionally
-    /// multiplied by a register, optionally saturated.
+    /// `IPA`: the attribute's value at the pixel center or, CENTROID, at
+    /// the centroid (see `exec::Machine::ipa`), optionally multiplied by
+    /// a register, optionally saturated. The value is the macro
+    /// `IPA{k}` (`IPAC{k}` for CENTROID) of plane `k`, which
+    /// `Translated::source` defines for the draw's way of interpolating.
     pub(super) fn ipa(&mut self) -> Result<(), String> {
         let w = self.word;
         let mode = bits(w, 54, 2);
@@ -64,12 +65,11 @@ impl Writer<'_> {
             }
         };
         let (rd, rb) = (bits(w, 0, 8), bits(w, 20, 8));
-        let (x, y) = if bits(w, 52, 2) == 1 {
-            ("cpx", "cpy")
+        let mut value = if bits(w, 52, 2) == 1 {
+            format!("IPAC{plane}")
         } else {
-            ("px", "py")
+            format!("IPA{plane}")
         };
-        let mut value = format!("plane(planes, plane_base + {plane}u, {x}, {y})");
         if mode == 1 {
             let b = self.read(rb);
             value = format!("({value} * as_type<float>({b}))");

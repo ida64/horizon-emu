@@ -85,14 +85,15 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBlendFactor, MTLBlendOperation, MTLBuffer, MTLColorWriteMask, MTLCommandBuffer,
-    MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLGPUFamily, MTLLibrary, MTLLoadAction, MTLMathMode, MTLOrigin, MTLPixelFormat,
-    MTLPrimitiveTopologyClass, MTLPrimitiveType, MTLRegion, MTLRenderCommandEncoder,
-    MTLRenderPassDescriptor, MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLResource,
-    MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerBorderColor, MTLSamplerDescriptor,
-    MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSamplerState, MTLScissorRect, MTLSize,
-    MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureType,
-    MTLTextureUsage, MTLViewport,
+    MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLCullMode, MTLDepthClipMode,
+    MTLDevice, MTLGPUFamily, MTLIndexType, MTLLibrary, MTLLoadAction, MTLMathMode, MTLOrigin,
+    MTLPixelFormat, MTLPrimitiveTopologyClass, MTLPrimitiveType, MTLRegion,
+    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
+    MTLRenderPipelineState, MTLResource, MTLResourceOptions, MTLSamplerAddressMode,
+    MTLSamplerBorderColor, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
+    MTLSamplerState, MTLScissorRect, MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture,
+    MTLTextureDescriptor, MTLTextureType, MTLTextureUsage, MTLViewport, MTLWinding,
 };
 
 use super::blend::{Blend, Factor, Operation};
@@ -116,6 +117,7 @@ type Sampler = ProtocolObject<dyn MTLSamplerState>;
 type CommandBuffer = ProtocolObject<dyn MTLCommandBuffer>;
 type Encoder = ProtocolObject<dyn MTLRenderCommandEncoder>;
 type Library = ProtocolObject<dyn MTLLibrary>;
+type ComputePipeline = ProtocolObject<dyn MTLComputePipelineState>;
 /// A draw's texture fault words, with its unbound slots and the refusal
 /// an executed sample of each is.
 type Faults = (Retained<MetalBuffer>, Vec<(usize, String)>);
@@ -224,6 +226,12 @@ struct Program2 {
     translated: Result<Arc<Translated>, String>,
 }
 
+/// A vertex program's translation, kept as [`Program2`].
+struct VertexProgram {
+    program: Arc<Program>,
+    translated: Result<Arc<msl::TranslatedVertex>, String>,
+}
+
 /// Compiled MSL libraries kept \[assumption: a library is one translated
 /// pixel program, tens to hundreds of KiB of host memory; this is more
 /// than the programs a HOME menu session draws with\].
@@ -252,6 +260,10 @@ struct State {
     residents: Vec<Resident>,
     frame: Option<Frame>,
     programs: HashMap<usize, Program2>,
+    vertex_programs: HashMap<usize, VertexProgram>,
+    /// Reasons draws shaded their vertices on the CPU (`pipeline::native`),
+    /// counted.
+    cpu_vertices: HashMap<String, u64>,
     /// Compiled MSL by source: programs drawn with different attachment
     /// formats or blending share their functions.
     libraries: Lru<String, Retained<Library>>,
@@ -272,6 +284,10 @@ struct State {
     /// What an unbound texture slot is bound to: a 1x1 texture and a
     /// sampler, never read into a result that reaches guest memory.
     placeholder: Option<(Retained<MetalTexture>, Retained<Sampler>)>,
+    /// Buffer space for the frame's draw data.
+    arena: Arena,
+    /// The packing kernels (`State::pack`), plain and layered.
+    pack_pipelines: HashMap<bool, Retained<ComputePipeline>>,
 }
 
 impl Default for State {
@@ -280,6 +296,8 @@ impl Default for State {
             residents: Vec::new(),
             frame: None,
             programs: HashMap::new(),
+            vertex_programs: HashMap::new(),
+            cpu_vertices: HashMap::new(),
             libraries: Lru::new(LIBRARY_LIMIT),
             pipelines: Lru::new(PIPELINE_LIMIT),
             clear_pipelines: HashMap::new(),
@@ -290,6 +308,8 @@ impl Default for State {
             draws: 0,
             faults: Vec::new(),
             placeholder: None,
+            arena: Arena::default(),
+            pack_pipelines: HashMap::new(),
         }
     }
 }
@@ -317,6 +337,64 @@ struct PipelineKey {
     depth: Option<msl::DepthStage>,
     /// Multisampled targets (layered: one layer per sample).
     multisample: Option<msl::MultisampleStage>,
+    /// A native draw's vertex function.
+    native: Option<NativeKey>,
+}
+
+/// What a native draw's vertex function is made from: its program, the
+/// constant buffer 1 its translation was made for, the attributes it
+/// fetches and the output words of its clip distances.
+type NativeKey = (usize, Option<Vec<u8>>, Vec<msl::Fetch>, Vec<u32>);
+
+/// Where a draw's fragments come from.
+pub enum Geometry<'a> {
+    /// The software pipeline's set-up triangles, each drawn over its pixel
+    /// bounding box and covered by its exact edge test.
+    Triangles(&'a [Triangle]),
+    /// Vertices shaded on the host GPU and rasterized by Metal.
+    Native(&'a NativeDraw<'a>),
+}
+
+/// The vertex stage of a native draw (see `pipeline::native`).
+pub struct NativeDraw<'a> {
+    /// The vertex program.
+    pub program: &'a Arc<Program>,
+    /// Constant buffer contents of the vertex stage and their bound sizes.
+    pub constants: &'a [(Vec<u8>, usize)],
+    /// Attributes whose `SET_VERTEX_ATTRIBUTE_A` SOURCE is INACTIVE (bit
+    /// per attribute): a program that reads one runs on the CPU, which
+    /// refuses the read.
+    pub inactive: u32,
+    pub fetches: Vec<msl::Fetch>,
+    /// By stream slot.
+    pub streams: Vec<NativeStream>,
+    /// (fetch index, vertex ID) per batch position.
+    pub elements: Vec<u32>,
+    /// Triangles by batch position, the provoking vertex first.
+    pub indices: Vec<u32>,
+    /// The viewport words of `msl::NativeVertex::new` (without the layer).
+    pub view: [f32; 9],
+    /// The instance ID and the instance per-instance streams step by.
+    pub instance: u32,
+    pub fetch_instance: u32,
+    /// Output words of the user clip distances.
+    pub clip_words: Vec<u32>,
+    /// Culled faces: 0 none, 1 front, 2 back.
+    pub cull: u8,
+    /// Front faces wind clockwise in Metal's framebuffer.
+    pub front_clockwise: bool,
+    /// Clip to the depth range (else clamp).
+    pub depth_clip: bool,
+    /// The polygon offset words of `native_depth_bias` (MSL prelude).
+    pub depth_bias: [f32; 4],
+}
+
+/// A vertex stream's bytes from its first fetched element on.
+pub struct NativeStream {
+    pub bytes: Vec<u8>,
+    pub first: u32,
+    pub stride: u32,
+    pub divisor: u32,
 }
 
 /// The Metal renderer of one channel.
@@ -335,7 +413,7 @@ pub struct Renderer {
 /// set it up.
 pub struct Draw<'a> {
     pub program: &'a Arc<Program>,
-    pub triangles: &'a [Triangle],
+    pub geometry: Geometry<'a>,
     /// Color outputs, and the surface of each (by `window` index).
     pub colors: &'a [ColorOutput],
     pub surfaces: &'a [Surface],
@@ -414,12 +492,61 @@ impl Renderer {
         let _ = self.fall_back(reason.to_string());
     }
 
+    /// Counts a draw whose vertices the CPU shades rather than Metal
+    /// (`pipeline::native`); each reason is reported once on stderr.
+    pub fn note_cpu_vertices(&self, reason: &str) {
+        let mut state = self.state.lock().unwrap();
+        let count = state.cpu_vertices.entry(reason.to_string()).or_default();
+        if *count == 0 {
+            eprintln!("Metal renderer: vertices shaded on the CPU: {reason}");
+        }
+        *count += 1;
+    }
+
+    /// Counts of draws whose vertices the CPU shaded, by reason
+    /// ([`Renderer::note_cpu_vertices`]).
+    pub fn cpu_vertices(&self) -> Vec<(String, u64)> {
+        let state = self.state.lock().unwrap();
+        let mut list: Vec<_> = state
+            .cpu_vertices
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        list.sort();
+        list
+    }
+
     /// Ends the command buffer, waits for the GPU and writes every dirty
     /// target back to guest memory (through `memory`, which notes the
     /// writes in `writes`).
     pub fn flush(&self, memory: &dyn GpuMemory, writes: &Writes) -> Result<(), Unmodeled> {
+        self.write_back(memory, writes, None)
+    }
+
+    /// Ends the command buffer, waits for the GPU and writes the dirty
+    /// targets back that overlap `range` (all with `None`). The others stay
+    /// dirty: their textures are final for the work so far, and later work
+    /// continues in a new command buffer.
+    fn write_back(
+        &self,
+        memory: &dyn GpuMemory,
+        writes: &Writes,
+        range: Option<(u64, u64)>,
+    ) -> Result<(), Unmodeled> {
         use std::sync::atomic::Ordering;
         let mut state = self.state.lock().unwrap();
+        let wanted = |r: &Resident| range.is_none_or(|range| overlap(r.extent(), range));
+        // The wanted dirty residents packed into their guest bytes on the
+        // GPU, after the work rendering them (see `State::pack`); `None`
+        // where the CPU converts instead.
+        let mut packs = Vec::with_capacity(state.residents.len());
+        for index in 0..state.residents.len() {
+            packs.push(if wanted(&state.residents[index]) {
+                state.pack(index)?
+            } else {
+                None
+            });
+        }
         state.finish();
         // An executed sample of an unbound texture is the interpreter's
         // refusal; nothing of the work is written back.
@@ -433,8 +560,8 @@ impl Renderer {
                 }
             }
         }
-        // Residents whose mirror still equals memory do after their own
-        // write-back too (residents do not overlap).
+        // Residents written back whose mirror still equals memory do after
+        // their own write-back too (residents do not overlap).
         let current: Vec<bool> = state
             .residents
             .iter()
@@ -445,25 +572,36 @@ impl Renderer {
             .collect();
         self.writing_back.store(true, Ordering::Relaxed);
         let mut result = Ok(());
-        for resident in &mut state.residents {
+        let mut written = vec![false; state.residents.len()];
+        for ((resident, written), pack) in state.residents.iter_mut().zip(&mut written).zip(packs) {
+            if !wanted(resident) {
+                continue;
+            }
             if let Some(rect) = resident.dirty.take()
                 && result.is_ok()
             {
-                result = resident.write_back(rect, memory);
+                result = match pack {
+                    Some(pack) => resident.store_packed(pack, memory),
+                    None => resident.write_back(rect, memory),
+                };
             }
+            *written = true;
         }
         self.writing_back.store(false, Ordering::Relaxed);
-        // Every resident's dirty rectangle was taken above.
-        self.any_dirty.store(false, Ordering::Relaxed);
+        let any_dirty = state.residents.iter().any(|r| r.dirty.is_some());
+        self.any_dirty.store(any_dirty, Ordering::Relaxed);
         let stamp = writes.stamp();
-        for (resident, current) in state.residents.iter_mut().zip(current) {
-            resident.stamp = current.then_some(stamp);
+        for ((resident, current), written) in state.residents.iter_mut().zip(current).zip(written) {
+            if written {
+                resident.stamp = current.then_some(stamp);
+            }
         }
         state.trim();
         result
     }
 
-    /// Flushes if `length` bytes at `address` overlap a dirty target.
+    /// Writes back the dirty targets that overlap `length` bytes at
+    /// `address`, if any.
     fn before_access(
         &self,
         memory: &dyn GpuMemory,
@@ -475,14 +613,16 @@ impl Renderer {
         if self.writing_back.load(Ordering::Relaxed) || !self.any_dirty.load(Ordering::Relaxed) {
             return Ok(());
         }
+        let range = (address, address + length as u64);
         let overlaps = {
             let state = self.state.lock().unwrap();
-            state.residents.iter().any(|r| {
-                r.dirty.is_some() && overlap(r.extent(), (address, address + length as u64))
-            })
+            state
+                .residents
+                .iter()
+                .any(|r| r.dirty.is_some() && overlap(r.extent(), range))
         };
         if overlaps {
-            self.flush(memory, writes)?;
+            self.write_back(memory, writes, Some(range))?;
         }
         Ok(())
     }
@@ -526,10 +666,74 @@ impl Renderer {
         if draw.depth.is_some() && !Self::gpu().fetch {
             return self.fall_back("depth test without framebuffer fetch".into());
         }
+        // A native draw's vertex program, translated once per content of
+        // its constant buffer 1 (as the pixel program).
+        let vertex = match &draw.geometry {
+            Geometry::Triangles(_) => None,
+            Geometry::Native(native) => {
+                let buffer_1 = native
+                    .constants
+                    .get(1)
+                    .map_or(&[][..], |(data, size)| &data[..data.len().min(*size)]);
+                let translated = {
+                    let mut state = self.state.lock().unwrap();
+                    let key = Arc::as_ptr(native.program) as usize;
+                    let entry = state
+                        .vertex_programs
+                        .entry(key)
+                        .or_insert_with(|| VertexProgram {
+                            program: Arc::clone(native.program),
+                            translated: msl::translate_vertex(native.program, buffer_1)
+                                .map(Arc::new),
+                        });
+                    if let Ok(t) = &entry.translated
+                        && t.constant_buffer_1
+                            .as_deref()
+                            .is_some_and(|table| table != buffer_1)
+                    {
+                        entry.translated =
+                            msl::translate_vertex(native.program, buffer_1).map(Arc::new);
+                    }
+                    entry.translated.clone()
+                };
+                let translated = match translated {
+                    Ok(t) => t,
+                    Err(reason) => {
+                        self.note_cpu_vertices(&format!("vertex program: {reason}"));
+                        return Ok(false);
+                    }
+                };
+                // A read of an inactive attribute is the CPU stage's
+                // refusal when it executes.
+                if translated.inputs.iter().any(|&word| {
+                    (0x20..0xA0).contains(&word)
+                        && native.inactive & (1 << ((word - 0x20) / 4)) != 0
+                }) {
+                    self.note_cpu_vertices("vertex program reads an inactive attribute");
+                    return Ok(false);
+                }
+                let (constants, sizes) = match stage_constants(
+                    &translated.indirect,
+                    &translated.constants,
+                    native.constants,
+                ) {
+                    Ok(bound) => bound,
+                    Err(reason) => {
+                        self.note_cpu_vertices(&format!("vertex stage: {reason}"));
+                        return Ok(false);
+                    }
+                };
+                Some((native, translated, constants, sizes))
+            }
+        };
         // Per triangle: the exact coverage test and the depth plane (see
         // `Translated::source`).
-        let mut triangle_words = Vec::with_capacity(draw.triangles.len() * msl::TRIANGLE_WORDS);
-        for triangle in draw.triangles {
+        let triangles = match draw.geometry {
+            Geometry::Triangles(triangles) => triangles,
+            Geometry::Native(_) => &[],
+        };
+        let mut triangle_words = Vec::with_capacity(triangles.len() * msl::TRIANGLE_WORDS);
+        for triangle in triangles {
             let (vertices, outside) = triangle.edges();
             for coordinate in vertices.into_iter().flatten() {
                 let Ok(coordinate) = i32::try_from(coordinate) else {
@@ -547,50 +751,11 @@ impl Renderer {
             let depth = triangle.depth;
             triangle_words.extend([depth.dx, depth.dy, depth.base].map(f32::to_bits));
         }
-        // Slots read at register offsets (LDC): their readable part of the
-        // bound range, in words, and its size in bytes (see
-        // `Translated::source`). A bound range can reach past the memory
-        // its owner mapped (see `pipeline::read_mapped`); an indexed read
-        // there, which the interpreter refuses (hardware would fault),
-        // reads 0 on Metal. No statically known read may go there.
-        // By slot (`draw.constants` has one per slot, 18): borrowed from
-        // the draw unless padded.
-        let mut constants: [Option<Cow<'_, [u8]>>; 18] = Default::default();
-        let mut sizes = [0u32; 18];
-        for &slot in &translated.indirect {
-            let Some((data, size)) = draw.constants.get(slot as usize) else {
-                return self.fall_back(format!("constant buffer slot {slot}"));
+        let (constants, sizes) =
+            match stage_constants(&translated.indirect, &translated.constants, draw.constants) {
+                Ok(bound) => bound,
+                Err(reason) => return self.fall_back(reason),
             };
-            let readable = data.len().min(*size);
-            let padded = readable.next_multiple_of(4).max(4);
-            constants[slot as usize] = Some(if padded == readable {
-                Cow::Borrowed(&data[..readable])
-            } else {
-                let mut buffer = data[..readable].to_vec();
-                buffer.resize(padded, 0);
-                Cow::Owned(buffer)
-            });
-            sizes[slot as usize] = readable as u32;
-        }
-        // Constant buffer words read statically must be readable.
-        for &(slot, offset) in &translated.constants {
-            let indexed = translated.indirect.contains(&slot);
-            let Some((data, size)) = draw.constants.get(slot as usize) else {
-                return self.fall_back(format!("constant buffer slot {slot}"));
-            };
-            let end = offset as usize + 4;
-            if end > data.len() && end <= *size {
-                return self.fall_back("constant read past the mapped part".into());
-            }
-            if indexed {
-                // Bounds-checked by the program against `sizes`.
-                continue;
-            }
-            let buffer = constants[slot as usize].get_or_insert(Cow::Borrowed(data.as_slice()));
-            if buffer.len() < end {
-                buffer.to_mut().resize(end, 0);
-            }
-        }
         // Textures and samplers. A handle that names no texture is bound to
         // a placeholder and marked: the program records an executed sample
         // of it, which `flush` refuses as the interpreter does (see
@@ -607,7 +772,8 @@ impl Renderer {
                 return self.fall_back("texture handle outside the constant buffer".into());
             };
             let handle = u32::from_le_bytes(bytes.try_into().expect("4 bytes"));
-            let (texture, tsc) = match draw.textures.resolve(handle) {
+            let resolved = draw.textures.resolve(handle);
+            let (texture, tsc) = match resolved {
                 Ok(resolved) => resolved,
                 Err(refusal) => {
                     unbound.push((slot, refusal.0));
@@ -667,7 +833,7 @@ impl Renderer {
             )
             .collect();
         let samples = draw.multisample.samples;
-        let residents = self.residents(memory, writes, &targets, samples.log2)?;
+        let residents = self.residents(memory, writes, &targets, samples.log2, false)?;
 
         let mut state = self.state.lock().unwrap();
         let gpu = Self::gpu();
@@ -703,19 +869,65 @@ impl Renderer {
                 alpha_to_one: draw.multisample.alpha_to_one,
                 center_depth: draw.multisample.center_depth,
             }),
+            native: vertex.as_ref().map(|(native, translated, ..)| {
+                (
+                    Arc::as_ptr(native.program) as usize,
+                    translated.constant_buffer_1.clone(),
+                    native.fetches.clone(),
+                    native.clip_words.clone(),
+                )
+            }),
         };
+        let layered = key.multisample.is_some();
         let pipeline = match state.pipelines.get(&key) {
             Some(p) => p.clone(),
             None => {
                 let outputs: Vec<usize> = key.attachments.iter().map(|a| a.3).collect();
+                let native_vertex = match &vertex {
+                    None => None,
+                    Some((native, translated_vertex, ..)) => {
+                        let varyings: Vec<(u32, super::shader::Interpolation)> = translated
+                            .ipa_words
+                            .iter()
+                            .map(|&word| {
+                                (word, draw.program.header().ps_interpolation(word as usize))
+                            })
+                            .collect();
+                        match msl::NativeVertex::new(
+                            translated_vertex,
+                            &native.fetches,
+                            &varyings,
+                            &native.clip_words,
+                            layered,
+                            false,
+                        ) {
+                            Ok(source) => Some(source),
+                            Err(reason) => {
+                                drop(state);
+                                self.note_cpu_vertices(&format!("vertex fetch: {reason}"));
+                                return Ok(false);
+                            }
+                        }
+                    }
+                };
                 let source = translated.source(
                     draw.program,
                     &outputs,
                     key.alpha_test,
                     key.depth,
                     key.multisample,
+                    native_vertex.as_ref(),
                 );
-                let library = state.library(gpu, source)?;
+                let library = match state.library(gpu, source) {
+                    Ok(library) => library,
+                    Err(error) if native_vertex.is_some() => {
+                        drop(state);
+                        let first = error.0.lines().next().unwrap_or_default().to_string();
+                        self.note_cpu_vertices(&first);
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                };
                 // With the stencil test the function stores the whole
                 // word (unchanged where nothing changed it).
                 let depth = key.depth.map(|stage| {
@@ -724,13 +936,19 @@ impl Renderer {
                         stage.write || stage.stencil,
                     )
                 });
+                let vertex_function = match (&native_vertex, layered) {
+                    (Some(_), _) => "vertex_native",
+                    (None, true) => "vertex_layered",
+                    (None, false) => "vertex_main",
+                };
                 let pipeline = build_pipeline(
                     gpu,
                     &library,
+                    vertex_function,
                     "fragment_main",
                     &key.attachments,
                     depth,
-                    key.multisample.is_some(),
+                    layered,
                 )?;
                 state.pipelines.insert(key.clone(), pipeline.clone(), 1);
                 pipeline
@@ -762,22 +980,22 @@ impl Renderer {
             };
             gpu_textures.push((metal, sampler));
         }
-        // Geometry: each triangle's pixel bounding box as two triangles,
-        // in normalized device coordinates of a viewport covering the
-        // first target; the fragment function keeps the pixels the
-        // triangle covers. The box's edges lie on pixel edges, so how
-        // Metal rounds them does not matter, and Metal's fill rule gives
-        // each pixel of the box to one half. Multisampled targets are held
-        // as one layer per sample at the size in pixels.
+        // Plane geometry: each triangle's pixel bounding box as two
+        // triangles, in normalized device coordinates of a viewport
+        // covering the first target; the fragment function keeps the
+        // pixels the triangle covers. The box's edges lie on pixel edges,
+        // so how Metal rounds them does not matter, and Metal's fill rule
+        // gives each pixel of the box to one half. Multisampled targets are
+        // held as one layer per sample at the size in pixels.
         let pixels = |surface: &Surface| samples.pixels(surface);
         let (width, height) = {
             let p = pixels(&targets[0].0);
             (p.x1 as f32, p.y1 as f32)
         };
-        let mut positions = Vec::with_capacity(draw.triangles.len() * 24);
+        let mut positions = Vec::with_capacity(triangles.len() * 24);
         let mut planes =
-            Vec::with_capacity(draw.triangles.len() * translated.ipa_words.len().max(1) * 3);
-        for triangle in draw.triangles {
+            Vec::with_capacity(triangles.len() * translated.ipa_words.len().max(1) * 3);
+        for triangle in triangles {
             let b = triangle.bounds();
             let x = |x: u32| x as f32 / width * 2.0 - 1.0;
             let y = |y: u32| 1.0 - y as f32 / height * 2.0;
@@ -810,14 +1028,39 @@ impl Renderer {
             .collect();
         let encoder = state.encoder(&residents, &srgb)?;
         encoder.setRenderPipelineState(&pipeline);
-        encoder.setViewport(MTLViewport {
-            originX: 0.0,
-            originY: 0.0,
+        let viewport = |dx: f64, dy: f64| MTLViewport {
+            originX: dx,
+            originY: dy,
             width: f64::from(width),
             height: f64::from(height),
             znear: 0.0,
             zfar: 1.0,
-        });
+        };
+        encoder.setViewport(viewport(0.0, 0.0));
+        // Per-draw rasterizer state (the pass's draws share the encoder).
+        match &vertex {
+            Some((native, ..)) => {
+                encoder.setCullMode(match native.cull {
+                    1 => MTLCullMode::Front,
+                    2 => MTLCullMode::Back,
+                    _ => MTLCullMode::None,
+                });
+                encoder.setFrontFacingWinding(if native.front_clockwise {
+                    MTLWinding::Clockwise
+                } else {
+                    MTLWinding::CounterClockwise
+                });
+                encoder.setDepthClipMode(if native.depth_clip {
+                    MTLDepthClipMode::Clip
+                } else {
+                    MTLDepthClipMode::Clamp
+                });
+            }
+            None => {
+                encoder.setCullMode(MTLCullMode::None);
+                encoder.setDepthClipMode(MTLDepthClipMode::Clip);
+            }
+        }
         let scissor = draw.bounds.intersect(&Rect {
             x0: 0,
             y0: 0,
@@ -839,20 +1082,111 @@ impl Renderer {
         // retains them, and copies bytes), indices are within the
         // function's bindings.
         unsafe {
-            bind(gpu, &encoder, Stage::Vertex, bytes_of(&positions), 0)?;
-            bind(gpu, &encoder, Stage::Fragment, bytes_of(&planes), 0)?;
-            bind(gpu, &encoder, Stage::Fragment, bytes_of(&biases), 1)?;
+            match &vertex {
+                None => {
+                    bind(
+                        &mut state.arena,
+                        &encoder,
+                        Stage::Vertex,
+                        bytes_of(&positions),
+                        0,
+                    )?;
+                    bind(
+                        &mut state.arena,
+                        &encoder,
+                        Stage::Fragment,
+                        bytes_of(&planes),
+                        0,
+                    )?;
+                    bind(
+                        &mut state.arena,
+                        &encoder,
+                        Stage::Fragment,
+                        bytes_of_u32(&triangle_words),
+                        24,
+                    )?;
+                }
+                Some((native, _, vertex_constants, vertex_sizes)) => {
+                    bind(
+                        &mut state.arena,
+                        &encoder,
+                        Stage::Vertex,
+                        bytes_of_u32(&native.elements),
+                        0,
+                    )?;
+                    for (slot, data) in vertex_constants.iter().enumerate() {
+                        if let Some(data) = data {
+                            bind(&mut state.arena, &encoder, Stage::Vertex, data, 2 + slot)?;
+                        }
+                    }
+                    bind(
+                        &mut state.arena,
+                        &encoder,
+                        Stage::Vertex,
+                        bytes_of_u32(vertex_sizes),
+                        20,
+                    )?;
+                    let mut words = vec![native.instance, native.fetch_instance];
+                    for stream in &native.streams {
+                        words.extend([stream.first, stream.stride, stream.divisor]);
+                    }
+                    bind(
+                        &mut state.arena,
+                        &encoder,
+                        Stage::Vertex,
+                        bytes_of_u32(&words),
+                        29,
+                    )?;
+                    for (slot, stream) in native.streams.iter().enumerate() {
+                        bind(
+                            &mut state.arena,
+                            &encoder,
+                            Stage::Vertex,
+                            &stream.bytes,
+                            msl::STREAM_BUFFER + slot,
+                        )?;
+                    }
+                    if draw.depth.is_some() {
+                        bind(
+                            &mut state.arena,
+                            &encoder,
+                            Stage::Fragment,
+                            bytes_of(&native.depth_bias),
+                            27,
+                        )?;
+                    }
+                }
+            }
+            bind(
+                &mut state.arena,
+                &encoder,
+                Stage::Fragment,
+                bytes_of(&biases),
+                1,
+            )?;
             for (slot, data) in constants.iter().enumerate() {
                 if let Some(data) = data {
-                    bind(gpu, &encoder, Stage::Fragment, data, 2 + slot)?;
+                    bind(&mut state.arena, &encoder, Stage::Fragment, data, 2 + slot)?;
                 }
             }
             if !translated.indirect.is_empty() {
-                bind(gpu, &encoder, Stage::Fragment, bytes_of_u32(&sizes), 20)?;
+                bind(
+                    &mut state.arena,
+                    &encoder,
+                    Stage::Fragment,
+                    bytes_of_u32(&sizes),
+                    20,
+                )?;
             }
             if let Some((compare, reference)) = draw.alpha_test {
                 let words = [compare_number(compare), reference.to_bits()];
-                bind(gpu, &encoder, Stage::Fragment, bytes_of_u32(&words), 22)?;
+                bind(
+                    &mut state.arena,
+                    &encoder,
+                    Stage::Fragment,
+                    bytes_of_u32(&words),
+                    22,
+                )?;
             }
             if let Some((_, depth)) = draw.depth {
                 let words = [
@@ -860,22 +1194,27 @@ impl Renderer {
                     depth.clamp.0.to_bits(),
                     depth.clamp.1.to_bits(),
                 ];
-                bind(gpu, &encoder, Stage::Fragment, bytes_of_u32(&words), 23)?;
+                bind(
+                    &mut state.arena,
+                    &encoder,
+                    Stage::Fragment,
+                    bytes_of_u32(&words),
+                    23,
+                )?;
             }
             if let Some(stencil) = draw.depth.and_then(|(_, depth)| depth.stencil) {
                 let mut words = Vec::with_capacity(14);
                 for face in [stencil.front, stencil.back] {
                     words.extend(stencil_words(&face));
                 }
-                bind(gpu, &encoder, Stage::Fragment, bytes_of_u32(&words), 25)?;
+                bind(
+                    &mut state.arena,
+                    &encoder,
+                    Stage::Fragment,
+                    bytes_of_u32(&words),
+                    25,
+                )?;
             }
-            bind(
-                gpu,
-                &encoder,
-                Stage::Fragment,
-                bytes_of_u32(&triangle_words),
-                24,
-            )?;
             for (i, (texture, sampler)) in gpu_textures.iter().enumerate() {
                 encoder.setFragmentTexture_atIndex(Some(texture), i);
                 encoder.setFragmentSamplerState_atIndex(Some(sampler), i);
@@ -886,20 +1225,14 @@ impl Renderer {
                 state.faults.push((faults, unbound));
             } else if !fault_words.is_empty() {
                 bind(
-                    gpu,
+                    &mut state.arena,
                     &encoder,
                     Stage::Fragment,
                     bytes_of_u32(&fault_words),
                     21,
                 )?;
             }
-            if samples.is_single() {
-                encoder.drawPrimitives_vertexStart_vertexCount(
-                    MTLPrimitiveType::Triangle,
-                    0,
-                    draw.triangles.len() * 6,
-                );
-            } else {
+            if !samples.is_single() && vertex.is_none() {
                 let sample_words: Vec<u32> = (0..samples.count())
                     .map(|s| {
                         let [x, y] = samples.positions[s];
@@ -907,21 +1240,67 @@ impl Renderer {
                     })
                     .collect();
                 bind(
-                    gpu,
+                    &mut state.arena,
                     &encoder,
                     Stage::Fragment,
                     bytes_of_u32(&sample_words),
                     26,
                 )?;
-                // One draw per sample, each into its layer (see
-                // `Translated::source`).
-                for layer in 0..samples.count() as u32 {
-                    bind(gpu, &encoder, Stage::Vertex, bytes_of_u32(&[layer]), 1)?;
-                    encoder.drawPrimitives_vertexStart_vertexCount(
-                        MTLPrimitiveType::Triangle,
-                        0,
-                        draw.triangles.len() * 6,
-                    );
+            }
+            let index_buffer = match &vertex {
+                Some((native, ..)) => Some(state.arena.alloc(bytes_of_u32(&native.indices))?),
+                None => None,
+            };
+            // One draw per sample of multisampled targets, each into its
+            // layer (see `Translated::source`).
+            for layer in 0..samples.count() as u32 {
+                match (&vertex, &index_buffer) {
+                    (Some((native, ..)), Some((indices, offset))) => {
+                        // Metal samples each pixel at its center: shifted so
+                        // that it lands on the layer's sample.
+                        let [dx, dy] = if samples.is_single() {
+                            [0.0, 0.0]
+                        } else {
+                            samples.offset(layer as usize).map(|o| 0.5 - f64::from(o))
+                        };
+                        encoder.setViewport(viewport(dx, dy));
+                        let mut view = [0u32; 10];
+                        for (word, value) in view.iter_mut().zip(native.view) {
+                            *word = value.to_bits();
+                        }
+                        view[9] = layer;
+                        bind(
+                            &mut state.arena,
+                            &encoder,
+                            Stage::Vertex,
+                            bytes_of_u32(&view),
+                            1,
+                        )?;
+                        encoder
+                            .drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset(
+                                MTLPrimitiveType::Triangle,
+                                native.indices.len(),
+                                MTLIndexType::UInt32,
+                                indices,
+                                *offset,
+                            );
+                    }
+                    _ => {
+                        if !samples.is_single() {
+                            bind(
+                                &mut state.arena,
+                                &encoder,
+                                Stage::Vertex,
+                                bytes_of_u32(&[layer]),
+                                1,
+                            )?;
+                        }
+                        encoder.drawPrimitives_vertexStart_vertexCount(
+                            MTLPrimitiveType::Triangle,
+                            0,
+                            triangles.len() * 6,
+                        );
+                    }
                 }
             }
         }
@@ -941,6 +1320,7 @@ impl Renderer {
     /// A color clear on Metal: `components` (bit i: component i) of
     /// `rect` of the target set to `color`, encoded as the format stores
     /// it (no sRGB conversion, as `CLEAR_SURFACE` writes the value raw).
+    #[allow(clippy::too_many_arguments)]
     pub fn clear(
         &self,
         memory: &dyn GpuMemory,
@@ -964,6 +1344,7 @@ impl Renderer {
             writes,
             &[(surface, Content::Color(format))],
             samples.log2,
+            rect == size && components == 0xF,
         )?;
         let mut state = self.state.lock().unwrap();
         let gpu = Self::gpu();
@@ -976,6 +1357,11 @@ impl Renderer {
                 let p = build_pipeline(
                     gpu,
                     &library,
+                    if layered {
+                        "vertex_layered"
+                    } else {
+                        "vertex_main"
+                    },
                     "clear_main",
                     &[(pixel_format.0, None, components, 0)],
                     None,
@@ -1003,8 +1389,14 @@ impl Renderer {
         });
         // SAFETY: as in `draw`.
         unsafe {
-            bind(gpu, &encoder, Stage::Fragment, bytes_of(&color), 0)?;
-            draw_clear(gpu, &encoder, samples)?;
+            bind(
+                &mut state.arena,
+                &encoder,
+                Stage::Fragment,
+                bytes_of(&color),
+                0,
+            )?;
+            draw_clear(&mut state.arena, &encoder, samples)?;
         }
         state.rendered(residents[0], rect, writes);
         self.any_dirty
@@ -1063,11 +1455,14 @@ impl Renderer {
         if rect.is_empty() {
             return Ok(true);
         }
+        // Every bit of every texel set: the buffer's content is replaced.
+        let overwrite = rect == size && masks[0] == 0 && masks[2] == 0;
         let residents = self.residents(
             memory,
             writes,
             &[(surface, Content::Depth(format))],
             samples.log2,
+            overwrite,
         )?;
         let mut state = self.state.lock().unwrap();
         let gpu = Self::gpu();
@@ -1087,6 +1482,11 @@ impl Renderer {
                 let p = build_pipeline(
                     gpu,
                     &library,
+                    if layered {
+                        "vertex_layered"
+                    } else {
+                        "vertex_main"
+                    },
                     function,
                     &[],
                     Some((pixel_format, true)),
@@ -1114,8 +1514,14 @@ impl Renderer {
         });
         // SAFETY: as in `draw`.
         unsafe {
-            bind(gpu, &encoder, Stage::Fragment, bytes_of_u32(&masks), 0)?;
-            draw_clear(gpu, &encoder, samples)?;
+            bind(
+                &mut state.arena,
+                &encoder,
+                Stage::Fragment,
+                bytes_of_u32(&masks),
+                0,
+            )?;
+            draw_clear(&mut state.arena, &encoder, samples)?;
         }
         state.rendered(residents[0], rect, writes);
         self.any_dirty
@@ -1132,6 +1538,7 @@ impl Renderer {
         writes: &Writes,
         targets: &[(Surface, Content)],
         log2: [u32; 2],
+        overwrite: bool,
     ) -> Result<Vec<usize>, Unmodeled> {
         self.state.lock().unwrap().trim_residents(targets);
         let other = |r: &Resident, surface: Surface, format: Content| {
@@ -1189,6 +1596,12 @@ impl Renderer {
             };
             match found {
                 Some((index, true)) => indices.push(index),
+                // A target the caller replaces whole needs no look at
+                // memory: what it held does not matter.
+                Some((index, false)) if overwrite => {
+                    self.state.lock().unwrap().residents[index].stamp = Some(writes.stamp());
+                    indices.push(index);
+                }
                 Some((index, false)) => {
                     // Compare with guest memory, without holding the
                     // state (reads may flush); reload if it changed.
@@ -1258,6 +1671,166 @@ impl State {
             frame.command.commit();
             frame.command.waitUntilCompleted();
         }
+        // Nothing recorded uses the arena's space any more.
+        self.arena.reset();
+    }
+
+    /// Encodes, after the work recorded so far, a compute pass that writes
+    /// resident `index`'s dirty texels as the guest stores them (samples
+    /// interleaved as `multisample` lays them out, block-linear GOBs or
+    /// pitch rows) over a copy of the mirror's bands that hold them, so
+    /// that the write-back is a copy of whole bands (see
+    /// [`Resident::store_packed`]). `None` (nothing encoded) for a resident
+    /// that is not dirty, of a texel size without a raw view, or whose
+    /// mirror lays texels out otherwise than [`guest_offset`] says.
+    fn pack(&mut self, index: usize) -> Result<Option<Packed>, Unmodeled> {
+        let resident = &self.residents[index];
+        let Some(rect) = resident.dirty else {
+            return Ok(None);
+        };
+        let bpp = resident.surface.bytes_per_pixel;
+        let raw_format = match bpp {
+            1 => MTLPixelFormat::R8Uint,
+            2 => MTLPixelFormat::R16Uint,
+            4 => MTLPixelFormat::R32Uint,
+            8 => MTLPixelFormat::RG32Uint,
+            16 => MTLPixelFormat::RGBA32Uint,
+            _ => return Ok(None),
+        };
+        let layout = Samples {
+            log2: resident.log2,
+            ..Samples::SINGLE
+        };
+        let texels = layout.texels(rect);
+        if texels.is_empty() {
+            return Ok(None);
+        }
+        let (Some(first), Some(last)) = (
+            resident.mirror.band_range(texels.y0),
+            resident.mirror.band_range(texels.y1 - 1),
+        ) else {
+            return Ok(None);
+        };
+        let pitch = match resident.surface.layout {
+            super::surface::Layout::Pitch { pitch } => Some(pitch),
+            super::surface::Layout::BlockLinear(_) => None,
+        };
+        let words = PackWords {
+            x0: texels.x0,
+            y0: texels.y0,
+            width: texels.x1 - texels.x0,
+            height: texels.y1 - texels.y0,
+            bpp,
+            lx: resident.log2[0],
+            ly: resident.log2[1],
+            pitch: pitch.unwrap_or(0),
+            band_bytes: first.len() as u32,
+            start: first.start as u32,
+        };
+        // The mirror must lay texels out as the kernel does.
+        let corners = [
+            (texels.x0, texels.y0),
+            (texels.x1 - 1, texels.y0),
+            (texels.x0, texels.y1 - 1),
+            (texels.x1 - 1, texels.y1 - 1),
+        ];
+        if corners.iter().any(|&(x, y)| {
+            first.start + guest_offset(&words, x, y) as usize != resident.mirror.texel_offset(x, y)
+        }) {
+            self.note("write-back on the CPU: mirror layout");
+            return Ok(None);
+        }
+        let Some(view) = resident.texture.newTextureViewWithPixelFormat(raw_format) else {
+            self.note("write-back on the CPU: no raw view");
+            return Ok(None);
+        };
+        let (start, end) = (first.start, last.end);
+        let layered = resident.log2 != [0, 0];
+        let (buffer, offset) = self.arena.alloc(&resident.mirror.data()[start..end])?;
+        let pipeline = self.pack_pipeline(layered)?;
+        let command = self.command()?;
+        let encoder = command
+            .computeCommandEncoder()
+            .ok_or_else(|| Unmodeled("Metal: no compute encoder".into()))?;
+        encoder.setComputePipelineState(&pipeline);
+        // SAFETY: the kernel's bindings: the view, the staging range and
+        // the words; the grid covers the dirty texels.
+        unsafe {
+            encoder.setTexture_atIndex(Some(&view), 0);
+            encoder.setBuffer_offset_atIndex(Some(&buffer), offset, 0);
+            let bytes =
+                NonNull::new((&words as *const PackWords).cast_mut().cast()).expect("non-null");
+            encoder.setBytes_length_atIndex(bytes, std::mem::size_of::<PackWords>(), 1);
+        }
+        let group = MTLSize {
+            width: 16,
+            height: 16,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: words.width as usize,
+                height: words.height as usize,
+                depth: 1,
+            },
+            group,
+        );
+        encoder.endEncoding();
+        Ok(Some(Packed {
+            buffer,
+            offset,
+            bands: start..end,
+            texels,
+        }))
+    }
+
+    /// Counts a reason as [`Renderer::fall_back`] does.
+    fn note(&mut self, reason: &str) {
+        let count = self.fallbacks.entry(reason.to_string()).or_default();
+        if *count == 0 {
+            eprintln!("Metal renderer: {reason}");
+        }
+        *count += 1;
+    }
+
+    /// The command buffer being recorded (made if there is none), with no
+    /// render pass open.
+    fn command(&mut self) -> Result<Retained<CommandBuffer>, Unmodeled> {
+        if self.frame.is_none() {
+            let command = Renderer::gpu()
+                .queue
+                .commandBuffer()
+                .ok_or_else(|| Unmodeled("Metal: no command buffer".into()))?;
+            self.frame = Some(Frame {
+                command,
+                pass: None,
+            });
+        }
+        let frame = self.frame.as_mut().expect("just made");
+        if let Some((encoder, _)) = frame.pass.take() {
+            encoder.endEncoding();
+        }
+        Ok(frame.command.clone())
+    }
+
+    /// The packing kernel for layered (one layer per sample) or plain
+    /// residents (made once).
+    fn pack_pipeline(&mut self, layered: bool) -> Result<Retained<ComputePipeline>, Unmodeled> {
+        if let Some(pipeline) = self.pack_pipelines.get(&layered) {
+            return Ok(pipeline.clone());
+        }
+        let gpu = Renderer::gpu();
+        let library = self.library(gpu, PACK_SOURCE.to_string())?;
+        let name = if layered { "pack_layers" } else { "pack_plain" };
+        let function = library
+            .newFunctionWithName(&NSString::from_str(name))
+            .ok_or_else(|| Unmodeled("Metal: no packing function".into()))?;
+        let pipeline = gpu
+            .device
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|e| Unmodeled(format!("Metal: packing pipeline: {e}")))?;
+        self.pack_pipelines.insert(layered, pipeline.clone());
+        Ok(pipeline)
     }
 
     /// Drops what the software caches no longer hold: uploads of textures
@@ -1268,13 +1841,20 @@ impl State {
     fn trim(&mut self) {
         self.textures
             .retain(|_, (texture, _)| Arc::strong_count(texture) > 1);
-        let before = self.programs.len();
+        let before = self.programs.len() + self.vertex_programs.len();
         self.programs
             .retain(|_, entry| Arc::strong_count(&entry.program) > 1);
-        if self.programs.len() != before {
-            let programs = &self.programs;
-            self.pipelines
-                .retain(|key, _| programs.contains_key(&key.program));
+        self.vertex_programs
+            .retain(|_, entry| Arc::strong_count(&entry.program) > 1);
+        if self.programs.len() + self.vertex_programs.len() != before {
+            let (programs, vertex_programs) = (&self.programs, &self.vertex_programs);
+            self.pipelines.retain(|key, _| {
+                programs.contains_key(&key.program)
+                    && key
+                        .native
+                        .as_ref()
+                        .is_none_or(|native| vertex_programs.contains_key(&native.0))
+            });
         }
     }
 
@@ -1444,6 +2024,28 @@ impl Resident {
         extent(&self.surface)
     }
 
+    /// Stores the texels [`State::pack`] packed, the GPU being done: its
+    /// bands into the mirror, and the texels from there to guest memory.
+    fn store_packed(&mut self, packed: Packed, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+        let length = packed.bands.len();
+        // SAFETY: the staging range holds `length` bytes the finished GPU
+        // work wrote; nothing else uses it until the arena hands it out
+        // again.
+        let staged = unsafe {
+            std::slice::from_raw_parts(
+                packed
+                    .buffer
+                    .contents()
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(packed.offset),
+                length,
+            )
+        };
+        self.mirror.data_mut()[packed.bands].copy_from_slice(staged);
+        self.mirror.store_rect(memory, packed.texels)
+    }
+
     /// Writes `rect` (pixels) of the Metal texture to guest memory.
     fn write_back(&mut self, rect: Rect, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
         let bpp = self.surface.bytes_per_pixel as usize;
@@ -1536,7 +2138,11 @@ fn deinterleave(texels: Vec<u8>, rect: Rect, layout: Samples, bpp: usize) -> Vec
 ///
 /// As [`bind`]: the encoder's pipeline is a clear pipeline, layered when
 /// `samples` has more than one.
-unsafe fn draw_clear(gpu: &Gpu, encoder: &Encoder, samples: Samples) -> Result<(), Unmodeled> {
+unsafe fn draw_clear(
+    arena: &mut Arena,
+    encoder: &Encoder,
+    samples: Samples,
+) -> Result<(), Unmodeled> {
     if samples.is_single() {
         // SAFETY: per the caller.
         unsafe { encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3) };
@@ -1545,12 +2151,99 @@ unsafe fn draw_clear(gpu: &Gpu, encoder: &Encoder, samples: Samples) -> Result<(
     for layer in 0..samples.count() as u32 {
         // SAFETY: per the caller.
         unsafe {
-            bind(gpu, encoder, Stage::Vertex, bytes_of_u32(&[layer]), 1)?;
+            bind(arena, encoder, Stage::Vertex, bytes_of_u32(&[layer]), 1)?;
             encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
         }
     }
     Ok(())
 }
+
+/// What [`State::pack`] encoded: where the packed bands are staged, the
+/// range of the mirror's data they replace and the texels written.
+struct Packed {
+    buffer: Retained<MetalBuffer>,
+    offset: usize,
+    bands: std::ops::Range<usize>,
+    texels: Rect,
+}
+
+/// The words of the packing kernel ([`PACK_SOURCE`] `PackWords`): the
+/// texel rectangle, texel size, samples (log2 x, y), the pitch (0: block
+/// linear), the bytes per band of 8 rows and the mirror data offset of
+/// the first band packed.
+#[repr(C)]
+struct PackWords {
+    x0: u32,
+    y0: u32,
+    width: u32,
+    height: u32,
+    bpp: u32,
+    lx: u32,
+    ly: u32,
+    pitch: u32,
+    band_bytes: u32,
+    start: u32,
+}
+
+/// Offset of texel (`x`, `y`) from the first band packed, as
+/// [`PACK_SOURCE`] `guest_offset` computes it: bands of 8 rows one after
+/// the other; in a block-linear band the GOBs left to right, 512 bytes
+/// each, a 16-byte unit of byte column c and row r at ((c & 0x20) << 3) |
+/// ((r & 6) << 5) | ((c & 0x10) << 1) | ((r & 1) << 4) [public: Ryujinx
+/// `BlockLinearLayout.cs`, as `surface::Window`]; in a pitch band 8 rows of
+/// `pitch` bytes.
+fn guest_offset(p: &PackWords, x: u32, y: u32) -> u32 {
+    let band = (y >> 3) * p.band_bytes;
+    let column = x * p.bpp;
+    let within = if p.pitch != 0 {
+        (y & 7) * p.pitch + column
+    } else {
+        let (c, r) = (column & 63, y & 7);
+        (column >> 6) * 512
+            + (((c & 0x20) << 3) | ((r & 6) << 5) | ((c & 0x10) << 1) | ((r & 1) << 4))
+            + (c & 0xF)
+    };
+    band + within - p.start
+}
+
+/// The packing kernels (`State::pack`): one thread per texel reads it (the
+/// layer of its sample for multisampled residents, the sample from the
+/// texel's place in its pixel's block as `multisample::Samples::cell`
+/// places them) through a view of the texture as unsigned words and
+/// stores its bytes at its guest offset (`guest_offset`).
+const PACK_SOURCE: &str = r#"#include <metal_stdlib>
+using namespace metal;
+struct PackWords { uint x0, y0, width, height, bpp, lx, ly, pitch, band_bytes, start; };
+static inline uint guest_offset(constant PackWords& p, uint x, uint y) {
+    const uint band = (y >> 3) * p.band_bytes;
+    const uint column = x * p.bpp;
+    uint within;
+    if (p.pitch != 0u) {
+        within = (y & 7u) * p.pitch + column;
+    } else {
+        const uint c = column & 63u, r = y & 7u;
+        within = (column >> 6) * 512u + (((c & 0x20u) << 3) | ((r & 6u) << 5) | ((c & 0x10u) << 1) | ((r & 1u) << 4)) + (c & 0xFu);
+    }
+    return band + within - p.start;
+}
+static inline void store(device uchar* out, uint4 v, uint bpp) {
+    for (uint i = 0u; i < bpp; i++) {
+        out[i] = uchar(v[min(i >> 2, 3u)] >> (8u * (i & 3u)));
+    }
+}
+kernel void pack_plain(texture2d<uint, access::read> t [[texture(0)]], device uchar* out [[buffer(0)]], constant PackWords& p [[buffer(1)]], uint2 g [[thread_position_in_grid]]) {
+    if (g.x >= p.width || g.y >= p.height) { return; }
+    const uint x = p.x0 + g.x, y = p.y0 + g.y;
+    store(out + guest_offset(p, x, y), t.read(uint2(x, y)), p.bpp);
+}
+kernel void pack_layers(texture2d_array<uint, access::read> t [[texture(0)]], device uchar* out [[buffer(0)]], constant PackWords& p [[buffer(1)]], uint2 g [[thread_position_in_grid]]) {
+    if (g.x >= p.width || g.y >= p.height) { return; }
+    const uint x = p.x0 + g.x, y = p.y0 + g.y;
+    const uint cx = x & ((1u << p.lx) - 1u), cy = y & ((1u << p.ly) - 1u);
+    const uint sample = (cx & 1u) | ((cy & 1u) << 1) | ((cx & 2u) << 1) | ((cy & 2u) << 2);
+    store(out + guest_offset(p, x, y), t.read(uint2(x >> p.lx, y >> p.ly), sample), p.bpp);
+}
+"#;
 
 const CLEAR_SOURCE: &str = r#"#include <metal_stdlib>
 using namespace metal;
@@ -1632,25 +2325,22 @@ fn compile_library(gpu: &Gpu, source: &str) -> Result<Retained<Library>, Unmodel
         .map_err(|e| Unmodeled(format!("Metal: shader compilation failed: {e}\n{source}")))
 }
 
-/// A pipeline of `vertex_main` (`vertex_layered` when `layered`: targets
-/// of one layer per sample) and `fragment` with color `attachments`
-/// (pixel format, blend, write mask, program output) and, after them, the
-/// depth buffer's words `depth` (pixel format, written), never blended.
+/// A pipeline of vertex function `vertex` and `fragment` with color
+/// `attachments` (pixel format, blend, write mask, program output) and,
+/// after them, the depth buffer's words `depth` (pixel format, written),
+/// never blended; `layered` when the vertex function picks the layer of
+/// targets of one layer per sample.
 fn build_pipeline(
     gpu: &Gpu,
     library: &Library,
+    vertex: &str,
     fragment: &str,
     attachments: &[(usize, Option<Blend>, u8, usize)],
     depth: Option<(MTLPixelFormat, bool)>,
     layered: bool,
 ) -> Result<Retained<Pipeline>, Unmodeled> {
-    let vertex_name = if layered {
-        "vertex_layered"
-    } else {
-        "vertex_main"
-    };
     let vertex = library
-        .newFunctionWithName(&NSString::from_str(vertex_name))
+        .newFunctionWithName(&NSString::from_str(vertex))
         .ok_or_else(|| Unmodeled("Metal: no vertex function".into()))?;
     let fragment = library
         .newFunctionWithName(&NSString::from_str(fragment))
@@ -1926,14 +2616,14 @@ enum Stage {
 }
 
 /// Binds `data` at buffer `index` of `stage`: copied into the command
-/// stream when small (no allocation, as Metal advises below 4 KiB), as a
-/// buffer of its own otherwise.
+/// stream when small (no allocation, as Metal advises below 4 KiB), into
+/// the frame's arena otherwise.
 ///
 /// # Safety
 ///
 /// `index` is within the stage function's buffer bindings.
 unsafe fn bind(
-    gpu: &Gpu,
+    arena: &mut Arena,
     encoder: &Encoder,
     stage: Stage,
     data: &[u8],
@@ -1953,15 +2643,129 @@ unsafe fn bind(
         }
         return Ok(());
     }
-    let buffer = buffer(gpu, data)?;
+    let (buffer, offset) = arena.alloc(data)?;
     // SAFETY: Metal retains the buffer; `index` per the caller.
     unsafe {
         match stage {
-            Stage::Vertex => encoder.setVertexBuffer_offset_atIndex(Some(&buffer), 0, index),
-            Stage::Fragment => encoder.setFragmentBuffer_offset_atIndex(Some(&buffer), 0, index),
+            Stage::Vertex => encoder.setVertexBuffer_offset_atIndex(Some(&buffer), offset, index),
+            Stage::Fragment => {
+                encoder.setFragmentBuffer_offset_atIndex(Some(&buffer), offset, index)
+            }
         }
     }
     Ok(())
+}
+
+/// Shared buffer space for the data of the draws one command buffer
+/// records (vertex streams, indices, large bindings), handed out in
+/// order and taken back whole once the command buffer completed
+/// ([`State::finish`]): allocating a Metal buffer per binding costs a
+/// kernel call each.
+#[derive(Default)]
+struct Arena {
+    chunks: Vec<Retained<MetalBuffer>>,
+    /// The chunk being filled and the bytes used of it.
+    current: usize,
+    used: usize,
+}
+
+impl Arena {
+    /// Bytes per chunk \[assumption: a frame's draw data of a game at a
+    /// few chunks; larger data gets a chunk of its own size\].
+    const CHUNK: usize = 16 << 20;
+    /// Offsets are aligned for any buffer binding [public: Apple, Metal
+    /// feature set tables, "Minimum constant buffer offset alignment": 256
+    /// bytes on macOS GPUs].
+    const ALIGN: usize = 256;
+
+    /// `data` copied into the arena: its buffer and offset.
+    fn alloc(&mut self, data: &[u8]) -> Result<(Retained<MetalBuffer>, usize), Unmodeled> {
+        let length = data.len().max(4);
+        loop {
+            if let Some(chunk) = self.chunks.get(self.current) {
+                let offset = self.used.next_multiple_of(Self::ALIGN);
+                if offset + length <= chunk.length() {
+                    // SAFETY: the range is inside the shared buffer, which
+                    // no recorded GPU work uses (see `reset`).
+                    unsafe {
+                        let base = chunk.contents().as_ptr().cast::<u8>().add(offset);
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), base, data.len());
+                    }
+                    self.used = offset + length;
+                    return Ok((chunk.clone(), offset));
+                }
+                self.current += 1;
+                self.used = 0;
+                continue;
+            }
+            let size = length.max(Self::CHUNK);
+            let chunk = Renderer::gpu()
+                .device
+                .newBufferWithLength_options(size, MTLResourceOptions::StorageModeShared)
+                .ok_or_else(|| Unmodeled("Metal: buffer allocation failed".into()))?;
+            // A chunk past the usual size is not kept for later frames.
+            self.chunks.insert(self.current, chunk);
+        }
+    }
+
+    /// Every chunk free again; an oversized one is dropped.
+    fn reset(&mut self) {
+        self.chunks.retain(|chunk| chunk.length() <= Self::CHUNK);
+        self.current = 0;
+        self.used = 0;
+    }
+}
+
+/// A stage's constant buffers as its function binds them (see
+/// `Translated::source`), by slot, with the sizes of the readable parts
+/// of indexed slots; or why they cannot be bound. Slots read at register
+/// offsets (LDC) are their readable part of the bound range, in words; a
+/// bound range can reach past the memory its owner mapped (see
+/// `pipeline::read_mapped`); an indexed read there, which the interpreter
+/// refuses (hardware would fault), reads 0 on Metal. No statically known
+/// read may go there. Borrowed from `supplied` (one per slot) unless
+/// padded.
+#[allow(clippy::type_complexity)]
+fn stage_constants<'c>(
+    indirect: &std::collections::BTreeSet<u32>,
+    statics: &std::collections::BTreeSet<(u32, u32)>,
+    supplied: &'c [(Vec<u8>, usize)],
+) -> Result<([Option<Cow<'c, [u8]>>; 18], [u32; 18]), String> {
+    let mut constants: [Option<Cow<'c, [u8]>>; 18] = Default::default();
+    let mut sizes = [0u32; 18];
+    for &slot in indirect {
+        let Some((data, size)) = supplied.get(slot as usize) else {
+            return Err(format!("constant buffer slot {slot}"));
+        };
+        let readable = data.len().min(*size);
+        let padded = readable.next_multiple_of(4).max(4);
+        constants[slot as usize] = Some(if padded == readable {
+            Cow::Borrowed(&data[..readable])
+        } else {
+            let mut buffer = data[..readable].to_vec();
+            buffer.resize(padded, 0);
+            Cow::Owned(buffer)
+        });
+        sizes[slot as usize] = readable as u32;
+    }
+    for &(slot, offset) in statics {
+        let Some((data, size)) = supplied.get(slot as usize) else {
+            return Err(format!("constant buffer slot {slot}"));
+        };
+        let end = offset as usize + 4;
+        if end > data.len() && end <= *size {
+            return Err("constant read past the mapped part".into());
+        }
+        if indirect.contains(&slot) {
+            // Bounds-checked by the program against the sizes.
+            continue;
+        }
+        let buffer = constants[slot as usize].get_or_insert(Cow::Borrowed(data.as_slice()));
+        if buffer.len() < end {
+            buffer.to_mut().resize(end, 0);
+        }
+    }
+    Ok((constants, sizes))
 }
 
 fn bytes_of(values: &[f32]) -> &[u8] {

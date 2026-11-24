@@ -1937,4 +1937,131 @@ fn multisampling_matches_software() {
     }
 }
 
+/// A 64x64 frame drawn by `kind` from two meshes of 8x8 quads (384
+/// vertices each, enough for the native vertex stage of `pipeline::native`
+/// on Metal), each quad as two triangles at its own random depths,
+/// half of them wound the other way, with back faces culled under
+/// `front_face` (`OGL_SET_FRONT_FACE`) and `origin`
+/// (`SET_WINDOW_ORIGIN`), the depth test LESS against a cleared Z24S8
+/// buffer. The color target after a write-back.
+fn mesh_frame(kind: super::RendererKind, origin: u32, front_face: u32) -> Vec<u8> {
+    let elf = std::fs::read(STARTER).expect("starter ELF (fw_elf) must be present");
+    let mut frame = Frame::sized_with(SIZE, SIZE, kind);
+    frame.program(1, 0, starter_program(&elf, 0x4c0e00));
+    frame.program(5, 0x800, starter_program(&elf, 0x4be400));
+    frame.constants(0, 3, 0x30_0000, &ui2d_vertex_constants(&[]));
+    let fill = vec![0xFFu8; (SIZE * SIZE * 4) as usize];
+    frame.ram.put(DEPTH, &fill);
+    for (offset, value) in [
+        (0x13ac, origin),
+        (0x1918, 1),     // OGL_SET_CULL
+        (0x1920, 0x405), // OGL_SET_CULL_FACE BACK
+        (0x191c, front_face),
+        (0x0fe0, (DEPTH >> 32) as u32),
+        (0x0fe4, DEPTH as u32),
+        (0x0fe8, 0x14),
+        (0x0fec, 0),
+        (0x1228, SIZE),
+        (0x122c, SIZE),
+        (0x1230, 1),
+        (0x1538, 1),
+        (0x12cc, 1),
+        (0x130c, 0x201),
+        (0x12e8, 1),
+    ] {
+        frame.method(offset, value);
+    }
+    let mut random = Random(0x1234_5678_9abc_def1);
+    for (mesh, color) in [[1.0, 0.25, 0.0, 1.0], [0.25, 0.5, 1.0, 1.0]]
+        .into_iter()
+        .enumerate()
+    {
+        frame.constants(4, 3, 0x30_1000 + 0x100 * mesh as u64, &floats(&color));
+        let mut vertices = Vec::new();
+        for qy in 0..8 {
+            for qx in 0..8 {
+                let (x0, y0) = (qx as f32 / 4.0 - 1.0, qy as f32 / 4.0 - 1.0);
+                let (x1, y1) = (x0 + 0.25, y0 + 0.25);
+                let z = [0; 4].map(|_| random.unit() * 1.6 - 0.8);
+                let corners = [
+                    [x0, y0, z[0]],
+                    [x1, y0, z[1]],
+                    [x1, y1, z[2]],
+                    [x0, y1, z[3]],
+                ];
+                let order: [usize; 6] = if (qx + qy + mesh) % 2 == 0 {
+                    [0, 1, 2, 0, 2, 3]
+                } else {
+                    [0, 2, 1, 0, 3, 2]
+                };
+                for i in order {
+                    vertices.extend(corners[i]);
+                }
+            }
+        }
+        let address = 0x40_0000 + 0x2000 * mesh as u64;
+        frame.vertices(address, 12, &vertices, &[(0, 0x02)]);
+        frame.method(0x1618, 4); // BEGIN TRIANGLES
+        frame.method(0x0d74, 0);
+        frame.method(0x0d78, (vertices.len() / 3) as u32);
+        frame.method(0x1614, 0);
+    }
+    frame.channel.flush(&frame.ram).unwrap();
+    if let Some(metal) = &frame.channel.hooks.metal {
+        assert_eq!(metal.fallbacks(), (2, vec![]), "Metal drew both meshes");
+        assert_eq!(metal.cpu_vertices(), vec![], "on the native path");
+    }
+    frame.ram.bytes(TARGET, (SIZE * SIZE * 4) as usize)
+}
+
+/// Draws of hundreds of vertices run their vertex stage on the GPU
+/// (`pipeline::native`) and are rasterized by Metal: what they cover,
+/// cull and keep through the depth test matches the software renderer at
+/// every quad's interior (Metal's fill rule and interpolation may differ
+/// at triangle edges, the software's are the reference), for both window
+/// origins and front faces.
+#[test]
+fn native_draws_match_software() {
+    use super::RendererKind::{Metal, Software};
+    if !super::metal::available() {
+        return;
+    }
+    for origin in [0, 0x10] {
+        for front_face in [0x900, 0x901] {
+            let software = mesh_frame(Software, origin, front_face);
+            let metal = mesh_frame(Metal, origin, front_face);
+            let pixel =
+                |frame: &[u8], x: u32, y: u32| frame[((y * SIZE + x) * 4) as usize..][..4].to_vec();
+            // Each quad's two triangles meet on its diagonal; points well
+            // inside either triangle.
+            let mut colors = std::collections::HashSet::new();
+            for qy in 0..8 {
+                for qx in 0..8 {
+                    for (dx, dy) in [(2, 5), (5, 2)] {
+                        let (x, y) = (qx * 8 + dx, qy * 8 + dy);
+                        let expected = pixel(&software, x, y);
+                        assert_eq!(
+                            pixel(&metal, x, y),
+                            expected,
+                            "origin {origin:#x} front {front_face:#x} at {x},{y}"
+                        );
+                        colors.insert(expected);
+                    }
+                }
+            }
+            // Both meshes show (each quad faces front in one of them).
+            assert_eq!(colors.len(), 2, "{colors:?}");
+            let same = software
+                .chunks(4)
+                .zip(metal.chunks(4))
+                .filter(|(a, b)| a == b)
+                .count();
+            assert!(
+                same * 100 >= software.len() / 4 * 90,
+                "origin {origin:#x} front {front_face:#x}: {same} pixels equal"
+            );
+        }
+    }
+}
+
 mod lines;

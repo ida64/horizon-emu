@@ -68,6 +68,11 @@ mod ops;
 #[cfg(test)]
 mod tests;
 mod texture;
+mod vertex;
+
+pub use vertex::{
+    Fetch, MAX_STREAMS, NativeVertex, STREAM_BUFFER, TranslatedVertex, translate_vertex,
+};
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -181,8 +186,16 @@ enum Form {
     Imm32,
 }
 
+/// The program stage a [`Writer`] translates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Pixel,
+    Vertex,
+}
+
 struct Writer<'a> {
     program: &'a Program,
+    stage: Stage,
     out: String,
     registers: BTreeSet<u32>,
     predicates: BTreeSet<u32>,
@@ -193,6 +206,11 @@ struct Writer<'a> {
     implicit_lod: Vec<bool>,
     constants: BTreeSet<(u32, u32)>,
     indirect: BTreeSet<u32>,
+    /// Vertex programs: input attribute words `ALD` reads (`i{word}`).
+    inputs: BTreeSet<u32>,
+    /// Vertex programs: output attribute words `AST` writes or `ALD.O`
+    /// reads (`o{word}`).
+    outputs: BTreeSet<u32>,
     word: u64,
     pc: u32,
 }
@@ -420,14 +438,16 @@ impl Writer<'_> {
         if self.alu(op)? || self.integer(op)? {
             return Ok(());
         }
-        match op {
-            Op::Ipa => self.ipa(),
-            Op::Shfl => self.shfl(),
-            Op::Fswzadd => self.fswzadd(),
-            Op::Ldc => self.ldc(),
-            Op::Texs => self.texs(),
-            Op::Tex => self.tex(),
-            Op::TexB | Op::TldB | Op::Tld4B | Op::TmmlB | Op::TxdB | Op::TxqB => {
+        match (self.stage, op) {
+            (Stage::Pixel, Op::Ipa) => self.ipa(),
+            (Stage::Pixel, Op::Shfl) => self.shfl(),
+            (Stage::Pixel, Op::Fswzadd) => self.fswzadd(),
+            (Stage::Pixel, Op::Texs) => self.texs(),
+            (Stage::Pixel, Op::Tex) => self.tex(),
+            (Stage::Vertex, Op::Ald) => self.ald(),
+            (Stage::Vertex, Op::Ast) => self.ast(),
+            (_, Op::Ldc) => self.ldc(),
+            (_, Op::TexB | Op::TldB | Op::Tld4B | Op::TmmlB | Op::TxdB | Op::TxqB) => {
                 self.refuse("bindless texture (handle in a register)")
             }
             _ => self.refuse("not translated"),
@@ -522,6 +542,17 @@ static inline bool covers_at(const device int* t, float x, float y, uint sx, uin
 /// `raster::Triangle::covers`: the pixel center.
 static inline bool covers(const device int* t, float x, float y) {
     return covers_at(t, x, y, 8u, 8u);
+}
+/// Polygon offset of a native draw (see `metal`): `b` holds the
+/// constant term for a fixed least representable value, the slope
+/// factor, the clamp (0: none) and the constant factor for float depth's
+/// value-dependent one, 2^(exponent(z) - 23) (`pipeline::depth_bias`).
+static inline float native_depth_bias(constant float* b, float z, float slope) {
+    int e;
+    const float m = frexp(fabs(z), e);
+    const float r = m == 0.0f ? 0.0f : ldexp(1.0f, e - 24);
+    const float bias = (b[0] + b[3] * r) + b[1] * slope;
+    return b[2] > 0.0f ? min(bias, b[2]) : (b[2] < 0.0f ? max(bias, b[2]) : bias);
 }
 /// `raster::alpha_coverage` for `n` samples.
 static inline uint alpha_coverage(float alpha, uint n) {
@@ -668,8 +699,12 @@ impl Translated {
         alpha_test: bool,
         depth: Option<DepthStage>,
         multisample: Option<MultisampleStage>,
+        native: Option<&NativeVertex>,
     ) -> String {
         let mut s = String::from(PRELUDE);
+        if let Some(vertex) = native {
+            s.push_str(&vertex.source);
+        }
         // The depth attachment's words, how its depth is read (from `zin`)
         // and written (into `w`, the word being updated)
         // (`DepthFormat::read_depth`, `write_depth`), and how its stencil
@@ -725,13 +760,21 @@ impl Translated {
             let _ = writeln!(s, "    {words} z [[color({})]];", outputs.len());
         }
         let _ = writeln!(s, "}};");
-        let mut parameters = vec![
-            "float4 position [[position]]".to_string(),
-            "uint primitive [[primitive_id]]".to_string(),
-            "const device float* planes [[buffer(0)]]".to_string(),
-            "const device float* lod_bias [[buffer(1)]]".to_string(),
-            "const device int* triangles [[buffer(24)]]".to_string(),
-        ];
+        let mut parameters = if native.is_some() {
+            vec![
+                "Varyings in [[stage_in]]".to_string(),
+                "bool front [[front_facing]]".to_string(),
+                "const device float* lod_bias [[buffer(1)]]".to_string(),
+            ]
+        } else {
+            vec![
+                "float4 position [[position]]".to_string(),
+                "uint primitive [[primitive_id]]".to_string(),
+                "const device float* planes [[buffer(0)]]".to_string(),
+                "const device float* lod_bias [[buffer(1)]]".to_string(),
+                "const device int* triangles [[buffer(24)]]".to_string(),
+            ]
+        };
         let slots: BTreeSet<u32> = self
             .constants
             .iter()
@@ -763,8 +806,11 @@ impl Translated {
             if stencil.is_some() {
                 parameters.push("constant uint* stencil_test [[buffer(25)]]".to_string());
             }
+            if native.is_some() {
+                parameters.push("constant float* depth_bias [[buffer(27)]]".to_string());
+            }
         }
-        if multisample.is_some() {
+        if multisample.is_some() && native.is_none() {
             parameters.push("uint layer [[render_target_array_index]]".to_string());
             parameters.push("constant uint* sample_positions [[buffer(26)]]".to_string());
         }
@@ -773,17 +819,26 @@ impl Translated {
             "fragment Output fragment_main({}) {{",
             parameters.join(", ")
         );
-        let _ = writeln!(
-            s,
-            "    const float px = position.x; const float py = position.y;\n    const uint plane_base = (primitive >> 1u) * {}u;\n    const device int* tri = triangles + (primitive >> 1u) * {TRIANGLE_WORDS}u;",
-            self.ipa_words.len().max(1)
-        );
-        // The centroid (cpx, cpy) `IPA` CENTROID evaluates at.
-        match multisample {
-            None => {
-                let _ = writeln!(s, "    const float cpx = px; const float cpy = py;");
+        if native.is_some() {
+            let _ = writeln!(
+                s,
+                "    const float px = in.position.x; const float py = in.position.y;"
+            );
+            if multisample.is_some() {
+                let _ = writeln!(s, "    const uint layer = in.layer;");
             }
-            Some(stage) => {
+        } else {
+            let _ = writeln!(
+                s,
+                "    const float px = position.x; const float py = position.y;\n    const uint plane_base = (primitive >> 1u) * {}u;\n    const device int* tri = triangles + (primitive >> 1u) * {TRIANGLE_WORDS}u;",
+                self.ipa_words.len().max(1)
+            );
+        }
+        // The centroid (cpx, cpy) `IPA` CENTROID evaluates at. Native
+        // draws interpolate where Metal samples the pixel (the sample's
+        // position in a multisampled layer, see `metal`).
+        match multisample {
+            Some(stage) if native.is_none() => {
                 let _ = writeln!(
                     s,
                     "    uint coverage_mask = 0u;\n    for (uint k = 0u; k < {n}u; k++) {{ const uint p = sample_positions[k]; coverage_mask |= covers_at(tri, px, py, p & 0xffu, p >> 8) ? 1u << k : 0u; }}\n    float cpx = px; float cpy = py;\n    if (coverage_mask != 0u && coverage_mask != {all:#x}u) {{ const uint p = sample_positions[ctz(coverage_mask)]; cpx = (px - 0.5f) + float(p & 0xffu) / 16.0f; cpy = (py - 0.5f) + float(p >> 8) / 16.0f; }}",
@@ -791,12 +846,40 @@ impl Translated {
                     all = (1u32 << stage.samples) - 1,
                 );
             }
+            _ => {
+                let _ = writeln!(s, "    const float cpx = px; const float cpy = py;");
+            }
+        }
+        // The depth slope polygon offset needs, taken while the whole
+        // quad runs.
+        if native.is_some() && depth.is_some() {
+            let _ = writeln!(
+                s,
+                "    const float zslope = max(fabs(dfdx(in.depth)), fabs(dfdy(in.depth)));"
+            );
+        }
+        // IPA{k} and IPAC{k}: plane k at the center and at the centroid.
+        for (k, &word) in self.ipa_words.iter().enumerate() {
+            let (center, centroid) = match native {
+                Some(vertex) => {
+                    let value = vertex.varying(word, k);
+                    (value.clone(), value)
+                }
+                None => (
+                    format!("plane(planes, plane_base + {k}u, px, py)"),
+                    format!("plane(planes, plane_base + {k}u, cpx, cpy)"),
+                ),
+            };
+            let _ = writeln!(s, "#define IPA{k} {center}\n#define IPAC{k} {centroid}");
         }
         s.push_str(&self.body);
-        let covered = if multisample.is_some() {
-            "((coverage_mask >> layer) & 1u) == 0u"
-        } else {
-            "!covers(tri, px, py)"
+        for k in 0..self.ipa_words.len() {
+            let _ = writeln!(s, "#undef IPA{k}\n#undef IPAC{k}");
+        }
+        let covered = match (native, multisample) {
+            (Some(_), _) => "false",
+            (None, Some(_)) => "((coverage_mask >> layer) & 1u) == 0u",
+            (None, None) => "!covers(tri, px, py)",
         };
         let _ = writeln!(s, "    if (killed || {covered}) {{ discard_fragment(); }}");
         let (registers, depth_register) = output_registers(program);
@@ -823,10 +906,13 @@ impl Translated {
         }
         let _ = writeln!(s, "    Output out;");
         if let Some((words, read, write, stencil)) = depth {
-            let incoming = match (depth_register, multisample) {
-                (Some(register), _) => format!("as_type<float>(r{register})"),
-                (None, Some(stage)) if !stage.center_depth => "(as_type<float>(tri[9]) + as_type<float>(tri[7]) * ((px - 0.5f) + float(sample_positions[layer] & 0xffu) / 16.0f)) + as_type<float>(tri[8]) * ((py - 0.5f) + float(sample_positions[layer] >> 8) / 16.0f)".into(),
-                (None, _) => "(as_type<float>(tri[9]) + as_type<float>(tri[7]) * px) + as_type<float>(tri[8]) * py".into(),
+            let incoming = match (depth_register, multisample, native) {
+                (Some(register), _, _) => format!("as_type<float>(r{register})"),
+                // Window z where Metal samples, offset (see
+                // `NativeVertex::depth_bias`).
+                (None, _, Some(_)) => "in.depth + native_depth_bias(depth_bias, in.depth, zslope)".into(),
+                (None, Some(stage), None) if !stage.center_depth => "(as_type<float>(tri[9]) + as_type<float>(tri[7]) * ((px - 0.5f) + float(sample_positions[layer] & 0xffu) / 16.0f)) + as_type<float>(tri[8]) * ((py - 0.5f) + float(sample_positions[layer] >> 8) / 16.0f)".into(),
+                (None, _, None) => "(as_type<float>(tri[9]) + as_type<float>(tri[7]) * px) + as_type<float>(tri[8]) * py".into(),
             };
             let _ = writeln!(
                 s,
@@ -834,9 +920,14 @@ impl Translated {
             );
             match stencil {
                 Some((read_stencil, write_stencil)) => {
+                    let face = if native.is_some() {
+                        "(front ? 0u : 7u)"
+                    } else {
+                        "(((uint(tri[6]) >> 3u) & 1u) != 0u ? 7u : 0u)"
+                    };
                     let _ = writeln!(
                         s,
-                        "      constant uint* st = stencil_test + (((uint(tri[6]) >> 3u) & 1u) != 0u ? 7u : 0u);\n      const uint s0 = {read_stencil};\n      const bool stencil_passed = compare(st[3], float(st[4] & st[5]), float(s0 & st[5]));\n      const bool passed = stencil_passed && compare(depth_test[0], z, {read});\n      const uint s = (s0 & ~st[6]) | (stencil_op(!stencil_passed ? st[0] : (!passed ? st[1] : st[2]), s0, st[4]) & st[6]);\n      w = {write_stencil};"
+                        "      constant uint* st = stencil_test + {face};\n      const uint s0 = {read_stencil};\n      const bool stencil_passed = compare(st[3], float(st[4] & st[5]), float(s0 & st[5]));\n      const bool passed = stencil_passed && compare(depth_test[0], z, {read});\n      const uint s = (s0 & ~st[6]) | (stencil_op(!stencil_passed ? st[0] : (!passed ? st[1] : st[2]), s0, st[4]) & st[6]);\n      w = {write_stencil};"
                     );
                 }
                 None => {
@@ -919,6 +1010,9 @@ pub fn translate(program: &Program, constant_buffer_1: &[u8]) -> Result<Translat
     let flow = flow::analyze(program, constant_buffer_1)?;
     let mut writer = Writer {
         program,
+        stage: Stage::Pixel,
+        inputs: BTreeSet::new(),
+        outputs: BTreeSet::new(),
         out: String::new(),
         registers: BTreeSet::new(),
         predicates: BTreeSet::new(),
