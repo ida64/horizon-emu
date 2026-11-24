@@ -36,7 +36,7 @@ use super::{
     pushbuffer::{GpEntry, Header, MethodRun},
 };
 use crate::{
-    maxwell::{Engines, Unmodeled},
+    maxwell::{Engines, Release, Unmodeled},
     snapshot::SnapshotError,
 };
 
@@ -208,6 +208,10 @@ pub struct Context {
     classes: [Option<u16>; 8],
     /// How the last turn on the host ended, for reports.
     pub last: Option<Outcome>,
+    /// GP_PUT as the channel last read it: a new value means the guest
+    /// submitted work after what was fetched, and the engines synchronize
+    /// ([`Engines::synchronize`]). `None` after a restore.
+    put_seen: Option<u32>,
 }
 
 /// A [`Context`] as a machine snapshot holds it: everything but the words
@@ -283,6 +287,7 @@ impl Context {
             engines,
             classes: [None; 8],
             last: None,
+            put_seen: None,
         })
     }
 
@@ -338,14 +343,6 @@ impl Context {
             self.gp_entries,
             classes.join(" "),
         )
-    }
-
-    /// Makes the engines' work visible in memory before the channel
-    /// signals (`Engines::flush`).
-    fn flush(&mut self, memory: &ChannelMemory) -> Result<(), Unmodeled> {
-        self.engines
-            .flush(memory)
-            .map_err(|unmodeled| with_fault(memory, unmodeled))
     }
 
     /// Writes everything the engines hold back to memory
@@ -421,6 +418,7 @@ impl Context {
             engines,
             classes: saved.classes,
             last: saved.last,
+            put_seen: None,
         })
     }
 
@@ -454,8 +452,23 @@ impl Context {
                 return Ok(Outcome::Interrupted);
             }
             let Some(segment) = &mut self.segment else {
-                if self.gp_put(env.bus)? == self.gp_get {
-                    return Ok(Outcome::Idle);
+                let put = self.gp_put(env.bus)?;
+                if self.put_seen != Some(put) {
+                    self.put_seen = Some(put);
+                    self.engines
+                        .synchronize(memory)
+                        .map_err(|unmodeled| with_fault(memory, unmodeled))?;
+                }
+                if put == self.gp_get {
+                    // Releases the engines hold back are made before the
+                    // channel rests; work submitted meanwhile goes on.
+                    self.engines
+                        .idle(memory)
+                        .map_err(|unmodeled| with_fault(memory, unmodeled))?;
+                    if self.gp_put(env.bus)? == self.gp_get {
+                        return Ok(Outcome::Idle);
+                    }
+                    continue;
                 }
                 let mut entry = [0; 8];
                 let at = self.gp_base + u64::from(self.gp_get) * 8;
@@ -508,6 +521,13 @@ impl Context {
                 },
             };
             if let Some(wait) = executed {
+                // Releases the engines hold back may be what it waits for.
+                self.engines
+                    .idle(memory)
+                    .map_err(|unmodeled| with_fault(memory, unmodeled))?;
+                if self.acquired(env, wait)? {
+                    continue;
+                }
                 return Ok(Outcome::Blocked(wait));
             }
             if let Some(segment) = &mut self.segment {
@@ -561,9 +581,8 @@ impl Context {
             }
             return Ok(None);
         }
-        if signals(method, argument) {
-            self.flush(memory)?;
-        }
+        // Releases are made once the engines' work before them is visible
+        // in memory (`Engines::release`).
         let host = &mut self.host;
         match method {
             method::NOP | method::FB_FLUSH | method::WFI | method::MEM_OP_A | method::MEM_OP_C => {}
@@ -593,7 +612,9 @@ impl Context {
                     Unmodeled(format!("SYNCPOINTB {argument:#x}: no syncpoint {index}"))
                 })?;
                 match argument & SYNCPOINT_OPERATION {
-                    SYNCPOINT_INCREMENT => env.syncpoints.add(index, 1),
+                    SYNCPOINT_INCREMENT => {
+                        self.release(env, memory, Release::Increment(index as u32))?
+                    }
                     SYNCPOINT_WAIT => {
                         let threshold = host.syncpoint_payload;
                         if (value.wrapping_sub(threshold) as i32) < 0 {
@@ -603,6 +624,9 @@ impl Context {
                                 switch: argument & SYNCPOINT_SWITCH != 0,
                             }));
                         }
+                        self.engines
+                            .synchronize(memory)
+                            .map_err(|unmodeled| with_fault(memory, unmodeled))?;
                     }
                     _ => {
                         return Err(Unmodeled(format!(
@@ -638,25 +662,56 @@ impl Context {
                     operation,
                     switch: argument & SEMAPHORE_ACQUIRE_SWITCH != 0,
                 };
-                Ok((!self.acquired(env, wait)?).then_some(wait))
+                if !self.acquired(env, wait)? {
+                    return Ok(Some(wait));
+                }
+                let memory = ChannelMemory::new(self.space, env.bus);
+                self.engines
+                    .synchronize(&memory)
+                    .map_err(|unmodeled| with_fault(&memory, unmodeled))?;
+                Ok(None)
             }
             SEMAPHORE_RELEASE => {
                 let fields = SEMAPHORE_OPERATION | SEMAPHORE_RELEASE_WFI_DISABLE;
                 if argument & !(fields | SEMAPHORE_RELEASE_4_BYTES) != 0 {
                     return Err(unmodeled());
                 }
-                if argument & SEMAPHORE_RELEASE_4_BYTES != 0 {
-                    self.space.write(env.bus, address, &payload.to_le_bytes())?;
+                let bytes = if argument & SEMAPHORE_RELEASE_4_BYTES != 0 {
+                    payload.to_le_bytes().to_vec()
                 } else {
                     // Payload, a zero word, then the 64-bit GPU time.
-                    let mut release = [0; 16];
+                    let mut release = vec![0; 16];
                     release[..4].copy_from_slice(&payload.to_le_bytes());
                     release[8..].copy_from_slice(&(env.now)().to_le_bytes());
-                    self.space.write(env.bus, address, &release)?;
-                }
+                    release
+                };
+                let memory = ChannelMemory::new(self.space, env.bus);
+                self.release(env, &memory, Release::Write { address, bytes })?;
                 Ok(None)
             }
             _ => Err(unmodeled()),
+        }
+    }
+
+    /// Makes `release` once the engines' work before it is visible in
+    /// memory: now, or by the engines when it is (`Engines::release`).
+    fn release(
+        &mut self,
+        env: &Env,
+        memory: &ChannelMemory,
+        release: Release,
+    ) -> Result<(), Unmodeled> {
+        let now = self
+            .engines
+            .release(memory, release)
+            .map_err(|unmodeled| with_fault(memory, unmodeled))?;
+        match now {
+            Some(Release::Write { address, bytes }) => self.space.write(env.bus, address, &bytes),
+            Some(Release::Increment(index)) => {
+                env.syncpoints.add(index as usize, 1);
+                Ok(())
+            }
+            None => Ok(()),
         }
     }
 
@@ -695,18 +750,6 @@ fn with_fault(memory: &ChannelMemory, Unmodeled(what): Unmodeled) -> Unmodeled {
         .map(|Unmodeled(fault)| format!(" ({fault})"))
         .unwrap_or_default();
     Unmodeled(format!("{what}{fault}"))
-}
-
-/// Host methods after which others may observe what the channel's engines
-/// wrote: semaphore releases and syncpoint increments (fences). Wait for
-/// idle and the explicit flushes and barriers (`FB_FLUSH`, `MEM_OP_B`/`D`)
-/// let no one observe anything until a signal follows.
-fn signals(method: u32, argument: u32) -> bool {
-    match method {
-        method::SEMAPHORE_D => argument & SEMAPHORE_OPERATION == SEMAPHORE_RELEASE,
-        method::SYNCPOINT_B => argument & SYNCPOINT_OPERATION == SYNCPOINT_INCREMENT,
-        _ => false,
-    }
 }
 
 /// The word at the segment's position, fetching ahead.

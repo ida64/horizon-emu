@@ -259,10 +259,11 @@ impl Writer<'_> {
     }
 
     /// Records, before a sample of texture `slot`, that an unbound slot
-    /// was sampled (see the module documentation). A vertex program has
-    /// no fault words: its draw goes to the CPU when a slot is unbound.
+    /// was sampled (see the module documentation). A vertex or compute
+    /// program has no fault words: its work goes to the CPU when a slot
+    /// is unbound.
     fn note_sample(&mut self, slot: usize) {
-        if self.stage == Stage::Vertex {
+        if self.stage != Stage::Pixel {
             return;
         }
         self.line(&format!(
@@ -315,9 +316,9 @@ impl Writer<'_> {
                 "unaligned second destination",
             )?;
         }
-        // A vertex has no derivatives: implicit level of detail is the
-        // base level (`exec/tex.rs`).
-        let vertex = self.stage == Stage::Vertex;
+        // A vertex or a compute thread has no derivatives: implicit level
+        // of detail is the base level (`exec/tex.rs`).
+        let vertex = self.stage != Stage::Pixel;
         if vertex {
             self.require(
                 !matches!(encoding, 4 | 5 | 6 | 9),

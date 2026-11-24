@@ -1,5 +1,5 @@
 //! QMD decoding, and kernels launched through the compute class and run
-//! by the interpreter. QMD bit positions:
+//! by the interpreter, and by Metal against it. QMD bit positions:
 //! [public: NVIDIA open-gpu-doc `classes/compute/clb1c0qmd.h`].
 
 use super::super::tests::Ram;
@@ -210,15 +210,33 @@ fn words(ram: &Ram, address: u64, count: usize) -> Vec<u32> {
 /// driver does: program region, QMD address, signaling PCAS with
 /// SCHEDULE.
 fn launch(ram: &Ram, kernel: &[u64], qmd: &[u32; QMD_SIZE / 4]) -> Result<(), Unmodeled> {
+    launch_with(RendererKind::Software, ram, kernel, qmd).map(|_| ())
+}
+
+/// [`launch`] on a channel drawing with `kind`, whose work is then all in
+/// memory; the Metal renderer's fallback reasons.
+fn launch_with(
+    kind: RendererKind,
+    ram: &Ram,
+    kernel: &[u64],
+    qmd: &[u32; QMD_SIZE / 4],
+) -> Result<Vec<(String, u64)>, Unmodeled> {
     ram.put(CODE, &code(kernel));
     ram.put(QMD, &bytes(qmd));
-    let mut channel = Channel::with_renderer(RendererKind::Software);
+    let mut channel = Channel::with_renderer(kind);
     let mut call = |method: u32, argument: u32| channel.call(1, method / 4, argument, ram);
     call(0, 0xB1C0)?;
     call(0x1608, (REGION >> 32) as u32)?;
     call(0x160c, REGION as u32)?;
     call(0x2b4, (QMD >> 8) as u32)?;
-    call(0x2bc, 3)
+    call(0x2bc, 3)?;
+    channel.settle(ram)?;
+    Ok(channel
+        .hooks
+        .metal
+        .as_ref()
+        .map(|metal| metal.fallbacks().1)
+        .unwrap_or_default())
 }
 
 #[test]
@@ -381,4 +399,184 @@ fn thread_ids_of_a_three_dimensional_block() {
         .map(|t| (t % 3) | (t / 3 % 2) << 16 | (t / 6) << 26)
         .collect();
     assert_eq!(words(&ram, 0x4000, 12), expected);
+}
+
+/// `IADD32I rd, ra, imm`.
+fn iadd32i(rd: u64, ra: u64, imm: u64) -> u64 {
+    0x1C00_0000_0000_0000 | imm << 20 | PT | ra << 8 | rd
+}
+
+/// `IADD rd, ra, c[0][offset]`, setting the carry with `cc`, adding it
+/// with `x`.
+fn iadd_c0(rd: u64, ra: u64, offset: u64, cc: bool, x: bool) -> u64 {
+    0x4C10_0000_0000_0000
+        | u64::from(cc) << 47
+        | u64::from(x) << 43
+        | (offset / 4) << 20
+        | PT
+        | ra << 8
+        | rd
+}
+
+/// The 64-bit address of word `index` (in `ri`, as a byte offset) of the
+/// buffer whose descriptor (address, size) is at `c[0][descriptor]`, in
+/// the pair at `rd`: as compilers take buffer addresses from constants.
+fn address(rd: u64, ri: u64, descriptor: u64) -> [u64; 2] {
+    [
+        iadd_c0(rd, ri, descriptor, true, false),
+        iadd_c0(rd + 1, RZ, descriptor + 4, false, true),
+    ]
+}
+
+/// Buffer descriptors at `c[0][16 i]`: (address, 0, size).
+fn descriptors(ram: &Ram, buffers: &[(u32, u32)]) {
+    for (i, &(address, size)) in buffers.iter().enumerate() {
+        let at = CBUF + 16 * i as u64;
+        ram.put(at, &address.to_le_bytes());
+        ram.put(at + 4, &0u32.to_le_bytes());
+        ram.put(at + 8, &size.to_le_bytes());
+    }
+}
+
+/// Kernels give on Metal what the interpreter gives: global memory
+/// loads and stores at buffer addresses from constants, thread and block
+/// IDs of 3D blocks, shared memory with barriers (threads that exited
+/// passing them), and the launch's semaphore release once the work is
+/// in memory.
+#[test]
+fn kernels_on_metal_match_the_interpreter() {
+    if !super::super::metal::available() {
+        return;
+    }
+    const LDG_E: u64 = 1 << 45;
+    let vector = |ram: &Ram| {
+        for i in 0..64u32 {
+            ram.put(0x4000 + u64::from(i) * 4, &(i * 3).to_le_bytes());
+            ram.put(0x5000 + u64::from(i) * 4, &(1000 + i).to_le_bytes());
+        }
+        descriptors(ram, &[(0x4000, 0x100), (0x5000, 0x100), (0x6000, 0x100)]);
+    };
+    let mut vector_add = vec![
+        s2r(0, TID_X),
+        s2r(1, CTAID_X),
+        iscadd(0, 1, 0, 5),
+        iscadd(1, 0, RZ, 2),
+    ];
+    vector_add.extend(address(2, 1, 0x00));
+    vector_add.extend(address(4, 1, 0x10));
+    vector_add.extend(address(6, 1, 0x20));
+    vector_add.extend([
+        ldg(8, 2) | LDG_E,
+        ldg(9, 4) | LDG_E,
+        iadd(8, 8, 9),
+        stg(6, 8) | LDG_E,
+        EXIT,
+    ]);
+    // Sums 64 inputs per block in shared memory (`reduction`).
+    let mut sum = vec![
+        s2r(0, TID_X),
+        s2r(2, CTAID_X),
+        iscadd(3, 2, 0, 6),
+        iscadd(10, 3, RZ, 2),
+    ];
+    sum.extend(address(4, 10, 0x00));
+    sum.extend([ldg(6, 4) | LDG_E, iscadd(1, 0, RZ, 2), sts(1, 0, 6), BAR_SYNC]);
+    for s in [32u64, 16, 8, 4, 2, 1] {
+        sum.extend([
+            isetp(0, 0, s, 1),
+            on(0, lds(6, 1, s * 4)),
+            on(0, lds(7, 1, 0)),
+            on(0, iadd(7, 7, 6)),
+            on(0, sts(1, 0, 7)),
+            BAR_SYNC,
+        ]);
+    }
+    sum.extend([isetp(1, 0, 0, 2), on(1, lds(7, 1, 0)), on(1, iscadd(11, 2, RZ, 2))]);
+    sum.extend(address(8, 11, 0x10).map(|inst| on(1, inst)));
+    sum.extend([on(1, stg(8, 7) | LDG_E), EXIT]);
+    let sum_inputs = |ram: &Ram| {
+        for i in 0..128u32 {
+            ram.put(0x4000 + u64::from(i) * 4, &(i * i + 7).to_le_bytes());
+        }
+        descriptors(ram, &[(0x4000, 0x200), (0x5000, 8)]);
+    };
+    let mut ids = vec![
+        s2r(0, 32),
+        s2r(1, 34),
+        s2r(2, 35),
+        s2r(3, TID_X),
+        iscadd(4, 1, 3, 1),
+        iadd(4, 4, 1),
+        iscadd(4, 2, 4, 2),
+        iscadd(4, 2, 4, 1),
+        iscadd(5, 4, RZ, 2),
+    ];
+    ids.extend(address(6, 5, 0x00));
+    ids.extend([stg(6, 0) | LDG_E, EXIT]);
+    let mut exited = vec![
+        s2r(0, TID_X),
+        iscadd(1, 0, RZ, 2),
+        isetp(0, 0, 32, 6),
+        on(0, EXIT),
+        sts(1, 0, 0),
+        BAR_SYNC,
+        lds(3, RZ, 0),
+    ];
+    exited.extend(address(4, 1, 0x00));
+    exited.extend([stg(4, 3) | LDG_E, EXIT]);
+    let output = |ram: &Ram| descriptors(ram, &[(0x4000, 0x100)]);
+    // A butterfly sum across each warp (`SHFL.BFLY`, the whole warp), its
+    // threads' results stored by thread.
+    let shfl = |rd: u64, ra: u64, lane: u64| {
+        0xEF10_0000_0007_0000 | rd | ra << 8 | lane << 20 | 3 << 28 | 3 << 30 | 0x1F << 34 | 7 << 48
+    };
+    let mut warp_sum = vec![s2r(0, TID_X), iadd32i(2, 0, 1)];
+    for lane in [16, 8, 4, 2, 1] {
+        warp_sum.extend([shfl(3, 2, lane), iadd(2, 2, 3)]);
+    }
+    warp_sum.push(iscadd(1, 0, RZ, 2));
+    warp_sum.extend(address(4, 1, 0x00));
+    warp_sum.extend([stg(4, 2) | LDG_E, EXIT]);
+    // Every thread of two blocks adds one to a counter (`ATOM.E.ADD`).
+    let mut count = vec![iadd32i(3, RZ, 1)];
+    count.extend(address(4, RZ, 0x00));
+    count.extend([0xED01_0000_0000_0000 | 3 << 20 | PT | 4 << 8 | 2, EXIT]);
+    let counter = |ram: &Ram| descriptors(ram, &[(0x4000, 4)]);
+    let cases: [(&str, Vec<u64>, [u32; 3], [u32; 3], u32, &dyn Fn(&Ram)); 6] = [
+        ("vector add", vector_add, [2, 1, 1], [32, 1, 1], 0, &vector),
+        ("reduction", sum, [2, 1, 1], [64, 1, 1], 0x100, &sum_inputs),
+        ("thread IDs", ids, [1, 1, 1], [3, 2, 2], 0, &output),
+        ("exited threads", exited, [1, 1, 1], [40, 1, 1], 0x100, &output),
+        ("warp sum", warp_sum, [1, 1, 1], [64, 1, 1], 0, &output),
+        ("atomic count", count, [2, 1, 1], [48, 1, 1], 0, &counter),
+    ];
+    for (name, kernel, grid, block, shared, inputs) in cases {
+        let q = qmd(
+            (CODE - REGION) as u32,
+            grid,
+            block,
+            shared,
+            CBUF,
+            Some((0x7000, 0xC0FFEE)),
+        );
+        let results: Vec<Vec<u32>> = [RendererKind::Software, RendererKind::Metal]
+            .into_iter()
+            .map(|kind| {
+                let ram = Ram::new(0x8000);
+                inputs(&ram);
+                let fallbacks = launch_with(kind, &ram, &kernel, &q)
+                    .unwrap_or_else(|e| panic!("{name} {kind:?}: {e:?}"));
+                assert!(fallbacks.is_empty(), "{name}: {fallbacks:?}");
+                assert_eq!(ram.word(0x7000), 0xC0FFEE, "{name} {kind:?}: release");
+                words(&ram, 0x4000, 0x1000)
+            })
+            .collect();
+        assert!(results[0] != vec![0; 0x1000], "{name}: nothing written");
+        let differing: Vec<(usize, u32, u32)> = (0..0x1000)
+            .filter(|&i| results[0][i] != results[1][i])
+            .map(|i| (i, results[0][i], results[1][i]))
+            .take(8)
+            .collect();
+        assert!(differing.is_empty(), "{name}: Metal differs at {differing:x?}");
+    }
 }

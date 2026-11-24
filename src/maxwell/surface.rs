@@ -192,6 +192,14 @@ impl Window {
         }
     }
 
+    /// The window [`Window::load`] makes of `rect`, holding zeros, for a
+    /// caller that fills the bands it stores.
+    pub fn blank(surface: Surface, rect: Rect) -> Window {
+        let mut window = Window::shape(surface, rect);
+        window.data = vec![0; window.band_bytes * window.bands as usize];
+        window
+    }
+
     /// Reads the bands of `surface` covering `rect` (clipped to the
     /// surface).
     pub fn load(memory: &dyn GpuMemory, surface: Surface, rect: Rect) -> Result<Window, Unmodeled> {

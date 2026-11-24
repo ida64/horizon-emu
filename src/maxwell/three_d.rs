@@ -215,9 +215,12 @@ fn write_words(memory: &dyn GpuMemory, address: u64, words: &[u32]) -> Result<()
     })
 }
 
-/// Writes a semaphore release: the payload alone, or the four-word
-/// structure (payload, 0, 64-bit timestamp) [public: NVIDIA `clb197.h`
-/// `STRUCTURE_SIZE`].
+/// A semaphore release: the payload alone, or the four-word structure
+/// (payload, 0, 64-bit timestamp) [public: NVIDIA `clb197.h`
+/// `STRUCTURE_SIZE`], written once the work before it is visible in
+/// memory ([`Hooks::release`]). The timestamp is taken when the release
+/// is executed \[assumption: what the guest reads of it is the time
+/// between releases, which the host's pace decides either way\].
 pub fn release_semaphore(
     memory: &dyn GpuMemory,
     hooks: &Hooks,
@@ -225,19 +228,17 @@ pub fn release_semaphore(
     payload: u32,
     four_words: bool,
 ) -> Result<(), Unmodeled> {
-    hooks.signal(memory)?;
-    if !four_words {
-        return write_words(memory, address, &[payload]);
-    }
-    let timer = hooks.timer.as_ref().ok_or_else(|| {
-        Unmodeled("four-word semaphore release without a GPU timer connected".into())
-    })?;
-    let time = timer();
-    write_words(
-        memory,
-        address,
-        &[payload, 0, time as u32, (time >> 32) as u32],
-    )
+    let words = if four_words {
+        let timer = hooks.timer.as_ref().ok_or_else(|| {
+            Unmodeled("four-word semaphore release without a GPU timer connected".into())
+        })?;
+        let time = timer();
+        vec![payload, 0, time as u32, (time >> 32) as u32]
+    } else {
+        vec![payload]
+    };
+    let bytes = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    hooks.release(memory, super::Release::Write { address, bytes })
 }
 
 impl ThreeD {
@@ -406,15 +407,14 @@ impl ThreeD {
             CHECK_CLASS_VERSION | CHECK_SPH_VERSION | CHECK_AAM_VERSION => {}
             NOTIFY => return Err(refuse(method, argument, "notifier")),
             INCREMENT_SYNC_POINT => {
-                let increment = hooks.syncpoint_increment.as_ref().ok_or_else(|| {
-                    refuse(
+                if hooks.syncpoint_increment.is_none() {
+                    return Err(refuse(
                         method,
                         argument,
                         "syncpoint increment without host1x connected",
-                    )
-                })?;
-                hooks.signal(memory)?;
-                increment(argument & 0xFFF);
+                    ));
+                }
+                hooks.release(memory, super::Release::Increment(argument & 0xFFF))?;
             }
             SET_GLOBAL_RENDER_ENABLE_C => {
                 if argument & 7 != 1 {
@@ -695,6 +695,8 @@ impl ThreeD {
                     value == payload
                 };
                 if done {
+                    // What the releaser wrote before is to be seen.
+                    hooks.writes.synchronize();
                     Ok(())
                 } else {
                     Err(refuse(

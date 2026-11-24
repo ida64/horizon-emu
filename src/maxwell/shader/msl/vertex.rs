@@ -54,6 +54,10 @@ pub struct TranslatedVertex {
     pub constant_buffer_1: Option<Vec<u8>>,
     /// As [`super::Translated::globals`].
     pub globals: Vec<(u32, u32)>,
+    /// The program stores to global memory (`STG`; `RED` is refused: a
+    /// vertex may be shaded more than once, and a store repeated stores
+    /// the same value, an atomic update does not).
+    pub stores: bool,
     /// As [`super::Translated::textures`] and [`super::Translated::kinds`]
     /// (every sample is of a level the program names, or the base one).
     pub textures: Vec<u32>,
@@ -98,6 +102,10 @@ pub fn translate_vertex(
         match inst.op {
             Op::Ldc => {
                 writer.indirect.insert(bits(inst.word, 36, 5));
+            }
+            Op::Red | Op::Atom => {
+                writer.pc = pc;
+                return writer.refuse("atomic update in a vertex program");
             }
             // The interpreter refuses a vertex program that kills.
             Op::Kil if !flow::inert(inst.word) => {
@@ -146,6 +154,7 @@ pub fn translate_vertex(
         indirect: writer.indirect,
         constant_buffer_1: flow.jump_tables.then(|| constant_buffer_1.to_vec()),
         globals: writer.globals,
+        stores: memory::stores(program, &flow.pcs),
         textures: writer.textures,
         kinds: writer.kinds,
         queries: writer.queries,
@@ -228,13 +237,13 @@ pub struct NativeVertex {
     varyings: Vec<(u32, Interpolation)>,
 }
 
-/// Vertex stream binding slots: `MAX_STREAMS` buffers from
-/// [`STREAM_BUFFER`].
-pub const MAX_STREAMS: usize = 8;
+/// Vertex streams a draw may fetch from (Maxwell's 16 vertex streams), all
+/// in the one buffer [`STREAM_BUFFER`], each at its own offset.
+pub const MAX_STREAMS: usize = 16;
 pub const STREAM_BUFFER: usize = 21;
 /// The word of the draw's words (buffer 29) that says what buffer 0
 /// holds, after the words of [`MAX_STREAMS`] streams.
-pub const INDEXED_WORD: usize = 2 + 3 * MAX_STREAMS;
+pub const INDEXED_WORD: usize = 2 + 4 * MAX_STREAMS;
 
 /// The word of the draw's words where a program's global memory table
 /// starts (`memory.rs`).
@@ -262,9 +271,10 @@ impl NativeVertex {
     /// their sizes, as for the fragment function; buffer 29 the draw's
     /// words: the instance ID, the instance per-instance streams step by
     /// (with `SET_GLOBAL_BASE_INSTANCE_INDEX`), then per stream slot the
-    /// first element of its uploaded range, its stride and its divisor (0:
-    /// per vertex), and at [`INDEXED_WORD`] the elements' form;
-    /// [`STREAM_BUFFER`] + slot the streams' bytes.
+    /// first element of its uploaded range, its stride, its divisor (0:
+    /// per vertex) and the offset of its bytes in buffer
+    /// [`STREAM_BUFFER`], and at [`INDEXED_WORD`] the elements' form;
+    /// [`STREAM_BUFFER`] the streams' bytes.
     ///
     /// The position is mapped so Metal's viewport (the whole target) puts
     /// the vertex where the draw's viewport transform does: window x =
@@ -341,13 +351,12 @@ impl NativeVertex {
             parameters.push("const device uint* cb_size [[buffer(20)]]".to_string());
         }
         let streams: BTreeSet<u32> = fetches.iter().map(|f| f.slot).collect();
-        for &slot in &streams {
-            if slot as usize >= MAX_STREAMS {
-                return Err(format!("vertex stream slot {slot}"));
-            }
+        if let Some(&slot) = streams.iter().find(|&&slot| slot as usize >= MAX_STREAMS) {
+            return Err(format!("vertex stream slot {slot}"));
+        }
+        if !streams.is_empty() {
             parameters.push(format!(
-                "const device uchar* vs{slot} [[buffer({})]]",
-                STREAM_BUFFER + slot as usize
+                "const device uchar* vs [[buffer({STREAM_BUFFER})]]"
             ));
         }
         for (i, kind) in vertex.kinds.iter().enumerate() {
@@ -534,14 +543,14 @@ fn fetch_code(fetch: &Fetch) -> Result<String, String> {
     // `divisor` instances.
     let _ = writeln!(
         s,
-        "    uint4 a{a} = uint4(0u, 0u, 0u, {one:#x}u);\n    {{ const uint divisor = draw[4u + 3u * {slot}u]; const uint element = divisor != 0u ? (draw[1] + iid) / divisor : fetch;\n      const uint at = (element - draw[2u + 3u * {slot}u]) * draw[3u + 3u * {slot}u] + {offset}u;"
+        "    uint4 a{a} = uint4(0u, 0u, 0u, {one:#x}u);\n    {{ const uint divisor = draw[4u + 4u * {slot}u]; const uint element = divisor != 0u ? (draw[1] + iid) / divisor : fetch;\n      const uint at = draw[5u + 4u * {slot}u] + (element - draw[2u + 4u * {slot}u]) * draw[3u + 4u * {slot}u] + {offset}u;"
     );
     let words = size.div_ceil(4);
     for k in 0..words {
         let length = (size - 4 * k).min(4);
         let _ = writeln!(
             s,
-            "      const uint w{k} = load_bytes(vs{slot}, at + {}u, {length}u);",
+            "      const uint w{k} = load_bytes(vs, at + {}u, {length}u);",
             4 * k
         );
     }

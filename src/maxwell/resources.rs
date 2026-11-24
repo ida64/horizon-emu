@@ -5,11 +5,13 @@
 //! reused only after the bytes in memory compare equal, at every draw. A
 //! texture is compared at most once per *epoch* of its channel ([`Writes`]):
 //! once its bytes compared equal, it is reused without reading memory
-//! again until the channel signals (a semaphore release, report or
-//! syncpoint increment) or one of the channel's own engines writes memory
-//! overlapping it. The hardware's own caches (`INVALIDATE_SHADER_CACHES`,
-//! `INVALIDATE_TEXTURE_HEADER_CACHE`, ...) therefore have no counterpart
-//! here, and their invalidation methods have no effect.
+//! again until the channel synchronizes with another agent (it fetches
+//! work the guest submitted after what it fetched before, or a semaphore
+//! acquire or syncpoint wait lets it go on) or one of the channel's own
+//! engines writes memory overlapping it. The hardware's own caches
+//! (`INVALIDATE_SHADER_CACHES`, `INVALIDATE_TEXTURE_HEADER_CACHE`, ...)
+//! therefore have no counterpart here, and their invalidation methods
+//! have no effect.
 //!
 //! Both caches are bounded ([`PROGRAM_BUDGET`], [`TEXTURE_BUDGET`]):
 //! beyond its budget a cache drops the entries used least recently
@@ -19,14 +21,15 @@
 //!
 //! Within an epoch, a write to a validated texture by anything but the
 //! channel's own engines (the guest CPU, another channel) is not seen
-//! until the next signal. No correct guest makes one: the texture was
-//! validated because a draw of this channel read it, and memory a
-//! submitted draw reads may only be overwritten once that draw is known
-//! to be complete. NVN learns that only from a sync object, a semaphore
-//! or syncpoint the channel releases after the draw (`nvnQueueFenceSync`,
-//! `nvnSyncWait`, `nvnQueueFinish` [public: NVN API as documented by the
-//! Switch homebrew headers]), and every such release starts a new epoch.
-//! On hardware the same race reads stale texture cache lines.
+//! until the channel next synchronizes. No correct guest relies on one:
+//! work the channel has fetched was submitted before such a write, and
+//! may read what the write puts there only if it waits for the writer
+//! first, with a semaphore acquire or syncpoint wait (the writer
+//! releases it after writing), which starts a new epoch; work submitted
+//! after the write comes with a new GP_PUT, which starts one too. The
+//! channel's own releases do not: a writer that learns from one that the
+//! channel is done with memory may reuse it only for work it submits
+//! afterwards. On hardware the same races read stale cache lines.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -39,9 +42,9 @@ use super::texture::{Texture, Tic, Tsc};
 use super::{GpuMemory, Unmodeled};
 
 /// The guest memory a channel's engines wrote in the current epoch: since
-/// the channel's last signal ([`Writes::signal`]). Caches of guest memory
-/// stamp what they last compared ([`Writes::stamp`]) and need not read
-/// memory again while [`Writes::unchanged`] holds.
+/// the channel last synchronized ([`Writes::synchronize`]). Caches of
+/// guest memory stamp what they last compared ([`Writes::stamp`]) and
+/// need not read memory again while [`Writes::unchanged`] holds.
 #[derive(Default)]
 pub struct Writes(Mutex<WriteLog>);
 
@@ -89,9 +92,10 @@ impl Writes {
         log.stamped = false;
     }
 
-    /// The channel signaled: a new epoch starts, in which every cached
-    /// copy is compared with memory again before it is used.
-    pub fn signal(&self) {
+    /// The channel synchronized with another agent, which may have
+    /// written memory: a new epoch starts, in which every cached copy is
+    /// compared with memory again before it is used.
+    pub fn synchronize(&self) {
         let mut log = self.0.lock().unwrap();
         log.epoch += 1;
         log.ranges.clear();
@@ -186,29 +190,37 @@ fn read_unless_equal(
     let Some(expected) = expected.filter(|expected| expected.len() == length) else {
         return read(memory, address, length).map(Some);
     };
-    let mut buffer = [0u8; 4096];
-    let mut at = 0;
-    for chunk in expected.chunks(buffer.len()) {
-        let piece = &mut buffer[..chunk.len()];
-        memory
-            .read(address + at as u64, piece)
-            .ok_or_else(|| unmapped(address, length))?;
-        if piece != chunk {
-            let mut bytes = Vec::with_capacity(length);
-            bytes.extend_from_slice(&expected[..at]);
-            bytes.extend_from_slice(piece);
-            let done = bytes.len();
-            bytes.resize(length, 0);
-            if done < length {
-                memory
-                    .read(address + done as u64, &mut bytes[done..])
-                    .ok_or_else(|| unmapped(address, length))?;
-            }
-            return Ok(Some(bytes));
-        }
-        at += chunk.len();
+    // Large pieces: every read of engine memory may look for pending
+    // write-backs over it (`metal::Coherent`).
+    const PIECE: usize = 256 << 10;
+    thread_local! {
+        static BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     }
-    Ok(None)
+    BUFFER.with_borrow_mut(|buffer| {
+        buffer.resize(PIECE.min(length), 0);
+        let mut at = 0;
+        for chunk in expected.chunks(PIECE) {
+            let piece = &mut buffer[..chunk.len()];
+            memory
+                .read(address + at as u64, piece)
+                .ok_or_else(|| unmapped(address, length))?;
+            if piece != chunk {
+                let mut bytes = Vec::with_capacity(length);
+                bytes.extend_from_slice(&expected[..at]);
+                bytes.extend_from_slice(piece);
+                let done = bytes.len();
+                bytes.resize(length, 0);
+                if done < length {
+                    memory
+                        .read(address + done as u64, &mut bytes[done..])
+                        .ok_or_else(|| unmapped(address, length))?;
+                }
+                return Ok(Some(bytes));
+            }
+            at += chunk.len();
+        }
+        Ok(None)
+    })
 }
 
 /// Host memory the decoded programs of one channel may take, with the
@@ -870,11 +882,11 @@ mod tests {
         let first = resolve();
         // Unchanged within the epoch, and compared equal in the next.
         assert!(Arc::ptr_eq(&resolve(), &first));
-        writes.signal();
+        writes.synchronize();
         assert!(Arc::ptr_eq(&resolve(), &first));
         // Changed: decoded again.
         ram.put(TEXELS, &b);
-        writes.signal();
+        writes.synchronize();
         let second = resolve();
         assert!(!Arc::ptr_eq(&second, &first));
         assert_ne!(second.level(0).unwrap().3[0], first.level(0).unwrap().3[0]);
@@ -904,7 +916,7 @@ mod tests {
                 .insert((words, content_hash(&c)), impostor, 1);
         }
         ram.put(TEXELS, &c);
-        writes.signal();
+        writes.synchronize();
         let third = resolve();
         assert!(!Arc::ptr_eq(&third, &first) && !Arc::ptr_eq(&third, &second));
     }

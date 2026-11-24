@@ -41,13 +41,13 @@ use super::{RZ, Writer};
 /// loads into an even register (`MOV`, `IADD`, or `ISCADD`, which adds
 /// an index to the low word), with the word after it loaded into the
 /// next register: where 64-bit addresses may come from. None for a
-/// program without `LDG`, `STG` or `RED`.
+/// program without `LDG`, `STG`, `RED` or `ATOM`.
 pub(super) fn candidates(program: &Program, pcs: &[u32]) -> Vec<(u32, u32)> {
     let instructions = || {
         pcs.iter()
             .map(|&pc| program.code[(pc / 8) as usize].expect("instruction"))
     };
-    if !instructions().any(|inst| matches!(inst.op, Op::Ldg | Op::Stg | Op::Red)) {
+    if !instructions().any(|inst| matches!(inst.op, Op::Ldg | Op::Stg | Op::Red | Op::Atom)) {
         return Vec::new();
     }
     let mut loads: BTreeMap<(u32, u32), BTreeSet<u32>> = BTreeMap::new();
@@ -85,16 +85,17 @@ pub(super) fn stores(program: &Program, pcs: &[u32]) -> bool {
 }
 
 impl Writer<'_> {
-    /// Opens a block with `ad`, the 64-bit address in the register pair
-    /// at `ra` plus `offset`.
-    fn global_address(&mut self, ra: u32, offset: i64) -> Result<(), String> {
+    /// Opens a block with `ad`, the address in the register pair at `ra`
+    /// (in `ra` alone, zero-extended, without `wide`: a 32-bit address)
+    /// plus `offset`.
+    fn global_address(&mut self, ra: u32, offset: i64, wide: bool) -> Result<(), String> {
         self.require(
-            ra.is_multiple_of(2) || ra == RZ,
+            !wide || ra.is_multiple_of(2) || ra == RZ,
             "64-bit address in an odd register",
         )?;
         self.require(!self.globals.is_empty(), "global memory no constant names")?;
         let low = self.read(ra);
-        let high = if ra == RZ {
+        let high = if ra == RZ || !wide {
             "0u".to_string()
         } else {
             self.read(ra + 1)
@@ -120,13 +121,13 @@ impl Writer<'_> {
         );
     }
 
-    /// `STG` of one, two or four words with a 64-bit address (`E`):
-    /// source register 0-7, address register pair 8-15, offset 20-43
+    /// `STG` of one, two or four words: source register 0-7, address
+    /// register 8-15 (a pair with `E`, bit 45), offset 20-43
     /// signed, size 48-50. Fragments outside the primitive store
     /// nothing (`exec.rs` `store_global`).
     pub(super) fn stg(&mut self) -> Result<(), String> {
         let w = self.word;
-        self.require(bit(w, 45), "32-bit address")?;
+        let wide = bit(w, 45);
         let (rd, ra) = (bits(w, 0, 8), bits(w, 8, 8));
         let size = bits(w, 48, 3);
         self.require(matches!(size, 4..=6), "store narrower than a word")?;
@@ -138,7 +139,7 @@ impl Writer<'_> {
         let values: Vec<String> = (0..count)
             .map(|i| self.read(if rd == RZ { RZ } else { rd + i }))
             .collect();
-        self.global_address(ra, i64::from(sext(bits(w, 20, 24), 24)))?;
+        self.global_address(ra, i64::from(sext(bits(w, 20, 24), 24)), wide)?;
         let body: String = values
             .iter()
             .enumerate()
@@ -151,12 +152,12 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// `RED` with a 64-bit address (`exec.rs` `atomic`): source register
-    /// 0-7, address register pair 8-15, type 20-22 (U32, S32), operation
+    /// `RED` (`exec.rs` `atomic`): source register 0-7, address register
+    /// 8-15 (a pair with `E`, bit 48), type 20-22 (U32, S32), operation
     /// 23-25 (ADD, MIN, MAX, AND, OR, XOR), offset 28-47 signed.
     pub(super) fn red(&mut self) -> Result<(), String> {
         let w = self.word;
-        self.require(bit(w, 48), "32-bit address")?;
+        let wide = bit(w, 48);
         let (source, ra) = (bits(w, 0, 8), bits(w, 8, 8));
         let (kind, operation) = (bits(w, 20, 3), bits(w, 23, 3));
         self.require(kind < 2, &format!("type {kind}"))?;
@@ -171,7 +172,7 @@ impl Writer<'_> {
             other => return self.refuse(&format!("operation {other}")),
         };
         let value = self.read(source);
-        self.global_address(ra, i64::from(sext(bits(w, 28, 20), 20)))?;
+        self.global_address(ra, i64::from(sext(bits(w, 28, 20), 20)), wide)?;
         let body = if signed && matches!(operation, 1 | 2) {
             format!(
                 "if (GM_LIVE) {{ {function}((device atomic_int*)&gm[at], as_type<int>({value}), memory_order_relaxed); }}"
@@ -184,12 +185,49 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// `LDG` with a 64-bit address (`E`): address register pair 8-15,
+    /// `ATOM` (`exec.rs` `atomic`): destination 0-7 (the value memory
+    /// held), address register 8-15 (a pair with `E`, bit 48), source
+    /// 20-27, type 49-51 (U32, S32), operation 52-55 (ADD, MIN, MAX, AND,
+    /// OR, XOR, EXCH), offset 28-47 signed.
+    pub(super) fn atom(&mut self) -> Result<(), String> {
+        let w = self.word;
+        let wide = bit(w, 48);
+        let (rd, ra, source) = (bits(w, 0, 8), bits(w, 8, 8), bits(w, 20, 8));
+        let (kind, operation) = (bits(w, 49, 3), bits(w, 52, 4));
+        self.require(kind < 2, &format!("type {kind}"))?;
+        let signed = kind == 1;
+        let function = match operation {
+            0 => "atomic_fetch_add_explicit",
+            1 => "atomic_fetch_min_explicit",
+            2 => "atomic_fetch_max_explicit",
+            5 => "atomic_fetch_and_explicit",
+            6 => "atomic_fetch_or_explicit",
+            7 => "atomic_fetch_xor_explicit",
+            8 => "atomic_exchange_explicit",
+            other => return self.refuse(&format!("operation {other}")),
+        };
+        let value = self.read(source);
+        self.global_address(ra, i64::from(sext(bits(w, 28, 20), 20)), wide)?;
+        self.line("uint old = 0u;");
+        let body = if signed && matches!(operation, 1 | 2) {
+            format!(
+                "old = as_type<uint>({function}((device atomic_int*)&gm[at], as_type<int>({value}), memory_order_relaxed));"
+            )
+        } else {
+            format!("old = {function}(&gm[at], {value}, memory_order_relaxed);")
+        };
+        self.global_words(4, &body);
+        self.set(rd, "old");
+        self.line("}");
+        Ok(())
+    }
+
+    /// `LDG`: address register 8-15 (a pair with `E`, bit 45),
     /// offset 20-43 signed, size 48-50 (bytes and halves zero- or
     /// sign-extended, one, two or four words).
     pub(super) fn ldg(&mut self) -> Result<(), String> {
         let w = self.word;
-        self.require(bit(w, 45), "32-bit address")?;
+        let wide = bit(w, 45);
         let (rd, ra) = (bits(w, 0, 8), bits(w, 8, 8));
         let size = match bits(w, 48, 3) {
             7 => 6,
@@ -201,7 +239,7 @@ impl Writer<'_> {
             rd == RZ || rd.is_multiple_of(count),
             "vector destination not aligned",
         )?;
-        self.global_address(ra, i64::from(sext(bits(w, 20, 24), 24)))?;
+        self.global_address(ra, i64::from(sext(bits(w, 20, 24), 24)), wide)?;
         self.line("uint g0 = 0u, g1 = 0u, g2 = 0u, g3 = 0u;");
         let words: String = (0..count)
             .map(|i| format!("g{i} = GM(at + {i}u); "))

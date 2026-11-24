@@ -329,6 +329,19 @@ impl Kernel {
     pub fn mnemonics(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.code.iter().flatten().map(|inst| inst.op.mnemonic())
     }
+
+    /// The kernel's code as a [`Program`], for the translator
+    /// (`msl::translate_compute`), which reads code only: its header is a
+    /// vertex program's with empty attribute maps.
+    pub fn program(&self) -> Program {
+        let mut sph = [0u8; SPH_SIZE];
+        sph[..4].copy_from_slice(&(1u32 | 1 << 10).to_le_bytes());
+        Program {
+            header: Header::parse(&sph).expect("a vertex program header"),
+            code: self.code.clone(),
+            extents: Default::default(),
+        }
+    }
 }
 
 #[derive(Default)]

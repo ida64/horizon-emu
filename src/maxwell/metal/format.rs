@@ -115,9 +115,9 @@ pub fn border_color(tsc: &Tsc) -> Option<MTLSamplerBorderColor> {
 /// sampler's limit: GM20B's tap placement is not documented.
 pub fn check_texture(tic: &Tic, tsc: &Tsc, kind: TextureKind) -> Result<(), String> {
     let fits = match kind {
-        TextureKind::Flat => {
-            tic.target == Target::Texture2D && !tic.array && tic.shape.layers == 1
-        }
+        // A 2D sample reads layer 0, of an array texture too (as the
+        // interpreter's `texture::filtering` reads it).
+        TextureKind::Flat => tic.target == Target::Texture2D && tic.shape.layers == 1,
         TextureKind::Array => tic.target == Target::Texture2D,
         TextureKind::Cube => tic.target == Target::Cube && tic.shape.layers == 6,
         TextureKind::Volume => tic.target == Target::Texture3D && tic.shape.layers == 1,

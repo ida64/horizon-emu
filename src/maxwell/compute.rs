@@ -200,19 +200,35 @@ impl Compute {
             sampler_from_header: qmd.sampler_from_header,
         };
         let textures = DrawTextures::new(memory, pools, &self.caches.textures, &hooks.writes);
-        let unit = textures.unit();
-        let env = shader::Env {
-            const_buffers: std::array::from_fn(|slot| {
-                let (data, size) = &buffers[slot];
-                shader::ConstantBuffer { data, size: *size }
-            }),
-            textures: &unit,
-            texture_buffer_index: texture_slot,
-            memory,
-            // Not read: S2R SR_Y_DIRECTION is refused in compute programs.
-            y_direction: 0.0,
+        let on_gpu = match hooks.metal.as_deref() {
+            Some(metal) => metal.dispatch(
+                memory,
+                &hooks.writes,
+                &super::metal::compute::Dispatch {
+                    kernel: &kernel,
+                    constants: &buffers,
+                    textures: &textures,
+                    texture_buffer_index: texture_slot,
+                    launch: qmd.launch,
+                },
+            )?,
+            None => false,
         };
-        kernel.run(&env, &qmd.launch)?;
+        if !on_gpu {
+            let unit = textures.unit();
+            let env = shader::Env {
+                const_buffers: std::array::from_fn(|slot| {
+                    let (data, size) = &buffers[slot];
+                    shader::ConstantBuffer { data, size: *size }
+                }),
+                textures: &unit,
+                texture_buffer_index: texture_slot,
+                memory,
+                // Not read: S2R SR_Y_DIRECTION is refused in compute programs.
+                y_direction: 0.0,
+            };
+            kernel.run(&env, &qmd.launch)?;
+        }
         for release in qmd.releases.iter().flatten() {
             three_d::release_semaphore(
                 memory,

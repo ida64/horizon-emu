@@ -91,11 +91,39 @@ pub trait Engines: Send {
     ) -> Result<(), Unmodeled>;
 
     /// Makes everything earlier calls wrote visible in guest memory, as
-    /// the channel is about to signal: the pushbuffer executor calls it
-    /// before its own semaphore releases and syncpoint increments, the
-    /// host work that lets other agents observe the channel's progress.
-    /// Engines that write memory as they go have nothing to do.
+    /// the channel is about to signal. Engines that write memory as they
+    /// go have nothing to do.
     fn flush(&mut self, _memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+        Ok(())
+    }
+
+    /// The pushbuffer executor's own semaphore release or syncpoint
+    /// increment, the host work that lets other agents observe the
+    /// channel's progress: made once everything earlier calls did is
+    /// visible in guest memory. Returned to be made now, or `None` when
+    /// the engines make it themselves once their work before it is done
+    /// ([`idle`](Self::idle) waits for that).
+    fn release(
+        &mut self,
+        memory: &dyn GpuMemory,
+        release: Release,
+    ) -> Result<Option<Release>, Unmodeled> {
+        self.flush(memory)?;
+        Ok(Some(release))
+    }
+
+    /// The channel has nothing to run (it is idle, or waits for a
+    /// semaphore or syncpoint): the releases the engines hold back are
+    /// made, once the work before each is done.
+    fn idle(&mut self, _memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+        Ok(())
+    }
+
+    /// The channel synchronized with another agent (it fetched work
+    /// submitted after what it had, or a semaphore acquire or syncpoint
+    /// wait let it go on): what others wrote to memory before is to be
+    /// seen from here on (`resources::Writes::synchronize`).
+    fn synchronize(&mut self, _memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
         Ok(())
     }
 
@@ -129,27 +157,68 @@ pub struct Hooks {
     /// semaphore releases.
     pub timer: Option<Box<dyn Fn() -> u64 + Send>>,
     /// Increments a host1x syncpoint by one (3D `INCREMENT_SYNC_POINT`).
-    pub syncpoint_increment: Option<Box<dyn Fn(u32) + Send>>,
+    pub syncpoint_increment: Option<std::sync::Arc<dyn Fn(u32) + Send + Sync>>,
     /// The Metal renderer of the channel, if it renders with Metal: every
     /// completion the channel signals (semaphore release, report,
-    /// syncpoint increment) first writes its pending work back to guest
-    /// memory ([`metal::Renderer::flush`]), but for the targets it holds
-    /// on demand (depth buffers and multisampled targets, see [`metal`]).
+    /// syncpoint increment) is made once its pending work is back in
+    /// guest memory ([`metal::Renderer::release`]), but for the targets it
+    /// holds on demand (depth buffers and multisampled targets, see
+    /// [`metal`]).
     pub metal: Option<std::sync::Arc<metal::Renderer>>,
-    /// What the engines wrote since the channel last signaled.
+    /// What the engines wrote since the channel last synchronized.
     pub writes: resources::Writes,
+}
+
+/// A completion a channel signals: what others observe of its progress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Release {
+    /// Bytes written at a GPU virtual address (a semaphore release or a
+    /// report).
+    Write { address: u64, bytes: Vec<u8> },
+    /// A host1x syncpoint incremented by one.
+    Increment(u32),
 }
 
 impl Hooks {
     /// The channel is about to signal (release a semaphore or report,
     /// increment a syncpoint): makes all rendering so far visible in guest
-    /// memory and starts a new epoch of [`resources::Writes`].
+    /// memory.
     pub fn signal(&self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
         if let Some(renderer) = &self.metal {
             renderer.flush(memory, &self.writes)?;
         }
-        self.writes.signal();
         Ok(())
+    }
+
+    /// Makes `release` once all rendering so far is visible in guest
+    /// memory: now, or when the Metal renderer has done the work before
+    /// it.
+    pub fn release(&self, memory: &dyn GpuMemory, release: Release) -> Result<(), Unmodeled> {
+        let now = match &self.metal {
+            Some(renderer) => renderer.release(memory, &self.writes, release)?,
+            None => Some(release),
+        };
+        match now {
+            Some(release) => self.make(memory, release),
+            None => Ok(()),
+        }
+    }
+
+    fn make(&self, memory: &dyn GpuMemory, release: Release) -> Result<(), Unmodeled> {
+        match release {
+            Release::Write { address, bytes } => memory.write(address, &bytes).ok_or_else(|| {
+                Unmodeled(format!(
+                    "semaphore write to unmapped GPU address {address:#x}"
+                ))
+            }),
+            Release::Increment(index) => {
+                let increment = self.syncpoint_increment.as_ref().ok_or_else(|| {
+                    Unmodeled("syncpoint increment without host1x connected".into())
+                })?;
+                increment(index);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -306,7 +375,11 @@ impl Channel {
     }
 
     /// Connects host1x syncpoint increments.
-    pub fn set_syncpoint_increment(&mut self, increment: Box<dyn Fn(u32) + Send>) {
+    pub fn set_syncpoint_increment(&mut self, increment: Box<dyn Fn(u32) + Send + Sync>) {
+        let increment: std::sync::Arc<dyn Fn(u32) + Send + Sync> = increment.into();
+        if let Some(renderer) = &self.hooks.metal {
+            renderer.set_increment(increment.clone());
+        }
         self.hooks.syncpoint_increment = Some(increment);
     }
 
@@ -377,6 +450,10 @@ impl Engines for Channel {
             }
             None => &tracked,
         };
+        // Signals whose work the GPU has done since are made.
+        if let Some(renderer) = &self.hooks.metal {
+            renderer.complete(&tracked, &self.hooks.writes, false)?;
+        }
         let slot = self
             .subchannels
             .get_mut(subchannel as usize)
@@ -453,6 +530,41 @@ impl Engines for Channel {
         self.hooks.signal(&tracked)
     }
 
+    fn release(
+        &mut self,
+        memory: &dyn GpuMemory,
+        release: Release,
+    ) -> Result<Option<Release>, Unmodeled> {
+        self.draw_held(memory)?;
+        let tracked = resources::Tracked {
+            memory,
+            writes: &self.hooks.writes,
+        };
+        match &self.hooks.metal {
+            Some(renderer) => renderer.release(&tracked, &self.hooks.writes, release),
+            None => Ok(Some(release)),
+        }
+    }
+
+    fn idle(&mut self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+        self.draw_held(memory)?;
+        if let Some(renderer) = &self.hooks.metal {
+            let tracked = resources::Tracked {
+                memory,
+                writes: &self.hooks.writes,
+            };
+            renderer.complete(&tracked, &self.hooks.writes, true)?;
+        }
+        Ok(())
+    }
+
+    /// Draws held back belong to the work before: they are drawn first.
+    fn synchronize(&mut self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+        self.draw_held(memory)?;
+        self.hooks.writes.synchronize();
+        Ok(())
+    }
+
     fn settle(&mut self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
         self.draw_held(memory)?;
         let tracked = resources::Tracked {
@@ -462,7 +574,7 @@ impl Engines for Channel {
         if let Some(renderer) = &self.hooks.metal {
             renderer.settle(&tracked, &self.hooks.writes)?;
         }
-        self.hooks.writes.signal();
+        self.hooks.writes.synchronize();
         Ok(())
     }
 
@@ -490,7 +602,7 @@ impl Engines for Channel {
         if let Some(renderer) = &self.hooks.metal {
             renderer.drop_caches();
         }
-        self.hooks.writes.signal();
+        self.hooks.writes.synchronize();
         Ok(())
     }
 }

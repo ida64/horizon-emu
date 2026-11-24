@@ -348,8 +348,9 @@ fn depth_held_on_demand_is_written_back_for_an_engine_read() {
 }
 
 /// Memory of a depth buffer held on demand that the guest gave another
-/// use (other bytes are there now) is not written: an engine reading it,
-/// and a snapshot, find the guest's bytes.
+/// use (other bytes are there now, written before the work that follows
+/// was submitted) is not written: an engine reading it, and a snapshot,
+/// find the guest's bytes.
 #[test]
 fn depth_held_on_demand_is_dropped_when_its_memory_is_reused() {
     let reused: Vec<u8> = (0..DEPTH_BYTES).map(|i| (i * 7 + i / 256) as u8).collect();
@@ -360,6 +361,7 @@ fn depth_held_on_demand_is_dropped_when_its_memory_is_reused() {
 
     let mut metal = depth_frame(Metal);
     metal.ram.put(DEPTH, &reused);
+    metal.channel.synchronize(&metal.ram).unwrap();
     assert!(copy_depth(&mut metal) == expected, "rendered depth written");
     assert!(metal.ram.bytes(DEPTH, DEPTH_BYTES) == reused);
     metal.channel.settle(&metal.ram).unwrap();
@@ -368,6 +370,7 @@ fn depth_held_on_demand_is_dropped_when_its_memory_is_reused() {
     // The same with the snapshot's write-back first.
     let mut metal = depth_frame(Metal);
     metal.ram.put(DEPTH, &reused);
+    metal.channel.synchronize(&metal.ram).unwrap();
     metal.channel.settle(&metal.ram).unwrap();
     assert!(metal.ram.bytes(DEPTH, DEPTH_BYTES) == reused);
     assert!(copy_depth(&mut metal) == expected);

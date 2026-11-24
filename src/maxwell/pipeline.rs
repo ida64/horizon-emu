@@ -1325,14 +1325,12 @@ pub fn draw(
 /// programs stored there.
 const NATIVE_MINIMUM: usize = 7;
 
-/// Buffers the vertex streams of native draws are read into, kept from
-/// draw to draw by the thread drawing (a chunk mesh's stream is megabytes:
-/// allocated afresh, each takes its pages from the system and gives them
-/// back).
-const STREAM_BUFFERS_KEPT: usize = 2 * super::shader::msl::MAX_STREAMS;
-
 thread_local! {
-    static STREAM_BUFFERS: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The buffer the vertex streams of native draws are read into, kept
+    /// from draw to draw by the thread drawing (a chunk mesh's stream is
+    /// megabytes: allocated afresh, it takes its pages from the system
+    /// and gives them back).
+    static STREAM_BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// What [`indexed_geometry`] gives: how Metal's vertex ID names a vertex,
@@ -1575,6 +1573,8 @@ fn native(
         return Ok(true);
     }
     let mut streams = Vec::with_capacity(slots.len());
+    let mut stream_bytes = STREAM_BYTES.with(|kept| std::mem::take(&mut *kept.borrow_mut()));
+    stream_bytes.clear();
     for &index in &slots {
         let stream = fetch.streams[index];
         let (first, last) = match fetch_instance.checked_div(stream.divisor) {
@@ -1599,22 +1599,18 @@ fn native(
         if stop == start || stop - 1 > stream.limit {
             return fall_back("vertex fetch beyond the stream limit");
         }
-        // In a buffer of an earlier draw, if one is kept: its length is
-        // set without clearing what the read replaces.
+        // Each stream's bytes at a 16-byte boundary of the one buffer.
+        let offset = stream_bytes.len().next_multiple_of(16);
         let length = (stop - start) as usize;
-        let mut bytes = STREAM_BUFFERS
-            .with(|kept| kept.borrow_mut().pop())
-            .unwrap_or_default();
-        if bytes.len() < length {
-            bytes.resize(length, 0);
-        } else {
-            bytes.truncate(length);
-        }
-        if context.memory.read(start, &mut bytes).is_none() {
+        let Ok(at) = u32::try_from(offset) else {
+            return fall_back("vertex streams past 4 GiB");
+        };
+        stream_bytes.resize(offset + length, 0);
+        if context.memory.read(start, &mut stream_bytes[offset..]).is_none() {
             return fall_back("vertex fetch from unmapped memory");
         }
         streams.push(NativeStream {
-            bytes,
+            offset: at,
             first,
             stride: stream.stride,
             divisor: stream.divisor,
@@ -1644,6 +1640,7 @@ fn native(
         inactive: fetch.inactive,
         fetches,
         streams,
+        stream_bytes,
         vertices,
         indices,
         view: [
@@ -1684,14 +1681,7 @@ fn native(
         count_passed: context.passed.is_some(),
     };
     let drawn = metal.draw(context.memory, context.writes, &draw);
-    STREAM_BUFFERS.with(|kept| {
-        let mut kept = kept.borrow_mut();
-        for stream in native.streams {
-            if kept.len() < STREAM_BUFFERS_KEPT {
-                kept.push(stream.bytes);
-            }
-        }
-    });
+    STREAM_BYTES.with(|kept| *kept.borrow_mut() = native.stream_bytes);
     drawn
 }
 

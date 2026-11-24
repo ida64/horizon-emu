@@ -242,9 +242,8 @@ impl Renderer {
             x1: rect.x1.div_ceil(1 << lx),
             y1: rect.y1.div_ceil(1 << ly),
         };
-        state.rendered(to_index, pixels, writes);
-        self.any_dirty
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let newly = state.rendered(to_index, pixels, writes);
+        self.dirtied(newly);
         Ok(true)
     }
 

@@ -1,5 +1,6 @@
-//! The Metal renderer: 3D draws and clears of a channel run on the host
-//! GPU through Metal, with the software renderer as the reference and the
+//! The Metal renderer: 3D draws and clears, and compute launches
+//! ([`compute`]), of a channel run on the host GPU through Metal, with the
+//! software renderer and the interpreter as the reference and the
 //! fallback.
 //!
 //! # What runs where
@@ -27,39 +28,50 @@
 //! the surface, plus a mirror of the surface's bytes as guest memory had
 //! them when the two were last made equal. Rendering makes the resident
 //! *dirty* (the Metal texture is newer than guest memory, over a known
-//! rectangle). A write-back waits for the GPU and stores the dirty pixels
-//! in guest memory, in the surface's own layout. That happens:
+//! rectangle). A write-back stores the dirty pixels in guest memory, in
+//! the surface's own layout. That happens:
 //!
 //! - when the channel signals: semaphore releases, reports and syncpoint
 //!   increments of its engines and of the pushbuffer executor
-//!   ([`super::Hooks::signal`], [`super::Engines::flush`]), except for
-//!   the targets held on demand (below);
+//!   ([`super::Hooks::release`], [`super::Engines::release`]), except
+//!   for the targets held on demand (below). The write-back is recorded
+//!   after the work so far (targets packed into their guest bytes on the
+//!   GPU, global memory regions copied) and finished once the GPU has
+//!   done it, and the release is made then ([`Renderer::release`],
+//!   [`Renderer::complete`]), the channel going on with later work
+//!   meanwhile, as hardware does. The channel finishes them as the GPU
+//!   gets done, between methods, and waits for them when it has nothing
+//!   to run ([`super::Engines::idle`]);
 //! - before any other access of the channel's engines to memory that
-//!   overlaps a dirty target: all engine memory accesses go through
-//!   [`Coherent`], which writes back first. That covers copies, 2D blits
-//!   the GPU does not do ([`blit`]), inline uploads, texture sampling of
-//!   a render target that is not sampled on the GPU (below), and constant
-//!   and vertex data;
+//!   overlaps a dirty target or an unfinished write-back: all engine
+//!   memory accesses go through [`Coherent`], which writes back first.
+//!   That covers copies, 2D blits the GPU does not do ([`blit`]), inline
+//!   uploads, texture sampling of a render target that is not sampled on
+//!   the GPU (below), and constant and vertex data;
 //! - before a draw or clear Metal cannot express runs in the software
 //!   renderer, and before a machine snapshot ([`Renderer::settle`]).
 //!
-//! Between signals the dirty pixels exist only on the host GPU. Nothing
-//! outside the channel can tell: the guest CPU, other channels and the
-//! display learn that rendering finished only from a signal (NVN fences
-//! are syncpoint increments or semaphore releases the CPU, nvservices or
-//! another channel waits on; the compositor flips a buffer once its fence
-//! passed), and on hardware too, memory written by work not yet followed
-//! by a signal may or may not hold the result. Ends of a channel's turn,
-//! wait-for-idle, `FB_FLUSH` and L2 flushes are not signals: they let no
-//! one observe anything until a signal follows.
+//! Until its release is made, nothing outside the channel can tell
+//! whether a write-back happened: the guest CPU, other channels and the
+//! display learn that rendering finished only from a release (NVN
+//! fences are syncpoint increments or semaphore releases the CPU,
+//! nvservices or another channel waits on; the compositor flips a buffer
+//! once its fence passed), and on hardware too, memory written by work
+//! not yet followed by a release may or may not hold the result. Ends of
+//! a channel's turn, wait-for-idle, `FB_FLUSH` and L2 flushes are not
+//! signals: they let no one observe anything until a signal follows.
 //!
 //! Before a resident is used, its mirror is compared with guest memory
-//! (and the Metal texture reloaded if they differ) at most once per epoch
-//! of [`Writes`]: after each signal of the channel, and after the
-//! channel's own engines wrote memory overlapping it. Anything else (the
-//! CPU, another channel) may only write a surface the channel rendered or
-//! read once a signal told it the GPU is done with it; between, such a
-//! write races with the GPU, as on hardware.
+//! (and the Metal texture reloaded, into a new texture so that recorded
+//! work keeps the old one, if they differ) at most once per epoch of
+//! [`Writes`]: after each synchronization of the channel with another
+//! agent (new work submitted, a semaphore acquire or syncpoint wait
+//! passed), and after the channel's own engines wrote memory overlapping
+//! it. A resident whose write-back is unfinished holds what memory is
+//! to hold. Anything else (the CPU, another channel) may only write a
+//! surface the channel rendered or read once a release told it the GPU
+//! is done with it; between, such a write races with the GPU, as on
+//! hardware.
 //!
 //! # The GPU works while the frame is recorded
 //!
@@ -104,25 +116,32 @@
 //!
 //! # Sampling render targets
 //!
-//! A texture whose levels (some or all) are current residents whose
-//! Metal texture gives the header's values ([`shared_components`]: a
-//! color target of the format that samples the header's bytes, read
-//! through sRGB decoding where the header asks, or a ZF32 or Z16 depth
-//! buffer) is sampled from a [`Composite`]: a Metal texture whose levels
-//! are filled from those residents on the GPU each time they were
-//! rendered to, and from guest memory for the other levels. Guest memory
-//! is not involved: no write-back, decode or upload of the rendered
-//! levels (a guest draws the stages of its post-processing from one
-//! another's targets every frame). A draw that renders to a level it
-//! samples samples what the target held before the draw.
+//! A texture whose levels (some or all, of any of its array layers or
+//! cube faces) are current residents whose Metal texture gives the
+//! header's values ([`shared_components`]: a color target of the format
+//! that samples the header's bytes, read through sRGB decoding where the
+//! header asks, or a ZF32 or Z16 depth buffer; the target may be wider or
+//! taller than the level, as a GOB-aligned target is, [`holds_level`]) is
+//! sampled from a [`Composite`]: a Metal texture whose levels are filled
+//! from those residents on the GPU each time they were rendered to, and
+//! from guest memory for the other levels. Guest memory is not involved:
+//! no write-back, decode or upload of the rendered levels (a guest draws
+//! the stages of its post-processing from one another's targets every
+//! frame). A draw that renders to a level it samples samples what the
+//! target held before the draw.
+//!
+//! A target drawn to in another color format of the same texel size as
+//! the resident at its memory (the same surface) takes the resident's
+//! texels as unsigned words on the GPU; a target replacing a surface
+//! whole drops the residents inside its memory unwritten.
 //!
 //! # Global memory
 //!
-//! The memory programs address with `LDG`, `STG` and `RED` lives in one
-//! Metal buffer ([`Globals`]) that every draw's program is given, with a
-//! table of where the regions its constants name are in it: what a
-//! program stores, a later draw's program loads without the bytes
-//! leaving the GPU. A region programs may have stored to is written
+//! The memory programs address with `LDG`, `STG`, `RED` and `ATOM` lives
+//! in one Metal buffer ([`Globals`]) that every draw's and launch's
+//! program is given, with a table of where the regions its constants name
+//! are in it: what a program stores, a later program loads without the
+//! bytes leaving the GPU. A region programs may have stored to is written
 //! back to guest memory as a render target is: at a signal, or before an
 //! engine of the channel accesses it ([`Coherent`]).
 
@@ -155,6 +174,7 @@
 //! kernel ([`blit`]) would each need a second form, and both fragment
 //! generators a per-sample one.\]
 pub mod blit;
+pub mod compute;
 mod format;
 
 use std::borrow::Cow;
@@ -166,7 +186,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
-    MTLBlendFactor, MTLBlendOperation, MTLBuffer, MTLColorWriteMask, MTLCommandBuffer,
+    MTLBlendFactor, MTLBlendOperation, MTLBlitCommandEncoder, MTLBuffer, MTLColorWriteMask,
+    MTLCommandBuffer,
     MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions, MTLComputeCommandEncoder,
     MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLCullMode, MTLDepthClipMode,
     MTLDevice, MTLGPUFamily, MTLIndexType, MTLLibrary, MTLLoadAction, MTLMathMode, MTLOrigin,
@@ -190,7 +211,7 @@ use super::surface::{Rect, Surface, Window};
 use super::sampling::Target;
 use super::texture::format::{ColorFormat, DepthFormat};
 use super::texture::{Texture, Tic, Tsc};
-use super::{GpuMemory, Unmodeled};
+use super::{GpuMemory, Release, Unmodeled};
 
 type Device = ProtocolObject<dyn MTLDevice>;
 type Queue = ProtocolObject<dyn MTLCommandQueue>;
@@ -363,6 +384,10 @@ struct Resident {
     mirror: Window,
     /// Pixels rendered since the last write-back.
     dirty: Option<Rect>,
+    /// Written back at signals whose write-backs have yet to reach guest
+    /// memory ([`Pending`]), how many: the texture is current, the mirror
+    /// and memory are not yet.
+    pending: u32,
     /// When `mirror` was last known to equal guest memory.
     stamp: Option<Stamp>,
     /// [`State::clock`] when a draw or clear last used it.
@@ -454,6 +479,9 @@ struct State {
     pass_draws: u32,
     programs: HashMap<usize, Program2>,
     vertex_programs: HashMap<usize, VertexProgram>,
+    /// Kernels of compute launches, by the address of the compute class's
+    /// [`Kernel`](super::shader::Kernel) (`compute::Renderer::dispatch`).
+    kernels: HashMap<usize, compute::KernelEntry>,
     /// Reasons draws shaded their vertices on the CPU (`pipeline::native`),
     /// counted.
     cpu_vertices: HashMap<String, u64>,
@@ -494,6 +522,9 @@ struct State {
     /// that bound placeholders, with each unbound slot and the refusal a
     /// sample of it is (see `shader::msl` `texture.rs`).
     faults: Vec<Faults>,
+    /// Signals whose write-backs wait for the GPU, oldest first
+    /// ([`Renderer::release`]).
+    pending: std::collections::VecDeque<Pending>,
     /// What fragment functions tell the renderer ([`Feedback`]), made
     /// when first needed.
     feedback: Option<Feedback>,
@@ -506,6 +537,11 @@ struct State {
     /// The memory programs address through their constants
     /// ([`Renderer::global_tables`]), made when first needed.
     globals: Option<Globals>,
+    /// The extents of the dirty residents and global memory regions,
+    /// sorted and merged ([`Renderer::before_access`]); rebuilt when
+    /// something became dirty since ([`Renderer::dirtied`]). It may hold
+    /// extents written back since, which costs a needless look only.
+    dirty_extents: Vec<(u64, u64)>,
     /// The packing kernels (`State::pack`), plain and layered.
     pack_pipelines: HashMap<bool, Retained<ComputePipeline>>,
     /// The 2D blit kernel (`blit`), made once.
@@ -521,6 +557,7 @@ impl Default for State {
             pass_draws: 0,
             programs: HashMap::new(),
             vertex_programs: HashMap::new(),
+            kernels: HashMap::new(),
             cpu_vertices: HashMap::new(),
             libraries: Lru::new(LIBRARY_LIMIT),
             pipelines: Lru::new(PIPELINE_LIMIT),
@@ -533,12 +570,14 @@ impl Default for State {
             software_time: HashMap::new(),
             draws: 0,
             faults: Vec::new(),
+            pending: Default::default(),
             feedback: None,
             placeholders: HashMap::new(),
             native: HashMap::new(),
             texture_bytes: 0,
             arena: Arena::default(),
             globals: None,
+            dirty_extents: Vec::new(),
             pack_pipelines: HashMap::new(),
             composites: HashMap::new(),
             versions: 0,
@@ -604,6 +643,8 @@ pub struct NativeDraw<'a> {
     pub fetches: Vec<msl::Fetch>,
     /// By stream slot.
     pub streams: Vec<NativeStream>,
+    /// The bytes of all streams, each at its offset.
+    pub stream_bytes: Vec<u8>,
     /// How Metal's vertex ID names a vertex.
     pub vertices: NativeVertices,
     /// The triangles' vertices as Metal's indices, the provoking vertex
@@ -647,9 +688,10 @@ pub enum NativeIndices<'a> {
     Buffer { bytes: Cow<'a, [u8]>, wide: bool },
 }
 
-/// A vertex stream's bytes from its first fetched element on.
+/// A vertex stream's bytes from its first fetched element on: where they
+/// are in [`NativeDraw::stream_bytes`].
 pub struct NativeStream {
-    pub bytes: Vec<u8>,
+    pub offset: u32,
     pub first: u32,
     pub stride: u32,
     pub divisor: u32,
@@ -683,6 +725,14 @@ pub struct Renderer {
     /// after a flush wrote them all back. While clear, an access needs no
     /// look at the residents ([`Renderer::before_access`]).
     any_dirty: std::sync::atomic::AtomicBool,
+    /// Something became dirty since `State::dirty_extents` was built.
+    extents_stale: std::sync::atomic::AtomicBool,
+    /// How many signals wait in `State::pending`: none, and a poll need
+    /// not lock the state.
+    pending_count: std::sync::atomic::AtomicUsize,
+    /// Increments a host1x syncpoint, for the releases the renderer
+    /// makes itself.
+    increment: Mutex<Option<Arc<dyn Fn(u32) + Send + Sync>>>,
 }
 
 /// What a draw hands the Metal renderer once the software pipeline has
@@ -778,6 +828,9 @@ impl Renderer {
             state: Mutex::new(State::default()),
             writing_back: Default::default(),
             any_dirty: Default::default(),
+            extents_stale: Default::default(),
+            pending_count: Default::default(),
+            increment: Mutex::new(None),
         })
     }
 
@@ -795,6 +848,8 @@ impl Renderer {
             draws,
             ..State::default()
         };
+        self.pending_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn gpu() -> &'static Gpu {
@@ -892,6 +947,216 @@ impl Renderer {
         self.write_back(memory, writes, Scope::Signal)
     }
 
+    /// Connects host1x syncpoint increments, for the releases the
+    /// renderer makes itself ([`Renderer::release`]).
+    pub fn set_increment(&self, increment: Arc<dyn Fn(u32) + Send + Sync>) {
+        *self.increment.lock().unwrap() = Some(increment);
+    }
+
+    /// The channel signals `release`: it is to be made once every dirty
+    /// target the guest may read from then on (all but those held on
+    /// demand, [`Resident::on_demand`]), every global memory region
+    /// programs stored to and every report is in guest memory. Those
+    /// write-backs are recorded after the work so far (targets packed on
+    /// the GPU, regions copied) and finished, with the release, once the
+    /// GPU has done it ([`Renderer::complete`]); the channel goes on
+    /// meanwhile, as hardware does, its later work in later command
+    /// buffers. Returns the release to be made now when there is nothing
+    /// to wait for, or what is to be written cannot be recorded so (then
+    /// it is written back now, after waiting for the GPU).
+    ///
+    /// Until it is finished, a write-back holds back any access of the
+    /// channel's engines to its memory ([`Coherent`]), and any later
+    /// write-back of the same memory: memory is written in the order of
+    /// the work.
+    pub fn release(
+        &self,
+        memory: &dyn GpuMemory,
+        writes: &Writes,
+        release: Release,
+    ) -> Result<Option<Release>, Unmodeled> {
+        use std::sync::atomic::Ordering;
+        let increment = self.increment.lock().unwrap().is_some();
+        {
+            let mut state = self.state.lock().unwrap();
+            let wanted: Vec<usize> = (0..state.residents.len())
+                .filter(|&i| state.residents[i].dirty.is_some() && !state.residents[i].on_demand())
+                .collect();
+            let keys: Vec<(u64, u32)> = state
+                .globals
+                .iter()
+                .flat_map(|globals| &globals.regions)
+                .filter(|(_, region)| region.dirty)
+                .map(|(key, _)| *key)
+                .collect();
+            let reports = state
+                .feedback
+                .as_ref()
+                .map_or(0, |feedback| feedback.pending.len());
+            let nothing = wanted.is_empty() && keys.is_empty() && reports == 0;
+            if (nothing && state.pending.is_empty())
+                || (matches!(release, Release::Increment(_)) && !increment)
+                || state.arena.chunks_in_use() > ARENA_UNWAITED
+                || state
+                    .feedback
+                    .as_ref()
+                    .is_some_and(|feedback| feedback.slot + 1 >= FEEDBACK_SLOTS || feedback.trapped)
+            {
+                drop(state);
+                self.write_back(memory, writes, Scope::Signal)?;
+                return Ok(Some(release));
+            }
+            let mut extents: Vec<(u64, u64)> = wanted
+                .iter()
+                .map(|&i| state.residents[i].extent())
+                .chain(keys.iter().map(|&key| global_extent(key)))
+                .collect();
+            if let Some(feedback) = &state.feedback {
+                extents.extend(feedback.pending.iter().map(Report::extent));
+            }
+            let mut packs = Vec::with_capacity(wanted.len());
+            for &index in &wanted {
+                match state.pack(index)? {
+                    Some(packed) => packs.push((index, packed)),
+                    None => {
+                        // The CPU reads the texture: once the GPU is done.
+                        drop(state);
+                        self.write_back(memory, writes, Scope::Signal)?;
+                        return Ok(Some(release));
+                    }
+                }
+            }
+            let mut residents = Vec::with_capacity(packs.len());
+            for (index, packed) in packs {
+                let resident = &mut state.residents[index];
+                residents.push(PendingResident {
+                    surface: resident.surface,
+                    log2: resident.log2,
+                    packed,
+                });
+                resident.dirty = None;
+                resident.pending += 1;
+            }
+            let mut regions = Vec::with_capacity(keys.len());
+            if !keys.is_empty() {
+                let command = state.command()?;
+                let blit = command
+                    .blitCommandEncoder()
+                    .ok_or_else(|| Unmodeled("Metal: no blit encoder".into()))?;
+                let State { globals, arena, .. } = &mut *state;
+                let globals = globals.as_mut().expect("regions are in it");
+                for key in keys {
+                    let region = globals.regions.get_mut(&key).expect("listed");
+                    let size = key.1 as usize;
+                    let (staging, offset) = arena.alloc(&vec![0; size])?;
+                    // SAFETY: both ranges are inside their buffers.
+                    unsafe {
+                        blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                            &globals.buffer,
+                            region.offset,
+                            &staging,
+                            offset,
+                            size,
+                        );
+                    }
+                    region.dirty = false;
+                    region.pending += 1;
+                    regions.push((key, staging, offset));
+                }
+                blit.endEncoding();
+            }
+            let reports = state
+                .feedback
+                .as_mut()
+                .map(|feedback| std::mem::take(&mut feedback.pending))
+                .unwrap_or_default();
+            let faults = std::mem::take(&mut state.faults);
+            let bound = state
+                .globals
+                .as_mut()
+                .is_some_and(|globals| std::mem::take(&mut globals.bound));
+            let command = if nothing && faults.is_empty() && !bound {
+                // Nothing of its own: it follows the earlier ones.
+                None
+            } else {
+                state.submit();
+                state.submitted.clone()
+            };
+            state.pending.push_back(Pending {
+                command,
+                residents,
+                regions,
+                reports,
+                faults,
+                bound,
+                extents,
+                release,
+            });
+            self.pending_count.store(state.pending.len(), Ordering::Relaxed);
+            self.any_dirty.store(true, Ordering::Relaxed);
+            self.extents_stale.store(true, Ordering::Relaxed);
+            return Ok(None);
+        }
+    }
+
+    /// Finishes the write-backs of signals the GPU has done the work
+    /// before (all of them, waiting for the GPU, with `wait`), in order,
+    /// and makes their releases ([`Renderer::release`]).
+    pub fn complete(
+        &self,
+        memory: &dyn GpuMemory,
+        writes: &Writes,
+        wait: bool,
+    ) -> Result<(), Unmodeled> {
+        use objc2_metal::MTLCommandBufferStatus;
+        use std::sync::atomic::Ordering;
+        if self.pending_count.load(Ordering::Relaxed) == 0 {
+            return Ok(());
+        }
+        loop {
+            let pending = {
+                let mut state = self.state.lock().unwrap();
+                let Some(front) = state.pending.front() else {
+                    return Ok(());
+                };
+                if let Some(command) = &front.command {
+                    let status = command.status();
+                    if !wait
+                        && status != MTLCommandBufferStatus::Completed
+                        && status != MTLCommandBufferStatus::Error
+                    {
+                        return Ok(());
+                    }
+                    command.waitUntilCompleted();
+                }
+                let pending = state.pending.pop_front().expect("looked at");
+                self.pending_count.store(state.pending.len(), Ordering::Relaxed);
+                self.writing_back.store(true, Ordering::Relaxed);
+                let mut pending = pending;
+                let result = finish(&mut state, &mut pending, memory, writes);
+                self.writing_back.store(false, Ordering::Relaxed);
+                if state.pending.is_empty() {
+                    self.any_dirty.store(state.anything_dirty(), Ordering::Relaxed);
+                }
+                result?;
+                pending
+            };
+            match pending.release {
+                Release::Write { address, bytes } => {
+                    memory.write(address, &bytes).ok_or_else(|| {
+                        Unmodeled(format!(
+                            "semaphore write to unmapped GPU address {address:#x}"
+                        ))
+                    })?;
+                }
+                Release::Increment(index) => {
+                    let increment = self.increment.lock().unwrap().clone();
+                    increment.expect("checked when held")(index);
+                }
+            }
+        }
+    }
+
     /// Writes every dirty target back to guest memory, those held on
     /// demand too: afterwards guest memory holds all of the channel's
     /// work (before a machine snapshot, and before the software renderer
@@ -914,6 +1179,8 @@ impl Renderer {
         scope: Scope,
     ) -> Result<(), Unmodeled> {
         use std::sync::atomic::Ordering;
+        // Earlier signals' write-backs come first.
+        self.complete(memory, writes, true)?;
         let mut state = self.state.lock().unwrap();
         let mut wanted: Vec<bool> = state
             .residents
@@ -1092,16 +1359,7 @@ impl Renderer {
             }
         }
         self.writing_back.store(false, Ordering::Relaxed);
-        let any_dirty = state.residents.iter().any(|r| r.dirty.is_some())
-            || state
-                .globals
-                .iter()
-                .any(|globals| globals.regions.values().any(|region| region.dirty))
-            || state
-                .feedback
-                .iter()
-                .any(|feedback| !feedback.pending.is_empty());
-        self.any_dirty.store(any_dirty, Ordering::Relaxed);
+        self.any_dirty.store(state.anything_dirty(), Ordering::Relaxed);
         let stamp = writes.stamp();
         for ((resident, current), wanted) in state.residents.iter_mut().zip(current).zip(wanted) {
             if wanted {
@@ -1110,6 +1368,16 @@ impl Renderer {
         }
         state.trim();
         result
+    }
+
+    /// Something may be dirty now; `newly` if it was clean before (a
+    /// resident rendered to, a global memory region stored to).
+    fn dirtied(&self, newly: bool) {
+        use std::sync::atomic::Ordering;
+        self.any_dirty.store(true, Ordering::Relaxed);
+        if newly {
+            self.extents_stale.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Writes back the dirty targets that overlap `length` bytes at
@@ -1126,18 +1394,45 @@ impl Renderer {
             return Ok(());
         }
         let range = (address, address + length as u64);
+        // Memory a signal's write-back has yet to write.
+        let pending = self.pending_count.load(Ordering::Relaxed) != 0
+            && self.state.lock().unwrap().pending.iter().any(|pending| {
+                pending.extents.iter().any(|&extent| overlap(extent, range))
+            });
+        if pending {
+            self.complete(memory, writes, true)?;
+        }
         let overlaps = {
-            let state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap();
+            if self.extents_stale.swap(false, Ordering::Relaxed) {
+                let mut extents: Vec<(u64, u64)> = state
+                    .residents
+                    .iter()
+                    .filter(|r| r.dirty.is_some())
+                    .map(|r| r.extent())
+                    .chain(state.globals.iter().flat_map(|globals| {
+                        globals
+                            .regions
+                            .iter()
+                            .filter(|(_, region)| region.dirty)
+                            .map(|(key, _)| global_extent(*key))
+                    }))
+                    .collect();
+                extents.sort_unstable();
+                let mut merged: Vec<(u64, u64)> = Vec::with_capacity(extents.len());
+                for (start, end) in extents {
+                    match merged.last_mut() {
+                        Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                        _ => merged.push((start, end)),
+                    }
+                }
+                state.dirty_extents = merged;
+            }
+            let first = state.dirty_extents.partition_point(|&(_, end)| end <= range.0);
             state
-                .residents
-                .iter()
-                .any(|r| r.dirty.is_some() && overlap(r.extent(), range))
-                || state.globals.iter().any(|globals| {
-                    globals
-                        .regions
-                        .iter()
-                        .any(|(key, region)| region.dirty && overlap(global_extent(*key), range))
-                })
+                .dirty_extents
+                .get(first)
+                .is_some_and(|&(start, _)| start < range.1)
                 || state.feedback.iter().any(|feedback| {
                     feedback
                         .pending
@@ -1381,7 +1676,7 @@ impl Renderer {
             if let Err(reason) = format::check_texture(&tic, &tsc, kind) {
                 return self.fall_back(reason);
             }
-            if matches!(sampled, Sampled::Composite(_)) && kind != TextureKind::Flat {
+            if matches!(sampled, Sampled::Composite(_)) && kind != composite_kind(&tic) {
                 return self.fall_back(format!("rendered texture in a {kind:?} slot"));
             }
             if translated.compare[slot] {
@@ -1469,7 +1764,9 @@ impl Renderer {
             [
                 (draw.constants, &translated.globals, translated.stores),
                 match &vertex {
-                    Some((native, vertex, ..)) => (native.constants, &vertex.globals, false),
+                    Some((native, vertex, ..)) => {
+                        (native.constants, &vertex.globals, vertex.stores)
+                    }
                     None => (&[], &[], false),
                 },
             ],
@@ -1824,10 +2121,11 @@ impl Renderer {
                     words[0] = native.instance;
                     words[1] = native.fetch_instance;
                     for (slot, stream) in native.streams.iter().enumerate() {
-                        words[2 + 3 * slot..][..3].copy_from_slice(&[
+                        words[2 + 4 * slot..][..4].copy_from_slice(&[
                             stream.first,
                             stream.stride,
                             stream.divisor,
+                            stream.offset,
                         ]);
                     }
                     words[msl::INDEXED_WORD] =
@@ -1841,13 +2139,13 @@ impl Renderer {
                         bytes_of_u32(&words),
                         29,
                     )?;
-                    for (slot, stream) in native.streams.iter().enumerate() {
+                    if !native.streams.is_empty() {
                         bind(
                             &mut state.arena,
                             &encoder,
                             Stage::Vertex,
-                            &stream.bytes,
-                            msl::STREAM_BUFFER + slot,
+                            &native.stream_bytes,
+                            msl::STREAM_BUFFER,
                         )?;
                     }
                     if draw.depth.is_some() {
@@ -2070,9 +2368,8 @@ impl Renderer {
             if matches!(content, Content::Depth(_)) && draw.depth.is_some_and(|d| !d.1.writes()) {
                 continue;
             }
-            state.rendered(index, scissor, writes);
-            self.any_dirty
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let newly = state.rendered(index, scissor, writes);
+            self.dirtied(newly);
         }
         state.draws += 1;
         Ok(true)
@@ -2159,9 +2456,8 @@ impl Renderer {
             )?;
             draw_clear(&mut state.arena, &encoder, samples)?;
         }
-        state.rendered(residents[0], rect, writes);
-        self.any_dirty
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let newly = state.rendered(residents[0], rect, writes);
+        self.dirtied(newly);
         Ok(true)
     }
 
@@ -2284,9 +2580,8 @@ impl Renderer {
             )?;
             draw_clear(&mut state.arena, &encoder, samples)?;
         }
-        state.rendered(residents[0], rect, writes);
-        self.any_dirty
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let newly = state.rendered(residents[0], rect, writes);
+        self.dirtied(newly);
         Ok(true)
     }
 
@@ -2366,7 +2661,6 @@ impl Renderer {
         key: (u64, u32),
         store: bool,
     ) -> Result<Option<usize>, Unmodeled> {
-        use std::sync::atomic::Ordering;
         let extent = global_extent(key);
         loop {
             {
@@ -2377,11 +2671,13 @@ impl Renderer {
                 });
                 if !conflict {
                     if let Some(region) = globals.regions.get_mut(&key)
-                        && (region.dirty || writes.unchanged(region.stamp, extent.0, extent.1))
+                        && (region.dirty
+                            || region.pending != 0
+                            || writes.unchanged(region.stamp, extent.0, extent.1))
                     {
                         if store {
+                            self.dirtied(!region.dirty);
                             region.dirty = true;
-                            self.any_dirty.store(true, Ordering::Relaxed);
                         }
                         return Ok(Some(region.offset));
                     }
@@ -2403,8 +2699,8 @@ impl Renderer {
         {
             region.stamp = stamp;
             if store {
+                self.dirtied(!region.dirty);
                 region.dirty = true;
-                self.any_dirty.store(true, Ordering::Relaxed);
             }
             return Ok(Some(region.offset));
         }
@@ -2440,10 +2736,11 @@ impl Renderer {
                 content: bytes,
                 stamp,
                 dirty: store,
+                pending: 0,
             },
         );
         if store {
-            self.any_dirty.store(true, Ordering::Relaxed);
+            self.dirtied(true);
         }
         Ok(Some(offset))
     }
@@ -2475,23 +2772,89 @@ impl Renderer {
         };
         // A resident of other dimensions, format or samples at overlapping
         // memory is written back and dropped, before any index is taken
-        // (and with no pass open that names one).
+        // (and with no pass open that names one). One inside the memory of
+        // a target the caller replaces whole is dropped unwritten: every
+        // byte it would write is overwritten.
         for &(surface, format) in targets {
-            let stale: bool = {
+            let target = extent(&surface);
+            // The one resident there being the same surface in another
+            // color format of the same texel size: its texels are the
+            // same bytes, copied on the GPU as unsigned words into a
+            // texture of the new format.
+            if let Content::Color(_) = format
+                && !overwrite
+            {
+                let mut state = self.state.lock().unwrap();
+                let overlapping: Vec<usize> = (0..state.residents.len())
+                    .filter(|&i| {
+                        let r = &state.residents[i];
+                        other(r, surface, format) && overlap(r.extent(), target)
+                    })
+                    .collect();
+                if let [index] = overlapping[..]
+                    && let r = &state.residents[index]
+                    && r.surface == surface
+                    && r.log2 == log2
+                    && matches!(r.format, Content::Color(_))
+                    && let Some(raw) = raw_view_format(surface.bytes_per_pixel)
+                    && let Some(pixel_format) = format.pixel_format()
+                {
+                    let layout = Samples {
+                        log2,
+                        ..Samples::SINGLE
+                    };
+                    let full = layout.pixels(&surface);
+                    let texture =
+                        new_target(Self::gpu(), pixel_format, full.x1, full.y1, layout.count())?;
+                    let from = r.texture.newTextureViewWithPixelFormat(raw);
+                    let to = texture.newTextureViewWithPixelFormat(raw);
+                    if let (Some(from), Some(to)) = (from, to) {
+                        let command = state.command()?;
+                        let blit = command
+                            .blitCommandEncoder()
+                            .ok_or_else(|| Unmodeled("Metal: no blit encoder".into()))?;
+                        // SAFETY: two views of one size and format.
+                        unsafe { blit.copyFromTexture_toTexture(&from, &to) };
+                        blit.endEncoding();
+                        state.versions += 1;
+                        let version = state.versions;
+                        let resident = &mut state.residents[index];
+                        resident.format = format;
+                        resident.texture = texture;
+                        resident.version = version;
+                        // Composites made of it read it as before.
+                        state.composites.retain(|_, composite| {
+                            !composite.levels.iter().any(|level| {
+                                level.resident.is_some() && holds_level(&surface, &level.surface)
+                            })
+                        });
+                        continue;
+                    }
+                }
+            }
+            let (stale, covered) = {
                 let state = self.state.lock().unwrap();
-                state
+                let mut stale = state
                     .residents
                     .iter()
-                    .any(|r| other(r, surface, format) && overlap(r.extent(), extent(&surface)))
+                    .filter(|r| other(r, surface, format) && overlap(r.extent(), target))
+                    .peekable();
+                let any = stale.peek().is_some();
+                (any, any && stale.all(|r| {
+                    let (start, end) = r.extent();
+                    overwrite && target.0 <= start && end <= target.1
+                }))
             };
             if stale {
-                let (start, end) = extent(&surface);
-                self.write_back(memory, writes, Scope::Range(start, end))?;
+                if !covered {
+                    self.write_back(memory, writes, Scope::Range(target.0, target.1))?;
+                }
                 let mut state = self.state.lock().unwrap();
                 state.submit();
-                state.residents.retain(|r| {
-                    !(other(r, surface, format) && overlap(r.extent(), extent(&surface)))
-                });
+                state
+                    .residents
+                    .retain(|r| !(other(r, surface, format) && overlap(r.extent(), target)));
+                self.extents_stale.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
         let layout = Samples {
@@ -2510,13 +2873,7 @@ impl Renderer {
                     .residents
                     .iter()
                     .position(|r| !other(r, surface, format))
-                    .map(|i| {
-                        let r = &state.residents[i];
-                        let (start, end) = r.extent();
-                        let current = r.dirty.is_some()
-                            || r.stamp.is_some_and(|s| writes.unchanged(s, start, end));
-                        (i, current)
-                    })
+                    .map(|i| (i, state.residents[i].current(writes)))
             };
             // The whole surface: its pixels, and the texels holding them.
             let full = layout.pixels(&surface);
@@ -2558,13 +2915,23 @@ impl Renderer {
                         Some(Ok(mut window)) => {
                             // Work recorded or running may read the
                             // texture (a depth buffer tested, not written):
-                            // it sees what the texture held when recorded.
-                            state.wait();
-                            let resident = &mut state.residents[index];
-                            upload_surface(&resident.texture, &mut window, full, log2);
+                            // it keeps the old one, as it was when recorded,
+                            // and the resident takes a new one. An open
+                            // pass may name it: it ends.
+                            state.command()?;
+                            let old = &state.residents[index].texture;
+                            let texture = new_target(
+                                Self::gpu(),
+                                old.pixelFormat(),
+                                full.x1,
+                                full.y1,
+                                layout.count(),
+                            )?;
+                            upload_surface(&texture, &mut window, full, log2);
                             state.versions += 1;
                             let version = state.versions;
                             let resident = &mut state.residents[index];
+                            resident.texture = texture;
                             resident.version = version;
                             resident.mirror = window;
                         }
@@ -2575,11 +2942,21 @@ impl Renderer {
                 }
                 None => {
                     let pixel_format = format.pixel_format().expect("checked by the caller");
-                    let mut window = Window::load(memory, surface, texels)?;
-                    let stamp = writes.stamp();
+                    let on_demand = matches!(format, Content::Depth(_)) || log2 != [0, 0];
                     let texture =
                         new_target(Self::gpu(), pixel_format, full.x1, full.y1, layout.count())?;
-                    upload_surface(&texture, &mut window, full, log2);
+                    // A target the caller replaces whole is not uploaded,
+                    // and its mirror reads only GOBs it covers in part (one
+                    // held on demand needs a mirror equal to memory, as
+                    // above).
+                    let (window, stamp) = if overwrite && !on_demand {
+                        (Window::load_to_overwrite(memory, surface, texels)?, None)
+                    } else {
+                        let mut window = Window::load(memory, surface, texels)?;
+                        let stamp = writes.stamp();
+                        upload_surface(&texture, &mut window, full, log2);
+                        (window, Some(stamp))
+                    };
                     let mut state = self.state.lock().unwrap();
                     state.residents.push(Resident {
                         surface,
@@ -2588,7 +2965,8 @@ impl Renderer {
                         texture,
                         mirror: window,
                         dirty: None,
-                        stamp: Some(stamp),
+                        pending: 0,
+                        stamp,
                         used: 0,
                         version: 0,
                     });
@@ -2666,10 +3044,11 @@ impl Renderer {
         let Some(levels) = level_surfaces(tic) else {
             return Ok(None);
         };
-        // Which levels are residents: their content, how Metal's read of
-        // each gives the header's components, and whether they are known
-        // to hold what the channel's work so far makes of them.
-        let candidates: Vec<Option<(Content, Reading, bool)>> = {
+        // Which levels are residents: the resident's surface and content,
+        // how Metal's read of each gives the header's components, and
+        // whether they are known to hold what the channel's work so far
+        // makes of them.
+        let candidates: Vec<Option<(Surface, Content, Reading, bool)>> = {
             let state = self.state.lock().unwrap();
             levels
                 .iter()
@@ -2677,25 +3056,29 @@ impl Renderer {
                     let resident = state
                         .residents
                         .iter()
-                        .find(|r| r.surface == *surface && r.log2 == [0, 0])?;
+                        .find(|r| holds_level(&r.surface, surface) && r.log2 == [0, 0])?;
                     let reading = shared_components(tic, resident.format)?;
-                    Some((resident.format, reading, resident.current(writes)))
+                    Some((
+                        resident.surface,
+                        resident.format,
+                        reading,
+                        resident.current(writes),
+                    ))
                 })
                 .collect()
         };
-        let Some((_, components, _)) = candidates.iter().flatten().next().copied() else {
+        let Some((_, _, components, _)) = candidates.iter().flatten().next().copied() else {
             return Ok(None);
         };
-        if candidates.iter().flatten().any(|c| c.1 != components) {
+        if candidates.iter().flatten().any(|c| c.2 != components) {
             return Ok(None);
         }
         // A resident not rendered to since the channel last signaled is
         // compared with memory first, as before a draw to it.
-        let unchecked: Vec<(Surface, Content)> = levels
+        let unchecked: Vec<(Surface, Content)> = candidates
             .iter()
-            .zip(&candidates)
-            .filter_map(|((surface, _), c)| match c {
-                Some((content, _, false)) => Some((*surface, *content)),
+            .filter_map(|c| match c {
+                Some((surface, content, _, false)) => Some((*surface, *content)),
                 _ => None,
             })
             .collect();
@@ -2803,6 +3186,21 @@ impl Renderer {
 }
 
 impl State {
+    /// Whether anything is to reach guest memory still: a dirty target or
+    /// global memory region, a report, a signal's write-back.
+    fn anything_dirty(&self) -> bool {
+        self.residents.iter().any(|r| r.dirty.is_some())
+            || self
+                .globals
+                .iter()
+                .any(|globals| globals.regions.values().any(|region| region.dirty))
+            || self
+                .feedback
+                .iter()
+                .any(|feedback| !feedback.pending.is_empty())
+            || !self.pending.is_empty()
+    }
+
     /// Commits the command buffer being recorded, if any: the GPU starts
     /// on it while later work is recorded into a new one. Command buffers
     /// of one queue run in the order they were committed [public: Apple,
@@ -2845,13 +3243,8 @@ impl State {
             return Ok(None);
         };
         let bpp = resident.surface.bytes_per_pixel;
-        let raw_format = match bpp {
-            1 => MTLPixelFormat::R8Uint,
-            2 => MTLPixelFormat::R16Uint,
-            4 => MTLPixelFormat::R32Uint,
-            8 => MTLPixelFormat::RG32Uint,
-            16 => MTLPixelFormat::RGBA32Uint,
-            _ => return Ok(None),
+        let Some(raw_format) = raw_view_format(bpp) else {
+            return Ok(None);
         };
         let layout = Samples {
             log2: resident.log2,
@@ -2861,6 +3254,16 @@ impl State {
         if texels.is_empty() {
             return Ok(None);
         }
+        // Whole bands: what is staged comes from the texture alone, not
+        // from a mirror an earlier write-back has yet to bring up to date
+        // ([`Renderer::release`]).
+        let band = super::surface::BAND_ROWS;
+        let texels = Rect {
+            x0: 0,
+            y0: texels.y0 / band * band,
+            x1: resident.surface.width,
+            y1: texels.y1.next_multiple_of(band).min(resident.surface.height),
+        };
         let (Some(first), Some(last)) = (
             resident.mirror.band_range(texels.y0),
             resident.mirror.band_range(texels.y1 - 1),
@@ -3018,7 +3421,10 @@ impl State {
         let residents = &self.residents;
         self.composites.retain(|_, composite| {
             composite.levels.iter().any(|level| {
-                level.resident.is_some() && residents.iter().any(|r| r.surface == level.surface)
+                level.resident.is_some()
+                    && residents
+                        .iter()
+                        .any(|r| r.log2 == [0, 0] && holds_level(&r.surface, &level.surface))
             })
         });
         while self.composites.len() > COMPOSITE_LIMIT {
@@ -3030,6 +3436,8 @@ impl State {
                 .expect("not empty");
             self.composites.remove(&oldest);
         }
+        self.kernels
+            .retain(|_, entry| Arc::strong_count(&entry.kernel) > 1);
         let before = self.programs.len() + self.vertex_programs.len();
         self.programs
             .retain(|_, entry| Arc::strong_count(&entry.program) > 1);
@@ -3090,9 +3498,10 @@ impl State {
     /// after a write-back notes the whole surface as written, so that
     /// caches of its memory (a texture sampling it) look again, through
     /// [`Coherent`], which writes it back; the resident itself stays
-    /// current.
-    fn rendered(&mut self, index: usize, rect: Rect, writes: &Writes) {
+    /// current. Whether the resident was clean before (it became dirty).
+    fn rendered(&mut self, index: usize, rect: Rect, writes: &Writes) -> bool {
         let resident = &mut self.residents[index];
+        let newly = resident.dirty.is_none();
         match resident.dirty {
             Some(dirty) => resident.dirty = Some(union(dirty, rect)),
             None => {
@@ -3104,6 +3513,7 @@ impl State {
         }
         self.versions += 1;
         self.residents[index].version = self.versions;
+        newly
     }
 
     /// The kernel filling a composite's level from a color resident, or
@@ -3137,7 +3547,10 @@ impl State {
             let Some((view, converted)) = &level.resident else {
                 continue;
             };
-            let Some(resident) = self.residents.iter().find(|r| r.surface == level.surface)
+            let Some(resident) = self
+                .residents
+                .iter()
+                .find(|r| r.log2 == [0, 0] && holds_level(&r.surface, &level.surface))
             else {
                 continue;
             };
@@ -3395,6 +3808,7 @@ impl Resident {
     fn current(&self, writes: &Writes) -> bool {
         let (start, end) = self.extent();
         self.dirty.is_some()
+            || self.pending != 0
             || self
                 .stamp
                 .is_some_and(|stamp| writes.unchanged(stamp, start, end))
@@ -3403,23 +3817,7 @@ impl Resident {
     /// Stores the texels [`State::pack`] packed, the GPU being done: its
     /// bands into the mirror, and the texels from there to guest memory.
     fn store_packed(&mut self, packed: Packed, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
-        let length = packed.bands.len();
-        // SAFETY: the staging range holds `length` bytes the finished GPU
-        // work wrote; nothing else uses it until the arena hands it out
-        // again.
-        let staged = unsafe {
-            std::slice::from_raw_parts(
-                packed
-                    .buffer
-                    .contents()
-                    .as_ptr()
-                    .cast::<u8>()
-                    .add(packed.offset),
-                length,
-            )
-        };
-        self.mirror.data_mut()[packed.bands].copy_from_slice(staged);
-        self.mirror.store_rect(memory, packed.texels)
+        store_staged(&mut self.mirror, packed, memory)
     }
 
     /// Writes `rect` (pixels) of the Metal texture to guest memory.
@@ -4142,6 +4540,10 @@ struct GlobalRegion {
     /// A program that may store to the copy was given it since: the copy
     /// is what memory is to hold, and is written back.
     dirty: bool,
+    /// Written back at signals whose write-backs have yet to reach guest
+    /// memory ([`Pending`]), how many: the copy is current, memory is not
+    /// yet.
+    pending: u32,
 }
 
 /// The addresses of a global memory region (address, size).
@@ -4175,6 +4577,169 @@ struct Feedback {
     base: u64,
     /// The reports that wait for their counts.
     pending: Vec<Report>,
+}
+
+/// A signal whose write-backs wait for the GPU ([`Renderer::release`]).
+struct Pending {
+    /// The command buffer whose work they wait for (`None`: nothing of
+    /// their own, only the signals before).
+    command: Option<Retained<CommandBuffer>>,
+    /// Targets packed, as [`State::pack`] packs them.
+    residents: Vec<PendingResident>,
+    /// Global memory regions, and where their bytes were copied to.
+    regions: Vec<((u64, u32), Retained<MetalBuffer>, usize)>,
+    reports: Vec<Report>,
+    /// Texture fault words of the draws before it.
+    faults: Vec<Faults>,
+    /// The global memory buffer's fault word is to be looked at.
+    bound: bool,
+    /// The memory written.
+    extents: Vec<(u64, u64)>,
+    release: Release,
+}
+
+struct PendingResident {
+    surface: Surface,
+    log2: [u32; 2],
+    packed: Packed,
+}
+
+/// The packed bands into `window` (the mirror of their resident, as
+/// [`State::pack`] read it), and the packed texels from there to guest
+/// memory.
+fn store_staged(window: &mut Window, packed: Packed, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+    let length = packed.bands.len();
+    // SAFETY: the staging range holds `length` bytes the finished GPU work
+    // wrote; nothing else uses it until the arena hands it out again.
+    let staged = unsafe {
+        std::slice::from_raw_parts(
+            packed.buffer.contents().as_ptr().cast::<u8>().add(packed.offset),
+            length,
+        )
+    };
+    window.data_mut()[packed.bands].copy_from_slice(staged);
+    window.store_rect(memory, packed.texels)
+}
+
+/// Writes what `pending` waited for to guest memory, the GPU having done
+/// the work before it; refuses as a waiting write-back would (an
+/// executed sample of an unbound texture, a global memory access outside
+/// the buffers).
+fn finish(
+    state: &mut State,
+    pending: &mut Pending,
+    memory: &dyn GpuMemory,
+    writes: &Writes,
+) -> Result<(), Unmodeled> {
+    for (buffer, slots) in &pending.faults {
+        let words = buffer.contents().cast::<u32>();
+        for (slot, refusal) in slots {
+            // SAFETY: two words per texture slot of the draw; the GPU
+            // finished it.
+            if unsafe { words.add(2 * slot + 1).read() } != 0 {
+                return Err(Unmodeled(refusal.clone()));
+            }
+        }
+    }
+    if pending.bound
+        && let Some(globals) = &state.globals
+    {
+        let word = globals.buffer.contents().cast::<u32>();
+        // SAFETY: the buffer starts with the fault word.
+        if unsafe { word.read_volatile() } != 0 {
+            // SAFETY: as above.
+            unsafe { word.write_volatile(0) };
+            return Err(Unmodeled(
+                "shader: global memory access outside the buffers the program's constants name"
+                    .into(),
+            ));
+        }
+    }
+    for resident in pending.residents.drain(..) {
+        // Its bytes, whatever format the resident there has now.
+        let found = state
+            .residents
+            .iter_mut()
+            .find(|r| r.surface == resident.surface && r.log2 == resident.log2);
+        match found {
+            Some(r) if !r.mirror.data().is_empty() => {
+                r.store_packed(resident.packed, memory)?;
+                r.pending = r.pending.saturating_sub(1);
+                r.stamp = Some(writes.stamp());
+            }
+            // Dropped since, or its mirror out for a comparison with
+            // memory (`Renderer::residents`, which finds memory changed
+            // and reloads): its bands as the pack staged them.
+            found => {
+                if let Some(r) = found {
+                    r.pending = r.pending.saturating_sub(1);
+                }
+                let surface = resident.surface;
+                let full = Rect {
+                    x0: 0,
+                    y0: 0,
+                    x1: surface.width,
+                    y1: surface.height,
+                };
+                store_staged(&mut Window::blank(surface, full), resident.packed, memory)?;
+            }
+        }
+    }
+    for (key, staging, offset) in &pending.regions {
+        // SAFETY: the copy of the region's bytes the finished GPU work
+        // made.
+        let staged = unsafe {
+            std::slice::from_raw_parts(
+                staging.contents().as_ptr().cast::<u8>().add(*offset),
+                key.1 as usize,
+            )
+        };
+        let region = state
+            .globals
+            .as_mut()
+            .and_then(|globals| globals.regions.get_mut(key));
+        if region.as_ref().is_none_or(|region| region.content != staged) {
+            memory.write(key.0, staged).ok_or_else(|| {
+                Unmodeled(format!(
+                    "Metal: global memory write-back to unmapped {:#x}",
+                    key.0
+                ))
+            })?;
+        }
+        if let Some(region) = region {
+            region.content.copy_from_slice(staged);
+            region.stamp = writes.stamp();
+            region.pending = region.pending.saturating_sub(1);
+        }
+    }
+    if let Some(feedback) = &state.feedback {
+        let words = feedback.buffer.contents().cast::<u32>();
+        for report in &pending.reports {
+            // SAFETY: two words per slot; the GPU finished the draws
+            // counted in the report's slots.
+            let counted: u64 = report
+                .slots
+                .clone()
+                .map(|slot| u64::from(unsafe { words.add(2 * slot + 1).read_volatile() }))
+                .sum();
+            let count = report.base + counted;
+            let written = if report.one_word {
+                memory.write(report.address, &(count as u32).to_le_bytes())
+            } else {
+                let mut bytes = [0; 16];
+                bytes[..8].copy_from_slice(&count.to_le_bytes());
+                bytes[8..].copy_from_slice(&report.time.to_le_bytes());
+                memory.write(report.address, &bytes)
+            };
+            if written.is_none() {
+                return Err(Unmodeled(format!(
+                    "report write to unmapped GPU address {:#x}",
+                    report.address
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A report of ZPASS_PIXEL_CNT to be written ([`Renderer::report_passed`]).
@@ -4307,54 +4872,58 @@ impl Composite {
         stamp: Stamp,
     ) -> Result<Composite, Unmodeled> {
         let (width, height) = (levels[0].0.width, levels[0].0.height);
-        // SAFETY: plain descriptor construction.
-        let descriptor = unsafe {
-            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-                MTLPixelFormat::RGBA32Float,
-                width as usize,
-                height as usize,
-                levels.len() > 1,
-            )
-        };
-        // SAFETY: the level count fits the base level's dimensions (the
-        // header was validated by `level_surfaces`).
-        unsafe { descriptor.setMipmapLevelCount(levels.len()) };
-        descriptor.setStorageMode(MTLStorageMode::Shared);
+        let layers = composite_layers(tic) as usize;
+        let count = levels.len() / layers;
+        let descriptor = texture_descriptor(
+            composite_kind(tic),
+            [width, height, 1],
+            layers as u32,
+            count as u32,
+        );
         descriptor.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite);
         let texture = gpu
             .device
             .newTextureWithDescriptor(&descriptor)
             .ok_or_else(|| Unmodeled("Metal: texture allocation failed".into()))?;
         let mut made = Vec::with_capacity(levels.len());
+        // Layer after layer, each's levels (`level_surfaces`).
         for (index, ((surface, range), &resident)) in levels.iter().zip(residents).enumerate() {
+            let (slice, level) = (index / count, index % count);
             let resident = if resident {
-                // SAFETY: one level and the one slice of the texture.
+                // SAFETY: one level of one slice of the texture.
                 let view = unsafe {
                     texture.newTextureViewWithPixelFormat_textureType_levels_slices(
                         MTLPixelFormat::RGBA32Float,
                         MTLTextureType::Type2D,
-                        NSRange::new(index, 1),
-                        NSRange::new(0, 1),
+                        NSRange::new(level, 1),
+                        NSRange::new(slice, 1),
                     )
                 }
                 .ok_or_else(|| Unmodeled("Metal: level view".into()))?;
                 Some((view, None))
             } else {
                 let (w, h, _, texels) = decoded
-                    .and_then(|decoded| decoded.level(tic.base_level + index as u32))
+                    .and_then(|decoded| decoded.level(tic.base_level + level as u32))
                     .ok_or_else(|| Unmodeled("Metal: texture level".into()))?;
-                // SAFETY: `texels` holds the level's w*h RGBA32F texels.
+                // The level's texels, layer after layer (`Texture::level`).
+                let image = w as usize * h as usize;
+                let texels = texels
+                    .get(slice * image..(slice + 1) * image)
+                    .ok_or_else(|| Unmodeled("Metal: texture layer".into()))?;
+                // SAFETY: `texels` holds the layer's w*h RGBA32F texels.
                 unsafe {
-                    texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                    texture.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(
                         region(Rect {
                             x0: 0,
                             y0: 0,
                             x1: w,
                             y1: h,
                         }),
-                        index,
+                        level,
+                        slice,
                         NonNull::new(texels.as_ptr() as *mut _).expect("non-null"),
                         w as usize * 16,
+                        0,
                     );
                 }
                 None
@@ -4383,17 +4952,56 @@ impl Composite {
     }
 }
 
-/// The levels of `tic` from its base level to its maximum level as the
-/// surfaces a render target at each would be, with the bytes of each in
-/// the texture's footprint; `None` for a texture that is not a plain 2D
-/// one of one layer and uncompressed one-texel blocks.
+/// The unsigned-word format a view of a texture of `bytes` bytes a texel
+/// reads and writes its bits as.
+fn raw_view_format(bytes: u32) -> Option<MTLPixelFormat> {
+    Some(match bytes {
+        1 => MTLPixelFormat::R8Uint,
+        2 => MTLPixelFormat::R16Uint,
+        4 => MTLPixelFormat::R32Uint,
+        8 => MTLPixelFormat::RG32Uint,
+        16 => MTLPixelFormat::RGBA32Uint,
+        _ => return None,
+    })
+}
+
+/// The texture type a composite of `tic` is, as the slots that sample it
+/// declare it ([`level_surfaces`] takes no other).
+pub(super) fn composite_kind(tic: &Tic) -> TextureKind {
+    if tic.target == Target::Cube {
+        TextureKind::Cube
+    } else if tic.array {
+        TextureKind::Array
+    } else {
+        TextureKind::Flat
+    }
+}
+
+/// The layers (array layers or cube faces) of `tic` a composite has.
+fn composite_layers(tic: &Tic) -> u32 {
+    if composite_kind(tic) == TextureKind::Flat {
+        1
+    } else {
+        tic.shape.layers
+    }
+}
+
+/// The levels of each layer of `tic` (array layer or cube face), from its
+/// base level to its maximum level, as the surfaces a render target at
+/// each would be, with the bytes of each in the texture's footprint:
+/// layer after layer, each's levels in order. `None` for a texture that
+/// is not a 2D one (of any layers) or a cube (not an array of cubes) of
+/// uncompressed one-texel blocks.
 fn level_surfaces(tic: &Tic) -> Option<Vec<(Surface, std::ops::Range<usize>)>> {
     use super::surface::Layout;
     use super::texture::format::Encoding;
     let format = tic.format;
-    if tic.target != Target::Texture2D
-        || tic.array
-        || tic.shape.layers != 1
+    let shape_fits = match tic.target {
+        Target::Texture2D => tic.array || tic.shape.layers == 1,
+        Target::Cube => !tic.array && tic.shape.layers == 6,
+        _ => false,
+    };
+    if !shape_fits
         || tic.shape.depth != 1
         || (tic.srgb && format.raw != 0x08)
         || !matches!(format.encoding, Encoding::Packed(_))
@@ -4404,6 +5012,9 @@ fn level_surfaces(tic: &Tic) -> Option<Vec<(Surface, std::ops::Range<usize>)>> {
     }
     let bytes_per_pixel = format.bytes_per_block;
     if let Some(pitch) = tic.pitch {
+        if composite_kind(tic) != TextureKind::Flat {
+            return None;
+        }
         return Some(vec![(
             Surface {
                 address: tic.address,
@@ -4419,23 +5030,43 @@ fn level_surfaces(tic: &Tic) -> Option<Vec<(Surface, std::ops::Range<usize>)>> {
     let levels = image
         .levels
         .get(tic.base_level as usize..=tic.max_level as usize)?;
-    Some(
-        levels
-            .iter()
-            .map(|level| {
-                (
-                    Surface {
-                        address: tic.address + level.offset,
-                        width: level.width,
-                        height: level.height,
-                        bytes_per_pixel,
-                        layout: Layout::BlockLinear(level.surface.block()),
-                    },
-                    level.offset as usize..(level.offset + level.size) as usize,
-                )
-            })
-            .collect(),
-    )
+    let mut surfaces = Vec::new();
+    for layer in 0..u64::from(composite_layers(tic)) {
+        for level in levels {
+            let offset = layer * image.layer_stride + level.offset;
+            surfaces.push((
+                Surface {
+                    address: tic.address + offset,
+                    width: level.width,
+                    height: level.height,
+                    bytes_per_pixel,
+                    layout: Layout::BlockLinear(level.surface.block()),
+                },
+                offset as usize..(offset + level.size) as usize,
+            ));
+        }
+    }
+    Some(surfaces)
+}
+
+/// Whether every texel of `level` is the texel of `resident` at the same
+/// coordinates: the same memory laid out alike (a target may be wider
+/// or taller than a texture of its memory, as a GOB-aligned target
+/// width is), the resident at least as large.
+fn holds_level(resident: &Surface, level: &Surface) -> bool {
+    use super::surface::Layout;
+    let gobs = |s: &Surface| (s.width * s.bytes_per_pixel).div_ceil(64);
+    resident.address == level.address
+        && resident.bytes_per_pixel == level.bytes_per_pixel
+        && resident.width >= level.width
+        && resident.height >= level.height
+        && match (resident.layout, level.layout) {
+            (Layout::Pitch { pitch: a }, Layout::Pitch { pitch: b }) => a == b,
+            (Layout::BlockLinear(a), Layout::BlockLinear(b)) => {
+                a == b && gobs(resident) == gobs(level)
+            }
+            _ => false,
+        }
 }
 
 /// How Metal's read of a resident holding `content` gives what the

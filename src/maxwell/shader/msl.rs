@@ -70,6 +70,7 @@
 //! instruction, a modifier, a texture target) is refused with the reason,
 //! and the draw is left to the interpreter.
 
+mod compute;
 mod flow;
 mod memory;
 mod ops;
@@ -78,6 +79,7 @@ mod tests;
 mod texture;
 mod vertex;
 
+pub use compute::{QUERY_BUFFER, TranslatedCompute, translate_compute};
 pub use vertex::{
     Fetch, GLOBAL_TABLE_WORD, INDEXED_WORD, MAX_STREAMS, NativeVertex, STREAM_BUFFER,
     TranslatedVertex, translate_vertex,
@@ -295,6 +297,7 @@ enum Form {
 enum Stage {
     Pixel,
     Vertex,
+    Compute,
 }
 
 struct Writer<'a> {
@@ -481,7 +484,37 @@ impl Writer<'_> {
             _ => 2,
         };
         let action = match inst.op {
-            Op::Nop | Op::Depbar | Op::Membar | Op::Bar => return Ok(()),
+            Op::Nop | Op::Depbar | Op::Membar => return Ok(()),
+            Op::Bar if self.stage != Stage::Compute => return Ok(()),
+            // `exec::Machine::barrier`: the thread parks after the
+            // barrier until every thread of the block has parked or
+            // exited (`compute.rs`).
+            Op::Bar => {
+                self.require(bits(w, 32, 3) == 0, "barrier mode other than SYNC")?;
+                self.require(bits(w, 35, 2) == 0, "barrier reduction")?;
+                self.require(
+                    bits(w, 39, 3) == PT && !bit(w, 42),
+                    "barrier predicate operand",
+                )?;
+                self.require(
+                    bit(w, 43) && bit(w, 44),
+                    "barrier or thread count in a register",
+                )?;
+                self.require(bits(w, 8, 8) == 0, "barrier other than 0")?;
+                self.require(bits(w, 20, 12) == 0, "barrier thread count")?;
+                let action = format!("pc = {}u; parked = true; break;", flow::next_pc(pc));
+                let (guard, negated) = (bits(w, 16, 3), bit(w, 19));
+                if guard == PT && negated {
+                    return Ok(());
+                }
+                if guard == PT {
+                    self.line(&action);
+                } else {
+                    let condition = self.pred_operand(16);
+                    self.line(&format!("if ({condition}) {{ {action} }}"));
+                }
+                return Ok(());
+            }
             // No guard field (see `exec`'s `step`).
             Op::Ssy | Op::Pbk | Op::Pcnt => {
                 let target = branch_target(w, pc).expect("checked by flow");
@@ -547,6 +580,12 @@ impl Writer<'_> {
             return Ok(());
         }
         match (self.stage, op) {
+            (Stage::Compute, Op::S2r) => self.compute_register(),
+            (Stage::Compute, Op::Shfl) => self.simd_shuffle(),
+            (Stage::Compute, Op::Lds) => self.shared(false),
+            (Stage::Compute, Op::Sts) => self.shared(true),
+            (Stage::Compute, Op::Atom) => self.atom(),
+            (Stage::Compute, Op::Vote) => self.refuse("vote in a compute program"),
             (Stage::Pixel, Op::Ipa) => self.ipa(),
             (Stage::Pixel, Op::Shfl) => self.shfl(),
             (Stage::Pixel, Op::Fswzadd) => self.fswzadd(),
@@ -558,11 +597,11 @@ impl Writer<'_> {
             (_, Op::Tld) => self.tld(),
             (_, Op::Txq) => self.txq(),
             (_, Op::Ldg) => self.ldg(),
-            (Stage::Pixel, Op::Stg) => self.stg(),
-            (Stage::Pixel, Op::Red) => self.red(),
-            (Stage::Pixel, Op::Ldl) => self.local(false),
-            (Stage::Pixel, Op::Stl) => self.local(true),
-            (Stage::Pixel, Op::Vmnmx) => self.vmnmx(),
+            (_, Op::Stg) => self.stg(),
+            (Stage::Pixel | Stage::Compute, Op::Red) => self.red(),
+            (Stage::Pixel | Stage::Compute, Op::Ldl) => self.local(false),
+            (Stage::Pixel | Stage::Compute, Op::Stl) => self.local(true),
+            (Stage::Pixel | Stage::Compute, Op::Vmnmx) => self.vmnmx(),
             (Stage::Pixel, Op::Tmml) => self.tmml(),
             // SR_Y_DIRECTION: 1.0, as the interpreter's (`pipeline`'s
             // `env`).
