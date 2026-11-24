@@ -2433,9 +2433,12 @@ impl<'env> Session<'env> {
                 self.system_register(core, vcpu, debug, SysRegAccess::from_syndrome(syndrome))
             }
             exception_class::DATA_ABORT_LOWER => {
-                // A write to DRAM whose write permission the write watch
-                // took is retried once it is given back.
-                if self.machine.ram.write_fault(physical_address) {
+                // An access to DRAM the read guard took is retried once a
+                // cache brought it up to date; a write to DRAM whose write
+                // permission the write watch took, once it is given back.
+                if self.machine.ram.guard_fault(physical_address)
+                    || self.machine.ram.write_fault(physical_address)
+                {
                     return Ok(None);
                 }
                 self.device_access(core, vcpu, syndrome, physical_address, virtual_address)

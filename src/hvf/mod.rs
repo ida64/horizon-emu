@@ -115,15 +115,17 @@ impl Vm {
 }
 
 /// Sets the stage-2 permissions of `size` bytes of mapped guest-physical
-/// memory at `ipa` (aligned to the host page size): read and execute, and
-/// write if `writable`; whether Hypervisor.framework took it. A guest
-/// write to memory without the write permission exits as a data abort
-/// (see [`crate::memory::GuestRam::write_fault`]).
-pub fn protect(ipa: u64, size: usize, writable: bool) -> bool {
-    let mut flags = sys::HV_MEMORY_READ | sys::HV_MEMORY_EXEC;
-    if writable {
-        flags |= sys::HV_MEMORY_WRITE;
-    }
+/// memory at `ipa` (aligned to the host page size); whether
+/// Hypervisor.framework took it. A guest access the permissions do not
+/// allow exits as a data abort (see [`crate::memory::GuestRam::write_fault`]
+/// and [`crate::memory::GuestRam::guard_fault`]).
+pub fn protect(ipa: u64, size: usize, access: crate::memory::Access) -> bool {
+    use crate::memory::Access;
+    let flags = match access {
+        Access::None => 0,
+        Access::Read => sys::HV_MEMORY_READ | sys::HV_MEMORY_EXEC,
+        Access::All => sys::HV_MEMORY_READ | sys::HV_MEMORY_WRITE | sys::HV_MEMORY_EXEC,
+    };
     // SAFETY: changes permissions of the VM's own mapping only.
     unsafe { sys::hv_vm_protect(ipa, size, flags) == sys::HV_SUCCESS }
 }

@@ -95,6 +95,13 @@ pub trait GpuMemory: Sync {
     fn unwritten_since(&self, _address: u64, _len: usize, _mark: WatchMark) -> bool {
         false
     }
+    /// Keeps the guest from `len` bytes at `address`, and has host reads
+    /// of them wait, until the guard is dropped or someone looks (the
+    /// DRAM read guard, [`crate::memory`]). `None` where memory cannot be
+    /// guarded.
+    fn guard(&self, _address: u64, _len: usize) -> Option<crate::memory::DramGuard> {
+        None
+    }
 }
 
 /// When engine memory was watched for writes ([`GpuMemory::watch`]): the
@@ -158,6 +165,13 @@ pub trait Engines: Send {
     /// wait let it go on): what others wrote to memory before is to be
     /// seen from here on (`resources::Writes::synchronize`).
     fn synchronize(&mut self, _memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+        Ok(())
+    }
+
+    /// Someone outside the channel is about to look at guest-physical
+    /// `start..end` (the DRAM read guard's hook, [`crate::memory`]): what
+    /// the engines hold of memory there they guarded is written back.
+    fn reveal(&mut self, _memory: &dyn GpuMemory, _start: u64, _end: u64) -> Result<(), Unmodeled> {
         Ok(())
     }
 
@@ -610,6 +624,17 @@ impl Engines for Channel {
         }
         self.hooks.writes.synchronize();
         Ok(())
+    }
+
+    fn reveal(&mut self, memory: &dyn GpuMemory, start: u64, end: u64) -> Result<(), Unmodeled> {
+        let tracked = resources::Tracked {
+            memory,
+            writes: &self.hooks.writes,
+        };
+        match &self.hooks.metal {
+            Some(renderer) => renderer.reveal(&tracked, &self.hooks.writes, start, end),
+            None => Ok(()),
+        }
     }
 
     fn save(&self) -> Result<Vec<u8>, SnapshotError> {

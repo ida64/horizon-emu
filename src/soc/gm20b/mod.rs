@@ -442,13 +442,32 @@ impl Gm20b {
             let shared = Arc::clone(&shared);
             thread::Builder::new()
                 .name("GM20B host".into())
-                .spawn(move || shared.work())
+                .spawn(move || {
+                    // The channels' engines bring memory up to date
+                    // themselves before they read it.
+                    let _exempt = crate::memory::exempt();
+                    shared.work()
+                })
                 .expect("the GPU host thread starts")
         };
         Self {
             shared,
             worker: Some(worker),
         }
+    }
+
+    /// The DRAM read guard's hook ([`crate::memory`]): before someone
+    /// outside the GPU looks at guest-physical memory its engines
+    /// guarded, the channel being executed stops between methods, as a
+    /// preemption does, and every channel's engines write back what they
+    /// hold there.
+    pub fn read_hook(&self) -> crate::memory::ReadHook {
+        let shared = Arc::downgrade(&self.shared);
+        Box::new(move |start, end| {
+            if let Some(shared) = shared.upgrade() {
+                shared.reveal(start, end);
+            }
+        })
     }
 
     pub fn bar0(&self) -> Box<dyn MmioDevice> {
@@ -691,6 +710,8 @@ struct Bar1(Arc<Shared>);
 impl MmioDevice for Bar0 {
     fn read(&self, _core: usize, offset: u64, size: u8) -> Option<u64> {
         let offset = word(offset, size)? as u32;
+        // The state is held: a read guard's hook would wait for it.
+        let _exempt = crate::memory::exempt();
         let mut state = self.0.usable()?;
         let value = state.read(&self.0, offset);
         self.0.refuse(value).map(u64::from)
@@ -698,6 +719,7 @@ impl MmioDevice for Bar0 {
 
     fn write(&self, _core: usize, offset: u64, size: u8, value: u64) -> Option<()> {
         let offset = word(offset, size)? as u32;
+        let _exempt = crate::memory::exempt();
         let mut state = self.0.usable()?;
         let done = state.write(&self.0, offset, value as u32);
         // Among the writes, the MMU invalidates after a page table change.
@@ -840,6 +862,29 @@ impl Shared {
             (self.nonstall)(lines.1);
         }
         state.lines = lines;
+    }
+
+    /// [`Gm20b::read_hook`].
+    fn reveal(&self, start: u64, end: u64) {
+        let mut state = self.state.lock().unwrap();
+        while state.fifo.executing.is_some() {
+            self.attention.store(true, Ordering::SeqCst);
+            state = self.left.wait(state).unwrap();
+        }
+        if state.failure.is_some() {
+            return;
+        }
+        let bus = self.bus.as_ref();
+        let mut failed = None;
+        for (instance, context) in state.fifo.contexts.iter_mut() {
+            if let Err(Unmodeled(what)) = context.reveal(bus, start, end) {
+                failed = Some(format!("channel instance {instance:#x}: {what}"));
+                break;
+            }
+        }
+        if let Some(what) = failed {
+            self.fail(&mut state, Unmodeled(what));
+        }
     }
 
     fn fail(&self, state: &mut State, Unmodeled(what): Unmodeled) {

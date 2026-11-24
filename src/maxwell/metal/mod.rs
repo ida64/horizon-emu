@@ -103,6 +103,19 @@
 //! such a surface returns between those is not the pixels. No guest seen
 //! reads them; every use goes through an engine.\]
 //!
+//! A single-sampled color target is held on demand too once its memory
+//! is guarded ([`GpuMemory::guard`], the DRAM read guard of
+//! [`crate::memory`]), which a signal does for those it would otherwise
+//! write back: the guest CPU cannot touch the pages, and a host read of
+//! them (the display, VIC, another channel) waits, until the GPU's
+//! read hook ([`Renderer::reveal`]) has written the targets there back,
+//! as for an engine's access, and let their guards go. So the target
+//! reaches memory when someone looks rather than at every signal.
+//! \[measurement: a game's scene signals some 40 times a frame, and its
+//! signals wrote back 64 MB of targets a frame, a third of the
+//! channel's thread, that nothing outside the GPU ever looked at but
+//! the display's 8 MB\]
+//!
 //! What the guest may do with the memory is give it another use (NVN
 //! sub-allocates memory pools; no unmap or remap tells). So a target held
 //! on demand is written back only while guest memory still holds what the
@@ -213,6 +226,7 @@ use super::sampling::Target;
 use super::texture::format::{ColorFormat, DepthFormat};
 use super::texture::{Texture, Tic, Tsc};
 use super::{GpuMemory, Release, Unmodeled, WatchMark};
+use crate::memory::DramGuard;
 
 type Device = ProtocolObject<dyn MTLDevice>;
 type Queue = ProtocolObject<dyn MTLCommandQueue>;
@@ -396,6 +410,10 @@ struct Resident {
     /// Tells the texture's content from any it held before: a count
     /// ([`State::versions`]) taken whenever it is rendered to or loaded.
     version: u64,
+    /// The read guard over its memory while it holds what memory lacks
+    /// and is not written back at signals (see "Targets held on
+    /// demand").
+    guard: Option<DramGuard>,
 }
 
 /// The attachments of a render pass: resident index and whether the sRGB
@@ -716,6 +734,9 @@ enum Scope {
     Range(u64, u64),
     /// All of them.
     All,
+    /// None: the feedback buffer is full, and the reports waiting for
+    /// its counts are written once the GPU is done.
+    Reports,
 }
 
 /// Arena chunks the channel's work not yet done on the GPU may fill
@@ -815,7 +836,8 @@ impl Renderer {
 
     /// Gives the draws from here on the next slot of the feedback
     /// buffer; a buffer whose slots are all used is read first
-    /// ([`resolve_feedback`]), which starts it over.
+    /// ([`resolve_feedback`]), which starts it over. That waits for the
+    /// GPU, but takes no target: the counts are all the reports need.
     fn next_slot(&self, memory: &dyn GpuMemory, writes: &Writes) -> Result<(), Unmodeled> {
         {
             let mut state = self.state.lock().unwrap();
@@ -825,7 +847,7 @@ impl Renderer {
                 return Ok(());
             }
         }
-        self.write_back(memory, writes, Scope::All)
+        self.write_back(memory, writes, Scope::Reports)
     }
 }
 
@@ -988,6 +1010,7 @@ impl Renderer {
         let increment = self.increment.lock().unwrap().is_some();
         {
             let mut state = self.state.lock().unwrap();
+            state.guard_held(memory);
             let wanted: Vec<usize> = (0..state.residents.len())
                 .filter(|&i| state.residents[i].dirty.is_some() && !state.residents[i].on_demand())
                 .collect();
@@ -1293,6 +1316,38 @@ impl Renderer {
         }
     }
 
+    /// Someone outside the channel is about to look at guest-physical
+    /// `start..end` (the read guard's hook, [`crate::memory`]): the
+    /// targets whose guarded memory it touches are written back, as for
+    /// an engine's access, and let their guards go.
+    pub fn reveal(
+        &self,
+        memory: &dyn GpuMemory,
+        writes: &Writes,
+        start: u64,
+        end: u64,
+    ) -> Result<(), Unmodeled> {
+        let extents: Vec<(u64, u64)> = {
+            let state = self.state.lock().unwrap();
+            state
+                .residents
+                .iter()
+                .filter(|r| r.guard.as_ref().is_some_and(|guard| guard.touches(start, end)))
+                .map(Resident::extent)
+                .collect()
+        };
+        for &(from, to) in &extents {
+            self.write_back(memory, writes, Scope::Range(from, to))?;
+        }
+        let mut state = self.state.lock().unwrap();
+        for resident in &mut state.residents {
+            if resident.guard.as_ref().is_some_and(|guard| guard.touches(start, end)) {
+                resident.guard = None;
+            }
+        }
+        Ok(())
+    }
+
     /// Writes every dirty target back to guest memory, those held on
     /// demand too: afterwards guest memory holds all of the channel's
     /// work (before a machine snapshot, and before the software renderer
@@ -1322,6 +1377,9 @@ impl Renderer {
         };
         self.complete_over(memory, writes, true, range)?;
         let mut state = self.state.lock().unwrap();
+        if matches!(scope, Scope::Signal) {
+            state.guard_held(memory);
+        }
         let mut wanted: Vec<bool> = state
             .residents
             .iter()
@@ -1331,6 +1389,7 @@ impl Renderer {
                         Scope::Signal => !r.on_demand(),
                         Scope::Range(start, end) => overlap(r.extent(), (start, end)),
                         Scope::All => true,
+                        Scope::Reports => false,
                     }
             })
             .collect();
@@ -1342,6 +1401,7 @@ impl Renderer {
                 region.dirty
                     && match scope {
                         Scope::Range(start, end) => overlap(global_extent(**key), (start, end)),
+                        Scope::Reports => false,
                         _ => true,
                     }
             })
@@ -3196,6 +3256,7 @@ impl Renderer {
                         stamp,
                         used: 0,
                         version: 0,
+                        guard: None,
                     });
                     indices.push(state.residents.len() - 1);
                 }
@@ -3611,7 +3672,14 @@ impl State {
         };
         let (start, end) = (first.start, last.end);
         let layered = resident.log2 != [0, 0];
-        let (buffer, offset) = self.arena.alloc(&resident.mirror.data()[start..end])?;
+        // Staged as the mirror holds the bands, unless the kernel writes
+        // every byte of them (no padding beside or below the texels).
+        let written = (texels.x1 - texels.x0) as usize * (texels.y1 - texels.y0) as usize * bpp as usize;
+        let (buffer, offset) = if written == end - start {
+            self.arena.reserve(end - start)?
+        } else {
+            self.arena.alloc(&resident.mirror.data()[start..end])?
+        };
         let pipeline = self.pack_pipeline(layered)?;
         let command = self.command()?;
         let encoder = command
@@ -3711,6 +3779,25 @@ impl State {
             .map(|(texture, _)| texture.bytes())
             .chain(self.native.values().map(|(raw, _)| raw.bytes.len()))
             .sum();
+    }
+
+    /// Before a signal: color targets newer than memory are held on
+    /// demand once their memory is guarded ([`GpuMemory::guard`]), and
+    /// one memory holds all of again lets its guard go.
+    fn guard_held(&mut self, memory: &dyn GpuMemory) {
+        for resident in &mut self.residents {
+            if resident.dirty.is_some() {
+                if resident.guard.is_none()
+                    && matches!(resident.format, Content::Color(_))
+                    && resident.log2 == [0, 0]
+                {
+                    let (start, end) = resident.extent();
+                    resident.guard = memory.guard(start, (end - start) as usize);
+                }
+            } else if resident.pending == 0 {
+                resident.guard = None;
+            }
+        }
     }
 
     /// Drops what the software caches no longer hold: uploads of textures
@@ -4099,10 +4186,11 @@ impl Resident {
     }
 
     /// Whether the target is written back only on demand rather than at
-    /// every signal: depth buffers and multisampled targets (see the
-    /// module documentation).
+    /// every signal: depth buffers and multisampled targets, and color
+    /// targets while their memory is guarded (see the module
+    /// documentation).
     fn on_demand(&self) -> bool {
-        matches!(self.format, Content::Depth(_)) || self.log2 != [0, 0]
+        matches!(self.format, Content::Depth(_)) || self.log2 != [0, 0] || self.guard.is_some()
     }
 
     /// Whether the texture holds what the channel's work so far makes of
@@ -4861,8 +4949,10 @@ fn global_extent((address, size): (u64, u32)) -> (u64, u64) {
 
 /// Slots of the feedback buffer ([`Feedback`]): the reports of
 /// ZPASS_PIXEL_CNT a channel can make between two write-backs that wait
-/// for the GPU; one more makes such a write-back.
-const FEEDBACK_SLOTS: usize = 2048;
+/// for the GPU; one more makes such a write-back. \[measurement: a game's
+/// scene reports some 500 counts a frame, which filled 2048 slots four
+/// times a second\]
+const FEEDBACK_SLOTS: usize = 16384;
 
 /// What fragment functions tell the renderer, in a buffer of
 /// [`FEEDBACK_SLOTS`] slots of two words (`msl::TRAP_BUFFER`): the trap
@@ -5632,19 +5722,25 @@ impl Arena {
 
     /// `data` copied into the arena: its buffer and offset.
     fn alloc(&mut self, data: &[u8]) -> Result<(Retained<MetalBuffer>, usize), Unmodeled> {
-        let length = data.len().max(4);
+        let (buffer, offset) = self.reserve(data.len())?;
+        // SAFETY: the range is inside the shared buffer, which no command
+        // buffer still to complete was given (see `next_chunk`).
+        unsafe {
+            let base = buffer.contents().as_ptr().cast::<u8>().add(offset);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), base, data.len());
+        }
+        Ok((buffer, offset))
+    }
+
+    /// `length` bytes of the arena for the GPU to fill, holding whatever
+    /// they last held: their buffer and offset.
+    fn reserve(&mut self, length: usize) -> Result<(Retained<MetalBuffer>, usize), Unmodeled> {
+        let length = length.max(4);
         let serial = self.committed + 1;
         loop {
             if let Some((chunk, last)) = self.chunks.get_mut(self.current) {
                 let offset = self.used.next_multiple_of(Self::ALIGN);
                 if offset + length <= chunk.length() {
-                    // SAFETY: the range is inside the shared buffer, which
-                    // no command buffer still to complete was given (see
-                    // `next_chunk`).
-                    unsafe {
-                        let base = chunk.contents().as_ptr().cast::<u8>().add(offset);
-                        std::ptr::copy_nonoverlapping(data.as_ptr(), base, data.len());
-                    }
                     self.used = offset + length;
                     *last = serial;
                     return Ok((chunk.clone(), offset));
@@ -5897,6 +5993,10 @@ impl GpuMemory for Coherent<'_> {
     /// as a write.
     fn unwritten_since(&self, address: u64, len: usize, mark: WatchMark) -> bool {
         self.before(address, len).is_some() && self.memory.unwritten_since(address, len, mark)
+    }
+
+    fn guard(&self, address: u64, len: usize) -> Option<crate::memory::DramGuard> {
+        self.memory.guard(address, len)
     }
 }
 

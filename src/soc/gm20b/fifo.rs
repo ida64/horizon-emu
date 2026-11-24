@@ -355,6 +355,15 @@ impl Context {
             .map_err(|unmodeled| with_fault(&memory, unmodeled))
     }
 
+    /// Writes what the engines hold of guarded guest-physical
+    /// `start..end` back ([`Engines::reveal`]), between methods.
+    pub fn reveal(&mut self, bus: &dyn BusMemory, start: u64, end: u64) -> Result<(), Unmodeled> {
+        let memory = ChannelMemory::new(self.space, bus);
+        self.engines
+            .reveal(&memory, start, end)
+            .map_err(|unmodeled| with_fault(&memory, unmodeled))
+    }
+
     /// The channel's state for a machine snapshot, taken between methods
     /// after [`write_back`](Self::write_back).
     pub fn save(&self) -> Result<SavedContext, SnapshotError> {

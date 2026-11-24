@@ -581,6 +581,7 @@ impl Soc {
         );
         bus.map("GPU BAR0", gm20b::BAR0_BASE, gm20b::BAR0_SIZE, gpu.bar0());
         bus.map("GPU BAR1", gm20b::BAR1_BASE, gm20b::BAR1_SIZE, gpu.bar1());
+        ram.set_read_hook(gpu.read_hook());
         let vic = Arc::new(falcon_host::HostFalcon::new(
             DeviceMemory::new(&mc, ram, mc::SMMU_VIC_ASID),
             vic::Vic::new(

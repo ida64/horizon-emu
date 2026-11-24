@@ -2147,6 +2147,9 @@ fn rasterize(
                 let work = &work;
                 let run = &run;
                 scope.spawn(move || {
+                    // Helpers of the channel's thread, which waits for
+                    // them: their reads are brought up to date as its.
+                    let _exempt = crate::memory::exempt();
                     loop {
                         let Some(slice) = work.lock().unwrap().next() else {
                             break;

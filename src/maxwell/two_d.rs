@@ -643,7 +643,11 @@ fn in_rows<T: Send>(items: &mut [T], width: usize, fill: impl Fn(usize, &mut [T]
     std::thread::scope(|scope| {
         for (index, items) in items.chunks_mut(band * width).enumerate() {
             let fill = &fill;
-            scope.spawn(move || fill(index * band, items));
+            // A helper of the channel's thread (see `pipeline::rasterize`).
+            scope.spawn(move || {
+                let _exempt = crate::memory::exempt();
+                fill(index * band, items)
+            });
         }
     });
 }

@@ -182,10 +182,7 @@ impl Renderer {
                 let Some(words) = layout_words(&r.surface) else {
                     return Ok(false);
                 };
-                // A target held on demand may be forgotten rather than
-                // written back (`write_back_later`): its texture is not
-                // what memory is to hold then.
-                if r.on_demand() || r.surface.bytes_per_pixel != surface.bytes_per_pixel {
+                if r.surface.bytes_per_pixel != surface.bytes_per_pixel {
                     return Ok(false);
                 }
                 sources.push((index, r.surface, words));
@@ -226,6 +223,16 @@ impl Renderer {
         if !self.write_back_later(memory, writes, stale)? {
             return Ok(false);
         }
+        // A target held on demand whose memory has a new owner is
+        // forgotten rather than written back (`write_back_later`): its
+        // texture is not what memory is to hold, memory is.
+        let sources: Vec<_> = {
+            let state = self.state.lock().unwrap();
+            sources
+                .into_iter()
+                .filter(|&(index, ..)| state.residents[index].pending != 0)
+                .collect()
+        };
         // The texels no resident holds, from memory as it is: what the
         // residents' write-backs are to change there the kernel takes
         // from them.
@@ -314,6 +321,7 @@ impl Renderer {
             stamp: None,
             used: 0,
             version,
+            guard: None,
         });
         let (start, end) = target;
         writes.record(start, end - start);

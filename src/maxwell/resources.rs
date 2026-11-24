@@ -183,6 +183,10 @@ impl GpuMemory for Tracked<'_> {
     fn unwritten_since(&self, address: u64, len: usize, mark: WatchMark) -> bool {
         self.memory.unwritten_since(address, len, mark)
     }
+
+    fn guard(&self, address: u64, len: usize) -> Option<crate::memory::DramGuard> {
+        self.memory.guard(address, len)
+    }
 }
 
 fn read(memory: &dyn GpuMemory, address: u64, length: usize) -> Result<Vec<u8>, Unmodeled> {

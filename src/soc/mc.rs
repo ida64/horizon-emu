@@ -54,7 +54,7 @@ use super::{
 use crate::{
     boot::DramSize,
     bus::MmioDevice,
-    memory::GuestRam,
+    memory::{DramGuard, GuestRam},
     snapshot::{Snapshot, SnapshotError, decode, encode},
 };
 
@@ -670,6 +670,27 @@ impl DeviceMemory {
             Some(())
         })?;
         Some(same)
+    }
+
+    /// The read guard over the range (`GuestRam::guard`), held until the
+    /// guard is dropped; `None` unless all of it is DRAM.
+    pub fn guard(&self, address: u64, len: usize) -> Option<DramGuard> {
+        let mut guard: Option<DramGuard> = None;
+        let mut all = true;
+        self.pieces(address, len, false, |place, _, len| {
+            match place {
+                Place::Dram(physical) => match self.ram.guard(physical, len) {
+                    Some(piece) => match &mut guard {
+                        Some(guard) => guard.merge(piece),
+                        None => guard = Some(piece),
+                    },
+                    None => all = false,
+                },
+                Place::Iram(..) | Place::Blocked => all = false,
+            }
+            Some(())
+        })?;
+        guard.filter(|_| all)
     }
 
     /// The DRAM write watch over the range (`GuestRam::watch`): the first

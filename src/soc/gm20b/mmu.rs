@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::mc::{DeviceMemory, PLACEMENT_SEED, place_piece};
 use crate::maxwell::{GpuMemory, Unmodeled, WatchMark};
+use crate::memory::DramGuard;
 
 /// Bus address bit that sends an access through the SMMU.
 pub const SMMU_BIT: u64 = 1 << 34;
@@ -100,6 +101,11 @@ pub trait BusMemory: Send + Sync {
     /// The fingerprint of where in DRAM the bytes lie, if nothing wrote
     /// them since `mark` (see `GpuMemory::unwritten_since`).
     fn unwritten_since(&self, _address: u64, _len: usize, _mark: u64) -> Option<u64> {
+        None
+    }
+
+    /// The DRAM read guard through this bus (`GpuMemory::guard`).
+    fn guard(&self, _address: u64, _len: usize) -> Option<DramGuard> {
         None
     }
 
@@ -186,6 +192,10 @@ impl BusMemory for SmmuBus {
     fn unwritten_since(&self, address: u64, len: usize, mark: u64) -> Option<u64> {
         self.memory
             .unwritten_since(smmu_address(address, len)?, len, mark)
+    }
+
+    fn guard(&self, address: u64, len: usize) -> Option<DramGuard> {
+        self.memory.guard(smmu_address(address, len)?, len)
     }
 
     /// Both counts only grow, so their sum stays the same only while
@@ -592,6 +602,25 @@ impl AddressSpace {
         })
     }
 
+    /// The read guard over the bytes, held until dropped; `None` if any
+    /// page has none.
+    pub fn guard(&self, bus: &dyn BusMemory, address: u64, len: usize) -> Option<DramGuard> {
+        let mut guard: Option<DramGuard> = None;
+        let mut all = true;
+        self.pieces(bus, address, len, false, |at, _, len| {
+            match bus.guard(at, len) {
+                Some(piece) => match &mut guard {
+                    Some(guard) => guard.merge(piece),
+                    None => guard = Some(piece),
+                },
+                None => all = false,
+            }
+            Ok(())
+        })
+        .ok()?;
+        guard.filter(|_| all)
+    }
+
     /// Whether nothing wrote the bytes since `mark` and they lie where
     /// they did then.
     pub fn unwritten_since(
@@ -674,6 +703,10 @@ impl GpuMemory for ChannelMemory<'_> {
 
     fn unwritten_since(&self, address: u64, len: usize, mark: WatchMark) -> bool {
         self.space.unwritten_since(self.bus, address, len, mark)
+    }
+
+    fn guard(&self, address: u64, len: usize) -> Option<DramGuard> {
+        self.space.guard(self.bus, address, len)
     }
 }
 
