@@ -1311,6 +1311,29 @@ impl Renderer {
         if attachments.is_empty() && draw.depth.is_none() {
             return self.fall_back("draw without color or depth targets".into());
         }
+        // Tests mandated to come first (`raster::DepthOutput::early`) the
+        // fragment function cannot make as the software renderer does:
+        // the stencil test, the samples of a pixel of the plane path, or
+        // a fragment dropped after its depth was to be written or it was
+        // to be counted.
+        if let Some((_, depth)) = draw.depth
+            && depth.early
+        {
+            if depth.stencil.is_some() {
+                return self.fall_back("mandated early tests with the stencil test".into());
+            }
+            if !draw.multisample.samples.is_single() && vertex.is_none() {
+                return self.fall_back("mandated early tests of several samples".into());
+            }
+            let drops = draw.alpha_test.is_some()
+                || draw.multisample.alpha_to_coverage
+                || draw.program.mnemonics().any(|mnemonic| mnemonic == "KIL");
+            if drops && (depth.write || draw.count_passed) {
+                return self.fall_back(
+                    "mandated early tests of fragments dropped afterwards".into(),
+                );
+            }
+        }
         // A fragment failing the stencil or depth test is discarded with
         // its colors; its stencil update survives only without them.
         if !attachments.is_empty()
@@ -1492,6 +1515,7 @@ impl Renderer {
                 format: depth.format,
                 write: depth.write,
                 stencil: depth.stencil.is_some(),
+                early: depth.early,
             }),
             multisample: (!samples.is_single()).then_some(msl::MultisampleStage {
                 samples: samples.count() as u32,

@@ -113,6 +113,13 @@ pub struct DepthStage {
     pub write: bool,
     /// Whether the stencil test runs (the format has stencil).
     pub stencil: bool,
+    /// `SET_API_MANDATED_EARLY_Z` (`raster::DepthOutput::early`): the
+    /// test comes before the program, which stores nothing in global
+    /// memory for a fragment that fails it, and takes the depth plane's
+    /// depth whatever the program writes. The draw is the software
+    /// renderer's where the function cannot do the same (the stencil
+    /// test, or a fragment dropped after its depth was to be written).
+    pub early: bool,
 }
 
 /// How a fragment function draws into multisampled targets (see
@@ -910,6 +917,7 @@ impl Translated {
         // and written (into `w`, the word being updated)
         // (`DepthFormat::read_depth`, `write_depth`), and how its stencil
         // is read and written (`s`) (`read_stencil`, `write_stencil`).
+        let mandated = depth.is_some_and(|stage| stage.early);
         let formats = depth.map(|stage| match stage.format {
             DepthFormat::Z32Float => ("uint", "as_type<float>(zin)", "as_type<uint>(z)", None),
             DepthFormat::Z32FloatX24S8 => (
@@ -1141,23 +1149,30 @@ impl Translated {
         // A quad none of whose fragments would pass the depth test does
         // not run the program: every fragment of it is discarded whatever
         // the program computes, when the program leaves the depth to the
-        // plane and stores nothing in global memory, and a failing
-        // fragment changes no stencil. (A quad with one passing fragment
-        // runs whole: the others give it its derivatives.) What is lost
-        // is the record of a sample of an unbound texture by fragments
-        // that fail the test (`texture.rs`), which the interpreter,
-        // testing after the program, refuses.
+        // plane and stores nothing in global memory (or the test is
+        // mandated to come first), and a failing fragment changes no
+        // stencil. (A quad with one passing fragment runs whole: the
+        // others give it its derivatives.) What is lost is the record of
+        // a sample of an unbound texture by fragments that fail the test
+        // (`texture.rs`), which the interpreter, testing after the
+        // program, refuses.
+        let _ = writeln!(s, "    bool early_passed = true; (void)early_passed;");
         if let Some((_, read, _, None)) = depth
-            && depth_register.is_none()
-            && !self.stores
+            && (mandated || (depth_register.is_none() && !self.stores))
             && (multisample.is_none() || native.is_some())
         {
             let _ = writeln!(
                 s,
-                "    {{ float z = {plane_depth};\n      const float lo = as_type<float>(depth_test[1]); const float hi = as_type<float>(depth_test[2]);\n      z = z < lo ? lo : (z > hi ? hi : z);\n      uint alive = (({live}) && compare(depth_test[0], z, {read})) ? 1u : 0u;\n      alive |= quad_shuffle_xor(alive, 1u); alive |= quad_shuffle_xor(alive, 2u);\n      if (alive == 0u) {{ discard_fragment(); Output none = {{}}; return none; }} }}"
+                "    {{ float z = {plane_depth};\n      const float lo = as_type<float>(depth_test[1]); const float hi = as_type<float>(depth_test[2]);\n      z = z < lo ? lo : (z > hi ? hi : z);\n      early_passed = compare(depth_test[0], z, {read});\n      uint alive = (({live}) && early_passed) ? 1u : 0u;\n      alive |= quad_shuffle_xor(alive, 1u); alive |= quad_shuffle_xor(alive, 2u);\n      if (alive == 0u) {{ discard_fragment(); Output none = {{}}; return none; }} }}"
             );
         }
-        let _ = writeln!(s, "#define GM_LIVE {live}");
+        // With the test mandated first, a fragment that fails it is none
+        // of the primitive's to the program.
+        if mandated {
+            let _ = writeln!(s, "#define GM_LIVE (({live}) && early_passed)");
+        } else {
+            let _ = writeln!(s, "#define GM_LIVE {live}");
+        }
         if !self.globals.is_empty() {
             let _ = writeln!(s, "{GLOBAL_WORD}\n#define GT(i) gt[i]");
         }
@@ -1214,8 +1229,8 @@ impl Translated {
         let _ = writeln!(s, "    Output out;");
         if let Some((words, read, write, stencil)) = depth {
             let incoming = match depth_register {
-                Some(register) => format!("as_type<float>(r{register})"),
-                None => plane_depth.to_string(),
+                Some(register) if !mandated => format!("as_type<float>(r{register})"),
+                _ => plane_depth.to_string(),
             };
             let _ = writeln!(
                 s,

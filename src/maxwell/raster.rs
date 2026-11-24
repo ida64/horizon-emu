@@ -235,6 +235,13 @@ pub struct DepthOutput {
     /// a stencil buffer the test passes and nothing is written: OpenGL 4.6
     /// core, 17.3.3).
     pub stencil: Option<Stencil>,
+    /// `SET_API_MANDATED_EARLY_Z`: the stencil and depth tests and their
+    /// updates come before the pixel program, which does not run for a
+    /// fragment that fails them (it stores nothing in global memory), and
+    /// whose depth output and kills change nothing of them [public:
+    /// OpenGL 4.6 core, 14.9 "Early Per-Fragment Tests", which the
+    /// method's name refers to].
+    pub early: bool,
 }
 
 impl DepthOutput {
@@ -651,6 +658,73 @@ fn shade_quad(
     bands: &mut BandSet<'_>,
 ) -> Result<(), Unmodeled> {
     let samples = &backend.multisample.samples;
+    let [lx, ly] = samples.log2;
+    let multisample = &backend.multisample;
+    // The stencil test, then the depth test, of sample `sample` of the
+    // pixel at (`px`, `py`) with depth `fragment` (the program's, if it
+    // wrote one); the stencil buffer is updated by the operation the
+    // outcome selects, a fragment failing either test writes no color
+    // (OpenGL 4.6 core, 17.3.3-17.3.4). A passing sample is counted.
+    let test = |bands: &mut BandSet<'_>, px: u32, py: u32, sample: usize, fragment: Option<f32>| {
+        let [cx, cy] = samples.cell(sample);
+        let (tx, ty) = (px << lx | cx, py << ly | cy);
+        if let (Some(depth), Some(band)) = (backend.depth, bands.depth.as_mut()) {
+            let [ox, oy] = if multisample.center_depth {
+                [0.5, 0.5]
+            } else {
+                samples.offset(sample)
+            };
+            let incoming = fragment
+                .unwrap_or_else(|| evaluate(&triangle.depth, px as f32 + ox, py as f32 + oy));
+            let incoming = incoming.clamp(depth.clamp.0, depth.clamp.1);
+            let texel = band.pixel_mut(tx, ty);
+            let stencil = depth.stencil.map(|stencil| {
+                let face = *stencil.face(triangle.front_facing);
+                let stored = depth.format.read_stencil(texel).unwrap_or(0);
+                (face, stored, face.test(stored))
+            });
+            let stencil_passed = stencil.is_none_or(|(_, _, passed)| passed);
+            let depth_passed =
+                stencil_passed && depth.compare.test(incoming, depth.format.read_depth(texel));
+            if let Some((face, stored, _)) = stencil {
+                let op = if !stencil_passed {
+                    face.fail
+                } else if !depth_passed {
+                    face.depth_fail
+                } else {
+                    face.pass
+                };
+                depth.format.write_stencil(face.update(op, stored), texel);
+            }
+            if !depth_passed {
+                return false;
+            }
+            if depth.write {
+                depth.format.write_depth(incoming, texel);
+            }
+        }
+        if let Some(passed) = backend.passed {
+            passed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        true
+    };
+    // Tests mandated early: the samples that pass are the fragment's.
+    let early = backend.depth.is_some_and(|depth| depth.early) && bands.depth.is_some();
+    let mut coverage = coverage;
+    if early {
+        for (lane, mask) in coverage.iter_mut().enumerate() {
+            let px = x + (lane as u32 & 1);
+            let py = y + (lane as u32 >> 1);
+            for sample in 0..samples.count() {
+                if *mask & (1 << sample) != 0 && !test(bands, px, py, sample, None) {
+                    *mask &= !(1 << sample);
+                }
+            }
+        }
+        if coverage == [0; 4] {
+            return Ok(());
+        }
+    }
     let mut quad = Quad {
         planes: &triangle.planes,
         x,
@@ -661,8 +735,6 @@ fn shade_quad(
         outputs: [FragmentOutput::default(); 4],
     };
     backend.program.run_fragment(env, &mut quad)?;
-    let [lx, ly] = samples.log2;
-    let multisample = &backend.multisample;
     for (lane, output) in quad.outputs.iter().enumerate() {
         if coverage[lane] == 0 || output.discarded {
             continue;
@@ -686,51 +758,11 @@ fn shade_quad(
         let px = x + (lane as u32 & 1);
         let py = y + (lane as u32 >> 1);
         for sample in (0..samples.count()).filter(|&s| mask & (1 << s) != 0) {
+            if !early && !test(bands, px, py, sample, output.depth) {
+                continue;
+            }
             let [cx, cy] = samples.cell(sample);
             let (tx, ty) = (px << lx | cx, py << ly | cy);
-            // The stencil test, then the depth test; the stencil buffer is
-            // updated by the operation the outcome selects, a fragment
-            // failing either test writes no color (OpenGL 4.6 core,
-            // 17.3.3-17.3.4).
-            if let (Some(depth), Some(band)) = (backend.depth, bands.depth.as_mut()) {
-                let [ox, oy] = if multisample.center_depth {
-                    [0.5, 0.5]
-                } else {
-                    samples.offset(sample)
-                };
-                let incoming = output
-                    .depth
-                    .unwrap_or_else(|| evaluate(&triangle.depth, px as f32 + ox, py as f32 + oy));
-                let incoming = incoming.clamp(depth.clamp.0, depth.clamp.1);
-                let texel = band.pixel_mut(tx, ty);
-                let stencil = depth.stencil.map(|stencil| {
-                    let face = *stencil.face(triangle.front_facing);
-                    let stored = depth.format.read_stencil(texel).unwrap_or(0);
-                    (face, stored, face.test(stored))
-                });
-                let stencil_passed = stencil.is_none_or(|(_, _, passed)| passed);
-                let depth_passed =
-                    stencil_passed && depth.compare.test(incoming, depth.format.read_depth(texel));
-                if let Some((face, stored, _)) = stencil {
-                    let op = if !stencil_passed {
-                        face.fail
-                    } else if !depth_passed {
-                        face.depth_fail
-                    } else {
-                        face.pass
-                    };
-                    depth.format.write_stencil(face.update(op, stored), texel);
-                }
-                if !depth_passed {
-                    continue;
-                }
-                if depth.write {
-                    depth.format.write_depth(incoming, texel);
-                }
-            }
-            if let Some(passed) = backend.passed {
-                passed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
             for color in backend.colors {
                 let band = &mut bands.colors[color.window];
                 write_color(color, backend, output, band, tx, ty);

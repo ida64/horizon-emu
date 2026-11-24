@@ -1939,6 +1939,9 @@ fn fragments(context: &Context<'_>, pixel: &Arc<Program>) -> Result<Fragments, U
                     write,
                     clamp,
                     stencil,
+                    // SET_API_MANDATED_EARLY_Z (0x0210) ENABLE [public:
+                    // NVIDIA `clb197.h`].
+                    early: r.get(0x0210) & 1 != 0,
                 },
             ))
         }
