@@ -271,6 +271,17 @@ impl Engines for Recorder {
         self.inner.flush(&observed)
     }
 
+    fn settle(&mut self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+        self.call_record(FLUSH, 0, 0);
+        let observed = Observed {
+            memory,
+            capture: &self.capture,
+            channel: self.channel,
+            shadow: &self.shadow,
+        };
+        self.inner.settle(&observed)
+    }
+
     /// The recorded engines' state; the capture's own bookkeeping (its
     /// shadow of memory) is not machine state.
     fn save(&self) -> Result<Vec<u8>, SnapshotError> {

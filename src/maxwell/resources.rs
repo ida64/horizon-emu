@@ -455,18 +455,23 @@ impl<'a> DrawTextures<'a> {
         }))
     }
 
-    fn texture(&self, index: u32) -> Result<Arc<Texture>, Unmodeled> {
-        if let Some(texture) = self.resolved.lock().unwrap().get(&index) {
-            return Ok(texture.clone());
-        }
+    /// The header at TIC index `index`.
+    fn tic(&self, index: u32) -> Result<Tic, Unmodeled> {
         if index > self.pools.header_maximum {
             return Err(Unmodeled(format!(
                 "texture: TIC index {index:#x} beyond the pool maximum {:#x}",
                 self.pools.header_maximum
             )));
         }
-        let words = self.words(self.pools.header_pool, index)?;
-        let tic = Tic::parse(words)?;
+        Tic::parse(self.words(self.pools.header_pool, index)?)
+    }
+
+    fn texture(&self, index: u32) -> Result<Arc<Texture>, Unmodeled> {
+        if let Some(texture) = self.resolved.lock().unwrap().get(&index) {
+            return Ok(texture.clone());
+        }
+        let tic = self.tic(index)?;
+        let words = tic.words;
         let (address, length) = Texture::footprint(&tic)?;
         let end = address.saturating_add(length);
         // The decode this TIC's memory last compared equal to, if kept.
@@ -521,13 +526,28 @@ impl<'a> DrawTextures<'a> {
     /// The texture and sampler of a bound-texture handle: TIC index in
     /// bits 19:0, TSC index in bits 31:20 (see [`ThreadTextures`]).
     pub fn resolve(&self, handle: u32) -> Result<(Arc<Texture>, Tsc), Unmodeled> {
+        let (tic, tsc) = self.indices(handle);
+        Ok((self.texture(tic)?, self.sampler(tsc)?))
+    }
+
+    /// The TIC and TSC indices of a bound-texture handle.
+    fn indices(&self, handle: u32) -> (u32, u32) {
         let tic = handle & 0xF_FFFF;
         let tsc = if self.pools.sampler_from_header {
             tic
         } else {
             handle >> 20
         };
-        Ok((self.texture(tic)?, self.sampler(tsc)?))
+        (tic, tsc)
+    }
+
+    /// The texture header and sampler of a bound-texture handle, without
+    /// the texture's contents (no read of its memory): what
+    /// [`resolve`](Self::resolve) decodes the texture by. Refuses as
+    /// `resolve` does for a handle that names no header or sampler.
+    pub fn header(&self, handle: u32) -> Result<(Tic, Tsc), Unmodeled> {
+        let (tic, tsc) = self.indices(handle);
+        Ok((self.tic(tic)?, self.sampler(tsc)?))
     }
 
     /// A per-thread view with its own small lookup cache.

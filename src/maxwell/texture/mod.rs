@@ -45,6 +45,20 @@ fn unsupported(field: &str, value: impl std::fmt::Display) -> Unmodeled {
 }
 
 impl Tic {
+    /// The level-of-detail range sampling may select, as the interpreter
+    /// clamps it (`clamp_lod`): (minimum, maximum) relative to the base
+    /// level.
+    pub fn lod_range(&self, tsc: &Tsc) -> (f32, f32) {
+        let resident = ((self.words[7] >> 12) & 4095) as f32 / 256.;
+        let top = (self.max_level - self.base_level) as f32;
+        (
+            tsc.min_lod.max(resident).clamp(0., top),
+            tsc.max_lod.max(resident).clamp(0., top),
+        )
+    }
+}
+
+impl Tic {
     /// Parses the block-linear and pitch headers. Color-key, sparse, multisample,
     /// packed-component, and header-overridden filtering modes are refused.
     /// Pitch textures have no mipmaps [public: Ryujinx Image/TexturePool.cs GetInfo].
@@ -338,18 +352,6 @@ impl Texture {
             .iter()
             .map(|m| std::mem::size_of_val(m.texels.as_slice()))
             .sum()
-    }
-
-    /// The level-of-detail range sampling may select, as the interpreter
-    /// clamps it (`clamp_lod`): (minimum, maximum) relative to the base
-    /// level.
-    pub fn lod_range(&self, tsc: &Tsc) -> (f32, f32) {
-        let resident = ((self.tic.words[7] >> 12) & 4095) as f32 / 256.;
-        let top = (self.tic.max_level - self.tic.base_level) as f32;
-        (
-            tsc.min_lod.max(resident).clamp(0., top),
-            tsc.max_lod.max(resident).clamp(0., top),
-        )
     }
 
     /// Byte extent of all allocated levels and layers (including layout padding).

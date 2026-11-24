@@ -7,7 +7,7 @@ use objc2_metal::{MTLPixelFormat, MTLSamplerBorderColor};
 use super::super::blend::{Blend, Factor};
 use super::super::sampling::Target;
 use super::super::texture::format::{ColorFormat, DepthFormat};
-use super::super::texture::{Texture, Tsc};
+use super::super::texture::{Tic, Tsc};
 
 /// The Metal pixel format with the same bytes per pixel and component
 /// layout as `format` (the linear form for sRGB formats; see [`srgb`]).
@@ -109,8 +109,7 @@ pub fn border_color(tsc: &Tsc) -> Option<MTLSamplerBorderColor> {
 /// textures; wrap, mirror, clamp-to-edge, border (with a border color
 /// Metal has) and mirror-once-clamp-to-edge addressing; no depth compare,
 /// no anisotropy.
-pub fn check_texture(texture: &Texture, tsc: &Tsc) -> Result<(), String> {
-    let tic = texture.tic();
+pub fn check_texture(tic: &Tic, tsc: &Tsc) -> Result<(), String> {
     if tic.target != Target::Texture2D || tic.array || tic.shape.layers != 1 {
         return Err(format!(
             "texture target {:?} array {} layers {}",

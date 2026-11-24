@@ -27,21 +27,21 @@
 //! the surface, plus a mirror of the surface's bytes as guest memory had
 //! them when the two were last made equal. Rendering makes the resident
 //! *dirty* (the Metal texture is newer than guest memory, over a known
-//! rectangle). Draws and clears are recorded into one command buffer that
-//! stays open until the next write-back, which ends it, waits for the GPU
-//! and stores the dirty pixels in guest memory, in the surface's own
-//! layout. That happens:
+//! rectangle). A write-back waits for the GPU and stores the dirty pixels
+//! in guest memory, in the surface's own layout. That happens:
 //!
 //! - when the channel signals: semaphore releases, reports and syncpoint
 //!   increments of its engines and of the pushbuffer executor
-//!   ([`super::Hooks::signal`], [`super::Engines::flush`]);
+//!   ([`super::Hooks::signal`], [`super::Engines::flush`]), except for
+//!   the targets held on demand (below);
 //! - before any other access of the channel's engines to memory that
 //!   overlaps a dirty target: all engine memory accesses go through
-//!   [`Coherent`], which writes back first. That covers copies, 2D blits,
-//!   inline uploads, texture sampling of a render target, and constant
+//!   [`Coherent`], which writes back first. That covers copies, 2D blits
+//!   the GPU does not do ([`blit`]), inline uploads, texture sampling of
+//!   a render target that is not sampled on the GPU (below), and constant
 //!   and vertex data;
 //! - before a draw or clear Metal cannot express runs in the software
-//!   renderer.
+//!   renderer, and before a machine snapshot ([`Renderer::settle`]).
 //!
 //! Between signals the dirty pixels exist only on the host GPU. Nothing
 //! outside the channel can tell: the guest CPU, other channels and the
@@ -60,6 +60,58 @@
 //! CPU, another channel) may only write a surface the channel rendered or
 //! read once a signal told it the GPU is done with it; between, such a
 //! write races with the GPU, as on hardware.
+//!
+//! # The GPU works while the frame is recorded
+//!
+//! Draws and clears are recorded into command buffers that are committed
+//! as recording goes: whenever a render pass ends (other attachments, a
+//! compute pass, or [`PASS_DRAWS`] draws in it) the buffer is committed and
+//! the next pass starts another, so the GPU runs the frame's first passes
+//! while the CPU records its later ones. Nothing waits at a commit. A
+//! write-back commits what is recorded and waits for the buffer committed
+//! last: buffers of one queue run in commit order, so everything recorded
+//! is done then, and most of it was done already. Draw data lives in the
+//! arena until such a wait ([`Arena`]); a signal with nothing to write
+//! back waits only once the arena has grown ([`ARENA_UNWAITED`]) or a
+//! draw's texture faults are to be read.
+//!
+//! # Targets held on demand
+//!
+//! Depth buffers and multisampled targets ([`Resident::on_demand`]) are
+//! not written back at signals: only when an engine of the channel
+//! accesses their memory ([`Coherent`]: a 2D blit or copy the GPU does
+//! not do, texture sampling, the software renderer), before a snapshot,
+//! and when a surface of another shape is rendered at their memory.
+//! \[inference: the guest CPU has no use for these bytes. GM20B keeps
+//! depth and multisampled color compressed, with the compression state
+//! outside the surface (nvgpu's comptags and compression bit cache,
+//! RECALLED), which is why the class has `DECOMPRESS_SURFACE` and
+//! `DECOMPRESS_ZETA_SURFACE` (NVIDIA open-gpu-doc `clb197.h`; NVN issues
+//! the former on its present path, see `three_d`): what a CPU read of
+//! such a surface returns between those is not the pixels. No guest seen
+//! reads them; every use goes through an engine.\]
+//!
+//! What the guest may do with the memory is give it another use (NVN
+//! sub-allocates memory pools; no unmap or remap tells). So a target held
+//! on demand is written back only while guest memory still holds what the
+//! mirror does, bit for bit: nothing wrote there since the two were last
+//! equal. Otherwise (other contents, or the memory is no longer mapped)
+//! the memory has a new owner whose data stands, and what was rendered is
+//! forgotten: the resident is left stale and loaded from memory when next
+//! drawn to. The comparison is skipped while the resident was made equal
+//! to memory in the current epoch of [`Writes`]: until the channel
+//! signals, the guest may not touch memory its submitted work uses.
+//!
+//! # Sampling render targets
+//!
+//! A texture whose levels (some or all) are current residents of a color
+//! format with the header's bytes is sampled from a [`Composite`]: a
+//! Metal texture whose levels are filled from those residents on the GPU
+//! each time they were rendered to, and from guest memory for the other
+//! levels. Guest memory is not involved: no write-back, decode or upload
+//! of the rendered levels (Minecraft draws level 0 of its block atlas
+//! every frame). A draw that renders to a level it samples reads guest
+//! memory instead, after the write-back of what was rendered before it.
 
 //!
 //! # Multisampled targets
@@ -73,6 +125,7 @@
 //! values are those of whole pixels while coverage, depth, stencil and
 //! blending are per sample. Write-back and loading interleave the layers'
 //! pixels into the texels holding them and back.
+pub mod blit;
 mod format;
 
 use std::borrow::Cow;
@@ -82,7 +135,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
+use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTLBlendFactor, MTLBlendOperation, MTLBuffer, MTLColorWriteMask, MTLCommandBuffer,
     MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions, MTLComputeCommandEncoder,
@@ -90,7 +143,7 @@ use objc2_metal::{
     MTLDevice, MTLGPUFamily, MTLIndexType, MTLLibrary, MTLLoadAction, MTLMathMode, MTLOrigin,
     MTLPixelFormat, MTLPrimitiveTopologyClass, MTLPrimitiveType, MTLRegion,
     MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
-    MTLRenderPipelineState, MTLResource, MTLResourceOptions, MTLSamplerAddressMode,
+    MTLRenderPipelineState, MTLResourceOptions, MTLSamplerAddressMode,
     MTLSamplerBorderColor, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
     MTLSamplerState, MTLScissorRect, MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture,
     MTLTextureDescriptor, MTLTextureType, MTLTextureUsage, MTLViewport, MTLWinding,
@@ -104,8 +157,9 @@ use super::resources::{DrawTextures, Stamp, Writes};
 use super::shader::Program;
 use super::shader::msl::{self, Translated};
 use super::surface::{Rect, Surface, Window};
-use super::texture::format::{ColorFormat, DepthFormat};
-use super::texture::{Texture, Tsc};
+use super::sampling::Target;
+use super::texture::format::{ColorFormat, ComponentType, DepthFormat};
+use super::texture::{Texture, Tic, Tsc};
 use super::{GpuMemory, Unmodeled};
 
 type Device = ProtocolObject<dyn MTLDevice>;
@@ -193,6 +247,9 @@ struct Resident {
     stamp: Option<Stamp>,
     /// [`State::clock`] when a draw or clear last used it.
     used: u64,
+    /// Tells the texture's content from any it held before: a count
+    /// ([`State::versions`]) taken whenever it is rendered to or loaded.
+    version: u64,
 }
 
 /// The attachments of a render pass: resident index and whether the sRGB
@@ -248,6 +305,25 @@ const SAMPLER_LIMIT: usize = 512;
 /// a dropped target is loaded from guest memory when next drawn to\].
 const RESIDENT_BUDGET: usize = 512 << 20;
 
+/// Draws and clears one render pass takes before it is ended and
+/// committed, to be continued in another with the same attachments: the
+/// GPU starts on a pass only once it is committed, so a frame drawn in
+/// one long pass would leave it idle until the frame is recorded
+/// \[assumption: a pass boundary costs the GPU a store and a load of the
+/// attachments, a fraction of a millisecond at 720p; tuned on Minecraft's
+/// world pass\].
+const PASS_DRAWS: u32 = 64;
+
+fn pass_draws_limit() -> u32 {
+    static LIMIT: LazyLock<u32> = LazyLock::new(|| {
+        std::env::var("HEMU_PASS_DRAWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(PASS_DRAWS)
+    });
+    *LIMIT
+}
+
 /// The renderer's host objects. Every cache is bounded: by
 /// least-recent use (`maxwell::lru`) for libraries, pipelines and
 /// samplers, by the software caches' own bounds for programs and
@@ -259,6 +335,11 @@ const RESIDENT_BUDGET: usize = 512 << 20;
 struct State {
     residents: Vec<Resident>,
     frame: Option<Frame>,
+    /// The command buffer committed last, until it is known to have
+    /// completed ([`State::wait`]).
+    submitted: Option<Retained<CommandBuffer>>,
+    /// Draws and clears recorded in the open pass ([`PASS_DRAWS`]).
+    pass_draws: u32,
     programs: HashMap<usize, Program2>,
     vertex_programs: HashMap<usize, VertexProgram>,
     /// Reasons draws shaded their vertices on the CPU (`pipeline::native`),
@@ -272,7 +353,14 @@ struct State {
     /// Uploaded textures by decoded texture (kept alive with it while the
     /// texture cache holds it too).
     textures: HashMap<usize, (Arc<Texture>, Retained<MetalTexture>)>,
-    samplers: Lru<[u32; 8], Retained<Sampler>>,
+    /// By TSC words and the level-of-detail range the texture's header
+    /// leaves ([`Tic::lod_range`]).
+    samplers: Lru<([u32; 8], [u32; 2]), Retained<Sampler>>,
+    /// Textures with levels held as residents, by header words.
+    composites: HashMap<[u32; 8], Composite>,
+    /// Counts changes of residents' textures ([`Resident::version`]).
+    versions: u64,
+    convert_pipeline: Option<Retained<ComputePipeline>>,
     /// Counts uses of residents (`Resident::used`).
     clock: u64,
     fallbacks: HashMap<String, u64>,
@@ -288,6 +376,8 @@ struct State {
     arena: Arena,
     /// The packing kernels (`State::pack`), plain and layered.
     pack_pipelines: HashMap<bool, Retained<ComputePipeline>>,
+    /// The 2D blit kernel (`blit`), made once.
+    blit_pipeline: Option<Retained<ComputePipeline>>,
 }
 
 impl Default for State {
@@ -295,6 +385,8 @@ impl Default for State {
         State {
             residents: Vec::new(),
             frame: None,
+            submitted: None,
+            pass_draws: 0,
             programs: HashMap::new(),
             vertex_programs: HashMap::new(),
             cpu_vertices: HashMap::new(),
@@ -310,6 +402,10 @@ impl Default for State {
             placeholder: None,
             arena: Arena::default(),
             pack_pipelines: HashMap::new(),
+            composites: HashMap::new(),
+            versions: 0,
+            convert_pipeline: None,
+            blit_pipeline: None,
         }
     }
 }
@@ -396,6 +492,24 @@ pub struct NativeStream {
     pub stride: u32,
     pub divisor: u32,
 }
+
+/// Which dirty residents a write-back takes.
+#[derive(Clone, Copy)]
+enum Scope {
+    /// The channel signals: those the guest may read once it has
+    /// (all but the ones held on demand, [`Resident::on_demand`]).
+    Signal,
+    /// Memory `start..end` is about to be accessed: those overlapping it.
+    Range(u64, u64),
+    /// All of them.
+    All,
+}
+
+/// Arena chunks a channel's recorded work may fill without anything
+/// having waited for the GPU \[assumption: a frame's draw data is a chunk
+/// or two; work whose results nothing reads is still held to the GPU's
+/// pace\].
+const ARENA_UNWAITED: usize = 4;
 
 /// The Metal renderer of one channel.
 pub struct Renderer {
@@ -516,38 +630,118 @@ impl Renderer {
         list
     }
 
-    /// Ends the command buffer, waits for the GPU and writes every dirty
-    /// target back to guest memory (through `memory`, which notes the
-    /// writes in `writes`).
-    pub fn flush(&self, memory: &dyn GpuMemory, writes: &Writes) -> Result<(), Unmodeled> {
-        self.write_back(memory, writes, None)
+    /// Textures being sampled from the targets that are their levels
+    /// ([`Composite`]).
+    #[cfg(test)]
+    pub(crate) fn composites(&self) -> usize {
+        self.state.lock().unwrap().composites.len()
     }
 
-    /// Ends the command buffer, waits for the GPU and writes the dirty
-    /// targets back that overlap `range` (all with `None`). The others stay
-    /// dirty: their textures are final for the work so far, and later work
-    /// continues in a new command buffer.
+    /// The channel is about to signal: writes every dirty target the
+    /// guest may read from then on back to guest memory (through
+    /// `memory`, which notes the writes in `writes`), after waiting for
+    /// the GPU. Depth buffers and multisampled targets stay on the GPU
+    /// ([`Resident::on_demand`]).
+    pub fn flush(&self, memory: &dyn GpuMemory, writes: &Writes) -> Result<(), Unmodeled> {
+        self.write_back(memory, writes, Scope::Signal)
+    }
+
+    /// Writes every dirty target back to guest memory, those held on
+    /// demand too: afterwards guest memory holds all of the channel's
+    /// work (before a machine snapshot, and before the software renderer
+    /// reads memory from several threads).
+    pub fn settle(&self, memory: &dyn GpuMemory, writes: &Writes) -> Result<(), Unmodeled> {
+        self.write_back(memory, writes, Scope::All)
+    }
+
+    /// Waits for the GPU and writes the dirty targets of `scope` back.
+    /// The others stay dirty: their textures are final for the work so
+    /// far, and later work continues in a new command buffer. A target
+    /// held on demand is written only where guest memory still holds what
+    /// it held when the two were last equal; otherwise the memory was
+    /// reused and what was rendered is forgotten (see the module
+    /// documentation).
     fn write_back(
         &self,
         memory: &dyn GpuMemory,
         writes: &Writes,
-        range: Option<(u64, u64)>,
+        scope: Scope,
     ) -> Result<(), Unmodeled> {
         use std::sync::atomic::Ordering;
         let mut state = self.state.lock().unwrap();
-        let wanted = |r: &Resident| range.is_none_or(|range| overlap(r.extent(), range));
-        // The wanted dirty residents packed into their guest bytes on the
-        // GPU, after the work rendering them (see `State::pack`); `None`
-        // where the CPU converts instead.
+        let mut wanted: Vec<bool> = state
+            .residents
+            .iter()
+            .map(|r| {
+                r.dirty.is_some()
+                    && match scope {
+                        Scope::Signal => !r.on_demand(),
+                        Scope::Range(start, end) => overlap(r.extent(), (start, end)),
+                        Scope::All => true,
+                    }
+            })
+            .collect();
+        if !wanted.contains(&true) {
+            // Nothing for guest memory: the GPU goes on with what is
+            // recorded, and nothing waits for it, unless a draw's texture
+            // faults are to be looked at or the recorded draws' data has
+            // piled up.
+            if matches!(scope, Scope::Range(..)) {
+                return Ok(());
+            }
+            if state.faults.is_empty() && state.arena.chunks_in_use() <= ARENA_UNWAITED {
+                state.submit();
+                state.trim();
+                return Ok(());
+            }
+        }
+        // Residents whose mirror is known to equal memory still (nothing
+        // of the channel wrote there since they were compared, in this
+        // epoch): they do after their own write-back too (residents do
+        // not overlap).
+        let mut current: Vec<bool> = state
+            .residents
+            .iter()
+            .map(|r| {
+                let (start, end) = r.extent();
+                r.stamp.is_some_and(|s| writes.unchanged(s, start, end))
+            })
+            .collect();
+        // Reads and writes of this function pass `Coherent` unchecked.
+        self.writing_back.store(true, Ordering::Relaxed);
+        // On-demand targets: has the guest reused the memory?
+        for (index, resident) in state.residents.iter_mut().enumerate() {
+            if !(wanted[index] && resident.on_demand()) || current[index] {
+                continue;
+            }
+            if matches!(resident.mirror.matches(memory), Ok(true)) {
+                current[index] = true;
+            } else {
+                // Forgotten: the texture is stale, and loaded from memory
+                // when next drawn to.
+                wanted[index] = false;
+                resident.dirty = None;
+                resident.stamp = None;
+            }
+        }
+        // The wanted residents packed into their guest bytes on the GPU,
+        // after the work rendering them (see `State::pack`); `None` where
+        // the CPU converts instead.
         let mut packs = Vec::with_capacity(state.residents.len());
-        for index in 0..state.residents.len() {
-            packs.push(if wanted(&state.residents[index]) {
-                state.pack(index)?
+        for (index, &wanted) in wanted.iter().enumerate() {
+            packs.push(if wanted {
+                match state.pack(index) {
+                    Ok(pack) => pack,
+                    Err(refusal) => {
+                        self.writing_back.store(false, Ordering::Relaxed);
+                        return Err(refusal);
+                    }
+                }
             } else {
                 None
             });
         }
-        state.finish();
+        state.wait();
         // An executed sample of an unbound texture is the interpreter's
         // refusal; nothing of the work is written back.
         for (buffer, slots) in std::mem::take(&mut state.faults) {
@@ -556,25 +750,14 @@ impl Renderer {
                 // SAFETY: the buffer holds two words per texture slot of
                 // the draw; the GPU finished.
                 if unsafe { words.add(2 * slot + 1).read() } != 0 {
+                    self.writing_back.store(false, Ordering::Relaxed);
                     return Err(Unmodeled(refusal));
                 }
             }
         }
-        // Residents written back whose mirror still equals memory do after
-        // their own write-back too (residents do not overlap).
-        let current: Vec<bool> = state
-            .residents
-            .iter()
-            .map(|r| {
-                let (start, end) = r.extent();
-                r.stamp.is_some_and(|s| writes.unchanged(s, start, end))
-            })
-            .collect();
-        self.writing_back.store(true, Ordering::Relaxed);
         let mut result = Ok(());
-        let mut written = vec![false; state.residents.len()];
-        for ((resident, written), pack) in state.residents.iter_mut().zip(&mut written).zip(packs) {
-            if !wanted(resident) {
+        for ((resident, &wanted), pack) in state.residents.iter_mut().zip(&wanted).zip(packs) {
+            if !wanted {
                 continue;
             }
             if let Some(rect) = resident.dirty.take()
@@ -585,14 +768,13 @@ impl Renderer {
                     None => resident.write_back(rect, memory),
                 };
             }
-            *written = true;
         }
         self.writing_back.store(false, Ordering::Relaxed);
         let any_dirty = state.residents.iter().any(|r| r.dirty.is_some());
         self.any_dirty.store(any_dirty, Ordering::Relaxed);
         let stamp = writes.stamp();
-        for ((resident, current), written) in state.residents.iter_mut().zip(current).zip(written) {
-            if written {
+        for ((resident, current), wanted) in state.residents.iter_mut().zip(current).zip(wanted) {
+            if wanted {
                 resident.stamp = current.then_some(stamp);
             }
         }
@@ -622,7 +804,7 @@ impl Renderer {
                 .any(|r| r.dirty.is_some() && overlap(r.extent(), range))
         };
         if overlaps {
-            self.write_back(memory, writes, Some(range))?;
+            self.write_back(memory, writes, Scope::Range(range.0, range.1))?;
         }
         Ok(())
     }
@@ -756,40 +938,16 @@ impl Renderer {
                 Ok(bound) => bound,
                 Err(reason) => return self.fall_back(reason),
             };
-        // Textures and samplers. A handle that names no texture is bound to
-        // a placeholder and marked: the program records an executed sample
-        // of it, which `flush` refuses as the interpreter does (see
-        // `shader::msl` `texture.rs`). netConnect's uber-shader names slots
-        // its draws leave unset (TIC index 0xfffff) on branches they do not
-        // take.
-        let mut bound = Vec::new();
-        let mut unbound = Vec::new();
-        for (slot, &handle_offset) in translated.textures.iter().enumerate() {
+        // The texture handles the program samples through.
+        let mut handles = Vec::with_capacity(translated.textures.len());
+        for &handle_offset in &translated.textures {
             let Some((data, _)) = draw.constants.get(draw.texture_buffer_index as usize) else {
                 return self.fall_back("texture handle buffer unbound".into());
             };
             let Some(bytes) = data.get(handle_offset as usize..handle_offset as usize + 4) else {
                 return self.fall_back("texture handle outside the constant buffer".into());
             };
-            let handle = u32::from_le_bytes(bytes.try_into().expect("4 bytes"));
-            let resolved = draw.textures.resolve(handle);
-            let (texture, tsc) = match resolved {
-                Ok(resolved) => resolved,
-                Err(refusal) => {
-                    unbound.push((slot, refusal.0));
-                    bound.push(None);
-                    continue;
-                }
-            };
-            if let Err(reason) = format::check_texture(&texture, &tsc) {
-                return self.fall_back(reason);
-            }
-            let bias = if translated.implicit_lod[slot] {
-                tsc.lod_bias
-            } else {
-                0.0
-            };
-            bound.push(Some((texture, tsc, bias)));
+            handles.push(u32::from_le_bytes(bytes.try_into().expect("4 bytes")));
         }
         // Targets.
         let mut attachments = Vec::new();
@@ -833,6 +991,47 @@ impl Renderer {
             )
             .collect();
         let samples = draw.multisample.samples;
+        // Before the targets' residents are taken: resolving a texture may
+        // drop residents (see [`Renderer::composite`]).
+        // Textures and samplers. A handle that names no texture is bound to
+        // a placeholder and marked: the program records an executed sample
+        // of it, which `flush` refuses as the interpreter does (see
+        // `shader::msl` `texture.rs`). netConnect's uber-shader names slots
+        // its draws leave unset (TIC index 0xfffff) on branches they do not
+        // take. A texture with levels held as render targets is sampled
+        // from them ([`Composite`]); any other is decoded from memory.
+        let mut bound = Vec::new();
+        let mut unbound = Vec::new();
+        for (slot, &handle) in handles.iter().enumerate() {
+            let (tic, tsc) = match draw.textures.header(handle) {
+                Ok(header) => header,
+                Err(refusal) => {
+                    unbound.push((slot, refusal.0));
+                    bound.push(None);
+                    continue;
+                }
+            };
+            let sampled = match self.composite(memory, writes, &tic, &targets)? {
+                Some(texture) => Sampled::Composite(texture),
+                None => match draw.textures.resolve(handle) {
+                    Ok((texture, _)) => Sampled::Decoded(texture),
+                    Err(refusal) => {
+                        unbound.push((slot, refusal.0));
+                        bound.push(None);
+                        continue;
+                    }
+                },
+            };
+            if let Err(reason) = format::check_texture(&tic, &tsc) {
+                return self.fall_back(reason);
+            }
+            let bias = if translated.implicit_lod[slot] {
+                tsc.lod_bias
+            } else {
+                0.0
+            };
+            bound.push(Some((sampled, tic, tsc, bias)));
+        }
         let residents = self.residents(memory, writes, &targets, samples.log2, false)?;
 
         let mut state = self.state.lock().unwrap();
@@ -957,24 +1156,31 @@ impl Renderer {
         // Textures and samplers on the GPU.
         let mut gpu_textures = Vec::new();
         for entry in &bound {
-            let Some((texture, tsc, _)) = entry else {
+            let Some((sampled, tic, tsc, _)) = entry else {
                 gpu_textures.push(state.placeholder(gpu)?);
                 continue;
             };
-            let id = Arc::as_ptr(texture) as usize;
-            let metal = match state.textures.get(&id) {
-                Some((_, t)) => t.clone(),
-                None => {
-                    let t = upload_texture(gpu, texture)?;
-                    state.textures.insert(id, (Arc::clone(texture), t.clone()));
-                    t
+            let metal = match sampled {
+                Sampled::Composite(texture) => texture.clone(),
+                Sampled::Decoded(texture) => {
+                    let id = Arc::as_ptr(texture) as usize;
+                    match state.textures.get(&id) {
+                        Some((_, t)) => t.clone(),
+                        None => {
+                            let t = upload_texture(gpu, texture)?;
+                            state.textures.insert(id, (Arc::clone(texture), t.clone()));
+                            t
+                        }
+                    }
                 }
             };
-            let sampler = match state.samplers.get(&tsc.words) {
+            let (min, max) = tic.lod_range(tsc);
+            let key = (tsc.words, [min.to_bits(), max.to_bits()]);
+            let sampler = match state.samplers.get(&key) {
                 Some(s) => s.clone(),
                 None => {
-                    let s = build_sampler(gpu, texture, tsc);
-                    state.samplers.insert(tsc.words, s.clone(), 1);
+                    let s = build_sampler(gpu, tsc, (min, max));
+                    state.samplers.insert(key, s.clone(), 1);
                     s
                 }
             };
@@ -1013,7 +1219,7 @@ impl Renderer {
         }
         let biases: Vec<f32> = bound
             .iter()
-            .map(|b| b.as_ref().map_or(0.0, |b| b.2))
+            .map(|b| b.as_ref().map_or(0.0, |b| b.3))
             .chain([0.0])
             .collect();
         // Texture fault words: word 2i marks slot i unbound.
@@ -1540,12 +1746,23 @@ impl Renderer {
         log2: [u32; 2],
         overwrite: bool,
     ) -> Result<Vec<usize>, Unmodeled> {
-        self.state.lock().unwrap().trim_residents(targets);
+        {
+            let mut state = self.state.lock().unwrap();
+            // Over budget with nothing clean to drop: targets held on
+            // demand are written back, to be dropped too.
+            if state.trim_residents(targets) && state.residents.iter().any(|r| r.dirty.is_some())
+            {
+                drop(state);
+                self.settle(memory, writes)?;
+                self.state.lock().unwrap().trim_residents(targets);
+            }
+        }
         let other = |r: &Resident, surface: Surface, format: Content| {
             r.surface != surface || r.format != format || r.log2 != log2
         };
         // A resident of other dimensions, format or samples at overlapping
-        // memory is written back and dropped, before any index is taken.
+        // memory is written back and dropped, before any index is taken
+        // (and with no pass open that names one).
         for &(surface, format) in targets {
             let stale: bool = {
                 let state = self.state.lock().unwrap();
@@ -1555,8 +1772,10 @@ impl Renderer {
                     .any(|r| other(r, surface, format) && overlap(r.extent(), extent(&surface)))
             };
             if stale {
-                self.flush(memory, writes)?;
+                let (start, end) = extent(&surface);
+                self.write_back(memory, writes, Scope::Range(start, end))?;
                 let mut state = self.state.lock().unwrap();
+                state.submit();
                 state.residents.retain(|r| {
                     !(other(r, surface, format) && overlap(r.extent(), extent(&surface)))
                 });
@@ -1597,8 +1816,12 @@ impl Renderer {
             match found {
                 Some((index, true)) => indices.push(index),
                 // A target the caller replaces whole needs no look at
-                // memory: what it held does not matter.
-                Some((index, false)) if overwrite => {
+                // memory: what it held does not matter. (One held on demand
+                // keeps a mirror equal to memory, which tells a reuse of
+                // the memory later.)
+                Some((index, false))
+                    if overwrite && !self.state.lock().unwrap().residents[index].on_demand() =>
+                {
                     self.state.lock().unwrap().residents[index].stamp = Some(writes.stamp());
                     indices.push(index);
                 }
@@ -1616,17 +1839,25 @@ impl Renderer {
                     };
                     let stamp = writes.stamp();
                     let mut state = self.state.lock().unwrap();
-                    let resident = &mut state.residents[index];
-                    resident.mirror = mirror;
+                    state.residents[index].mirror = mirror;
                     match reloaded {
                         None => {}
                         Some(Ok(mut window)) => {
+                            // Work recorded or running may read the
+                            // texture (a depth buffer tested, not written):
+                            // it sees what the texture held when recorded.
+                            state.wait();
+                            let resident = &mut state.residents[index];
                             upload_surface(&resident.texture, &mut window, full, log2);
+                            state.versions += 1;
+                            let version = state.versions;
+                            let resident = &mut state.residents[index];
+                            resident.version = version;
                             resident.mirror = window;
                         }
                         Some(Err(refusal)) => return Err(refusal),
                     }
-                    resident.stamp = Some(stamp);
+                    state.residents[index].stamp = Some(stamp);
                     indices.push(index);
                 }
                 None => {
@@ -1646,6 +1877,7 @@ impl Renderer {
                         dirty: None,
                         stamp: Some(stamp),
                         used: 0,
+                        version: 0,
                     });
                     indices.push(state.residents.len() - 1);
                 }
@@ -1659,19 +1891,202 @@ impl Renderer {
         }
         Ok(indices)
     }
+
+    /// The Metal texture to sample for the texture `tic` describes when
+    /// levels of it are render targets held on the GPU and current
+    /// ([`Composite`]); `None` when none is (or the draw renders to one:
+    /// it then samples what memory holds once the target is written
+    /// back), and the texture is decoded from memory as any other.
+    fn composite(
+        &self,
+        memory: &dyn GpuMemory,
+        writes: &Writes,
+        tic: &Tic,
+        targets: &[(Surface, Content)],
+    ) -> Result<Option<Retained<MetalTexture>>, Unmodeled> {
+        // Most textures have no level at a resident's address.
+        {
+            let state = self.state.lock().unwrap();
+            if !state
+                .residents
+                .iter()
+                .any(|r| r.surface.address >= tic.address && r.log2 == [0, 0])
+            {
+                return Ok(None);
+            }
+        }
+        let Some(levels) = level_surfaces(tic) else {
+            return Ok(None);
+        };
+        // Which levels are residents: their content, how Metal's
+        // components of each give the header's, and whether they are
+        // known to hold what the channel's work so far makes of them.
+        let candidates: Vec<Option<(Content, [u32; 4], bool)>> = {
+            let state = self.state.lock().unwrap();
+            levels
+                .iter()
+                .map(|(surface, _)| {
+                    let resident = state
+                        .residents
+                        .iter()
+                        .find(|r| r.surface == *surface && r.log2 == [0, 0])?;
+                    let Content::Color(format) = resident.format else {
+                        return None;
+                    };
+                    let components = shared_components(tic, format)?;
+                    Some((resident.format, components, resident.current(writes)))
+                })
+                .collect()
+        };
+        let Some((_, components, _)) = candidates.iter().flatten().next().copied() else {
+            return Ok(None);
+        };
+        if candidates.iter().flatten().any(|c| c.1 != components)
+            || levels
+                .iter()
+                .zip(&candidates)
+                .any(|((surface, _), c)| c.is_some() && targets.iter().any(|t| t.0 == *surface))
+        {
+            return Ok(None);
+        }
+        // A resident not rendered to since the channel last signaled is
+        // compared with memory first, as before a draw to it.
+        let unchecked: Vec<(Surface, Content)> = levels
+            .iter()
+            .zip(&candidates)
+            .filter_map(|((surface, _), c)| match c {
+                Some((content, _, false)) => Some((*surface, *content)),
+                _ => None,
+            })
+            .collect();
+        if !unchecked.is_empty() {
+            self.residents(memory, writes, &unchecked, [0, 0], false)?;
+        }
+        let from_memory = |composite: &Composite| {
+            composite
+                .levels
+                .iter()
+                .zip(&candidates)
+                .all(|(level, c)| level.resident.is_some() == c.is_some())
+                && composite.levels.len() == candidates.len()
+        };
+        {
+            let mut state = self.state.lock().unwrap();
+            state.clock += 1;
+            let now = state.clock;
+            // The composite kept for the header, if its levels come from
+            // where they do now and those from memory are known to be
+            // unchanged.
+            let ready = state.composites.get_mut(&tic.words).is_some_and(|composite| {
+                composite.used = now;
+                from_memory(composite)
+                    && composite.levels.iter().all(|level| {
+                        level.resident.is_some()
+                            || writes.unchanged(
+                                composite.stamp,
+                                tic.address + level.range.start as u64,
+                                tic.address + level.range.end as u64,
+                            )
+                    })
+            });
+            if ready {
+                state.convert(&tic.words)?;
+                return Ok(state
+                    .composites
+                    .get(&tic.words)
+                    .map(|composite| composite.texture.clone()));
+            }
+        }
+        // The levels memory holds, read without the state held (a read
+        // may write targets back). What cannot be read or decoded is the
+        // decoder's refusal.
+        let Ok((_, footprint)) = Texture::footprint(tic) else {
+            return Ok(None);
+        };
+        let mut raw = vec![0u8; footprint as usize];
+        let memory_levels = || {
+            levels
+                .iter()
+                .zip(&candidates)
+                .filter(|(_, c)| c.is_none())
+                .map(|((_, range), _)| range.clone())
+        };
+        for range in memory_levels() {
+            let address = tic.address + range.start as u64;
+            if memory.probe(address, &mut raw[range]).is_none() {
+                return Ok(None);
+            }
+        }
+        let stamp = writes.stamp();
+        let mut state = self.state.lock().unwrap();
+        let unchanged = state.composites.get(&tic.words).is_some_and(|composite| {
+            from_memory(composite)
+                && memory_levels().all(|range| composite.raw[range.clone()] == raw[range])
+        });
+        if unchanged {
+            let composite = state.composites.get_mut(&tic.words).expect("found above");
+            composite.stamp = stamp;
+        } else {
+            let decoded = if candidates.iter().any(Option::is_none) {
+                match Texture::decode(&raw, tic) {
+                    Ok(decoded) => Some(decoded),
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                None
+            };
+            let residents: Vec<bool> = candidates.iter().map(Option::is_some).collect();
+            let composite = Composite::new(
+                Self::gpu(),
+                tic,
+                &levels,
+                &residents,
+                components,
+                decoded.as_ref(),
+                raw,
+                stamp,
+            )?;
+            state.clock += 1;
+            let composite = Composite {
+                used: state.clock,
+                ..composite
+            };
+            state.composites.insert(tic.words, composite);
+        }
+        state.convert(&tic.words)?;
+        Ok(state
+            .composites
+            .get(&tic.words)
+            .map(|composite| composite.texture.clone()))
+    }
 }
 
 impl State {
-    /// Ends recording and waits for the GPU.
-    fn finish(&mut self) {
+    /// Commits the command buffer being recorded, if any: the GPU starts
+    /// on it while later work is recorded into a new one. Command buffers
+    /// of one queue run in the order they were committed [public: Apple,
+    /// `MTLCommandQueue`: "command buffers are executed in the order in
+    /// which they are committed"], so the last one committed completes
+    /// last.
+    fn submit(&mut self) {
         if let Some(mut frame) = self.frame.take() {
             if let Some((encoder, _)) = frame.pass.take() {
                 encoder.endEncoding();
             }
             frame.command.commit();
-            frame.command.waitUntilCompleted();
+            self.submitted = Some(frame.command.clone());
         }
-        // Nothing recorded uses the arena's space any more.
+        self.pass_draws = 0;
+    }
+
+    /// Commits what is recorded and waits until the GPU has done all the
+    /// work committed so far.
+    fn wait(&mut self) {
+        self.submit();
+        if let Some(command) = self.submitted.take() {
+            command.waitUntilCompleted();
+        }
+        // Nothing recorded or running uses the arena's space any more.
         self.arena.reset();
     }
 
@@ -1711,9 +2126,11 @@ impl State {
         ) else {
             return Ok(None);
         };
+        // A pitch surface's mirror holds its rows without the padding
+        // between them (`surface::Window`): 8 rows a band.
         let pitch = match resident.surface.layout {
-            super::surface::Layout::Pitch { pitch } => Some(pitch),
-            super::surface::Layout::BlockLinear(_) => None,
+            super::surface::Layout::Pitch { .. } => (first.len() / 8) as u32,
+            super::surface::Layout::BlockLinear(_) => 0,
         };
         let words = PackWords {
             x0: texels.x0,
@@ -1723,7 +2140,7 @@ impl State {
             bpp,
             lx: resident.log2[0],
             ly: resident.log2[1],
-            pitch: pitch.unwrap_or(0),
+            pitch,
             band_bytes: first.len() as u32,
             start: first.start as u32,
         };
@@ -1841,6 +2258,23 @@ impl State {
     fn trim(&mut self) {
         self.textures
             .retain(|_, (texture, _)| Arc::strong_count(texture) > 1);
+        // Composites none of whose levels is a resident any more, and the
+        // least recently used beyond the limit.
+        let residents = &self.residents;
+        self.composites.retain(|_, composite| {
+            composite.levels.iter().any(|level| {
+                level.resident.is_some() && residents.iter().any(|r| r.surface == level.surface)
+            })
+        });
+        while self.composites.len() > COMPOSITE_LIMIT {
+            let oldest = self
+                .composites
+                .iter()
+                .min_by_key(|(_, composite)| composite.used)
+                .map(|(key, _)| *key)
+                .expect("not empty");
+            self.composites.remove(&oldest);
+        }
         let before = self.programs.len() + self.vertex_programs.len();
         self.programs
             .retain(|_, entry| Arc::strong_count(&entry.program) > 1);
@@ -1858,18 +2292,20 @@ impl State {
         }
     }
 
-    /// With no frame recording (so no resident is dirty or an attachment
-    /// of an open pass, and no index is held), drops the least recently
-    /// used residents other than `targets` while all of them take more
-    /// than [`RESIDENT_BUDGET`]. Guest memory holds everything they hold.
-    fn trim_residents(&mut self, targets: &[(Surface, Content)]) {
+    /// With no frame recording (so no resident is an attachment of an
+    /// open pass, and no index is held), drops the least recently used
+    /// clean residents other than `targets` while all of them take more
+    /// than [`RESIDENT_BUDGET`] (guest memory holds everything they
+    /// hold). Whether they still take more.
+    fn trim_residents(&mut self, targets: &[(Surface, Content)]) -> bool {
         if self.frame.is_some() {
-            return;
+            return false;
         }
-        let size = |r: &Resident| r.texture.allocatedSize() + r.mirror.data().len();
+        // The texture takes about what the mirror does: the surface.
+        let size = |r: &Resident| 2 * r.mirror.data().len();
         let mut total: usize = self.residents.iter().map(size).sum();
         if total <= RESIDENT_BUDGET {
-            return;
+            return false;
         }
         let mut order: Vec<(u64, usize)> = self
             .residents
@@ -1892,6 +2328,7 @@ impl State {
             index += 1;
             !drop[index - 1]
         });
+        total > RESIDENT_BUDGET
     }
 
     /// Resident `index` got `rect` rendered by the GPU. The first draw
@@ -1910,6 +2347,94 @@ impl State {
                 resident.stamp = Some(writes.stamp());
             }
         }
+        self.versions += 1;
+        self.residents[index].version = self.versions;
+    }
+
+    /// The kernel filling a composite's level from a resident
+    /// ([`CONVERT_SOURCE`]), made once.
+    fn convert_pipeline(&mut self) -> Result<Retained<ComputePipeline>, Unmodeled> {
+        if let Some(pipeline) = &self.convert_pipeline {
+            return Ok(pipeline.clone());
+        }
+        let gpu = Renderer::gpu();
+        let library = self.library(gpu, CONVERT_SOURCE.to_string())?;
+        let function = library
+            .newFunctionWithName(&NSString::from_str("convert_level"))
+            .ok_or_else(|| Unmodeled("Metal: no conversion function".into()))?;
+        let pipeline = gpu
+            .device
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|e| Unmodeled(format!("Metal: conversion pipeline: {e}")))?;
+        self.convert_pipeline = Some(pipeline.clone());
+        Ok(pipeline)
+    }
+
+    /// Fills the levels of composite `key` that are residents rendered
+    /// since they were last converted, after the work recorded so far.
+    fn convert(&mut self, key: &[u32; 8]) -> Result<(), Unmodeled> {
+        let Some(composite) = self.composites.get(key) else {
+            return Ok(());
+        };
+        let mut stale = Vec::new();
+        for (index, level) in composite.levels.iter().enumerate() {
+            let Some((view, converted)) = &level.resident else {
+                continue;
+            };
+            let Some(resident) = self.residents.iter().find(|r| r.surface == level.surface)
+            else {
+                continue;
+            };
+            if *converted != Some(resident.version) {
+                stale.push((
+                    index,
+                    resident.texture.clone(),
+                    view.clone(),
+                    resident.version,
+                    level.surface,
+                ));
+            }
+        }
+        if stale.is_empty() {
+            return Ok(());
+        }
+        let select = composite.select;
+        let pipeline = self.convert_pipeline()?;
+        let command = self.command()?;
+        let encoder = command
+            .computeCommandEncoder()
+            .ok_or_else(|| Unmodeled("Metal: no compute encoder".into()))?;
+        encoder.setComputePipelineState(&pipeline);
+        for (_, source, view, _, surface) in &stale {
+            // SAFETY: the kernel's bindings: the resident, the level and
+            // the component selection; the grid covers the level.
+            unsafe {
+                encoder.setTexture_atIndex(Some(source), 0);
+                encoder.setTexture_atIndex(Some(view), 1);
+                let bytes = NonNull::new(select.as_ptr().cast_mut().cast()).expect("non-null");
+                encoder.setBytes_length_atIndex(bytes, std::mem::size_of_val(&select), 0);
+            }
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: surface.width as usize,
+                    height: surface.height as usize,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 16,
+                    height: 16,
+                    depth: 1,
+                },
+            );
+        }
+        encoder.endEncoding();
+        let composite = self.composites.get_mut(key).expect("found above");
+        for (index, _, _, version, _) in stale {
+            if let Some((_, converted)) = &mut composite.levels[index].resident {
+                *converted = Some(version);
+            }
+        }
+        Ok(())
     }
 
     /// What an unbound texture slot is bound to (made once).
@@ -1966,25 +2491,26 @@ impl State {
             .copied()
             .zip(srgb.iter().copied())
             .collect();
-        if self.frame.is_none() {
-            let command = Renderer::gpu()
-                .queue
-                .commandBuffer()
-                .ok_or_else(|| Unmodeled("Metal: no command buffer".into()))?;
-            self.frame = Some(Frame {
-                command,
-                pass: None,
-            });
-        }
-        let frame = self.frame.as_mut().expect("just made");
-        if let Some((encoder, attachments)) = &frame.pass
+        if let Some(frame) = &self.frame
+            && let Some((encoder, attachments)) = &frame.pass
             && *attachments == wanted
+            && self.pass_draws < pass_draws_limit()
         {
+            self.pass_draws += 1;
             return Ok(encoder.clone());
         }
-        if let Some((encoder, _)) = frame.pass.take() {
-            encoder.endEncoding();
-        }
+        // Another pass: the GPU starts on the work recorded so far while
+        // this one is recorded.
+        self.submit();
+        self.pass_draws = 1;
+        let command = Renderer::gpu()
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| Unmodeled("Metal: no command buffer".into()))?;
+        let frame = self.frame.insert(Frame {
+            command,
+            pass: None,
+        });
         let descriptor = MTLRenderPassDescriptor::new();
         // Multisampled targets: their layers, one per sample.
         if let Some(&(first, _)) = wanted.first() {
@@ -2022,6 +2548,25 @@ impl State {
 impl Resident {
     fn extent(&self) -> (u64, u64) {
         extent(&self.surface)
+    }
+
+    /// Whether the target is written back only on demand rather than at
+    /// every signal: depth buffers and multisampled targets (see the
+    /// module documentation).
+    fn on_demand(&self) -> bool {
+        matches!(self.format, Content::Depth(_)) || self.log2 != [0, 0]
+    }
+
+    /// Whether the texture holds what the channel's work so far makes of
+    /// the surface: rendered to and not written back yet, or equal to
+    /// guest memory when last compared with nothing of the channel having
+    /// written there since.
+    fn current(&self, writes: &Writes) -> bool {
+        let (start, end) = self.extent();
+        self.dirty.is_some()
+            || self
+                .stamp
+                .is_some_and(|stamp| writes.unchanged(stamp, start, end))
     }
 
     /// Stores the texels [`State::pack`] packed, the GPU being done: its
@@ -2168,9 +2713,9 @@ struct Packed {
 }
 
 /// The words of the packing kernel ([`PACK_SOURCE`] `PackWords`): the
-/// texel rectangle, texel size, samples (log2 x, y), the pitch (0: block
-/// linear), the bytes per band of 8 rows and the mirror data offset of
-/// the first band packed.
+/// texel rectangle, texel size, samples (log2 x, y), the bytes of a row of
+/// a pitch surface as the mirror holds it (0: block linear), the bytes
+/// per band of 8 rows and the mirror data offset of the first band packed.
 #[repr(C)]
 struct PackWords {
     x0: u32,
@@ -2191,7 +2736,7 @@ struct PackWords {
 /// each, a 16-byte unit of byte column c and row r at ((c & 0x20) << 3) |
 /// ((r & 6) << 5) | ((c & 0x10) << 1) | ((r & 1) << 4) [public: Ryujinx
 /// `BlockLinearLayout.cs`, as `surface::Window`]; in a pitch band 8 rows of
-/// `pitch` bytes.
+/// `pitch` bytes (the mirror's rows, without the surface's padding).
 fn guest_offset(p: &PackWords, x: u32, y: u32) -> u32 {
     let band = (y >> 3) * p.band_bytes;
     let column = x * p.bpp;
@@ -2465,6 +3010,7 @@ fn new_target(
     descriptor.setUsage(
         MTLTextureUsage::RenderTarget
             | MTLTextureUsage::ShaderRead
+            | MTLTextureUsage::ShaderWrite
             | MTLTextureUsage::PixelFormatView,
     );
     gpu.device
@@ -2552,7 +3098,239 @@ fn upload_texture(gpu: &Gpu, texture: &Texture) -> Result<Retained<MetalTexture>
     Ok(metal)
 }
 
-fn build_sampler(gpu: &Gpu, texture: &Texture, tsc: &Tsc) -> Retained<Sampler> {
+/// What a texture slot of a draw samples.
+enum Sampled {
+    /// A texture decoded from guest memory (`resources::TextureCache`).
+    Decoded(Arc<Texture>),
+    /// A texture with levels held as render targets ([`Composite`]).
+    Composite(Retained<MetalTexture>),
+}
+
+/// Composites kept \[assumption: a guest renders into a handful of the
+/// textures it samples (Minecraft: its block atlas); a dropped one is made
+/// again when next sampled\].
+const COMPOSITE_LIMIT: usize = 16;
+
+/// A texture some of whose levels are render targets held on the GPU
+/// (Minecraft draws level 0 of its four-level block atlas every frame and
+/// samples it right away): a Metal texture as [`upload_texture`] makes,
+/// whose levels that are residents are filled from them on the GPU
+/// ([`State::convert`], whenever they were rendered to since) and the
+/// others from guest memory. Sampling it needs no write-back, decode or
+/// upload of what was rendered; guest memory gets the rendered levels as
+/// any render target's, at the next write-back.
+struct Composite {
+    /// RGBA32Float, the levels from the header's base level to its
+    /// maximum level.
+    texture: Retained<MetalTexture>,
+    /// The same levels.
+    levels: Vec<CompositeLevel>,
+    /// For each component the header's swizzle yields, which of the
+    /// resident's red, green, blue and alpha (0-3) as Metal reads them,
+    /// zero (4) or one (5) it is.
+    select: [u32; 4],
+    /// The bytes of the texture's footprint the levels from memory were
+    /// decoded from (zeros where a resident's level lies), and when they
+    /// were last known to equal memory.
+    raw: Vec<u8>,
+    stamp: Stamp,
+    /// [`State::clock`] when last sampled.
+    used: u64,
+}
+
+struct CompositeLevel {
+    /// The level as a surface, and its bytes in the footprint.
+    surface: Surface,
+    range: std::ops::Range<usize>,
+    /// For a level that is a resident: the view of the level the kernel
+    /// writes, and the resident's version it last converted.
+    resident: Option<(Retained<MetalTexture>, Option<u64>)>,
+}
+
+impl Composite {
+    /// The composite of `tic`, whose `levels` ([`level_surfaces`]) are
+    /// residents where `residents` says and otherwise taken from
+    /// `decoded` (a decode of `raw`); resident levels are filled by the
+    /// next [`State::convert`].
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        gpu: &Gpu,
+        tic: &Tic,
+        levels: &[(Surface, std::ops::Range<usize>)],
+        residents: &[bool],
+        components: [u32; 4],
+        decoded: Option<&Texture>,
+        raw: Vec<u8>,
+        stamp: Stamp,
+    ) -> Result<Composite, Unmodeled> {
+        let (width, height) = (levels[0].0.width, levels[0].0.height);
+        // SAFETY: plain descriptor construction.
+        let descriptor = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA32Float,
+                width as usize,
+                height as usize,
+                levels.len() > 1,
+            )
+        };
+        // SAFETY: the level count fits the base level's dimensions (the
+        // header was validated by `level_surfaces`).
+        unsafe { descriptor.setMipmapLevelCount(levels.len()) };
+        descriptor.setStorageMode(MTLStorageMode::Shared);
+        descriptor.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite);
+        let texture = gpu
+            .device
+            .newTextureWithDescriptor(&descriptor)
+            .ok_or_else(|| Unmodeled("Metal: texture allocation failed".into()))?;
+        let mut made = Vec::with_capacity(levels.len());
+        for (index, ((surface, range), &resident)) in levels.iter().zip(residents).enumerate() {
+            let resident = if resident {
+                // SAFETY: one level and the one slice of the texture.
+                let view = unsafe {
+                    texture.newTextureViewWithPixelFormat_textureType_levels_slices(
+                        MTLPixelFormat::RGBA32Float,
+                        MTLTextureType::Type2D,
+                        NSRange::new(index, 1),
+                        NSRange::new(0, 1),
+                    )
+                }
+                .ok_or_else(|| Unmodeled("Metal: level view".into()))?;
+                Some((view, None))
+            } else {
+                let (w, h, _, texels) = decoded
+                    .and_then(|decoded| decoded.level(tic.base_level + index as u32))
+                    .ok_or_else(|| Unmodeled("Metal: texture level".into()))?;
+                // SAFETY: `texels` holds the level's w*h RGBA32F texels.
+                unsafe {
+                    texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                        region(Rect {
+                            x0: 0,
+                            y0: 0,
+                            x1: w,
+                            y1: h,
+                        }),
+                        index,
+                        NonNull::new(texels.as_ptr() as *mut _).expect("non-null"),
+                        w as usize * 16,
+                    );
+                }
+                None
+            };
+            made.push(CompositeLevel {
+                surface: *surface,
+                range: range.clone(),
+                resident,
+            });
+        }
+        // As `Texture::decode` applies the swizzle.
+        let select = tic.swizzle.map(|s| match s {
+            2..=5 => components[usize::from(s - 2)],
+            6 | 7 => 5,
+            _ => 4,
+        });
+        Ok(Composite {
+            texture,
+            levels: made,
+            select,
+            raw,
+            stamp,
+            used: 0,
+        })
+    }
+}
+
+/// The levels of `tic` from its base level to its maximum level as the
+/// surfaces a render target at each would be, with the bytes of each in
+/// the texture's footprint; `None` for a texture that is not a plain 2D
+/// one of one layer and uncompressed one-texel blocks without sRGB
+/// decoding.
+fn level_surfaces(tic: &Tic) -> Option<Vec<(Surface, std::ops::Range<usize>)>> {
+    use super::surface::Layout;
+    use super::texture::format::Encoding;
+    let format = tic.format;
+    if tic.target != Target::Texture2D
+        || tic.array
+        || tic.shape.layers != 1
+        || tic.shape.depth != 1
+        || tic.srgb
+        || !matches!(format.encoding, Encoding::Packed(_))
+        || (format.block_width, format.block_height) != (1, 1)
+        || tic.max_level < tic.base_level
+    {
+        return None;
+    }
+    let bytes_per_pixel = format.bytes_per_block;
+    if let Some(pitch) = tic.pitch {
+        return Some(vec![(
+            Surface {
+                address: tic.address,
+                width: tic.shape.width,
+                height: tic.shape.height,
+                bytes_per_pixel,
+                layout: Layout::Pitch { pitch },
+            },
+            0..pitch as usize * tic.shape.height as usize,
+        )]);
+    }
+    let image = super::texture::layout::block_linear_image(&tic.shape, tic.block).ok()?;
+    let levels = image
+        .levels
+        .get(tic.base_level as usize..=tic.max_level as usize)?;
+    Some(
+        levels
+            .iter()
+            .map(|level| {
+                (
+                    Surface {
+                        address: tic.address + level.offset,
+                        width: level.width,
+                        height: level.height,
+                        bytes_per_pixel,
+                        layout: Layout::BlockLinear(level.surface.block()),
+                    },
+                    level.offset as usize..(level.offset + level.size) as usize,
+                )
+            })
+            .collect(),
+    )
+}
+
+/// For each of the red, green, blue and alpha a texture header `tic`
+/// decodes from a texel's bytes, which of the red, green, blue and alpha
+/// (0-3) Metal reads from a resident of color format `format` holding the
+/// same bytes is the same value; `None` unless that holds for every
+/// texel. A8B8G8R8 UNORM headers over the four 8-bit UNORM target
+/// layouts: both sides are the byte / 255 (`texture::format::unorm_to_f32`;
+/// Metal's conversion of normalized formats [public: Apple, Metal Shading
+/// Language Specification, "Conversion rules for normalized integer
+/// pixel data types"]). An sRGB target's resident holds its bytes in the
+/// linear format ([`format::pixel_format`]), so a header without sRGB
+/// decoding reads them raw there too.
+fn shared_components(tic: &Tic, format: ColorFormat) -> Option<[u32; 4]> {
+    if tic.format.raw != 0x08 || tic.types != [ComponentType::Unorm; 4] || tic.srgb {
+        return None;
+    }
+    match format {
+        ColorFormat::Rgba8Unorm | ColorFormat::Rgba8Srgb => Some([0, 1, 2, 3]),
+        ColorFormat::Bgra8Unorm | ColorFormat::Bgra8Srgb => Some([2, 1, 0, 3]),
+        _ => None,
+    }
+}
+
+/// The kernel filling a level of a [`Composite`] from the resident that
+/// is the level: each texel as Metal reads it from the resident, its
+/// components selected by `select` ([`Composite::select`]).
+const CONVERT_SOURCE: &str = r#"#include <metal_stdlib>
+using namespace metal;
+kernel void convert_level(texture2d<float, access::read> source [[texture(0)]], texture2d<float, access::write> level [[texture(1)]], constant uint* select [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {
+    if (g.x >= level.get_width() || g.y >= level.get_height()) { return; }
+    const float4 c = source.read(g);
+    const float v[6] = { c.x, c.y, c.z, c.w, 0.0f, 1.0f };
+    level.write(float4(v[select[0]], v[select[1]], v[select[2]], v[select[3]]), g);
+}
+"#;
+
+fn build_sampler(gpu: &Gpu, tsc: &Tsc, (min, max): (f32, f32)) -> Retained<Sampler> {
     let descriptor = MTLSamplerDescriptor::new();
     let filter = |linear: bool| {
         if linear {
@@ -2580,7 +3358,6 @@ fn build_sampler(gpu: &Gpu, texture: &Texture, tsc: &Tsc) -> Retained<Sampler> {
     descriptor.setBorderColor(
         format::border_color(tsc).unwrap_or(MTLSamplerBorderColor::TransparentBlack),
     );
-    let (min, max) = texture.lod_range(tsc);
     descriptor.setLodMinClamp(min);
     descriptor.setLodMaxClamp(max);
     gpu.device
@@ -2713,6 +3490,15 @@ impl Arena {
         self.chunks.retain(|chunk| chunk.length() <= Self::CHUNK);
         self.current = 0;
         self.used = 0;
+    }
+
+    /// Chunks holding data of work recorded since the last reset.
+    fn chunks_in_use(&self) -> usize {
+        if self.chunks.is_empty() {
+            0
+        } else {
+            self.current + 1
+        }
     }
 }
 

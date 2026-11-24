@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::inline::{self, Completion, InlineToMemory};
 use super::mme::{MacroTarget, Mme};
 use super::pipeline::{
-    self, Batch, Bindings, Caches, ConstantBuffer, Context, Element, Registers, Topology,
+    self, Batch, Bindings, Caches, ConstantBuffer, Context, Element, IndexRun, Registers, Topology,
 };
 use super::surface::{Rect, Window};
 use super::{GpuMemory, Hooks, Unmodeled};
@@ -666,6 +666,7 @@ impl ThreeD {
             instance: self.instance,
             base_instance: 0,
             elements: Vec::new(),
+            run: None,
         });
         Ok(())
     }
@@ -692,6 +693,7 @@ impl ThreeD {
         let id_base = self.registers[SET_VERTEX_ID_BASE as usize];
         let from_start = self.registers[SET_DA_OUTPUT as usize] & (1 << 12) != 0;
         let batch = self.batch(DRAW_VERTEX_ARRAY, count)?;
+        batch.settle();
         batch.elements.extend((0..count).map(|i| {
             let fetch = start.wrapping_add(i);
             let id = if from_start { fetch } else { i };
@@ -709,20 +711,25 @@ impl ThreeD {
     /// `SET_VERTEX_ID_BASE` (NVN's base-vertex draws set both, starter
     /// macro 29).
     fn element(&self, index: u32) -> Element {
-        let restart = self.registers[SET_DA_PRIMITIVE_RESTART as usize] & 1 != 0;
-        if restart && index == self.registers[SET_DA_PRIMITIVE_RESTART_INDEX as usize] {
-            Element::Restart
-        } else {
-            Element::Vertex {
-                fetch: index.wrapping_add(self.registers[SET_GLOBAL_BASE_VERTEX_INDEX as usize]),
-                id: index.wrapping_add(self.registers[SET_VERTEX_ID_BASE as usize]),
-            }
-        }
+        pipeline::indexed_element(
+            index,
+            self.restart_index(),
+            self.registers[SET_GLOBAL_BASE_VERTEX_INDEX as usize],
+            self.registers[SET_VERTEX_ID_BASE as usize],
+        )
+    }
+
+    /// The primitive restart index, if restart is enabled.
+    fn restart_index(&self) -> Option<u32> {
+        (self.registers[SET_DA_PRIMITIVE_RESTART as usize] & 1 != 0)
+            .then(|| self.registers[SET_DA_PRIMITIVE_RESTART_INDEX as usize])
     }
 
     fn push_inline(&mut self, index: u32, _count: u32) -> Result<(), Unmodeled> {
         let element = self.element(index);
-        self.batch(DRAW_INLINE_INDEX, index)?.elements.push(element);
+        let batch = self.batch(DRAW_INLINE_INDEX, index)?;
+        batch.settle();
+        batch.elements.push(element);
         Ok(())
     }
 
@@ -757,17 +764,22 @@ impl ThreeD {
         memory
             .read(start, &mut bytes)
             .ok_or_else(|| Unmodeled(format!("3D: index buffer at unmapped {start:#x}")))?;
-        let elements: Vec<Element> = bytes
-            .chunks(bytes_per_index as usize)
-            .map(|chunk| {
-                let mut word = [0; 4];
-                word[..chunk.len()].copy_from_slice(chunk);
-                self.element(u32::from_le_bytes(word))
-            })
-            .collect();
-        self.batch(DRAW_INDEX_BUFFER, count)?
-            .elements
-            .extend(elements);
+        // Kept as the buffer's bytes: a batch that is this one run is
+        // drawn from them (`pipeline::IndexRun`).
+        let run = IndexRun {
+            bytes,
+            size: bytes_per_index as u32,
+            restart: self.restart_index(),
+            base_vertex: self.registers[SET_GLOBAL_BASE_VERTEX_INDEX as usize],
+            id_base: self.registers[SET_VERTEX_ID_BASE as usize],
+        };
+        let batch = self.batch(DRAW_INDEX_BUFFER, count)?;
+        if batch.is_empty() {
+            batch.run = Some(run);
+        } else {
+            batch.settle();
+            batch.elements.extend(run.elements());
+        }
         Ok(())
     }
 
@@ -776,7 +788,7 @@ impl ThreeD {
             .batch
             .take()
             .ok_or_else(|| refuse(END, 0, "END without BEGIN"))?;
-        if !self.rendering() || batch.elements.is_empty() {
+        if !self.rendering() || batch.is_empty() {
             return Ok(());
         }
         batch.base_instance = self.registers[SET_GLOBAL_BASE_INSTANCE_INDEX as usize];

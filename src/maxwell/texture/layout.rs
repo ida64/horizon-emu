@@ -113,6 +113,11 @@ impl BlockLinearSurface {
         u64::from(depth.div_ceil(1 << self.block.block_depth_log2)) * self.slice_size
     }
 
+    /// The block the surface is laid out in.
+    pub fn block(&self) -> BlockLinear {
+        self.block
+    }
+
     /// Width of the surface in GOBs.
     pub fn width_gobs(&self) -> u32 {
         self.width_gobs

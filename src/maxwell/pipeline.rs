@@ -123,8 +123,69 @@ pub enum Element {
     Restart,
 }
 
-/// A batch of vertices between `BEGIN` and `END`.
+/// The element an index of the index buffer is: a primitive restart
+/// (`restart`, the restart index if enabled, compared before any base is
+/// added), or a vertex fetched at the index plus `base_vertex`
+/// (`SET_GLOBAL_BASE_VERTEX_INDEX`) whose ID is the index plus `id_base`
+/// (`SET_VERTEX_ID_BASE`).
+pub fn indexed_element(index: u32, restart: Option<u32>, base_vertex: u32, id_base: u32) -> Element {
+    if restart == Some(index) {
+        Element::Restart
+    } else {
+        Element::Vertex {
+            fetch: index.wrapping_add(base_vertex),
+            id: index.wrapping_add(id_base),
+        }
+    }
+}
+
+/// A run of the index buffer as a draw names it, kept as the buffer's
+/// bytes: a batch that is one run is drawn from them without a list of
+/// its elements ([`Batch::run`]).
+#[derive(Debug, Clone)]
+pub struct IndexRun {
+    /// The indices, `size` bytes each, little-endian.
+    pub bytes: Vec<u8>,
+    /// Bytes per index: 1, 2 or 4.
+    pub size: u32,
+    /// The primitive restart index, if restart is enabled.
+    pub restart: Option<u32>,
+    /// `SET_GLOBAL_BASE_VERTEX_INDEX` and `SET_VERTEX_ID_BASE`.
+    pub base_vertex: u32,
+    pub id_base: u32,
+}
+
+impl IndexRun {
+    /// Indices in the run.
+    pub fn len(&self) -> usize {
+        self.bytes.len() / self.size as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// The indices' values.
+    pub fn indices(&self) -> impl Iterator<Item = u32> + '_ {
+        self.bytes.chunks_exact(self.size as usize).map(|chunk| {
+            let mut word = [0; 4];
+            word[..chunk.len()].copy_from_slice(chunk);
+            u32::from_le_bytes(word)
+        })
+    }
+
+    /// The run's elements ([`indexed_element`]).
+    pub fn elements(&self) -> Vec<Element> {
+        self.indices()
+            .map(|index| indexed_element(index, self.restart, self.base_vertex, self.id_base))
+            .collect()
+    }
+}
+
+/// A batch of vertices between `BEGIN` and `END`. Saved in machine
+/// snapshots as its elements ([`SavedBatch`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(into = "SavedBatch", from = "SavedBatch")]
 pub struct Batch {
     pub topology: Topology,
     /// Instance ID the shader reads (a\[0x2f8\]).
@@ -132,7 +193,66 @@ pub struct Batch {
     /// `SET_GLOBAL_BASE_INSTANCE_INDEX`, added to the instance for
     /// per-instance vertex fetch.
     pub base_instance: u32,
+    /// The elements, unless `run` holds them.
     pub elements: Vec<Element>,
+    /// The batch's elements as one run of the index buffer, when that is
+    /// all the batch is (`elements` is empty then): the elements are
+    /// listed only where something takes them one by one
+    /// ([`Batch::settle`]).
+    pub run: Option<IndexRun>,
+}
+
+impl Batch {
+    /// Elements in the batch.
+    pub fn len(&self) -> usize {
+        self.run
+            .as_ref()
+            .map_or(self.elements.len(), IndexRun::len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Lists the elements of `run`, if the batch is one.
+    pub fn settle(&mut self) {
+        if let Some(run) = self.run.take() {
+            self.elements = run.elements();
+        }
+    }
+}
+
+/// A [`Batch`] as machine snapshots hold it: its elements listed.
+#[derive(Serialize, Deserialize)]
+struct SavedBatch {
+    topology: Topology,
+    instance: u32,
+    base_instance: u32,
+    elements: Vec<Element>,
+}
+
+impl From<Batch> for SavedBatch {
+    fn from(mut batch: Batch) -> SavedBatch {
+        batch.settle();
+        SavedBatch {
+            topology: batch.topology,
+            instance: batch.instance,
+            base_instance: batch.base_instance,
+            elements: batch.elements,
+        }
+    }
+}
+
+impl From<SavedBatch> for Batch {
+    fn from(saved: SavedBatch) -> Batch {
+        Batch {
+            topology: saved.topology,
+            instance: saved.instance,
+            base_instance: saved.base_instance,
+            elements: saved.elements,
+            run: None,
+        }
+    }
 }
 
 /// A constant buffer binding: address and size in bytes.
@@ -1044,6 +1164,16 @@ fn clip_polygon(polygon: Vec<ClipVertex>, plane: ClipPlane) -> Vec<ClipVertex> {
 pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result<(), Unmodeled> {
     let r = context.registers;
     check_unmodeled_state(r)?;
+    // The elements listed, for the stages that take them one by one.
+    let listed;
+    let batch = if batch.run.is_some() {
+        let mut batch = batch.clone();
+        batch.settle();
+        listed = batch;
+        &listed
+    } else {
+        batch
+    };
     let vertex = program(context, caches, VERTEX_PIPELINE)?.ok_or_else(|| {
         refuse(
             "draw without a vertex shader",
@@ -1469,6 +1599,7 @@ fn geometry_stage(
         instance: batch.instance,
         base_instance: batch.base_instance,
         elements,
+        run: None,
     };
     Ok((batch, shaded))
 }
@@ -1763,7 +1894,7 @@ fn rasterize(
         }
         // The software renderer reads memory from several threads; all
         // of Metal's work is made visible before it starts.
-        metal.flush(context.memory, context.writes)?;
+        metal.settle(context.memory, context.writes)?;
     }
     let texels = samples.texels(bounds);
     for (surface, _) in &targets {

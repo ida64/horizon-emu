@@ -562,7 +562,8 @@ fn depth_and_stencil_clears(kind: super::RendererKind) {
         call(&mut channel, &ram, 0, method, value);
     }
     let words = |channel: &mut Channel, ram: &Ram| -> Vec<u32> {
-        channel.flush(ram).unwrap();
+        // Depth buffers are held on demand by the Metal renderer.
+        channel.settle(ram).unwrap();
         ram.bytes(0x4000, 16 * 8 * 4)
             .as_chunks::<4>()
             .0
@@ -1121,7 +1122,8 @@ fn depth_tested_frame(
         frame.method(0x0d78, 4);
         frame.method(0x1614, 0);
     }
-    frame.channel.flush(&frame.ram).unwrap();
+    // The depth buffer too (held on demand by the Metal renderer).
+    frame.channel.settle(&frame.ram).unwrap();
     if let Some(metal) = &frame.channel.hooks.metal {
         assert_eq!(metal.fallbacks(), (2, vec![]), "Metal drew both quads");
     }
@@ -1237,7 +1239,8 @@ fn stencil_tested_frame(
         frame.method(0x0d78, 4);
         frame.method(0x1614, 0);
     }
-    frame.channel.flush(&frame.ram).unwrap();
+    // The depth buffer too (held on demand by the Metal renderer).
+    frame.channel.settle(&frame.ram).unwrap();
     let counts = frame.channel.hooks.metal.as_ref().map(|m| m.fallbacks());
     (
         frame.ram.bytes(TARGET, (SIZE * SIZE * 4) as usize),
@@ -1814,7 +1817,8 @@ fn multisampled_frame(
         frame.method(0x0d78, 4);
         frame.method(0x1614, 0);
     }
-    frame.channel.flush(&frame.ram).unwrap();
+    // Multisampled targets are held on demand by the Metal renderer.
+    frame.channel.settle(&frame.ram).unwrap();
     if let Some(metal) = &frame.channel.hooks.metal {
         assert_eq!(
             metal.fallbacks(),
@@ -2065,3 +2069,4 @@ fn native_draws_match_software() {
 }
 
 mod lines;
+mod residents;

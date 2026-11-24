@@ -10,15 +10,20 @@
 //! `src_x0 + i * du_dx` with `ORIGIN_CORNER` (Ryujinx's reading of the
 //! origin modes: with CORNER the API adds half a step itself); `src_x0`,
 //! `du_dx` and their y counterparts are 32.32 fixed point.
+//!
+//! On a channel that renders with Metal, a blit that only moves texels'
+//! bytes from a surface the renderer holds runs on the GPU
+//! ([`super::metal::blit`]), from the columns and rows worked out here.
 
 use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
+use super::metal::blit::Blit;
 use super::surface::{Layout, Rect, Surface, Window};
 use super::texture::format::{ColorFormat, f32_to_unorm, unorm_to_f32};
 use super::texture::layout::BlockLinear;
-use super::{GpuMemory, Unmodeled};
+use super::{GpuMemory, Hooks, Unmodeled};
 
 /// Method registers of the class (below the macro methods).
 const METHODS: usize = 0xE00;
@@ -98,6 +103,7 @@ impl TwoD {
         method: u32,
         argument: u32,
         memory: &dyn GpuMemory,
+        hooks: &Hooks,
     ) -> Result<(), Unmodeled> {
         let index = method as usize;
         if index >= METHODS {
@@ -121,7 +127,7 @@ impl TwoD {
                 };
                 Ok(())
             }
-            PIXELS_FROM_MEMORY_SRC_Y0_INT => self.blit(memory),
+            PIXELS_FROM_MEMORY_SRC_Y0_INT => self.blit(memory, hooks),
             _ => Ok(()),
         }
     }
@@ -165,7 +171,7 @@ impl TwoD {
         (i64::from(self.registers[frac + 1] as i32) << 32) | i64::from(self.registers[frac])
     }
 
-    fn blit(&mut self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+    fn blit(&mut self, memory: &dyn GpuMemory, hooks: &Hooks) -> Result<(), Unmodeled> {
         let r = &self.registers;
         let enabled = match r[SET_RENDER_ENABLE_OVERRIDE] & 3 {
             1 => true,
@@ -266,10 +272,6 @@ impl TwoD {
             x1: sx1,
             y1: sy1,
         };
-        // The loaded source texels, row-major, as stored.
-        let source_bpp = source_format.bytes_per_pixel() as usize;
-        let mut texels = vec![0u8; (sx1 - sx0) as usize * (sy1 - sy0) as usize * source_bpp];
-        Window::read_rect(memory, source, loaded, &mut texels)?;
         let taps = |range: std::ops::Range<u32>, start: u32, origin: f64, step: f64, low, high| {
             range
                 .map(|i| Tap::new(position(i, start, origin, step), bilinear, low, high))
@@ -281,6 +283,30 @@ impl TwoD {
             bilinear,
             span_width: (sx1 - sx0) as usize,
         };
+        // A blit that moves bytes, from a surface Metal holds: on the GPU,
+        // with no look at either surface's memory.
+        if let Some(metal) = &hooks.metal
+            && sampling.moves_bytes(source_format, destination_format)
+        {
+            let texels = |taps: &[Tap], low: u32| -> Vec<u32> {
+                taps.iter().map(|tap| low + tap.first as u32).collect()
+            };
+            let blit = Blit {
+                source,
+                destination,
+                format: source_format,
+                rect,
+                columns: &texels(&sampling.columns, sx0),
+                rows: &texels(&sampling.rows, sy0),
+            };
+            if metal.blit(memory, &hooks.writes, &blit)? {
+                return Ok(());
+            }
+        }
+        // The loaded source texels, row-major, as stored.
+        let source_bpp = source_format.bytes_per_pixel() as usize;
+        let mut texels = vec![0u8; (sx1 - sx0) as usize * (sy1 - sy0) as usize * source_bpp];
+        Window::read_rect(memory, source, loaded, &mut texels)?;
         let destination_bpp = destination_format.bytes_per_pixel() as usize;
         let mut pixels = vec![0u8; sampling.columns.len() * sampling.rows.len() * destination_bpp];
         resample(
@@ -344,6 +370,23 @@ struct Sampling {
     span_width: usize,
 }
 
+impl Sampling {
+    /// Whether every pixel is one texel's decoded value: nearest sampling,
+    /// or a bilinear filter whose weights are all 0 on a source without
+    /// floats (see [`resample`]).
+    fn point(&self, from: ColorFormat) -> bool {
+        let unweighted = |taps: &[Tap]| taps.iter().all(|tap| tap.weight == 0.0);
+        !self.bilinear || (!is_float(from) && unweighted(&self.columns) && unweighted(&self.rows))
+    }
+
+    /// Whether the blit from `from` to `to` copies texels' bytes: point
+    /// samples between texels of one format that decodes and encodes to
+    /// the same bits (see [`keeps_bits`]).
+    fn moves_bytes(&self, from: ColorFormat, to: ColorFormat) -> bool {
+        from == to && keeps_bits(from) && self.point(from)
+    }
+}
+
 /// Fills `pixels` (the destination rectangle, row-major, in the destination
 /// format) from `texels` (the loaded source, row-major, in the source
 /// format). Bilinear filtering interpolates in `f32` between the decoded
@@ -360,10 +403,8 @@ fn resample(
     sampling: &Sampling,
     pixels: &mut [u8],
 ) {
-    let unweighted = |taps: &[Tap]| taps.iter().all(|tap| tap.weight == 0.0);
-    let point = !sampling.bilinear
-        || (!is_float(from) && unweighted(&sampling.columns) && unweighted(&sampling.rows));
-    if point && from == to && keeps_bits(from) {
+    let point = sampling.point(from);
+    if sampling.moves_bytes(from, to) {
         match from.bytes_per_pixel() {
             1 => gather::<1>(texels, sampling, pixels),
             2 => gather::<2>(texels, sampling, pixels),
@@ -912,7 +953,7 @@ mod tests {
             let bytes = random.bytes(MEMORY);
             let fast = Flat(Mutex::new(bytes.clone()));
             let reference = Flat(Mutex::new(bytes.clone()));
-            let outcome = two_d.blit(&fast);
+            let outcome = two_d.blit(&fast, &Hooks::default());
             let expected = reference_blit(&two_d, &reference);
             assert_eq!(outcome, expected, "case {case}");
             let (fast, reference) = (
@@ -961,11 +1002,9 @@ mod tests {
     }
 
     /// The MSAA 2x1 sample-grid reduction Minecraft blits every frame: a
-    /// 2560x720 A8R8G8B8 block-linear surface to 1280x720, du 2, u0 0.5,
-    /// bilinear, origin centre.
-    #[test]
-    fn the_sample_grid_reduction_matches_the_per_pixel_blit() {
-        let mut random = Random(0x1280);
+    /// 2560x720 A8R8G8B8 block-linear surface at 0 to a 1280x720 one at
+    /// 8 MiB, du 2, u0 0.5, bilinear, origin centre.
+    fn sample_grid_reduction() -> TwoD {
         let mut two_d = TwoD::default();
         let r = &mut two_d.registers;
         r[SET_OPERATION] = 3;
@@ -988,14 +1027,217 @@ mod tests {
         set_fixed(&mut two_d, SET_PIXELS_FROM_MEMORY_DU_DX_FRAC, 2 << 32);
         set_fixed(&mut two_d, SET_PIXELS_FROM_MEMORY_DV_DY_FRAC, 1 << 32);
         set_fixed(&mut two_d, SET_PIXELS_FROM_MEMORY_SRC_X0_FRAC, 1 << 31);
+        two_d
+    }
+
+    #[test]
+    fn the_sample_grid_reduction_matches_the_per_pixel_blit() {
+        let mut random = Random(0x1280);
+        let mut two_d = sample_grid_reduction();
         let bytes = random.bytes(12 << 20);
         let fast = Flat(Mutex::new(bytes.clone()));
         let reference = Flat(Mutex::new(bytes.clone()));
-        assert_eq!(two_d.blit(&fast), Ok(()));
+        assert_eq!(two_d.blit(&fast, &Hooks::default()), Ok(()));
         assert_eq!(reference_blit(&two_d, &reference), Ok(()));
         let fast = fast.0.into_inner().unwrap();
         assert!(fast == reference.0.into_inner().unwrap());
         assert!(fast != bytes);
+    }
+
+    /// The hooks of a channel that renders with Metal, if there is a
+    /// device.
+    fn metal_hooks() -> Option<Hooks> {
+        let renderer = super::super::metal::Renderer::new()?;
+        Some(Hooks {
+            metal: Some(std::sync::Arc::new(renderer)),
+            ..Hooks::default()
+        })
+    }
+
+    /// Runs `step` with engine memory over `flat` as a channel with
+    /// `hooks` passes it to its engines (`Channel::call`).
+    fn with_engine_memory<T>(
+        flat: &Flat,
+        hooks: &Hooks,
+        step: impl FnOnce(&dyn GpuMemory) -> T,
+    ) -> T {
+        let tracked = super::super::resources::Tracked {
+            memory: flat,
+            writes: &hooks.writes,
+        };
+        step(&super::super::metal::Coherent {
+            memory: &tracked,
+            renderer: hooks.metal.as_ref().expect("a Metal channel"),
+            writes: &hooks.writes,
+        })
+    }
+
+    /// The channel signals (`Channel::flush`): what it did reaches `flat`,
+    /// but for the multisampled surfaces the renderer holds, which reach
+    /// it on demand; all of them with `settle` (`Channel::settle`).
+    fn signal(flat: &Flat, hooks: &Hooks, settle: bool) {
+        let tracked = super::super::resources::Tracked {
+            memory: flat,
+            writes: &hooks.writes,
+        };
+        assert_eq!(hooks.signal(&tracked), Ok(()));
+        if settle {
+            let metal = hooks.metal.as_ref().expect("a Metal channel");
+            assert_eq!(metal.settle(&tracked, &hooks.writes), Ok(()));
+        }
+    }
+
+    /// The sample-grid reduction on Metal as a frame has it: a 2X1 target
+    /// rendered on the GPU (here by a 1:1 blit into it from another target
+    /// the renderer holds as a draw leaves it), then reduced. Nothing
+    /// reaches memory before the signal (the GPU did both blits). After
+    /// it the destination's memory is the software path's, and the 2X1
+    /// target's is still what it was: only the reduction read it, on the
+    /// GPU, so it stays there until the channel settles.
+    #[test]
+    fn the_sample_grid_reduction_on_metal_matches_the_software_blit() {
+        const FILL: u32 = 16 << 20;
+        let Some(hooks) = metal_hooks() else {
+            return;
+        };
+        let mut random = Random(0x1281);
+        let mut two_d = sample_grid_reduction();
+        // 1:1 from a 2560x720 surface at `FILL` to the reduction's source.
+        let mut fill = sample_grid_reduction();
+        fill.registers[m(SET_SRC_FORMAT + 0x24)] = FILL;
+        fill.registers[m(SET_DST_FORMAT + 0x18)] = 2560;
+        fill.registers[m(SET_DST_FORMAT + 0x24)] = 0;
+        fill.registers[SET_PIXELS_FROM_MEMORY_SAMPLE_MODE] = 0;
+        fill.registers[SET_PIXELS_FROM_MEMORY_DST_WIDTH] = 2560;
+        set_fixed(&mut fill, SET_PIXELS_FROM_MEMORY_DU_DX_FRAC, 1 << 32);
+        set_fixed(&mut fill, SET_PIXELS_FROM_MEMORY_SRC_X0_FRAC, 0);
+        let bytes = random.bytes(24 << 20);
+        let reference = Flat(Mutex::new(bytes.clone()));
+        assert_eq!(fill.blit(&reference, &Hooks::default()), Ok(()));
+        assert_eq!(two_d.blit(&reference, &Hooks::default()), Ok(()));
+        let reference = reference.0.into_inner().unwrap();
+        let flat = Flat(Mutex::new(bytes.clone()));
+        let metal = hooks.metal.as_ref().unwrap();
+        with_engine_memory(&flat, &hooks, |memory| {
+            for surface in [fill.surface(SET_SRC_FORMAT), two_d.surface(SET_SRC_FORMAT)] {
+                let held = metal.hold(memory, &hooks.writes, surface.unwrap(), [1, 0]);
+                assert_eq!(held, Ok(true));
+            }
+            assert_eq!(fill.blit(memory, &hooks), Ok(()));
+            assert_eq!(two_d.blit(memory, &hooks), Ok(()));
+        });
+        assert!(*flat.0.lock().unwrap() == bytes, "written before the signal");
+        signal(&flat, &hooks, false);
+        {
+            let flat = flat.0.lock().unwrap();
+            let (target, destination) = (0..8 << 20, 8 << 20..16 << 20);
+            assert!(flat[destination.clone()] == reference[destination.clone()]);
+            assert!(reference[destination.clone()] != bytes[destination]);
+            assert!(flat[target.clone()] == bytes[target.clone()], "2X1 target written");
+            assert!(reference[target.clone()] != bytes[target]);
+        }
+        signal(&flat, &hooks, true);
+        assert!(flat.0.into_inner().unwrap() == reference);
+    }
+
+    /// Blits on a channel that renders with Metal leave the software
+    /// path's bytes in memory once the channel signals. Each case is a
+    /// random blit between surfaces of one format that keeps its bits,
+    /// from a surface the renderer holds with a random number of samples
+    /// per pixel (as a draw to it leaves it; the destination too in half
+    /// the cases, which reaches memory on demand if it has samples), then
+    /// a second random blit from the first one's destination, which only
+    /// the GPU holds by then, to a third surface. Blits the GPU does not
+    /// take (filtered ones, formats Metal has no texture for) run in
+    /// software on the written-back surfaces. Every second case runs with
+    /// the surfaces the case before left on the GPU, at the same
+    /// addresses in other sizes and formats; in the others, the blits the
+    /// GPU took are counted by their destination's memory staying as it
+    /// was until the signal.
+    #[test]
+    fn blits_on_metal_match_the_software_blit() {
+        const THIRD: u32 = 1 << 19;
+        let Some(mut hooks) = metal_hooks() else {
+            return;
+        };
+        let codes: Vec<u32> = format_codes()
+            .into_iter()
+            .filter(|&code| keeps_bits(ColorFormat::from_raw(code).unwrap()))
+            .collect();
+        let mut random = Random(0xB117_6B0);
+        let mut on_gpu = [0, 0];
+        for case in 0..400 {
+            let fresh = case % 2 == 0;
+            if fresh {
+                hooks = metal_hooks().unwrap();
+            }
+            let metal = hooks.metal.as_ref().unwrap();
+            let code = random.pick(&codes);
+            let mut first = random_blit(&mut random, &[code]);
+            let mut second = random_blit(&mut random, &[code]);
+            // Half the cases take texels without filtering.
+            for two_d in [&mut first, &mut second] {
+                if random.below(2) == 0 {
+                    two_d.registers[SET_PIXELS_FROM_MEMORY_SAMPLE_MODE] &= 1;
+                }
+            }
+            // The second blit's source is the first one's destination.
+            for word in 0..=m(0x24) {
+                second.registers[m(SET_SRC_FORMAT) + word] =
+                    first.registers[m(SET_DST_FORMAT) + word];
+            }
+            second.registers[m(SET_DST_FORMAT + 0x24)] = THIRD;
+            let bytes = random.bytes(MEMORY);
+            const SAMPLES: [[u32; 2]; 6] = [[0, 0], [0, 0], [1, 0], [1, 1], [2, 1], [2, 2]];
+            let log2 = [SOURCE, DESTINATION].map(|_| random.pick(&SAMPLES));
+            let held_destination = random.below(2) == 0;
+
+            let reference = Flat(Mutex::new(bytes.clone()));
+            let none = Hooks::default();
+            let expected_first = first.blit(&reference, &none);
+            let after_first = reference.0.lock().unwrap().clone();
+            let expected_second = second.blit(&reference, &none);
+            let reference = reference.0.into_inner().unwrap();
+
+            let flat = Flat(Mutex::new(bytes.clone()));
+            let (outcome_first, outcome_second) = with_engine_memory(&flat, &hooks, |memory| {
+                if let Ok(source) = first.surface(SET_SRC_FORMAT) {
+                    metal.hold(memory, &hooks.writes, source, log2[0]).unwrap();
+                }
+                if let Ok(destination) = first.surface(SET_DST_FORMAT)
+                    && held_destination
+                {
+                    metal
+                        .hold(memory, &hooks.writes, destination, log2[1])
+                        .unwrap();
+                }
+                let outcome_first = first.blit(memory, &hooks);
+                let held = fresh && *flat.0.lock().unwrap() == bytes;
+                on_gpu[0] += usize::from(held && after_first != bytes);
+                let outcome_second = second.blit(memory, &hooks);
+                let held = held && *flat.0.lock().unwrap() == bytes;
+                on_gpu[1] += usize::from(held && reference != after_first);
+                (outcome_first, outcome_second)
+            });
+            assert_eq!(outcome_first, expected_first, "case {case}");
+            assert_eq!(outcome_second, expected_second, "case {case}");
+            signal(&flat, &hooks, held_destination && log2[1] != [0, 0]);
+            let flat = flat.0.into_inner().unwrap();
+            if flat != reference {
+                let at = flat
+                    .iter()
+                    .zip(&reference)
+                    .position(|(a, b)| a != b)
+                    .unwrap();
+                panic!(
+                    "case {case} ({:?}, samples {log2:?}): byte {at:#x} is {:#x}, the software blits wrote {:#x}",
+                    ColorFormat::from_raw(code).unwrap(),
+                    flat[at],
+                    reference[at],
+                );
+            }
+        }
+        assert!(on_gpu[0] > 30 && on_gpu[1] > 10, "{on_gpu:?}");
     }
 
     /// [`keeps_bits`]: every field value of every such format, the others

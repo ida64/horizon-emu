@@ -99,11 +99,19 @@ pub trait Engines: Send {
         Ok(())
     }
 
+    /// Makes guest memory hold all of the channel's work, including what
+    /// [`flush`](Self::flush) may leave on the host for the guest has no
+    /// use reading it (the Metal renderer's targets held on demand, see
+    /// [`metal`]): before a machine snapshot.
+    fn settle(&mut self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+        self.flush(memory)
+    }
+
     /// The engines' state for a machine snapshot: everything that decides
     /// what later methods do (register files, shadow RAM, bindings, macro
     /// code, transfers and macro calls in flight), never a cache of guest
     /// memory or anything held on the host GPU. Taken after
-    /// [`flush`](Self::flush), so nothing rendered is left only on the
+    /// [`settle`](Self::settle), so nothing rendered is left only on the
     /// host.
     fn save(&self) -> Result<Vec<u8>, SnapshotError>;
 
@@ -125,7 +133,8 @@ pub struct Hooks {
     /// The Metal renderer of the channel, if it renders with Metal: every
     /// completion the channel signals (semaphore release, report,
     /// syncpoint increment) first writes its pending work back to guest
-    /// memory ([`metal::Renderer::flush`]).
+    /// memory ([`metal::Renderer::flush`]), but for the targets it holds
+    /// on demand (depth buffers and multisampled targets, see [`metal`]).
     pub metal: Option<std::sync::Arc<metal::Renderer>>,
     /// What the engines wrote since the channel last signaled.
     pub writes: resources::Writes,
@@ -381,7 +390,7 @@ impl Engines for Channel {
             THREE_D => self
                 .three_d
                 .method(method, argument, memory, &mut self.mme, &self.hooks),
-            TWO_D => self.two_d.method(method, argument, memory),
+            TWO_D => self.two_d.method(method, argument, memory, &self.hooks),
             COPY | COPY_A => self.copy.method(method, argument, memory, &self.hooks),
             COMPUTE => self.compute.method(method, argument, memory, &self.hooks),
             _ => match method {
@@ -417,6 +426,18 @@ impl Engines for Channel {
             writes: &self.hooks.writes,
         };
         self.hooks.signal(&tracked)
+    }
+
+    fn settle(&mut self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+        let tracked = resources::Tracked {
+            memory,
+            writes: &self.hooks.writes,
+        };
+        if let Some(renderer) = &self.hooks.metal {
+            renderer.settle(&tracked, &self.hooks.writes)?;
+        }
+        self.hooks.writes.signal();
+        Ok(())
     }
 
     fn save(&self) -> Result<Vec<u8>, SnapshotError> {

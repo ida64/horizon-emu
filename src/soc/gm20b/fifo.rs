@@ -349,11 +349,13 @@ impl Context {
     }
 
     /// Writes everything the engines hold back to memory
-    /// ([`Engines::flush`]), between methods, before a machine snapshot:
+    /// ([`Engines::settle`]), between methods, before a machine snapshot:
     /// what memory holds is then all of the channel's work.
     pub fn write_back(&mut self, bus: &dyn BusMemory) -> Result<(), Unmodeled> {
         let memory = ChannelMemory::new(self.space, bus);
-        self.flush(&memory)
+        self.engines
+            .settle(&memory)
+            .map_err(|unmodeled| with_fault(&memory, unmodeled))
     }
 
     /// The channel's state for a machine snapshot, taken between methods
