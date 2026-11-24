@@ -842,7 +842,7 @@ impl Renderer {
         {
             let mut state = self.state.lock().unwrap();
             let feedback = state.feedback()?;
-            if feedback.slot + 1 < FEEDBACK_SLOTS {
+            if !feedback.full() {
                 feedback.slot += 1;
                 return Ok(());
             }
@@ -1032,7 +1032,7 @@ impl Renderer {
                 || state
                     .feedback
                     .as_ref()
-                    .is_some_and(|feedback| feedback.slot + 1 >= FEEDBACK_SLOTS || feedback.trapped)
+                    .is_some_and(|feedback| feedback.full() || feedback.trapped)
             {
                 drop(state);
                 self.write_back(memory, writes, Scope::Signal)?;
@@ -1410,7 +1410,7 @@ impl Renderer {
         // Reports that wait for their counts, and a feedback buffer with
         // no slot left, are read once the GPU is done.
         let reports = state.feedback.as_ref().is_some_and(|feedback| {
-            feedback.slot + 1 >= FEEDBACK_SLOTS
+            feedback.full()
                 || match scope {
                     Scope::Range(start, end) => feedback
                         .pending
@@ -1988,6 +1988,17 @@ impl Renderer {
             state.wait();
             state.trim_textures();
         }
+        // Samples passing the draw counted by Metal (its visibility
+        // results) rather than by the fragment function, whose atomic
+        // adds to one word contend: unless the tests are mandated first
+        // (the function counts fragments passing them whatever it does
+        // with them after) or a fragment failing the stencil test without
+        // a color target is kept for its stencil update (Metal would
+        // count it).
+        let host_counted = draw.count_passed
+            && !draw.depth.is_some_and(|(_, depth)| depth.early)
+            && !(attachments.is_empty() && draw.depth.is_some_and(|(_, depth)| depth.stencil.is_some()))
+            && state.feedback()?.counted.len() + samples.count() <= VISIBILITY_DRAWS;
         // Pipeline.
         let key = PipelineKey {
             program: Arc::as_ptr(draw.program) as usize,
@@ -2030,7 +2041,7 @@ impl Renderer {
                     native.point.map(|(size, sprite)| (size.to_bits(), sprite)),
                 )
             }),
-            count_passed: draw.count_passed,
+            count_passed: draw.count_passed && !host_counted,
         };
         let layered = key.multisample.is_some();
         let pipeline = match state.pipelines.get(&key) {
@@ -2515,6 +2526,20 @@ impl Renderer {
             // One draw per sample of multisampled targets, each into its
             // layer (see `Translated::source`).
             for layer in 0..samples.count() as u32 {
+                if host_counted {
+                    let feedback = state.feedback()?;
+                    let call = feedback.counted.len();
+                    feedback.counted.push(feedback.slot);
+                    encoder.setVisibilityResultMode_offset(
+                        objc2_metal::MTLVisibilityResultMode::Counting,
+                        8 * call,
+                    );
+                } else {
+                    encoder.setVisibilityResultMode_offset(
+                        objc2_metal::MTLVisibilityResultMode::Disabled,
+                        0,
+                    );
+                }
                 match (&vertex, &index_buffer) {
                     (Some((native, ..)), Some(((indices, offset), count, index_type))) => {
                         // Metal samples each pixel at its center: shifted so
@@ -2637,6 +2662,8 @@ impl Renderer {
             }
         };
         let encoder = state.encoder(&residents, &[false])?;
+        // Clears count no samples (see `Feedback::visibility`).
+        encoder.setVisibilityResultMode_offset(objc2_metal::MTLVisibilityResultMode::Disabled, 0);
         encoder.setRenderPipelineState(&pipeline);
         encoder.setViewport(MTLViewport {
             originX: 0.0,
@@ -2761,6 +2788,7 @@ impl Renderer {
             }
         };
         let encoder = state.encoder(&residents, &[false])?;
+        encoder.setVisibilityResultMode_offset(objc2_metal::MTLVisibilityResultMode::Disabled, 0);
         encoder.setRenderPipelineState(&pipeline);
         encoder.setViewport(MTLViewport {
             originX: 0.0,
@@ -4065,6 +4093,8 @@ impl State {
                 span: 0,
                 base: 0,
                 pending: Vec::new(),
+                visibility: buffer(Renderer::gpu(), &[0; 8 * VISIBILITY_DRAWS])?,
+                counted: Vec::new(),
             });
         }
         Ok(self.feedback.as_mut().expect("made above"))
@@ -4146,6 +4176,9 @@ impl State {
         // this one is recorded.
         self.submit();
         self.pass_draws = 1;
+        // Every pass gives Metal's counts of draws' passing samples the
+        // feedback buffer's visibility results.
+        let visibility = self.feedback()?.visibility.clone();
         let command = Renderer::gpu()
             .queue
             .commandBuffer()
@@ -4179,6 +4212,7 @@ impl State {
             attachment.setLoadAction(MTLLoadAction::Load);
             attachment.setStoreAction(MTLStoreAction::Store);
         }
+        descriptor.setVisibilityResultBuffer(Some(&visibility));
         let encoder = frame
             .command
             .renderCommandEncoderWithDescriptor(&descriptor)
@@ -4965,10 +4999,12 @@ const FEEDBACK_SLOTS: usize = 16384;
 /// What fragment functions tell the renderer, in a buffer of
 /// [`FEEDBACK_SLOTS`] slots of two words (`msl::TRAP_BUFFER`): the trap
 /// word (`msl::Translated::traps`) and the count of samples that passed
-/// ([`Draw::count_passed`]). A draw is given the slot current when it is
-/// recorded; a report of the count ends the slot, so that the counts of
-/// the draws before and after it stay apart until the GPU has drawn
-/// them and the report can be written ([`resolve_feedback`]).
+/// ([`Draw::count_passed`]) where the function counts them; and the
+/// counts Metal makes of the other draws (its visibility results). A draw
+/// is given the slot current when it is recorded; a report of the count
+/// ends the slot, so that the counts of the draws before and after it
+/// stay apart until the GPU has drawn them and the report can be written
+/// ([`resolve_feedback`]).
 struct Feedback {
     buffer: Retained<MetalBuffer>,
     /// The slot draws are given now.
@@ -4983,6 +5019,47 @@ struct Feedback {
     base: u64,
     /// The reports that wait for their counts.
     pending: Vec<Report>,
+    /// Metal's counts of the samples passing draws ([`Draw::count_passed`])
+    /// the fragment function leaves uncounted: a u64 per draw call,
+    /// written when its pass ends (every render pass is given this buffer
+    /// for its visibility results), and the slot each counts for.
+    visibility: Retained<MetalBuffer>,
+    counted: Vec<usize>,
+}
+
+/// Draw calls Metal counts for ([`Feedback::visibility`]); the feedback
+/// buffer is read and starts over once three quarters are used, at the
+/// next report (draws between two are fewer than the rest), and a draw
+/// past them all is counted by its fragment function.
+const VISIBILITY_DRAWS: usize = 65536;
+
+impl Feedback {
+    /// Whether the buffer is to be read and started over before the
+    /// draws are given another slot.
+    fn full(&self) -> bool {
+        self.slot + 1 >= FEEDBACK_SLOTS || self.counted.len() >= VISIBILITY_DRAWS / 4 * 3
+    }
+
+    /// What the draws given `slots` counted, the GPU having drawn them.
+    fn counted(&self, slots: std::ops::Range<usize>) -> u64 {
+        let words = self.buffer.contents().cast::<u32>();
+        let visible = self.visibility.contents().cast::<u64>();
+        // SAFETY: two words per slot and a u64 per counted draw call; the
+        // GPU finished the draws.
+        unsafe {
+            slots
+                .clone()
+                .map(|slot| u64::from(words.add(2 * slot + 1).read_volatile()))
+                .sum::<u64>()
+                + self
+                    .counted
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, slot)| slots.contains(slot))
+                    .map(|(draw, _)| visible.add(draw).read_volatile())
+                    .sum::<u64>()
+        }
+    }
 }
 
 /// A signal whose write-backs wait for the GPU ([`Renderer::release`]).
@@ -5126,16 +5203,8 @@ fn finish(
         }
     }
     if let Some(feedback) = &state.feedback {
-        let words = feedback.buffer.contents().cast::<u32>();
         for report in &pending.reports {
-            // SAFETY: two words per slot; the GPU finished the draws
-            // counted in the report's slots.
-            let counted: u64 = report
-                .slots
-                .clone()
-                .map(|slot| u64::from(unsafe { words.add(2 * slot + 1).read_volatile() }))
-                .sum();
-            let count = report.base + counted;
+            let count = report.base + feedback.counted(report.slots.clone());
             let written = if report.one_word {
                 memory.write(report.address, &(count as u32).to_le_bytes())
             } else {
@@ -5204,11 +5273,8 @@ fn resolve_feedback(state: &mut State, memory: &dyn GpuMemory) -> Result<(), Unm
             trapped & 0x3fff_ffff
         )));
     }
-    let counted = |slots: std::ops::Range<usize>| -> u64 {
-        slots.map(|slot| u64::from(words[2 * slot + 1])).sum()
-    };
-    for report in feedback.pending.drain(..) {
-        let count = report.base + counted(report.slots.clone());
+    for report in std::mem::take(&mut feedback.pending) {
+        let count = report.base + feedback.counted(report.slots.clone());
         let low = (count as u32).to_le_bytes();
         let written = if report.one_word {
             memory.write(report.address, &low)
@@ -5225,7 +5291,16 @@ fn resolve_feedback(state: &mut State, memory: &dyn GpuMemory) -> Result<(), Unm
             )));
         }
     }
-    feedback.base += counted(feedback.span..feedback.slot + 1);
+    feedback.base += feedback.counted(feedback.span..feedback.slot + 1);
+    // SAFETY: a u64 per counted draw call; the GPU finished.
+    unsafe {
+        std::ptr::write_bytes(
+            feedback.visibility.contents().cast::<u64>().as_ptr(),
+            0,
+            feedback.counted.len(),
+        );
+    }
+    feedback.counted.clear();
     words.fill(0);
     feedback.span = 0;
     feedback.slot = 0;
