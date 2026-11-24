@@ -301,6 +301,11 @@ pub struct Context<'a> {
     pub metal: Option<&'a super::metal::Renderer>,
     /// What the channel's engines wrote since it last signaled.
     pub writes: &'a super::resources::Writes,
+    /// Where the software renderer counts the samples that pass the
+    /// stencil and depth tests, while `SET_ZPASS_PIXEL_COUNT` enables
+    /// the counter (the Metal renderer keeps its own count,
+    /// `metal::Renderer::take_passed`).
+    pub passed: Option<&'a std::sync::atomic::AtomicU64>,
 }
 
 const SET_COLOR_TARGET_A: u32 = 0x0800;
@@ -1676,6 +1681,7 @@ fn native(
         alpha_test: *alpha_test,
         depth: *depth,
         multisample: *multisample,
+        count_passed: context.passed.is_some(),
     };
     let drawn = metal.draw(context.memory, context.writes, &draw);
     STREAM_BUFFERS.with(|kept| {
@@ -2063,6 +2069,7 @@ fn rasterize(
             alpha_test,
             depth,
             multisample,
+            count_passed: context.passed.is_some(),
         };
         if metal.draw(context.memory, context.writes, &draw)? {
             return Ok(());
@@ -2091,6 +2098,7 @@ fn rasterize(
         blend_zero_rule: r.get(0x19c0) & 1 != 0,
         clip: bounds,
         multisample,
+        passed: context.passed,
     };
 
     // Bands of all windows, grouped by row.
@@ -2845,22 +2853,27 @@ fn point_rule(r: Registers<'_>, x: f32, y: f32, size: f32) -> Result<PointSquare
 }
 
 /// The size of a point: the last vertex-pipeline shader's point size
-/// output a\[0x6c\] with `SET_ATTRIBUTE_POINT_SIZE` ENABLE, else
-/// `SET_POINT_SIZE` (the attribute is enabled with SLOT 0 for shaders
-/// that write the point size).
-/// Other SLOT values, and the attribute enabled for a shader that does
-/// not write it, are refused: what either selects is not established.
+/// output a\[0x6c\] with `SET_ATTRIBUTE_POINT_SIZE` ENABLE where the
+/// shader writes it, else `SET_POINT_SIZE` \[inference: an application
+/// draws the points of its occlusion queries with ENABLE set, SLOT 0,
+/// `SET_POINT_SIZE` 1.0 and a nine-instruction vertex shader whose
+/// output map has no point size; the size the API sets is the one that
+/// draws them\]. Other SLOT values are refused: what they select is not
+/// established.
 fn point_size(r: Registers<'_>, last: &Program, vertex: &Shaded) -> Result<f32, Unmodeled> {
     let control = r.get(SET_ATTRIBUTE_POINT_SIZE);
     if control & 1 == 0 {
         return Ok(r.float(SET_POINT_SIZE));
     }
-    if control >> 4 & 0xFF != 0 || !last.header().vtg_output_used(0x6C / 4) {
+    if control >> 4 & 0xFF != 0 {
         return Err(refuse(
-            "point size attribute slot, or a shader that writes no point size",
+            "point size attribute slot",
             SET_ATTRIBUTE_POINT_SIZE,
             control,
         ));
+    }
+    if !last.header().vtg_output_used(0x6C / 4) {
+        return Ok(r.float(SET_POINT_SIZE));
     }
     Ok(f32::from_bits(vertex.attributes.0[0x6C / 4]))
 }

@@ -229,7 +229,7 @@ fn corpus_translates_and_compiles() {
             Ok(t) => {
                 if let Some(gpu) = &gpu {
                     let outputs = targets(program);
-                    let source = t.source(program, &outputs, false, None, None, None);
+                    let source = t.source(program, &outputs, false, None, None, None, false);
                     let start = std::time::Instant::now();
                     if let Err(e) = gpu.pipeline(&source, outputs.len()) {
                         panic!("{name}: {e}\n{source}");
@@ -512,7 +512,7 @@ fn render(
 ) -> Result<Vec<Vec<[f32; 4]>>, String> {
     let outputs = targets(program);
     let pipeline = gpu.pipeline(
-        &t.source(program, &outputs, false, None, None, None),
+        &t.source(program, &outputs, false, None, None, None, false),
         outputs.len(),
     )?;
     let positions: [[f32; 4]; 6] = [
@@ -1115,6 +1115,32 @@ fn gathers_and_fetches_match_interpreter() {
         for pixel in &colors[0] {
             assert_eq!(pixel.map(f32::to_bits), expected, "program {index}");
         }
+    }
+}
+
+/// `VOTE` and SR_LANEID as a warp of one thread: the ballot is 1, its
+/// highest bit 0 and its count 1 (`FLO`, `POPC`, as a program reduces an
+/// atomic add over its warp), and the lane 0, on both sides.
+#[test]
+fn a_warp_is_one_thread() {
+    let program = assembled(&[
+        0x50d8_e380_0007_0000, // VOTE R0
+        0xf0c8_0000_0007_0001, // S2R R1, SR_LANEID
+        0x5c30_0000_0007_0002, // FLO R2, R0
+        0x5c08_0000_0007_0003, // POPC R3, R0
+        0xe300_0000_0007_000f, // EXIT
+    ]);
+    let t = translate(&program, &[]).expect("translates");
+    assert!(!t.traps);
+    let input = inputs(&t, 9);
+    let expected = interpret(&program, &input).expect("interprets")[0].colors[0].map(f32::to_bits);
+    assert_eq!(expected, [1, 0, 0, 1]);
+    let Some(gpu) = Gpu::new() else {
+        return;
+    };
+    let colors = render(&gpu, &program, &t, &input).expect("renders");
+    for pixel in &colors[0] {
+        assert_eq!(pixel.map(f32::to_bits), expected);
     }
 }
 

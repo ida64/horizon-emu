@@ -494,10 +494,14 @@ struct State {
     /// that bound placeholders, with each unbound slot and the refusal a
     /// sample of it is (see `shader::msl` `texture.rs`).
     faults: Vec<Faults>,
-    /// The trap word of fragment functions (`msl::Translated::traps`),
-    /// made when first bound, and whether a draw was given it since it
-    /// was last looked at.
+    /// The trap word of fragment functions (`msl::Translated::traps`)
+    /// and after it the count of samples that passed
+    /// ([`Draw::count_passed`]), made when first bound, and whether a
+    /// draw that may trap was given it since it was last looked at.
     trap: Option<(Retained<MetalBuffer>, bool)>,
+    /// A draw that counts was recorded since the count was last taken
+    /// ([`Renderer::take_passed`]).
+    passed_bound: bool,
     /// What an unbound texture slot of each kind is bound to: a 1x1
     /// texture and a sampler, never read into a result that reaches
     /// guest memory.
@@ -520,6 +524,7 @@ impl Default for State {
             frame: None,
             submitted: None,
             pass_draws: 0,
+            passed_bound: false,
             programs: HashMap::new(),
             vertex_programs: HashMap::new(),
             cpu_vertices: HashMap::new(),
@@ -574,6 +579,8 @@ struct PipelineKey {
     multisample: Option<msl::MultisampleStage>,
     /// A native draw's vertex function.
     native: Option<NativeKey>,
+    /// The function counts the samples that pass ([`Draw::count_passed`]).
+    count_passed: bool,
 }
 
 /// What a native draw's vertex function is made from: its program, the
@@ -704,6 +711,36 @@ pub struct Draw<'a> {
     pub depth: Option<(Surface, DepthOutput)>,
     /// Samples per pixel of the targets (see `pipeline::multisample`).
     pub multisample: super::pipeline::Multisample,
+    /// `SET_ZPASS_PIXEL_COUNT` is enabled: the samples that pass the
+    /// stencil and depth tests are counted ([`Renderer::take_passed`]).
+    pub count_passed: bool,
+}
+
+impl Renderer {
+    /// The samples that passed the stencil and depth tests of the draws
+    /// that count them ([`Draw::count_passed`]) since this was last
+    /// asked, once the GPU has done every draw recorded. The count is
+    /// kept in 32 bits between two askings \[assumption: a guest asks,
+    /// with a report or a reset of its counter, before 2^32 samples
+    /// pass\].
+    pub fn take_passed(&self) -> u64 {
+        let mut state = self.state.lock().unwrap();
+        if !std::mem::take(&mut state.passed_bound) {
+            return 0;
+        }
+        state.wait();
+        let Some((trap, _)) = &state.trap else {
+            return 0;
+        };
+        // SAFETY: the buffer holds the trap word and the count; the GPU
+        // finished.
+        unsafe {
+            let word = trap.contents().cast::<u32>().as_ptr().add(1);
+            let count = word.read();
+            word.write(0);
+            u64::from(count)
+        }
+    }
 }
 
 impl Renderer {
@@ -1438,6 +1475,7 @@ impl Renderer {
                     native.clip_words.clone(),
                 )
             }),
+            count_passed: draw.count_passed,
         };
         let layered = key.multisample.is_some();
         let pipeline = match state.pipelines.get(&key) {
@@ -1478,6 +1516,7 @@ impl Renderer {
                     key.depth,
                     key.multisample,
                     native_vertex.as_ref(),
+                    key.count_passed,
                 );
                 let library = match state.library(gpu, source) {
                     Ok(library) => library,
@@ -1824,18 +1863,19 @@ impl Renderer {
                     25,
                 )?;
             }
-            if translated.traps {
+            if translated.traps || draw.count_passed {
                 let trap = match &mut state.trap {
                     Some((trap, bound)) => {
-                        *bound = true;
+                        *bound |= translated.traps;
                         trap.clone()
                     }
                     None => {
-                        let trap = buffer(gpu, &[0; 4])?;
-                        state.trap = Some((trap.clone(), true));
+                        let trap = buffer(gpu, &[0; 8])?;
+                        state.trap = Some((trap.clone(), translated.traps));
                         trap
                     }
                 };
+                state.passed_bound |= draw.count_passed;
                 encoder.setFragmentBuffer_offset_atIndex(Some(&trap), 0, msl::TRAP_BUFFER);
             }
             for (i, (texture, sampler)) in vertex_textures.iter().enumerate() {

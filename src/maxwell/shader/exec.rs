@@ -1013,6 +1013,7 @@ impl<'a, const L: usize> Machine<'a, L> {
                     Ok(())
                 })
             }
+            Op::Vote if !self.is_compute() => self.vote(active),
             Op::Lds => self.shared_access(active, false),
             Op::Sts => self.shared_access(active, true),
             Op::Ldl => self.local_access(active, false),
@@ -1036,7 +1037,34 @@ impl<'a, const L: usize> Machine<'a, L> {
         }
     }
 
-    /// `S2R`: dest 0-7, register 20-27: SR_LANEID (0), SR_Y_DIRECTION
+    /// `VOTE` outside a compute program: the register destination (0-7)
+    /// takes the ballot, a bit per thread of the warp whose source
+    /// predicate (39-41, negated by 42) holds \[observed: a pixel
+    /// program of an application takes the highest set bit and the
+    /// count of the ballot's bits (`FLO`, `POPC`), and the thread whose
+    /// SR_LANEID equals the former adds the latter to a counter in
+    /// global memory with `RED`: one atomic add for the warp instead of
+    /// one per thread\]; the destination predicate (45-47) takes the
+    /// vote, ALL, ANY or EQ (48-49) \[recalled\]. How GM20B gathers
+    /// fragments or vertices into warps is not established, and what a
+    /// program computes cannot depend on it: here every thread is a warp
+    /// of its own \[assumption\], the ballot its predicate and its lane
+    /// 0, which gives such a reduction the sum any other grouping gives.
+    fn vote(&mut self, active: Mask) -> Result<(), Unmodeled> {
+        let w = self.word;
+        let mode = bits(w, 48, 2);
+        self.require(mode < 3, "vote mode")?;
+        self.each(active, |m, lane| {
+            let holds = m.src_pred(lane, 39);
+            m.set(lane, bits(w, 0, 8), u32::from(holds));
+            m.set_pred(lane, bits(w, 45, 3), mode == 2 || holds);
+            Ok(())
+        })
+    }
+
+    /// `S2R`: dest 0-7, register 20-27: SR_LANEID (0: the thread's lane
+    /// in its warp; outside a compute program every thread is a warp of
+    /// its own, see [`Machine::vote`]), SR_Y_DIRECTION
     /// (18), SR_THREAD_KILL (19: all ones for a fragment outside the
     /// primitive, a helper of its quad, else 0 \[recalled\]),
     /// SR_INVOCATION_INFO (29, see the module documentation),
@@ -1056,6 +1084,7 @@ impl<'a, const L: usize> Machine<'a, L> {
                 }
             }
             (Io::Compute(_), _) => return self.fail(&format!("special register {sr}")),
+            (_, 0) => 0,
             (_, 18) => self.env.y_direction.to_bits(),
             (Io::Fragment { covered, .. }, 19) => {
                 if covered[lane] {

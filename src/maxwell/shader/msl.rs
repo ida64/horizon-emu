@@ -568,6 +568,23 @@ impl Writer<'_> {
                 self.set(bits(self.word, 0, 8), "(GM_LIVE ? 0u : 0xffffffffu)");
                 Ok(())
             }
+            // SR_LANEID: every thread a warp of its own (`exec`
+            // `Machine::vote`).
+            (_, Op::S2r) if bits(self.word, 20, 8) == 0 => {
+                self.set(bits(self.word, 0, 8), "0u");
+                Ok(())
+            }
+            (_, Op::Vote) => {
+                let w = self.word;
+                let mode = bits(w, 48, 2);
+                self.require(mode < 3, "vote mode")?;
+                let holds = self.pred_operand(39);
+                self.line(&format!("{{ const bool holds = {holds};"));
+                self.set(bits(w, 0, 8), "(holds ? 1u : 0u)");
+                self.set_pred(bits(w, 45, 3), if mode == 2 { "true" } else { "holds" });
+                self.line("}");
+                Ok(())
+            }
             (Stage::Vertex, Op::Ald) => self.ald(),
             (Stage::Vertex, Op::Ast) => self.ast(),
             (_, Op::Ldc) => self.ldc(),
@@ -577,7 +594,7 @@ impl Writer<'_> {
             // What the interpreter refuses when it is executed
             // (`exec::Machine::special_register` has no other register
             // for a fragment) is refused when it is executed here.
-            (Stage::Pixel, Op::Vote | Op::Votevtg | Op::S2r) => {
+            (Stage::Pixel, Op::Votevtg | Op::S2r) => {
                 self.line(&format!(
                     "atomic_store_explicit(&trap[0], {:#x}u, memory_order_relaxed);",
                     self.pc | 0x8000_0000
@@ -869,6 +886,12 @@ impl Translated {
     /// alpha test; the depth plane is taken at the sample's position
     /// unless `center_depth`; with `alpha_to_one` every output's alpha is
     /// 1.
+    ///
+    /// With `zpass` the function counts itself in the word after the
+    /// trap word ([`TRAP_BUFFER`]) when its fragment (in a multisampled
+    /// layer, its sample) passes every test: `ZPASS_PIXEL_CNT`, as
+    /// `raster::shade_quad` counts.
+    #[allow(clippy::too_many_arguments)]
     pub fn source(
         &self,
         program: &Program,
@@ -877,6 +900,7 @@ impl Translated {
         depth: Option<DepthStage>,
         multisample: Option<MultisampleStage>,
         native: Option<&NativeVertex>,
+        zpass: bool,
     ) -> String {
         let mut s = String::from(PRELUDE);
         if let Some(vertex) = native {
@@ -979,6 +1003,9 @@ impl Translated {
         if !self.textures.is_empty() {
             parameters.push("device atomic_uint* texture_faults [[buffer(21)]]".to_string());
         }
+        if self.traps || zpass {
+            parameters.push(format!("device atomic_uint* trap [[buffer({TRAP_BUFFER})]]"));
+        }
         if !self.globals.is_empty() {
             parameters.push(format!(
                 "device atomic_uint* gm [[buffer({GLOBAL_BUFFER})]]"
@@ -987,9 +1014,6 @@ impl Translated {
                 "const device uint* gt [[buffer({})]]",
                 GLOBAL_BUFFER + 1
             ));
-        }
-        if self.traps {
-            parameters.push(format!("device atomic_uint* trap [[buffer({TRAP_BUFFER})]]"));
         }
         if alpha_test {
             parameters.push("constant uint* alpha_test [[buffer(22)]]".to_string());
@@ -1158,7 +1182,14 @@ impl Translated {
             (None, Some(_)) => "((coverage_mask >> layer) & 1u) == 0u",
             (None, None) => "!covers(tri, px, py)",
         };
-        let _ = writeln!(s, "    if (killed || {covered}) {{ discard_fragment(); }}");
+        // A fragment counted as passing must have been dropped nowhere.
+        let discard = if zpass {
+            let _ = writeln!(s, "    bool dropped = false;");
+            "discard_fragment(); dropped = true;"
+        } else {
+            "discard_fragment();"
+        };
+        let _ = writeln!(s, "    if (killed || {covered}) {{ {discard} }}");
         // Output 0 alpha (the draw refuses an alpha test or alpha to
         // coverage that needs it when the program does not write it).
         let alpha = match registers[0] {
@@ -1168,7 +1199,7 @@ impl Translated {
         if alpha_test {
             let _ = writeln!(
                 s,
-                "    if (!compare(alpha_test[0], {alpha}, as_type<float>(alpha_test[1]))) {{ discard_fragment(); }}"
+                "    if (!compare(alpha_test[0], {alpha}, as_type<float>(alpha_test[1]))) {{ {discard} }}"
             );
         }
         if let Some(stage) = multisample
@@ -1176,7 +1207,7 @@ impl Translated {
         {
             let _ = writeln!(
                 s,
-                "    if (((alpha_coverage({alpha}, {}u) >> layer) & 1u) == 0u) {{ discard_fragment(); }}",
+                "    if (((alpha_coverage({alpha}, {}u) >> layer) & 1u) == 0u) {{ {discard} }}",
                 stage.samples
             );
         }
@@ -1215,9 +1246,15 @@ impl Translated {
             let failed = if stencil.is_some() && outputs.is_empty() {
                 "out.z = w; return out;"
             } else {
-                "discard_fragment();"
+                discard
             };
             let _ = writeln!(s, "      if (!passed) {{ {failed} }}\n      out.z = w; }}");
+        }
+        if zpass {
+            let _ = writeln!(
+                s,
+                "    if (!dropped && ({live})) {{ atomic_fetch_add_explicit(&trap[1], 1u, memory_order_relaxed); }}"
+            );
         }
         // Outputs as the interpreter gathers them: each target with a
         // component mask takes the next four registers from R0; depth is

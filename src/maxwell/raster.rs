@@ -262,6 +262,10 @@ pub struct Backend<'a> {
     pub clip: Rect,
     /// Samples per pixel, where they are and how they are stored.
     pub multisample: Multisample,
+    /// Where the samples that pass the stencil and depth tests are
+    /// counted (`SET_ZPASS_PIXEL_COUNT`, ZPASS_PIXEL_CNT), while that
+    /// counter is enabled.
+    pub passed: Option<&'a std::sync::atomic::AtomicU64>,
 }
 
 /// A triangle in physical window space, ready to rasterize.
@@ -723,6 +727,9 @@ fn shade_quad(
                 if depth.write {
                     depth.format.write_depth(incoming, texel);
                 }
+            }
+            if let Some(passed) = backend.passed {
+                passed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             for color in backend.colors {
                 let band = &mut bands.colors[color.window];

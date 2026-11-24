@@ -74,6 +74,7 @@ const SET_GLOBAL_BASE_VERTEX_INDEX: u32 = m(0x1434);
 const SET_GLOBAL_BASE_INSTANCE_INDEX: u32 = m(0x1438);
 const STORE_ZCULL: u32 = m(0x1464);
 const LOAD_ZCULL: u32 = m(0x1500);
+const SET_ZPASS_PIXEL_COUNT: u32 = m(0x1514);
 const CLEAR_REPORT_VALUE: u32 = m(0x1530);
 const SET_RENDER_ENABLE_C: u32 = m(0x1558);
 const DRAW_INLINE_INDEX: u32 = m(0x15e8);
@@ -139,6 +140,14 @@ pub struct ThreeD {
     /// (`Engines::settle`).
     #[serde(skip)]
     held: Option<(Batch, u32)>,
+    /// ZPASS_PIXEL_CNT: the samples that passed the stencil and depth
+    /// tests while `SET_ZPASS_PIXEL_COUNT` enabled the counter, since
+    /// `CLEAR_REPORT_VALUE` last reset it; what the Metal renderer
+    /// counted since it was last asked is not in it yet
+    /// ([`ThreeD::passed`]). Not saved: a snapshot taken between a reset
+    /// and a report restores the count as 0 \[known difference\].
+    #[serde(skip)]
+    passed: std::sync::atomic::AtomicU64,
     #[serde(skip)]
     caches: Caches,
     /// Graphics-engine priv registers written through `SET_FALCON04`:
@@ -161,6 +170,7 @@ impl Default for ThreeD {
             batch: None,
             instance: 0,
             held: None,
+            passed: Default::default(),
             caches: Caches::default(),
             priv_registers: Default::default(),
         }
@@ -463,7 +473,15 @@ impl ThreeD {
             }
             UNBIND_ALL => return Err(refuse(method, argument, "UNBIND_ALL")),
             SET_REPORT_SEMAPHORE_D => self.report(argument, memory, hooks)?,
-            CLEAR_REPORT_VALUE => return Err(refuse(method, argument, "counter reset")),
+            // TYPE 4:0 [public: NVIDIA `clb197.h` `CLEAR_REPORT_VALUE`]:
+            // ZPASS_PIXEL_CNT (1) is the counter modeled.
+            CLEAR_REPORT_VALUE => {
+                if argument & 0x1F != 1 {
+                    return Err(refuse(method, argument, "reset of a counter not modeled"));
+                }
+                self.passed(hooks);
+                *self.passed.get_mut() = 0;
+            }
             CLEAR_SURFACE => {
                 if self.rendering() {
                     self.clear(argument, memory, hooks)?;
@@ -686,8 +704,44 @@ impl ThreeD {
                     ))
                 }
             }
+            // REPORT_ONLY of ZPASS_PIXEL_CNT (2) or ZPASS_PIXEL_CNT64
+            // (0x15) [public: NVIDIA `clb197.h`
+            // `SET_REPORT_SEMAPHORE_D_REPORT`]: the count, in one word or
+            // as a 64-bit value followed by a 64-bit timestamp (the
+            // layout `SET_RENDER_ENABLE_C` reads). A report tells the
+            // guest the GPU has come this far, as a release does.
+            (2, 2 | 0x15) => {
+                let count = self.passed(hooks);
+                hooks.signal(memory)?;
+                if one_word {
+                    return write_words(memory, address, &[count as u32]);
+                }
+                let timer = hooks.timer.as_ref().ok_or_else(|| {
+                    Unmodeled("four-word report without a GPU timer connected".into())
+                })?;
+                let time = timer();
+                write_words(
+                    memory,
+                    address,
+                    &[
+                        count as u32,
+                        (count >> 32) as u32,
+                        time as u32,
+                        (time >> 32) as u32,
+                    ],
+                )
+            }
             _ => Err(refuse(SET_REPORT_SEMAPHORE_D, control, "report or counter")),
         }
+    }
+
+    /// ZPASS_PIXEL_CNT now: what the software renderer counted and what
+    /// the Metal renderer has, which waits for the GPU to have drawn
+    /// everything recorded.
+    fn passed(&self, hooks: &Hooks) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let metal = hooks.metal.as_ref().map_or(0, |metal| metal.take_passed());
+        self.passed.fetch_add(metal, Relaxed) + metal
     }
 
     fn begin(&mut self, argument: u32) -> Result<(), Unmodeled> {
@@ -870,12 +924,14 @@ impl ThreeD {
         let Some((batch, instances)) = self.held.take() else {
             return Ok(());
         };
+        let counting = self.registers[SET_ZPASS_PIXEL_COUNT as usize] & 1 != 0;
         let context = Context {
             registers: Registers(&self.registers),
             bindings: &self.bindings,
             memory,
             metal: hooks.metal.as_deref(),
             writes: &hooks.writes,
+            passed: counting.then_some(&self.passed),
         };
         pipeline::draw(&context, &mut self.caches, &batch, instances)
     }

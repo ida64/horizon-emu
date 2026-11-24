@@ -956,6 +956,14 @@ fn program_bytes(kind: u32, header: &[(usize, u8)], words: &[u64]) -> Vec<u8> {
 /// AST a[0x70..0x7c)): w starts at 1, so the quad is drawn; with the
 /// pixel program's color (1, 0.5, 0.25, 1).
 fn position_xyz_quad(kind: super::RendererKind) -> [u8; 4] {
+    counted_xyz_quad(kind, false).0
+}
+
+/// [`position_xyz_quad`]'s pixel; with `count`, also what a one-word
+/// report of ZPASS_PIXEL_CNT gives after the quad, the counter enabled
+/// and reset before it.
+fn counted_xyz_quad(kind: super::RendererKind, count: bool) -> ([u8; 4], u32) {
+    const REPORT: u64 = 0x48_0000;
     let mut frame = Frame::sized_with(SIZE, SIZE, kind);
     let vs = program_bytes(
         0x0401,
@@ -997,12 +1005,41 @@ fn position_xyz_quad(kind: super::RendererKind) -> [u8; 4] {
         -0.5, -0.5, 0.0, 0.25, -0.5, 0.0, 0.25, 0.75, 0.0, -0.5, 0.75, 0.0,
     ];
     frame.vertices(0x40_0000, 12, &quad, &[(0, 0x02)]);
+    if count {
+        frame.method(0x1514, 1); // SET_ZPASS_PIXEL_COUNT ENABLE
+        frame.method(0x1530, 1); // CLEAR_REPORT_VALUE ZPASS_PIXEL_CNT
+    }
     frame.method(0x1618, 7);
     frame.method(0x0d74, 0);
     frame.method(0x0d78, 4);
     frame.method(0x1614, 0);
+    let mut counted = 0;
+    if count {
+        // SET_REPORT_SEMAPHORE: REPORT_ONLY of ZPASS_PIXEL_CNT, one word.
+        frame.method(0x1b00, (REPORT >> 32) as u32);
+        frame.method(0x1b04, REPORT as u32);
+        frame.method(0x1b08, 0);
+        frame.method(0x1b0c, 2 | 2 << 23 | 1 << 28);
+        counted = frame.ram.word(REPORT);
+    }
     frame.channel.flush(&frame.ram).unwrap();
-    frame.pixel(20, 20)
+    (frame.pixel(20, 20), counted)
+}
+
+/// ZPASS_PIXEL_CNT counts the pixels of a quad (24 by 40 of them), in
+/// both renderers.
+#[test]
+fn passed_samples_are_counted() {
+    for kind in [super::RendererKind::Software, super::RendererKind::Metal] {
+        if kind == super::RendererKind::Metal && !super::metal::available() {
+            continue;
+        }
+        assert_eq!(
+            counted_xyz_quad(kind, true),
+            ([255, 128, 64, 255], 24 * 40),
+            "{kind:?}"
+        );
+    }
 }
 
 /// A target of an sRGB format (`A8BL8GL8RL8`, 0xD6) encodes the program's
