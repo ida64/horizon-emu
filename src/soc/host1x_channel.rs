@@ -5,14 +5,22 @@
 //! The latter emits the 32-bit wait as payload at 0x4e followed by ID at 0x50.
 //! nvservices initializes GET from PUT with DMACTRL=7, then runs with zero.
 //!
-//! A stream runs synchronously on the DMAPUT write until it reaches PUT or a
-//! host syncpoint wait whose threshold has not been reached. Such a wait
+//! A stream runs on the DMAPUT write until it reaches PUT or a host
+//! syncpoint wait whose threshold has not been reached. Such a wait
 //! stalls the channel where it stands (ring position and gather nesting are
 //! kept), as the hardware's command processor does; it continues once the
 //! syncpoint gets there: a thread of its own looks again at every change of
 //! the syncpoints ([`Syncpoints::wait_change`]), so at the guest time the
 //! syncpoint reached the threshold. The wait is channel state: a channel
 //! restored from a snapshot standing at one starts its thread again.
+//!
+//! The channel's registers are never held up by an engine's work, as on
+//! the chip, where the CPU's accesses to a channel do not wait for the
+//! engines it feeds: the thread running the stream lets go of the channel
+//! while an engine method runs (a VIC EXECUTE composes a whole picture),
+//! and a DMAPUT written meanwhile is taken up by that thread when the
+//! method is done, the write returning at once. One thread runs a stream
+//! at a time.
 //!
 //! Unimplemented methods/conditions fail the stream and never manufacture a
 //! fence completion; the DMAPUT write that ran into them is refused, or, for
@@ -29,7 +37,7 @@
 //! [channel_hw.c]: https://github.com/torvalds/linux/blob/master/drivers/gpu/host1x/hw/channel_hw.c
 
 use std::{
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Condvar, Mutex, MutexGuard, Weak},
     time::Duration,
 };
 
@@ -177,12 +185,20 @@ struct State {
     /// this machine has such a thread.
     #[serde(skip)]
     polling: bool,
+    /// Whether a thread is running the stream (see [`run`]). Not saved: a
+    /// snapshot is taken between runs.
+    #[serde(skip)]
+    running: bool,
     fault: bool,
 }
+
+/// An engine method the stream reached: class, method offset, data.
+type Call = (u32, u32, u32);
 
 impl State {
     fn idle(&self) -> bool {
         !self.fault
+            && !self.running
             && self.get == self.put
             && self.depth == 0
             && self.wait.is_none()
@@ -202,6 +218,8 @@ struct Inner {
     engine: Arc<Engine>,
     notes: Arc<Notes>,
     state: Mutex<State>,
+    /// Signalled when a run of the stream ends.
+    ran: Condvar,
 }
 
 impl Channel {
@@ -237,8 +255,10 @@ impl Channel {
                     depth: 0,
                     wait: None,
                     polling: false,
+                    running: false,
                     fault: false,
                 }),
+                ran: Condvar::new(),
             }),
         }
     }
@@ -254,12 +274,14 @@ impl Channel {
     /// 31:24; offset 0x50: id in CBREAD bits 7:0).
     ///
     /// Known while the stream stands at a host syncpoint wait, the one
-    /// method that stays in the command processor here (every other one
-    /// completes within the DMAPUT write that reaches it). Otherwise, idle
+    /// method that stays in the command processor here. A read while an
+    /// engine method runs waits for the run to end (the method in the
+    /// processor is not kept), so it sees what it did when every method
+    /// completed within the DMAPUT write that reached it. Otherwise, idle
     /// or faulted, the method the processor last held is not kept, and
     /// this refuses with a note.
     pub fn command_status(&self) -> Option<(u32, u32)> {
-        let state = self.inner.state.lock().unwrap();
+        let state = self.inner.between_runs();
         let Some(wait) = state.wait else {
             self.inner.notes.add(format!(
                 "host1x channel: CBSTAT/CBREAD read while the stream stands at no \
@@ -280,12 +302,19 @@ impl Channel {
 }
 
 impl Inner {
-    fn method(&self, state: &mut State, offset: u32, value: u32) -> Result<(), &'static str> {
+    /// Does a host class method; an engine method is handed back to be
+    /// run without the channel held.
+    fn method(
+        &self,
+        state: &mut State,
+        offset: u32,
+        value: u32,
+    ) -> Result<Option<Call>, &'static str> {
         if offset > 0xfff {
             return Err("method offset exceeds 12-bit range");
         }
         if state.class != 1 {
-            return (self.engine)(state.class, offset, value).ok_or("engine refused method");
+            return Ok(Some((state.class, offset, value)));
         }
         match offset {
             0 => {
@@ -336,7 +365,7 @@ impl Inner {
             9 | 0xb => return Err("shared syncpoint wait-base methods are unsupported"),
             _ => return Err("unknown host1x class method"),
         }
-        Ok(())
+        Ok(None)
     }
 
     fn word(&self, address: u64) -> Result<u32, &'static str> {
@@ -350,17 +379,26 @@ impl Inner {
         Ok(u32::from_le_bytes(bytes))
     }
 
-    /// Runs the stream until it reaches PUT or stands at an unmet wait.
-    fn execute(&self, state: &mut State) -> Result<(), &'static str> {
+    /// The channel locked when no thread is running its stream: the state
+    /// a snapshot takes, between engine methods' effects and not inside
+    /// one.
+    fn between_runs(&self) -> MutexGuard<'_, State> {
+        let state = self.state.lock().unwrap();
+        self.ran.wait_while(state, |state| state.running).unwrap()
+    }
+
+    /// Runs the stream until it reaches PUT, stands at an unmet wait
+    /// (`None`) or reaches an engine method, which it hands back, the
+    /// stream standing past it. `budget` limits the words fetched in one
+    /// [`run`].
+    fn execute(&self, state: &mut State, budget: &mut usize) -> Result<Option<Call>, &'static str> {
         if state.fault {
             return Err("channel remains faulted; DMA GET reset required");
         }
-        // Limits refuse loops rather than claiming that work completed.
-        let mut budget = 1_048_576usize;
         loop {
             if let Some(wait) = state.wait {
                 if !wait.met(&self.syncpoints) {
-                    return Ok(());
+                    return Ok(None);
                 }
                 state.wait = None;
             }
@@ -373,12 +411,12 @@ impl Inner {
                 continue;
             }
             if depth == 0 && state.get == state.put {
-                return Ok(());
+                return Ok(None);
             }
-            if budget == 0 {
+            if *budget == 0 {
                 return Err("CDMA execution limit reached (possible restart/gather cycle)");
             }
-            budget -= 1;
+            *budget -= 1;
             let address = if depth == 0 {
                 if state.get < state.start || state.get >= state.end {
                     return Err("DMA GET outside START/END");
@@ -395,8 +433,10 @@ impl Inner {
                 frame.get += 4;
                 if let Some((offset, increment)) = frame.insert {
                     frame.insert = Some((offset + u32::from(increment), increment));
-                    self.method(state, offset, value)?;
-                    continue;
+                    match self.method(state, offset, value)? {
+                        Some(call) => return Ok(Some(call)),
+                        None => continue,
+                    }
                 }
             }
             match std::mem::replace(&mut state.pending, Pending::None) {
@@ -412,8 +452,10 @@ impl Inner {
                             increment,
                         };
                     }
-                    self.method(state, offset, value)?;
-                    continue;
+                    match self.method(state, offset, value)? {
+                        Some(call) => return Ok(Some(call)),
+                        None => continue,
+                    }
                 }
                 Pending::Mask { offset, mask } => {
                     let bit = mask.trailing_zeros();
@@ -421,8 +463,10 @@ impl Inner {
                     if rest != 0 {
                         state.pending = Pending::Mask { offset, mask: rest };
                     }
-                    self.method(state, offset + bit, value)?;
-                    continue;
+                    match self.method(state, offset + bit, value)? {
+                        Some(call) => return Ok(Some(call)),
+                        None => continue,
+                    }
                 }
                 Pending::Gather {
                     offset,
@@ -477,7 +521,11 @@ impl Inner {
                         state.pending = Pending::Mask { offset, mask };
                     }
                 }
-                Opcode::Imm { offset, value } => self.method(state, offset, value)?,
+                Opcode::Imm { offset, value } => {
+                    if let Some(call) = self.method(state, offset, value)? {
+                        return Ok(Some(call));
+                    }
+                }
                 Opcode::Restart(target) => {
                     if depth != 0 {
                         // Restart changes the DMA ring GET, not the gather cursor.
@@ -508,20 +556,49 @@ impl Inner {
             }
         }
     }
+}
 
-    /// Runs the stream; on failure faults the channel and leaves a note.
-    fn run(&self, state: &mut State) -> Option<()> {
-        if let Err(reason) = self.execute(state) {
-            state.fault = true;
-            state.wait = None;
-            self.notes.add(format!(
-                "host1x channel: {reason}; GET={:#010x}, PUT={:#010x}, class={:#x}",
-                state.get, state.put, state.class
-            ));
-            return None;
-        }
-        Some(())
+/// Runs the stream from `state` (the channel locked) unless another thread
+/// already does, letting go of the channel while each engine method runs;
+/// then has a thread watch the wait it stands at, if any. On failure faults
+/// the channel, leaves a note and returns `None`.
+fn run<'a>(
+    inner: &'a Arc<Inner>,
+    mut state: MutexGuard<'a, State>,
+) -> (MutexGuard<'a, State>, Option<()>) {
+    if state.running {
+        return (state, Some(()));
     }
+    state.running = true;
+    // Limits refuse loops rather than claiming that work completed.
+    let mut budget = 1_048_576usize;
+    let outcome = loop {
+        match inner.execute(&mut state, &mut budget) {
+            Ok(None) => break Ok(()),
+            Ok(Some((class, offset, value))) => {
+                drop(state);
+                let accepted = (inner.engine)(class, offset, value);
+                state = inner.state.lock().unwrap();
+                if accepted.is_none() {
+                    break Err("engine refused method");
+                }
+            }
+            Err(reason) => break Err(reason),
+        }
+    };
+    state.running = false;
+    inner.ran.notify_all();
+    if let Err(reason) = outcome {
+        state.fault = true;
+        state.wait = None;
+        inner.notes.add(format!(
+            "host1x channel: {reason}; GET={:#010x}, PUT={:#010x}, class={:#x}",
+            state.get, state.put, state.class
+        ));
+        return (state, None);
+    }
+    watch(inner, &mut state);
+    (state, Some(()))
 }
 
 /// Watches the wait `state` stands at from a thread of its own, unless one
@@ -554,12 +631,13 @@ fn poll(inner: Weak<Inner>, clock: Arc<GuestClock>) {
             if !clock.is_paused() && state.wait.is_some_and(|wait| wait.met(&inner.syncpoints)) {
                 // A failure faults the channel; its note and the refusal of
                 // the next DMAPUT write report it.
-                let _ = inner.run(&mut state);
+                state = run(&inner, state).0;
             }
             if state.wait.is_none() {
                 state.polling = false;
                 return;
             }
+            drop(state);
             (Arc::clone(&inner.syncpoints), seen)
         };
         syncpoints.0.wait_change(syncpoints.1, PAUSED_POLL);
@@ -629,8 +707,7 @@ impl MmioDevice for Channel {
             }
         }
         if matches!(offset, 0x18 | 0x24) && state.ctrl & 1 == 0 {
-            inner.run(&mut state)?;
-            watch(inner, &mut state);
+            run(inner, state).1?;
         }
         Some(())
     }
@@ -646,7 +723,7 @@ impl MmioDevice for Channel {
 /// at a wait has a thread watching it again.
 impl Snapshot for Channel {
     fn save(&self) -> Result<Vec<u8>, SnapshotError> {
-        encode(&*self.inner.state.lock().unwrap())
+        encode(&*self.inner.between_runs())
     }
 
     fn restore(&self, saved: &[u8]) -> Result<(), SnapshotError> {
@@ -657,7 +734,7 @@ impl Snapshot for Channel {
                 restored.depth
             )));
         }
-        let mut state = self.inner.state.lock().unwrap();
+        let mut state = self.inner.between_runs();
         // A thread already watching goes on watching the restored wait,
         // or ends when there is none.
         let polling = state.polling;
@@ -684,11 +761,17 @@ mod tests {
     const RING: u32 = 0x1000;
     const GATHER: u32 = 0x8000;
 
+    /// Whether the test engine lets its methods finish, and its signal.
+    type Gate = Arc<(Mutex<bool>, Condvar)>;
+
     struct Bench {
         ram: Arc<GuestRam>,
         syncpoints: Arc<Syncpoints>,
         notes: Arc<Notes>,
         calls: Arc<Mutex<Vec<(u32, u32, u32)>>>,
+        /// Open at first: each engine method records itself, then stands
+        /// while the gate is closed.
+        gate: Gate,
         channel: Arc<Channel>,
     }
 
@@ -703,13 +786,16 @@ mod tests {
             let syncpoints = Arc::new(Syncpoints::default());
             let notes: Arc<Notes> = Arc::default();
             let calls = Arc::new(Mutex::new(Vec::new()));
-            let record = Arc::clone(&calls);
+            let gate: Gate = Arc::new((Mutex::new(true), Condvar::new()));
+            let (record, held) = (Arc::clone(&calls), Arc::clone(&gate));
             let channel = Arc::new(Channel::new(
                 DeviceMemory::new(&mc, &ram, SMMU_HOST1X_ASID),
                 Arc::clone(&syncpoints),
                 Arc::new(GuestClock::new()),
                 Arc::new(move |class, offset, value| {
                     record.lock().unwrap().push((class, offset, value));
+                    let (open, signal) = &*held;
+                    drop(signal.wait_while(open.lock().unwrap(), |open| !*open).unwrap());
                     Some(())
                 }),
                 Arc::clone(&notes),
@@ -724,6 +810,7 @@ mod tests {
                 syncpoints,
                 notes,
                 calls,
+                gate,
                 channel,
             }
         }
@@ -782,6 +869,65 @@ mod tests {
             [(0x5d, 0x10, 0xc0), (0x5d, 0x11, 0x100)]
         );
         assert!(bench.idle());
+        assert!(bench.notes.take().is_empty());
+    }
+
+    /// While an engine method runs (a VIC EXECUTE composing), the channel's
+    /// registers answer at once: GET and the status are read, a DMAPUT is
+    /// written and returns, its words then run on the thread that runs the
+    /// stream once the method is done; a snapshot taken meanwhile waits for
+    /// the run to end and holds where it ended.
+    #[test]
+    fn register_access_while_an_engine_method_runs_does_not_wait_for_it() {
+        let bench = Arc::new(Bench::new());
+        *bench.gate.0.lock().unwrap() = false;
+        let first = [setclass(0x5d, 0, 0), 0x1010_0002, 0xc0, 0x100];
+        let feeder = {
+            let bench = Arc::clone(&bench);
+            std::thread::spawn(move || bench.submit(&first))
+        };
+        assert_eq!(bench.engine_calls(1), [(0x5d, 0x10, 0xc0)]);
+        let (done, finished) = std::sync::mpsc::channel();
+        {
+            let bench = Arc::clone(&bench);
+            std::thread::spawn(move || {
+                let get = bench.channel.read(0, 0x1c, 4);
+                let idle = bench.idle();
+                // Two more methods after the first four words.
+                bench.poke(RING + 16, &[0x1010_0002, 0xc4, 0x200]);
+                let put = bench.channel.write(0, 0x18, 4, u64::from(RING) + 28);
+                done.send((get, idle, put)).unwrap();
+            });
+        }
+        let (get, idle, put) = finished
+            .recv_timeout(Duration::from_secs(2))
+            .expect("register access waited for the engine method");
+        // GET stands past the method running; the channel is busy.
+        assert_eq!(get, Some(u64::from(RING) + 12));
+        assert!(!idle);
+        assert_eq!(put, Some(()));
+        let saver = {
+            let bench = Arc::clone(&bench);
+            std::thread::spawn(move || bench.channel.save().unwrap())
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!saver.is_finished(), "a snapshot taken inside an engine method");
+        assert_eq!(bench.calls.lock().unwrap().len(), 1);
+        *bench.gate.0.lock().unwrap() = true;
+        bench.gate.1.notify_all();
+        assert_eq!(feeder.join().unwrap(), Some(()));
+        assert_eq!(
+            bench.engine_calls(4),
+            [
+                (0x5d, 0x10, 0xc0),
+                (0x5d, 0x11, 0x100),
+                (0x5d, 0x10, 0xc4),
+                (0x5d, 0x11, 0x200)
+            ]
+        );
+        assert!(bench.idle());
+        let saved: State = snapshot::decode("host1x channel", &saver.join().unwrap()).unwrap();
+        assert!(saved.idle(), "the snapshot holds the stream where its run ended");
         assert!(bench.notes.take().is_empty());
     }
 

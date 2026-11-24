@@ -76,13 +76,15 @@
 //!
 //! # Time
 //!
-//! An EXECUTE composes within the host1x channel's DMAPUT write that
-//! reaches it, so the host time it takes passes in guest time too: the
-//! core that wrote DMAPUT stands in that write, and the THI syncpoint
-//! increment that follows comes that much later. Other cores run on
-//! meanwhile. Stopping guest time for the duration would freeze the clock
-//! those cores read while they go on running, which no console does, so the
-//! model keeps guest time running and makes the host work short instead.
+//! An EXECUTE composes on the thread that runs the host1x channel's
+//! stream when it reaches the EXECUTE: the DMAPUT write that reaches it, or
+//! the channel's wait thread (see `host1x_channel`), so the host time it
+//! takes passes in guest time too, and the THI syncpoint increment that
+//! follows comes that much later. The channel's registers stay free
+//! meanwhile, and other cores run on. Stopping guest time for the duration
+//! would freeze the clock those cores read while they go on running, which
+//! no console does, so the model keeps guest time running and makes the
+//! host work short instead.
 //!
 //! That matters to the capture button. vi (`010000000000002d`, 23.5.0)
 //! asks nvnflinger for the next composed frame and waits for it with a
@@ -98,10 +100,14 @@
 //! capture missed the 100 ms often. Now each EXECUTE splits its rows among
 //! up to `BAND_THREADS` host threads (`in_bands`) and the sRGB curves are
 //! memoized exactly (`Memo`): 8, 10 and 7 ms for the same replays, and the
-//! picture written is the same bit for bit. The VIC's own time for such a
-//! picture is not public for VIC 4.0; at one pixel a clock and several
-//! hundred MHz it would be a few milliseconds \[assumption\], the order of
-//! what the model now takes.
+//! picture written is the same bit for bit. A lone slot copying 8-bit RGB
+//! 1:1 then went through tables of its composed values (`Fused`) and the
+//! outputs were written a row at a time: grc's 30-a-second NV12 capture of
+//! Minecraft's frames went from about 10 ms an EXECUTE to about 5 ms on a
+//! busy host (median, title menu), the same bit for bit (the tests compare
+//! both paths). The VIC's own time for such a picture is not public for
+//! VIC 4.0; at one pixel a clock and several hundred MHz it would be a few
+//! milliseconds \[assumption\], the order of what the model now takes.
 //!
 //! # Without the firmware
 //!
@@ -625,15 +631,33 @@ impl Surface {
         [r, g, b, alpha]
     }
 
-    /// Stores `color` at (`x`, `y`) in `bytes`, which hold the surface
-    /// from byte `start`.
-    fn put(&self, bytes: &mut [u8], start: u64, x: u32, y: u32, color: [f32; 4]) {
-        let at = (self.offset(x, y) - start) as usize;
-        for (channel, index) in self.format.rgb.into_iter().enumerate() {
-            bytes[at + index] = unorm8(color[channel]);
+    /// Copies `out.len()` bytes of row `y` from pixel `left` out of `rows`.
+    fn read_row(&self, rows: &Rows, left: u32, y: u32, out: &mut [u8]) {
+        row_runs(self.layout, left * BYTES_PER_PIXEL, y, out.len(), |at, run| {
+            let at = (at - rows.start) as usize;
+            out[run.clone()].copy_from_slice(&rows.bytes[at..at + run.len()]);
+        });
+    }
+
+    /// Stores `line` (pixels as stored) at pixel `left` of row `y` in
+    /// `bytes`, which hold the surface from byte `start`.
+    fn write_row(&self, bytes: &mut [u8], start: u64, left: u32, y: u32, line: &[u8]) {
+        row_runs(self.layout, left * BYTES_PER_PIXEL, y, line.len(), |at, run| {
+            let at = (at - start) as usize;
+            bytes[at..at + run.len()].copy_from_slice(&line[run]);
+        });
+    }
+
+    /// `colors` as stored, a pixel after another. X formats store the
+    /// alpha too (Ryujinx writes 35 as 31).
+    fn encode_row(&self, colors: &[[f32; 4]], line: &mut [u8]) {
+        let ([r, g, b], a) = (self.format.rgb, self.format.alpha);
+        for (color, pixel) in colors.iter().zip(line.chunks_exact_mut(BYTES_PER_PIXEL as usize)) {
+            pixel[r] = unorm8(color[0]);
+            pixel[g] = unorm8(color[1]);
+            pixel[b] = unorm8(color[2]);
+            pixel[a] = unorm8(color[3]);
         }
-        // X formats store the alpha too (Ryujinx writes 35 as 31).
-        bytes[at + self.format.alpha] = unorm8(color[3]);
     }
 
     /// How [`Surface::read`] holds rows from `top`: in runs of bytes, each
@@ -700,6 +724,32 @@ fn plane_layout(
             GOB_HEIGHT << block_height_log2,
         )),
         _ => Err(format!("block kind {kind}")),
+    }
+}
+
+/// The runs of `count` bytes of row `y` from byte column `x_bytes` in
+/// `layout` that lie together in memory, `run(offset of the run from the
+/// plane's start, its bytes in the row)`: the whole of it pitch-linear, the
+/// 16-byte runs a GOB keeps together block-linear.
+#[inline]
+fn row_runs(
+    layout: Layout,
+    x_bytes: u32,
+    y: u32,
+    count: usize,
+    mut run: impl FnMut(u64, std::ops::Range<usize>),
+) {
+    match layout {
+        Layout::Pitch(pitch) => run(u64::from(y) * pitch + u64::from(x_bytes), 0..count),
+        Layout::Block(surface, _) => {
+            let mut done = 0;
+            while done < count {
+                let x = x_bytes + done as u32;
+                let length = ((16 - x % 16) as usize).min(count - done);
+                run(surface.offset(x, y, 0), done..done + length);
+                done += length;
+            }
+        }
     }
 }
 
@@ -772,26 +822,12 @@ impl SamplePlane {
     }
 
     /// Stores `line` at byte `x_bytes` of row `y` in `rows` (read by
-    /// [`SamplePlane::read`] to hold that row). A GOB keeps 16-byte runs
-    /// of a row together, so a block-linear row goes by such runs.
+    /// [`SamplePlane::read`] to hold that row).
     fn place(&self, rows: &mut Rows, x_bytes: u32, y: u32, line: &[u8]) {
-        match self.layout {
-            Layout::Pitch(_) => {
-                let at = (self.offset(x_bytes, y) - rows.start) as usize;
-                rows.bytes[at..at + line.len()].copy_from_slice(line);
-            }
-            Layout::Block(..) => {
-                let mut x = x_bytes;
-                let mut rest = line;
-                while !rest.is_empty() {
-                    let run = ((16 - x % 16) as usize).min(rest.len());
-                    let at = (self.offset(x, y) - rows.start) as usize;
-                    rows.bytes[at..at + run].copy_from_slice(&rest[..run]);
-                    x += run as u32;
-                    rest = &rest[run..];
-                }
-            }
-        }
+        row_runs(self.layout, x_bytes, y, line.len(), |at, run| {
+            let at = (at - rows.start) as usize;
+            rows.bytes[at..at + run.len()].copy_from_slice(&line[run]);
+        });
     }
 }
 
@@ -1191,34 +1227,46 @@ impl Planar {
             sum
         };
         // Each plane's bytes of the area, a row of them a line, computed
-        // in bands of rows; then placed in the plane's layout.
-        let fill = |rect: Rect, samples: u32, value: &(dyn Fn(u32, u32) -> u8 + Sync)| {
+        // in bands of rows by `line(row, bytes)`; then placed in the
+        // plane's layout.
+        let fill = |rect: Rect, samples: u32, line: &(dyn Fn(u32, &mut [u8]) + Sync)| {
             let row = (rect.width() * samples) as usize;
             let mut bytes = vec![0u8; row * rect.height() as usize];
             let work = bytes.len();
             in_bands(&mut bytes, row, work, |first, band| {
-                for (y, line) in (rect.top + first as u32..).zip(band.chunks_mut(row)) {
-                    for (x, byte) in (rect.left * samples..).zip(line) {
-                        *byte = value(x, y);
-                    }
+                for (y, out) in (rect.top + first as u32..).zip(band.chunks_mut(row)) {
+                    line(y, out);
                 }
             });
             bytes
         };
-        let mut planes = vec![(self.luma, area, fill(area, 1, &|x, y| unorm8(at(x, y)[0])))];
+        let luma = |y: u32, out: &mut [u8]| {
+            let row = &colors[(y - area.top) as usize * width..][..width];
+            for (byte, color) in out.iter_mut().zip(row) {
+                *byte = unorm8(color[0]);
+            }
+        };
+        let mut planes = vec![(self.luma, area, fill(area, 1, &luma))];
         match self.chroma {
             ChromaPlanes::Interleaved { plane, u_first } => {
-                let value = move |x: u32, y: u32| {
-                    let byte = (x % 2) as usize;
-                    let component = if u_first { 1 + byte } else { 2 - byte };
-                    unorm8(chroma(x / 2, y, component))
+                let line = |cy: u32, out: &mut [u8]| {
+                    for (cx, pair) in (chroma_area.left..).zip(out.chunks_exact_mut(2)) {
+                        for (byte, value) in pair.iter_mut().enumerate() {
+                            let component = if u_first { 1 + byte } else { 2 - byte };
+                            *value = unorm8(chroma(cx, cy, component));
+                        }
+                    }
                 };
-                planes.push((plane, chroma_area, fill(chroma_area, 2, &value)));
+                planes.push((plane, chroma_area, fill(chroma_area, 2, &line)));
             }
             ChromaPlanes::Separate(separate) => {
                 for (index, plane) in separate.into_iter().enumerate() {
-                    let value = |x: u32, y: u32| unorm8(chroma(x, y, 1 + index));
-                    planes.push((plane, chroma_area, fill(chroma_area, 1, &value)));
+                    let line = |cy: u32, out: &mut [u8]| {
+                        for (cx, value) in (chroma_area.left..).zip(out) {
+                            *value = unorm8(chroma(cx, cy, 1 + index));
+                        }
+                    };
+                    planes.push((plane, chroma_area, fill(chroma_area, 1, &line)));
                 }
             }
         }
@@ -1281,11 +1329,11 @@ impl Output {
             let top = first_line + first as u32 * lines;
             let bottom = top + band.len().div_ceil(run) as u32 * lines;
             let base = start + (first * run) as u64;
+            let mut line = vec![0u8; width * BYTES_PER_PIXEL as usize];
             for y in top.max(area.top)..bottom.min(area.bottom) {
                 let row = &colors[(y - area.top) as usize * width..][..width];
-                for (x, color) in (area.left..).zip(row) {
-                    surface.put(band, base, x, y, *color);
-                }
+                surface.encode_row(row, &mut line);
+                surface.write_row(band, base, area.left, y, &line);
             }
         });
         memory
@@ -1802,7 +1850,7 @@ fn compose(memory: &DeviceMemory, methods: &[u32; method::COUNT]) -> Result<(), 
     let config = Config(std::array::from_fn(|i| {
         u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap())
     }));
-    compose_config(memory, methods, &config)
+    compose_config(memory, methods, &config, true)
         .map_err(|reason| format!("{reason}; {}", dump(methods, &config)))
 }
 
@@ -1820,10 +1868,14 @@ fn dump(methods: &[u32; method::COUNT], config: &Config) -> String {
     format!("methods {} config {}", methods.join(" "), words.join(" "))
 }
 
+/// Composes the EXECUTE of `methods` and `config`; `fused` lets a lone
+/// copying slot take [`Fused`] (the tests compare it with the general
+/// path).
 fn compose_config(
     memory: &DeviceMemory,
     methods: &[u32; method::COUNT],
     config: &Config,
+    fused: bool,
 ) -> Result<(), String> {
     let pipe = config.word(0);
     // nvnflinger writes 4 (`0xAEA60`: `| 0x40004`) or 0, libdrm 0; both
@@ -1903,53 +1955,85 @@ fn compose_config(
         });
     }
     let (width, height) = (area.width() as usize, area.height() as usize);
-    // Source samples read: each pixel of a slot takes its column's taps
-    // times its line's, plus the pass that finishes every pixel.
-    let taps = |all: &[Vec<(u32, f32)>]| all.iter().map(Vec::len).sum::<usize>();
-    let work = width * height
-        + (drawn.iter())
-            .map(|drawn| taps(&drawn.columns) * taps(&drawn.lines))
-            .sum::<usize>();
+    // The output's colour matrix and alpha fill, after regamma.
+    let encode = |mut color: [f32; 4]| {
+        // Converts to the output's encoding after regamma [INFERENCE: a
+        // YUV output is formed from encoded RGB].
+        if let Some(matrix) = output_matrix {
+            color = matrix.apply(color);
+        }
+        color[3] = match alpha_fill {
+            0 => 1.0,
+            1 => background[3],
+            _ => color[3],
+        };
+        color
+    };
     let mut colors = vec![[0.0; 4]; width * height];
-    in_bands(&mut colors, width, work, |first, band| {
-        let mut degamma = Memo::new(srgb_to_linear);
-        let mut regamma = Memo::new(clamped_linear_to_srgb);
-        let mut line = vec![background; width];
-        for (out_y, out_row) in (first..).zip(band.chunks_mut(width)) {
-            let y = if flip_y { height - 1 - out_y } else { out_y };
-            let row = area.top + y as u32;
-            line.fill(background);
-            for drawn in &drawn {
+    if let Some(lone) = fused.then(|| Fused::new(&drawn, background, regamma_mode)).flatten() {
+        let drawn = &drawn[0];
+        let outside = encode(lone.outside);
+        in_bands(&mut colors, width, width * height, |first, band| {
+            let mut line = vec![0u8; drawn.columns.len() * BYTES_PER_PIXEL as usize];
+            for (out_y, out_row) in (first..).zip(band.chunks_mut(width)) {
+                let y = if flip_y { height - 1 - out_y } else { out_y };
+                let row = area.top + y as u32;
+                let mut put =
+                    |x: usize, color| out_row[if flip_x { width - 1 - x } else { x }] = color;
                 if !(drawn.rect.top..drawn.rect.bottom).contains(&row) {
+                    (0..width).for_each(|x| put(x, outside));
                     continue;
                 }
-                let (slot, taps) = (drawn.slot, &drawn.lines[(row - drawn.rect.top) as usize]);
                 let start = (drawn.rect.left - area.left) as usize;
-                for (at, column) in line[start..].iter_mut().zip(&drawn.columns) {
-                    let color = slot.color(slot.sample(&drawn.rows, column, taps), &mut degamma);
-                    *at = slot.blend.apply(color, *at);
+                let end = start + drawn.columns.len();
+                (0..start).chain(end..width).for_each(|x| put(x, outside));
+                let source_row = drawn.lines[(row - drawn.rect.top) as usize][0].0;
+                let left = drawn.columns[0][0].0;
+                lone.surface.read_row(lone.rows, left, source_row, &mut line);
+                for (x, pixel) in (start..).zip(line.chunks_exact(BYTES_PER_PIXEL as usize)) {
+                    put(x, encode(lone.color(pixel)));
                 }
             }
-            for (x, &(mut color)) in line.iter().enumerate() {
-                if regamma_mode == GAMMA_SRGB {
-                    for value in &mut color[..3] {
-                        *value = regamma.get(*value);
+        });
+    } else {
+        // Source samples read: each pixel of a slot takes its column's taps
+        // times its line's, plus the pass that finishes every pixel.
+        let taps = |all: &[Vec<(u32, f32)>]| all.iter().map(Vec::len).sum::<usize>();
+        let work = width * height
+            + (drawn.iter())
+                .map(|drawn| taps(&drawn.columns) * taps(&drawn.lines))
+                .sum::<usize>();
+        in_bands(&mut colors, width, work, |first, band| {
+            let mut degamma = Memo::new(srgb_to_linear);
+            let mut regamma = Memo::new(clamped_linear_to_srgb);
+            let mut line = vec![background; width];
+            for (out_y, out_row) in (first..).zip(band.chunks_mut(width)) {
+                let y = if flip_y { height - 1 - out_y } else { out_y };
+                let row = area.top + y as u32;
+                line.fill(background);
+                for drawn in &drawn {
+                    if !(drawn.rect.top..drawn.rect.bottom).contains(&row) {
+                        continue;
+                    }
+                    let (slot, taps) = (drawn.slot, &drawn.lines[(row - drawn.rect.top) as usize]);
+                    let start = (drawn.rect.left - area.left) as usize;
+                    for (at, column) in line[start..].iter_mut().zip(&drawn.columns) {
+                        let color =
+                            slot.color(slot.sample(&drawn.rows, column, taps), &mut degamma);
+                        *at = slot.blend.apply(color, *at);
                     }
                 }
-                // Converts to the output's encoding after regamma
-                // [INFERENCE: a YUV output is formed from encoded RGB].
-                if let Some(matrix) = output_matrix {
-                    color = matrix.apply(color);
+                for (x, &(mut color)) in line.iter().enumerate() {
+                    if regamma_mode == GAMMA_SRGB {
+                        for value in &mut color[..3] {
+                            *value = regamma.get(*value);
+                        }
+                    }
+                    out_row[if flip_x { width - 1 - x } else { x }] = encode(color);
                 }
-                color[3] = match alpha_fill {
-                    0 => 1.0,
-                    1 => background[3],
-                    _ => color[3],
-                };
-                out_row[if flip_x { width - 1 - x } else { x }] = color;
             }
-        }
-    });
+        });
+    }
     if !transpose {
         return output.write(memory, area, &colors);
     }
@@ -1981,6 +2065,97 @@ struct Drawn<'a> {
     columns: Vec<Vec<(u32, f32)>>,
     lines: Vec<Vec<(u32, f32)>>,
     rows: SourceRows,
+}
+
+/// The composition of a lone slot that copies 8-bit RGB pixels 1:1, takes
+/// no colour matrix and has a constant alpha: grc's video capture of the
+/// game's frames (30 an second), nvnflinger's News and netConnect frames.
+/// Then each composed and regamma'd colour component is a function of the
+/// source pixel's byte for it alone: the slot's clamp and degamma act on
+/// each component by itself, and the blending factors depend only on the
+/// alphas, the source's constant and the background's. So each such
+/// function is tabulated over the 256 codes, by running the slot's and the
+/// output's own steps ([`Slot::color`], [`Blend::apply`], the regamma)
+/// on each code: a pixel looked up gets the values those steps give it.
+struct Fused<'a> {
+    surface: &'a Surface,
+    rows: &'a Rows,
+    /// R, G, B after blending and regamma, by the code of each.
+    tables: [[f32; 256]; 3],
+    alpha: f32,
+    /// The regamma'd background, around the slot.
+    outside: [f32; 4],
+}
+
+impl<'a> Fused<'a> {
+    fn new(drawn: &'a [Drawn], background: [f32; 4], regamma_mode: u32) -> Option<Fused<'a>> {
+        let [drawn] = drawn else {
+            return None;
+        };
+        let slot = drawn.slot;
+        let (Source::Rgb(surface), SourceRows::Rgb(rows)) = (&slot.surface, &drawn.rows) else {
+            return None;
+        };
+        // One tap of weight 1 for each column and line, on consecutive
+        // source columns and lines.
+        let copies = |taps: &[Vec<(u32, f32)>]| {
+            let first = taps.first().map_or(0, |tap| tap[0].0);
+            (taps.iter().zip(first..))
+                .all(|(tap, next)| matches!(tap[..], [(at, weight)] if at == next && weight == 1.0))
+        };
+        let alpha_constant = slot.blend.overrides[3].is_some()
+            || slot.constant_alpha
+            || !surface.format.stored_alpha;
+        if slot.matrix.is_some()
+            || !alpha_constant
+            || !copies(&drawn.columns)
+            || !copies(&drawn.lines)
+        {
+            return None;
+        }
+        let regamma = |value: f32| {
+            if regamma_mode == GAMMA_SRGB {
+                clamped_linear_to_srgb(value)
+            } else {
+                value
+            }
+        };
+        let mut degamma = Memo::new(srgb_to_linear);
+        let mut tables = [[0.0; 256]; 3];
+        let mut alpha = 0.0;
+        for code in 0..=255u8 {
+            // As `Surface::pixel` reads the code in each component.
+            let value = f32::from(code) / 255.0;
+            let stored_alpha = if surface.format.stored_alpha { value } else { 1.0 };
+            let color = slot.color([value, value, value, stored_alpha], &mut degamma);
+            let blended = slot.blend.apply(color, background);
+            for (table, component) in tables.iter_mut().zip(blended) {
+                table[usize::from(code)] = regamma(component);
+            }
+            alpha = blended[3];
+        }
+        let [r, g, b, a] = background;
+        Some(Fused {
+            surface,
+            rows,
+            tables,
+            alpha,
+            outside: [regamma(r), regamma(g), regamma(b), a],
+        })
+    }
+
+    /// The composed, regamma'd colour of a source pixel's bytes.
+    #[inline]
+    fn color(&self, pixel: &[u8]) -> [f32; 4] {
+        let [r, g, b] = self.surface.format.rgb;
+        let [tr, tg, tb] = &self.tables;
+        [
+            tr[usize::from(pixel[r])],
+            tg[usize::from(pixel[g])],
+            tb[usize::from(pixel[b])],
+            self.alpha,
+        ]
+    }
 }
 
 /// EXECUTEs that read fewer source samples than this (with a pass per

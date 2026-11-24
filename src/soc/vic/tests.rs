@@ -1087,3 +1087,375 @@ fn bands_cover_every_row_once() {
         }
     }
 }
+
+/// xorshift64*.
+struct Random(u64);
+
+impl Random {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn chance(&mut self, one_in: u64) -> bool {
+        self.below(one_in) == 0
+    }
+
+    fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+        items[self.below(items.len() as u64) as usize]
+    }
+}
+
+const SOURCE_AT: u64 = 0x10_0000;
+/// Output planes: luma, chroma U (or the pairs), chroma V.
+const PLANES_AT: [u64; 3] = [0x20_0000, 0x28_0000, 0x30_0000];
+
+/// A random enabled colour matrix (coefficients around 0..2, offsets
+/// around ±0.25).
+fn random_matrix(random: &mut Random) -> [u64; 4] {
+    let mut words = [0u64; 4];
+    words[0] = 2 << 60;
+    words[1] = 1 << 63;
+    for row in 0..3 {
+        for (column, word) in words.iter_mut().enumerate() {
+            let value = if column == 3 {
+                random.below(1 << 18) as i64 - (1 << 17)
+            } else {
+                random.below(2560) as i64 - 512
+            };
+            *word |= ((value as u64) & 0xF_FFFF) << (row * 20);
+        }
+    }
+    words
+}
+
+/// A random output surface configuration and the size of its picture:
+/// 32-bit RGB (31-38) or 8-bit YUV (67-72), pitch- or block-linear.
+fn random_output(random: &mut Random) -> ([u64; 2], (u32, u32)) {
+    let planar = random.chance(2);
+    let format = if planar {
+        random.pick(&[67, 68, 69, 70, 71, 72])
+    } else {
+        31 + random.below(8)
+    };
+    let subsampling = yuv_input(format as u32).map_or([1, 1], |(_, s)| s);
+    let siting = subsampling.map(|factor| if factor == 1 { 0 } else { random.below(3) });
+    let block = random.chance(2).then(|| random.below(5));
+    let kind = block.map_or(0, |log2| 1 << 11 | log2 << 15);
+    let width = 2 + 2 * random.below(40) as u32;
+    let height = 2 + 2 * random.below(30) as u32;
+    let w0 = format
+        | siting[0] << 7
+        | siting[1] << 9
+        | kind
+        | u64::from(width - 1) << 32
+        | u64::from(height - 1) << 46;
+    let pad = |random: &mut Random, size: u32| u64::from(size + random.below(3) as u32 * 4);
+    let chroma = [width.div_ceil(subsampling[0] as u32), height.div_ceil(subsampling[1] as u32)];
+    let w1 = (pad(random, width) - 1)
+        | (u64::from(height) - 1) << 14
+        | (pad(random, chroma[0]) - 1) << 32
+        | (u64::from(chroma[1]) - 1) << 46;
+    ([w0, w1], (width, height))
+}
+
+/// An inclusive rectangle word within `width`x`height`, sometimes larger
+/// than it, aligned to `align` both ways.
+fn random_rect(random: &mut Random, (width, height): (u32, u32), align: u64) -> u64 {
+    let mut axis = |size: u32| {
+        let start = random.below(u64::from(size) / 2 + 1) / align * align;
+        let end = (start + align * (1 + random.below(u64::from(size) / align + 2))).max(start + 1);
+        (start, end - 1)
+    };
+    let ((left, right), (top, bottom)) = (axis(width), axis(height));
+    left | right << 16 | top << 32 | bottom << 48
+}
+
+/// A random configuration: an output and one slot (sometimes two, a
+/// scaling one, one with a matrix), most of them the copies [`Fused`]
+/// takes; and the methods naming their surfaces.
+fn random_composition(random: &mut Random) -> (Config, [u32; method::COUNT]) {
+    let mut config = Config([0; CONFIG_SIZE / 8]);
+    let mut set = |offset: usize, value: u64| config.0[offset / 8] = value;
+    let background = (0..4).fold(0u64, |word, n| word | random.below(1024) << [16, 26, 36, 6][n]);
+    let output = random.pick(&[0u64, 1, 4])
+        | background
+        | random.below(2) << 46
+        | random.below(4) << 48;
+    let (words, size) = random_output(random);
+    let planar = yuv_input(field(words[0], 0, 7)).is_some();
+    let transpose = !planar && field(words[0], 11, 4) == 0 && random.chance(6);
+    set(0x10, output | u64::from(transpose) << 50);
+    set(0x18, random_rect(random, size, 2));
+    set(0x20, words[0]);
+    set(0x28, words[1]);
+    if planar || random.chance(2) {
+        for (offset, word) in [0x30, 0x38, 0x40, 0x48].into_iter().zip(random_matrix(random)) {
+            set(offset, word);
+        }
+    }
+    let slots = if random.chance(6) { 2 } else { 1 };
+    for slot in 0..slots {
+        let base = SLOT_BASE + slot * SLOT_SIZE;
+        let filter = if random.chance(4) { random.below(16) << 20 } else { 0 };
+        set(base, 1 | 1 << 8 | filter);
+        let clamp_low = if random.chance(2) { 0 } else { random.below(300) };
+        let clamp_high = if random.chance(2) { 1023 } else { 700 + random.below(324) };
+        set(
+            base + 0x10,
+            clamp_low
+                | clamp_high << 10
+                | random.below(1024) << 32
+                | random.below(2) << 42
+                | random.below(2) << 55,
+        );
+        let surface_size = (8 + random.below(80) as u32, 8 + random.below(60) as u32);
+        let source = random_rect(random, surface_size, 1);
+        let (left, right) = (field(source, 0, 14), field(source, 16, 14).min(surface_size.0 - 1));
+        let (top, bottom) = (field(source, 32, 14), field(source, 48, 14).min(surface_size.1 - 1));
+        let destination = if random.chance(5) {
+            random_rect(random, size, 1)
+        } else {
+            // The same size, somewhere.
+            let (x, y) = (random.below(16), random.below(16));
+            let (w, h) = (u64::from(right - left), u64::from(bottom - top));
+            x | (x + w) << 16 | y << 32 | (y + h) << 48
+        };
+        set(base + 0x20, u64::from(left) << 16 | u64::from(right) << 48);
+        set(base + 0x28, u64::from(top) << 16 | u64::from(bottom) << 48);
+        set(base + 0x30, destination);
+        let block = random.chance(2).then(|| random.below(5));
+        let format = 31 + random.below(8);
+        set(base + 0x40, surface_word(format, block, (u64::from(surface_size.0), u64::from(surface_size.1))));
+        set(
+            base + 0x48,
+            u64::from(surface_size.0 - 1) | u64::from(surface_size.1 - 1) << 14,
+        );
+        if random.chance(5) {
+            for (offset, word) in [0x60, 0x68, 0x70, 0x78].into_iter().zip(random_matrix(random)) {
+                set(base + offset, word);
+            }
+        }
+        let selections = random.below(5) << 32
+            | random.below(7) << 36
+            | random.below(4) << 40
+            | random.below(4) << 44;
+        let constants = random.below(1024) | random.below(1024) << 16;
+        let overrides = (0..4).fold(0u64, |word, channel| {
+            word | random.below(1024) << (2 + 10 * channel)
+                | u64::from(random.chance(4)) << (44 + channel)
+                | u64::from(random.chance(8)) << (48 + channel)
+        });
+        set(base + 0xA0, constants | selections);
+        set(base + 0xA8, overrides);
+    }
+    let mut methods = [0; method::COUNT];
+    for slot in 0..slots {
+        methods[method::SURFACES.start + slot * 24] = ((SOURCE_AT + slot as u64 * 0x4_0000) >> 8) as u32;
+    }
+    for (method, address) in method::SET_OUTPUT_SURFACE.zip(PLANES_AT) {
+        methods[method] = (address >> 8) as u32;
+    }
+    (config, methods)
+}
+
+/// Fills device addresses 0..4 MiB of `bench` with random bytes.
+fn scramble(bench: &Bench, random: &mut Random) {
+    let bytes: Vec<u8> = (0..0x40_0000).map(|_| random.next() as u8).collect();
+    bench.poke(0, &bytes);
+}
+
+/// The composition through [`Fused`] writes the same bytes as the
+/// per-pixel path, and refuses the same compositions, for random copies
+/// and the compositions around them.
+#[test]
+fn fused_compositions_match_the_per_pixel_path() {
+    let mut random = Random(0x5D5D_5D5D);
+    let (mut composed, mut differing) = (0, 0);
+    for case in 0..400 {
+        let (config, methods) = random_composition(&mut random);
+        let fused = Bench::new();
+        scramble(&fused, &mut random);
+        let general = Bench::new();
+        general.poke(0, &fused.peek_bytes(0, 0x40_0000));
+        let memory = |bench: &Bench| DeviceMemory::new(&bench.mc, &bench.ram, SMMU_VIC_ASID);
+        let outcome = compose_config(&memory(&fused), &methods, &config, true);
+        let expected = compose_config(&memory(&general), &methods, &config, false);
+        assert_eq!(outcome, expected, "case {case}");
+        let (after, reference) = (fused.peek_bytes(0, 0x40_0000), general.peek_bytes(0, 0x40_0000));
+        assert!(after == reference, "case {case}: {}", dump(&methods, &config));
+        composed += usize::from(outcome.is_ok());
+        differing += usize::from(outcome.is_ok() && after != general.peek_bytes(0, 0));
+    }
+    assert!(composed > 150, "{composed} compositions ran");
+    let _ = differing;
+}
+
+/// The writers before row-wise output: every pixel stored on its own.
+fn reference_write(
+    output: &Output,
+    memory: &DeviceMemory,
+    area: Rect,
+    colors: &[[f32; 4]],
+) -> Result<(), String> {
+    let surface = match output {
+        Output::Rgb(surface) => surface,
+        Output::Planar(planar) => return reference_planar_write(planar, memory, area, colors),
+    };
+    let mut rows = surface.read(memory, area.top, area.bottom)?;
+    let width = area.width() as usize;
+    for y in area.top..area.bottom {
+        for x in area.left..area.right {
+            let color = colors[(y - area.top) as usize * width + (x - area.left) as usize];
+            let at = (surface.offset(x, y) - rows.start) as usize;
+            for (channel, index) in surface.format.rgb.into_iter().enumerate() {
+                rows.bytes[at + index] = unorm8(color[channel]);
+            }
+            rows.bytes[at + surface.format.alpha] = unorm8(color[3]);
+        }
+    }
+    memory
+        .write(surface.address + rows.start, &rows.bytes)
+        .ok_or_else(|| "output not mapped".to_string())
+}
+
+fn reference_planar_write(
+    planar: &Planar,
+    memory: &DeviceMemory,
+    area: Rect,
+    colors: &[[f32; 4]],
+) -> Result<(), String> {
+    let [sx, sy] = planar.subsampling;
+    if [area.left, area.right].iter().any(|x| x % sx != 0)
+        || [area.top, area.bottom].iter().any(|y| y % sy != 0)
+    {
+        return Err(format!(
+            "target {area:?} splits the {sx}x{sy} chroma samples"
+        ));
+    }
+    let chroma_area = Rect {
+        left: area.left / sx,
+        top: area.top / sy,
+        right: area.right / sx,
+        bottom: area.bottom / sy,
+    };
+    let width = area.width() as usize;
+    let at = |x: u32, y: u32| colors[(y - area.top) as usize * width + (x - area.left) as usize];
+    let taps = |axis: usize, k: u32| -> [(u32, f32); 2] {
+        if planar.subsampling[axis] == 1 {
+            return [(k, 1.0), (k, 0.0)];
+        }
+        let odd = planar.siting[axis] as f32 / 2.0;
+        [(2 * k, 1.0 - odd), (2 * k + 1, odd)]
+    };
+    let chroma = |cx: u32, cy: u32, component: usize| {
+        let mut sum = 0.0;
+        for (y, wy) in taps(1, cy) {
+            for (x, wx) in taps(0, cx) {
+                if wx * wy != 0.0 {
+                    sum += wx * wy * at(x, y)[component].clamp(0.0, 1.0);
+                }
+            }
+        }
+        sum
+    };
+    let fill = |rect: Rect, samples: u32, value: &dyn Fn(u32, u32) -> u8| {
+        let row = (rect.width() * samples) as usize;
+        let mut bytes = vec![0u8; row * rect.height() as usize];
+        for (y, line) in (rect.top..).zip(bytes.chunks_mut(row)) {
+            for (x, byte) in (rect.left * samples..).zip(line) {
+                *byte = value(x, y);
+            }
+        }
+        bytes
+    };
+    let mut planes = vec![(planar.luma, area, fill(area, 1, &|x, y| unorm8(at(x, y)[0])))];
+    match planar.chroma {
+        ChromaPlanes::Interleaved { plane, u_first } => {
+            let value = move |x: u32, y: u32| {
+                let byte = (x % 2) as usize;
+                let component = if u_first { 1 + byte } else { 2 - byte };
+                unorm8(chroma(x / 2, y, component))
+            };
+            planes.push((plane, chroma_area, fill(chroma_area, 2, &value)));
+        }
+        ChromaPlanes::Separate(separate) => {
+            for (index, plane) in separate.into_iter().enumerate() {
+                let value = |x: u32, y: u32| unorm8(chroma(x, y, 1 + index));
+                planes.push((plane, chroma_area, fill(chroma_area, 1, &value)));
+            }
+        }
+    }
+    let mut stored = Vec::with_capacity(planes.len());
+    for (plane, rect, _) in &planes {
+        stored.push(plane.read(memory, rect.top, rect.bottom)?);
+    }
+    for ((plane, rect, bytes), mut rows) in planes.into_iter().zip(stored) {
+        let row = bytes.len() / rect.height() as usize;
+        let left = rect.left * row as u32 / rect.width();
+        for (y, line) in (rect.top..).zip(bytes.chunks(row)) {
+            for (x, &byte) in (left..).zip(line) {
+                let at = (plane.offset(x, y) - rows.start) as usize;
+                rows.bytes[at] = byte;
+            }
+        }
+        memory
+            .write(plane.address + rows.start, &rows.bytes)
+            .ok_or_else(|| format!("plane at {:#x} is not mapped", plane.address))?;
+    }
+    Ok(())
+}
+
+/// The row-wise output writers store what the per-pixel ones did, also
+/// for components outside 0..1, in every output format and layout.
+#[test]
+fn row_wise_writers_match_the_per_pixel_writers() {
+    let mut random = Random(0x0A7_u64 << 20 | 0x5D);
+    let specials = [-0.5, -0.0, 0.0, 0.5 / 255.0, 0.5, 1.0, 1.5, f32::NAN];
+    let mut written = 0;
+    for case in 0..300 {
+        let (words, size) = random_output(&mut random);
+        let addresses = PLANES_AT.map(|address| (address >> 8) as u32);
+        let output = Output::new(words, &addresses).unwrap();
+        let area = Rect::inclusive(random_rect(&mut random, size, 2)).intersect(Rect {
+            left: 0,
+            top: 0,
+            right: size.0,
+            bottom: size.1,
+        });
+        if area.width() == 0 || area.height() == 0 {
+            continue;
+        }
+        let colors: Vec<[f32; 4]> = (0..area.width() * area.height())
+            .map(|_| {
+                std::array::from_fn(|_| {
+                    if random.chance(8) {
+                        random.pick(&specials)
+                    } else {
+                        random.below(1 << 16) as f32 / 50_000.0 - 0.1
+                    }
+                })
+            })
+            .collect();
+        let fast = Bench::new();
+        scramble(&fast, &mut random);
+        let reference = Bench::new();
+        reference.poke(0, &fast.peek_bytes(0, 0x40_0000));
+        let memory = |bench: &Bench| DeviceMemory::new(&bench.mc, &bench.ram, SMMU_VIC_ASID);
+        let outcome = output.write(&memory(&fast), area, &colors);
+        let expected = reference_write(&output, &memory(&reference), area, &colors);
+        assert_eq!(outcome, expected, "case {case}");
+        assert!(
+            fast.peek_bytes(0, 0x40_0000) == reference.peek_bytes(0, 0x40_0000),
+            "case {case}: {words:x?} {area:?}"
+        );
+        written += usize::from(outcome.is_ok());
+    }
+    assert!(written > 100, "{written}");
+}
