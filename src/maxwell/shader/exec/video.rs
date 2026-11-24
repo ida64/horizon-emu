@@ -1,6 +1,5 @@
-//! Video operand selection and VMAD arithmetic [public: Ryujinx
-//! Instructions/InstEmitVideoArithmetic.cs and InstEmitAluHelper.cs].
-//! VSETP uses the same selectors [public: Decoders/InstDecoders.cs].
+//! Video operand selection, VMAD arithmetic, and VSETP, which uses the
+//! same selectors.
 use super::*;
 fn select(value: u32, selector: u32) -> Option<i64> {
     let signed = selector & 8 != 0;
@@ -36,7 +35,55 @@ fn boolean(a: bool, b: bool, op: u32) -> bool {
     }
 }
 impl<const L: usize> Machine<'_, L> {
+    /// `VMNMX`: the minimum (or with MX, bit 56, the maximum) of the
+    /// selected A and B, compared signed if B is, combined with register
+    /// 39 by the operation 53:51, of which MIN (5) and MAX (6) are
+    /// modeled, signed with bit 54 (selectors as `VMAD`).
+    /// CC and SAT are not modeled.
+    fn execute_vmnmx(&mut self, active: Mask) -> Result<(), Unmodeled> {
+        let w = self.word;
+        let sa = bits(w, 36, 3) | (bits(w, 48, 1) << 3);
+        let sb = bits(w, 28, 3) | (bits(w, 49, 1) << 3);
+        let operation = bits(w, 51, 3);
+        self.require(!bit(w, 47), "CC")?;
+        self.require(!bit(w, 55), "SAT")?;
+        self.require(
+            matches!(operation, 5 | 6),
+            format_args!("operation {operation}"),
+        )?;
+        let pick = |x: u32, y: u32, signed: bool, max: bool| {
+            let less = if signed {
+                (x as i32) < (y as i32)
+            } else {
+                x < y
+            };
+            if less != max { x } else { y }
+        };
+        self.each(active, |m, l| {
+            let a = select(m.r(l, bits(w, 8, 8)), sa).ok_or_else(|| m.unmodeled("A selector"))?;
+            let b = if bit(w, 50) {
+                select(m.r(l, bits(w, 20, 8)), sb).ok_or_else(|| m.unmodeled("B selector"))?
+            } else if sb & 8 != 0 {
+                bits(w, 20, 16) as i16 as i64
+            } else {
+                bits(w, 20, 16) as i64
+            };
+            let first = pick(a as u32, b as u32, sb & 8 != 0, bit(w, 56));
+            let c = m.r(l, bits(w, 39, 8));
+            m.set(
+                l,
+                bits(w, 0, 8),
+                pick(first, c, bit(w, 54), operation == 6),
+            );
+            Ok(())
+        })
+    }
+
     pub(super) fn execute_video(&mut self, active: Mask) -> Result<bool, Unmodeled> {
+        if self.op == Op::Vmnmx {
+            self.execute_vmnmx(active)?;
+            return Ok(true);
+        }
         if !matches!(self.op, Op::Vmad | Op::Vsetp) {
             return Ok(false);
         }

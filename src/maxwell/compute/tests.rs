@@ -1,6 +1,5 @@
 //! QMD decoding, and kernels launched through the compute class and run
-//! by the interpreter. Instruction encodings: [public: Ryujinx
-//! `Decoders/InstTable.cs`, `Decoders/InstDecoders.cs`]; QMD bit positions:
+//! by the interpreter. QMD bit positions:
 //! [public: NVIDIA open-gpu-doc `classes/compute/clb1c0qmd.h`].
 
 use super::super::tests::Ram;
@@ -341,8 +340,9 @@ fn shared_memory_read_before_any_write_refuses() {
     );
 }
 
+/// Threads that exited do not hold back a barrier the others reach.
 #[test]
-fn barrier_after_threads_exited_refuses() {
+fn barrier_releases_past_exited_threads() {
     let ram = Ram::new(0x8000);
     let kernel = [
         s2r(0, TID_X),
@@ -352,8 +352,7 @@ fn barrier_after_threads_exited_refuses() {
         EXIT,
     ];
     let q = qmd((CODE - REGION) as u32, [1, 1, 1], [40, 1, 1], 0, CBUF, None);
-    let error = launch(&ram, &kernel, &q).unwrap_err();
-    assert!(error.0.contains("exited"), "{error:?}");
+    launch(&ram, &kernel, &q).unwrap();
 }
 
 #[test]

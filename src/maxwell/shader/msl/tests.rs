@@ -689,8 +689,8 @@ fn translations_match_interpreter() {
     assert!(worst.0 <= 1e-3, "worst difference {worst:?}");
 }
 
-/// Programs from instruction encodings [public: Ryujinx
-/// `Decoders/InstDecoders.cs`], laid out as `shader::tests::assembled`.
+/// Programs from instruction encodings, laid out as
+/// `shader::tests::assembled`.
 fn assembled(words: &[u64]) -> Program {
     let mut bytes = vec![0; 0x50];
     bytes[..4].copy_from_slice(&0x1402u32.to_le_bytes());
@@ -794,7 +794,7 @@ fn control_flow_matches_interpreter() {
     }
 }
 
-/// `I2I` R form [public: Ryujinx `InstI2iR`]: destination format `dst`
+/// `I2I` R form: destination format `dst`
 /// (bits 9:8, signed bit 12), source format `src` (bits 11:10, signed bit
 /// 13), byte selector, -b, |b| and SAT.
 #[allow(clippy::too_many_arguments)]
@@ -854,15 +854,95 @@ fn integer_conversions_match_interpreter() {
     }
 }
 
+/// R forms of the integer and flag instructions below: opcode `base`
+/// (bits 63:48) with the guard PT, destination, A, B and C registers.
+fn r_form(base: u64, rd: u64, ra: u64, rb: u64, rc: u64) -> u64 {
+    base << 48 | 0x7_0000 | rd | ra << 8 | rb << 20 | rc << 39
+}
+
+/// `IMUL`, `POPC`, `FLO`, `LEA`, `LEA.HI`, `SHF`, `FCMP`, `CSET`,
+/// `CSETP`, `PSET` and the condition code of `I2I` give the interpreter's
+/// results on Metal.
+#[test]
+fn integer_and_flag_instructions_match_interpreter() {
+    const PT: u64 = 7;
+    let exit = 0xe30000000007000f;
+    let programs = [
+        (
+            assembled(&[
+                mov(4, 0x0000_f0f0),
+                mov(5, 3),
+                mov(6, 0xffff_fffb),
+                mov(7, 0x8000_0000),
+                // IMUL.HI signed: (-5 * -2^31) >> 32.
+                r_form(0x5c38, 0, 6, 7, 0) | 1 << 39 | 1 << 40,
+                r_form(0x5c08, 1, 0, 4, 0), // POPC
+                r_form(0x5c30, 2, 0, 4, 0), // FLO
+                // LEA: R5 + (R4 << 2).
+                r_form(0x5bd7, 3, 4, 5, 2),
+                exit,
+            ]),
+            Some([2, 8, 15, 0x3_c3c3]),
+        ),
+        (
+            assembled(&[
+                mov(4, 0xffff_fffb),
+                mov(5, 1f32.to_bits()),
+                mov(6, 0),
+                // I2I with CC: negative, not zero.
+                i2i(8, 4, (2, true), (2, true), 0, false, false, false) | 1 << 47,
+                r_form(0x5098, 0, 0, 0, PT) | 21 << 8, // CSET: negative
+                r_form(0x5098, 1, 0, 0, PT) | 10 << 8 | 1 << 44, // CSET.BF: zero
+                r_form(0x50a0, 1, 0, 0, PT) | 21 << 8, // CSETP P0, P1
+                // PSET.BF: P0 and not P1.
+                0x5088 << 48 | 0x7_0000 | 2 | 1 << 29 | 1 << 32 | PT << 39 | 1 << 44,
+                // FCMP: R5 > 0 ? R4 : R6.
+                r_form(0x5ba0, 3, 4, 6, 5) | 4 << 48,
+                exit,
+            ]),
+            Some([u32::MAX, 0, 1f32.to_bits(), 0xffff_fffb]),
+        ),
+        (
+            assembled(&[
+                mov(4, 0x8000_0001),
+                mov(5, 0x1234_5678),
+                mov(6, 4),
+                r_form(0x5bf8, 0, 4, 6, 5), // SHF left
+                r_form(0x5cf8, 1, 4, 6, 5), // SHF right
+                // LEA.HI: R6 + ((R5:R4) >> 28).
+                r_form(0x5bdf, 2, 4, 6, 5) | 4 << 28,
+                // FLO signed, counted from bit 31.
+                r_form(0x5c30, 3, 0, 4, 0) | 1 << 41 | 1 << 48,
+                exit,
+            ]),
+            None,
+        ),
+    ];
+    let gpu = Gpu::new();
+    for (index, (program, words)) in programs.iter().enumerate() {
+        let t = translate(program, &[]).unwrap_or_else(|e| panic!("program {index}: {e}"));
+        let input = inputs(&t, 1);
+        let expected = interpret(program, &input).expect("interprets")[0].colors[0].map(f32::to_bits);
+        if let Some(words) = words {
+            assert_eq!(expected, *words, "program {index}");
+        }
+        let Some(gpu) = &gpu else {
+            continue;
+        };
+        let colors = render(gpu, program, &t, &input).expect("renders");
+        for pixel in &colors[0] {
+            assert_eq!(pixel.map(f32::to_bits), expected, "program {index}");
+        }
+    }
+}
+
 /// `SHFL` with immediate operands: mode, destination, source, lane or
-/// offset `b`, clamp and segment mask `c`, destination predicate `pd`
-/// [public: Ryujinx `InstShfl`].
+/// offset `b`, clamp and segment mask `c`, destination predicate `pd`.
 fn shfl(mode: u64, rd: u64, ra: u64, b: u64, c: u64, pd: u64) -> u64 {
     0xef10_0000_0007_0000 | rd | ra << 8 | b << 20 | 3 << 28 | mode << 30 | c << 34 | pd << 48
 }
 
-/// `FSWZADD` R`rd` = R`ra` and R`rb` by the per-lane operations `ops`
-/// [public: Ryujinx `InstFswzadd`].
+/// `FSWZADD` R`rd` = R`ra` and R`rb` by the per-lane operations `ops`.
 fn fswzadd(rd: u64, ra: u64, rb: u64, ops: u64) -> u64 {
     0x50f8_0000_0007_0000 | rd | ra << 8 | rb << 20 | ops << 28
 }

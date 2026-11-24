@@ -12,9 +12,8 @@
 //!
 //! `BRX` jumps to `pc + 8 + imm24 + register`, where the compiler loads
 //! the register from a jump table in constant buffer 1 (an `LDC` B32 of
-//! slot 1, as NVN emits for `switch` [public: Ryujinx
-//! `Decoders/Decoder.cs`, which reads BRX targets from constant buffer 1
-//! as well]). That every value the register can hold at the branch comes
+//! slot 1, as NVN emits for `switch`). That every value the register can
+//! hold at the branch comes
 //! from such a load (or is the initial zero) is checked over all paths.
 //! The words such a load can read are those of its table when its address
 //! is provably the clamped index `min(x, K) << 2` the compiler emits

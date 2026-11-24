@@ -150,8 +150,7 @@ impl Default for ThreeD {
             // Rendering is enabled until a SET_RENDER_ENABLE_C says
             // otherwise: the netlist's initial value of that register is 0
             // (FALSE), which would leave nothing ever drawn if the
-            // register itself governed rendering [public: eden
-            // `Maxwell3D` keeps `execute_on = true` until the method runs].
+            // register itself governed rendering.
             render_enable: true,
             batch: None,
             instance: 0,
@@ -178,8 +177,8 @@ fn write_words(memory: &dyn GpuMemory, address: u64, words: &[u32]) -> Result<()
 }
 
 /// Writes a semaphore release: the payload alone, or the four-word
-/// structure (payload, 0, 64-bit timestamp) [public: eden
-/// `Maxwell3D::StampQueryResult`, NVIDIA `clb197.h` `STRUCTURE_SIZE`].
+/// structure (payload, 0, 64-bit timestamp) [public: NVIDIA `clb197.h`
+/// `STRUCTURE_SIZE`].
 pub fn release_semaphore(
     memory: &dyn GpuMemory,
     hooks: &Hooks,
@@ -264,13 +263,10 @@ impl ThreeD {
     }
 
     /// The shadow RAM [public: NVIDIA `clb197.h`
-    /// `SET_MME_SHADOW_RAM_CONTROL`; semantics from Ryujinx
-    /// `DeviceStateWithShadow` and eden `Maxwell3D::ProcessShadowRam`]:
-    /// in the track modes a write is also recorded in the shadow RAM, in
-    /// replay mode the recorded value replaces the argument. The two
-    /// reimplementations disagree for the first 0x80 methods (Ryujinx
-    /// passes them through, eden shadows them), so replay of those is
-    /// refused.
+    /// `SET_MME_SHADOW_RAM_CONTROL`]: in the track modes a write is also
+    /// recorded in the shadow RAM, in replay mode the recorded value
+    /// replaces the argument. Whether the first 0x80 methods are
+    /// shadowed is not established, so replay of those is refused.
     fn shadow(&mut self, method: u32, argument: u32) -> Result<u32, Unmodeled> {
         let index = method as usize;
         if method == SET_MME_SHADOW_RAM_CONTROL {
@@ -387,12 +383,38 @@ impl ThreeD {
                     ));
                 }
             }
+            // The modes that compare read two reports as
+            // `SET_REPORT_SEMAPHORE` writes them (a 64-bit value, then a
+            // 64-bit timestamp) at SET_RENDER_ENABLE_A/B: CONDITIONAL
+            // renders while the first one's value is not zero,
+            // RENDER_IF_EQUAL and RENDER_IF_NOT_EQUAL compare its value
+            // with the second one's, 16 bytes on. The values are read
+            // when the method
+            // arrives: reports are written in command order, so they hold
+            // what the commands before it reported.
             SET_RENDER_ENABLE_C => {
-                self.render_enable = match argument & 7 {
+                let mode = argument & 7;
+                self.render_enable = match mode {
                     0 => false,
                     1 => true,
+                    2..=4 => {
+                        let address = u64::from(self.registers[m(0x1550) as usize] & 0xFF) << 32
+                            | u64::from(self.registers[m(0x1554) as usize]);
+                        let value = |address: u64| {
+                            let mut bytes = [0; 8];
+                            memory.read(address, &mut bytes).ok_or_else(|| {
+                                Unmodeled(format!("render condition at unmapped {address:#x}"))
+                            })?;
+                            Ok::<_, Unmodeled>(u64::from_le_bytes(bytes))
+                        };
+                        match mode {
+                            2 => value(address)? != 0,
+                            3 => value(address)? == value(address + 16)?,
+                            _ => value(address)? != value(address + 16)?,
+                        }
+                    }
                     _ => {
-                        return Err(refuse(method, argument, "conditional rendering"));
+                        return Err(refuse(method, argument, "render enable mode"));
                     }
                 };
             }
@@ -481,9 +503,7 @@ impl ThreeD {
             // field into place: init blast 0x25ce30,
             // nvnCommandBufferSetConservativeRasterDilate 0x256b90,
             // 0x257fd0, 0x25a7b0 (sample locations). The completion
-            // handshake is what both public reimplementations do [public:
-            // eden `Maxwell3D::ProcessFirmwareCall4`, Ryujinx
-            // `ThreedClass.SetFalcon04`]. The write is kept in
+            // handshake is an \[assumption\]. The write is kept in
             // `priv_registers`, so the state is there; what those
             // registers change in rasterization is not documented
             // publicly and is NOT modeled. Addresses outside the graphics
@@ -539,8 +559,7 @@ impl ThreeD {
                     address + u64::from(offset)
                 ))
             })?;
-        // The offset advances by a word per load [public: eden
-        // `Maxwell3D::ProcessCBData`, Ryujinx `ConstantBufferUpdater`].
+        // The offset advances by a word per load.
         self.registers[LOAD_CONSTANT_BUFFER_OFFSET as usize] = offset + 4;
         Ok(())
     }
@@ -603,8 +622,7 @@ impl ThreeD {
             // RELEASE, or REPORT_ONLY (2), of the payload with REPORT NONE:
             // both write the payload (and, four-word, a timestamp); they
             // differ only in the ordering a release implies, which a
-            // synchronous model always provides [public: eden
-            // `Maxwell3D::ProcessQueryGet` handles both alike]. NVN's
+            // synchronous model always provides. NVN's
             // timestamp counter uses REPORT_ONLY with control 0xf002
             // (starter report table 0x3c8ba4, index 0).
             (0 | 2, 0) => release_semaphore(memory, hooks, address, payload, !one_word),
@@ -808,11 +826,9 @@ impl ThreeD {
     /// USE_SCISSOR0 (8) and USE_VIEWPORT_CLIP0 (12). A stencil clear sets
     /// `SET_STENCIL_CLEAR_VALUE` in a target whose format has stencil (one
     /// without has nothing to clear); with the control's bit 0 only the
-    /// bits the front stencil write mask (`0x139c`) lets through. Offsets
-    /// and that bit as in envytools' `gf100_3d.xml` (`CLEAR_STENCIL`,
-    /// `CLEAR_FLAGS.STENCIL_MASK`, `STENCIL_FRONT_MASK`). deko3d sets the
-    /// bit and clears depth and stencil together (`0x3`, ftpd's first
-    /// frame).
+    /// bits the front stencil write mask (`0x139c`) lets through
+    /// (`CLEAR_STENCIL`, `CLEAR_FLAGS.STENCIL_MASK`,
+    /// `STENCIL_FRONT_MASK`).
     fn clear(
         &mut self,
         argument: u32,

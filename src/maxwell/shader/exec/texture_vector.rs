@@ -1,6 +1,6 @@
-//! Operand order and offsets [public: Ryujinx Instructions/InstEmitTexture.cs,
-//! EmitTex, EmitTld4, EmitTmml, EmitTxd, EmitTxq, EmitTexs]. Unsupported
-//! multisample and per-texel gather offsets cannot be represented by TextureUnit.
+//! `TEX`, `TLD4`, `TMML`, `TXD` and `TXQ`: operand order and offsets.
+//! Unsupported multisample and per-texel gather offsets cannot be
+//! represented by TextureUnit.
 use super::super::super::sampling::{
     FetchRequest, GatherRequest, Lod, Query, SampleRequest, Target,
 };
@@ -282,10 +282,8 @@ impl<const L: usize> Machine<'_, L> {
                         },
                     }
                 } else {
-                    m.require(
-                        !m.is_compute(),
-                        "implicit level of detail in a compute program",
-                    )?;
+                    // No derivatives outside a fragment program: the
+                    // base level (see `tex.rs`).
                     Lod::Level(0.0)
                 };
                 m.env.textures.sample(

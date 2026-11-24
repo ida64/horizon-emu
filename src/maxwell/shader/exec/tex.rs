@@ -1,6 +1,6 @@
-//! Packed scalar operands and component maps follow [public: eden
-//! frontend/maxwell/translate/impl/texture_fetch_swizzled.cpp]. NODEP
-//! affects scheduling only: synchronous CPU sampling has no outstanding reads.
+//! `TEXS`, `TLDS` and `TLD4S`: packed scalar operands and component maps.
+//! NODEP affects scheduling only: synchronous CPU sampling has no
+//! outstanding reads.
 use super::super::super::sampling::{Lod, SampleRequest, Target};
 use super::*;
 impl<const L: usize> Machine<'_, L> {
@@ -56,6 +56,10 @@ impl<const L: usize> Machine<'_, L> {
             7..=9 => [self.rf(l, a + 1), self.rf(l, b), 0.0],
             _ => [self.rf(l, a), self.rf(l, a + 1), self.rf(l, b)],
         });
+        // Implicit level of detail comes from the quad's derivatives in a
+        // fragment program; other stages have none and sample the base
+        // level \[recalled: GLSL 4.60 §8.9, implicit derivatives exist
+        // only in fragment shaders, elsewhere the base level is used\].
         let implicit = matches!(encoding, 1 | 4 | 7 | 10 | 12);
         let implicit_lod = if L == 4 {
             Lod::Derivatives {
@@ -68,10 +72,6 @@ impl<const L: usize> Machine<'_, L> {
         };
         self.each(active, |m, l| {
             let lod = if implicit {
-                m.require(
-                    !m.is_compute(),
-                    "implicit level of detail in a compute program",
-                )?;
                 implicit_lod
             } else {
                 Lod::Level(match encoding {

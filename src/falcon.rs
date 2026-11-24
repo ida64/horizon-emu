@@ -1,11 +1,10 @@
 //! Falcon, NVIDIA's microcontroller core inside the Tegra's engines (the
 //! TSEC's is version 5): an interpreter for its instructions.
 //!
-//! Sources, for the facts: the envytools project's documentation of the
-//! core (`docs/hw/falcon/`: `isa.rst` for formats and subopcodes,
-//! `arith.rst`, `data.rst`, `branch.rst`, `io.rst`, `intr.rst`, `vm.rst`,
-//! `proc.rst`, whose pseudocode the operations here follow) and its
-//! disassembler's table (`envydis/falcon.c`) for the encodings version 5
+//! Sources, for the facts: public documentation of the core (formats and
+//! subopcodes, arithmetic, data, branches, IO, interrupts, the code TLB
+//! and the processor state, whose pseudocode the operations here follow)
+//! and a public table of the encodings version 5
 //! added or changed: the short `mov` of an immediate (`0x`, `4x`, `8x`,
 //! `dx`), the two-byte `st`, `cmp`, `mov` and `ld` (`20`..`26`, `32`,
 //! `3f`), `st` with an offset (`35`), three-operand `add` with a 16-bit

@@ -295,9 +295,8 @@ impl Writer<'_> {
         }
     }
 
-    /// The condition-code test `ccc` as a `bool` expression [public:
-    /// Ryujinx `Instructions/InstEmitConditionCode.cs` `GetCondition`, as
-    /// the interpreter's `condition`].
+    /// The condition-code test `ccc` as a `bool` expression (as the
+    /// interpreter's `condition`).
     fn condition(&mut self, ccc: u32) -> Result<String, String> {
         if ccc == 15 {
             return Ok("true".into());

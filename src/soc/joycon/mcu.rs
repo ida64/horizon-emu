@@ -7,9 +7,7 @@
 //! reports of kind `0x31` every output report of kind `0x11` carries a
 //! 38-byte request to the processor and every input report the 313 bytes
 //! of its answer. Public descriptions of the protocol name the parts used
-//! here (dekuNukem's `bluetooth_hid_subcommands_notes.md` for the
-//! subcommands and report kinds; the Joy-Con NFC driver of an open-source
-//! emulator, yuzu's `joycon_protocol/nfc.cpp`, for the NFC commands, their
+//! here (the subcommands and report kinds, the NFC commands, their
 //! arguments and the processor's NFC states). Layouts are what `hid` builds
 //! and checks; text offsets below are in its `main` (system module
 //! 0100000000000013):
@@ -65,8 +63,7 @@ const NFC: u8 = 4;
 /// NFC states, as the processor reports them. `hid` raises its "tag
 /// found" event when the state becomes 9 and its "tag lost" event when it
 /// becomes 8 (`0x156680`); a read ends with state 4 and a write with state
-/// 5 (`0x156DB0`, `0x1567E0`). 0 is idle and 1 polling with nothing found
-/// (yuzu's names).
+/// 5 (`0x156DB0`, `0x1567E0`). 0 is idle and 1 polling with nothing found.
 const IDLE: u8 = 0;
 const POLLING: u8 = 1;
 const READ_DONE: u8 = 4;
@@ -74,7 +71,7 @@ const WRITE_DONE: u8 = 5;
 const TAG_LOST: u8 = 8;
 const TAG_FOUND: u8 = 9;
 
-/// NFC commands (yuzu's `NFCCommand`).
+/// NFC commands.
 const CANCEL: u8 = 0x00;
 const START_POLLING: u8 = 0x01;
 const STOP_POLLING: u8 = 0x02;
@@ -322,7 +319,7 @@ impl Mcu {
     }
 
     /// ReadNtag: `d0 07`, the serial number the tag must have (all zeros:
-    /// any), which tags (yuzu: 0 any, 1 NTAG215), how many runs of pages
+    /// any), which tags (0 any, 1 NTAG215), how many runs of pages
     /// (up to 4) and each one's first and last page. The answer, sent in
     /// packets of NFC data (`hid` puts them together at `0x1562F0` and
     /// takes them apart at `0x158810`), is the tag's description as in
@@ -383,8 +380,8 @@ impl Mcu {
     }
 
     /// WriteNtag, put together from its packets: `d0 07`, the serial
-    /// number, which tags, 7 bytes yuzu sends as `00 01 04 ff ff ff ff`,
-    /// the 4 bytes for page 4 (yuzu: amiibo magic, write counter,
+    /// number, which tags, 7 bytes sent as `00 01 04 ff ff ff ff`,
+    /// the 4 bytes for page 4 (amiibo magic, write counter,
     /// version), how many runs, and each run's first page, length in bytes
     /// and bytes (`hid` builds it at `0x157A40`).
     ///
@@ -517,7 +514,7 @@ impl Mcu {
 
 /// An NFC answer: `data` in a packet numbered `packet`, with the console's
 /// last packet taken, its flags, and the checksum. A state report gives
-/// its length as the whole room (yuzu checks the `0x31` of `09 31`).
+/// its length as the whole room (the `0x31` of `09 31`).
 fn nfc_answer(kind: u8, carries: u8, packet: u8, taken: u8, flags: u8, data: &[u8]) -> Vec<u8> {
     let length = match carries {
         CARRIES_STATE => MAX_DATA,

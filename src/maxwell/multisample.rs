@@ -7,28 +7,17 @@
 //! samples of a pixel as a block of `2^lx` by `2^ly` texels of an
 //! ordinary surface `2^lx` times as wide and `2^ly` times as tall
 //! (1X1: 1x1, 2X1: 2x1, 2X2: 2x2, 4X2: 4x2, 4X4: 4x4): pixel (x, y),
-//! sample s is texel (x << lx | cx(s), y << ly | cy(s)) [public: Mesa
-//! nouveau `nv50_miptree.c` (`ms_x`, `ms_y`; surfaces are `width << ms_x`
-//! by `height << ms_y`), eden `texture_cache/samples_helper.h`
-//! `SamplesLog2`, Ryujinx `TextureCopyMS.cs`]. The render target and
-//! depth buffer size registers (`SET_COLOR_TARGET_WIDTH`,
+//! sample s is texel (x << lx | cx(s), y << ly | cy(s)). The render
+//! target and depth buffer size registers (`SET_COLOR_TARGET_WIDTH`,
 //! `SET_ZT_SIZE_A`) give the size of that surface, in texels; the
-//! surface clip, scissors and viewports count pixels [public: Mesa
-//! `nv50_miptree.c` `nv50_surface_from_miptree` shifts the width it
-//! programs; eden `image_info.cpp` takes the render target width as the
-//! texel size and `vk_texture_cache.cpp` shifts it back for the host
-//! image; inference, from Minecraft: a 2X1 target of width 2560 drawn with
-//! a 1280-pixel surface clip and viewport]. A texture header gives the
-//! size in pixels (Mesa `nvc0_tex.c` programs `width0` with the
-//! `MULTI_SAMPLE_COUNT` field; eden multiplies it out).
+//! surface clip, scissors and viewports count pixels \[inference, from a
+//! capture: a 2X1 target of width 2560 drawn with a 1280-pixel surface
+//! clip and viewport\]. A texture header gives the size in pixels, with
+//! the `MULTI_SAMPLE_COUNT` field.
 //!
 //! The block position of sample s takes the bits of s alternately for x
 //! and y: s = 0..7 at (0,0), (1,0), (0,1), (1,1), (2,0), (3,0), (2,1),
-//! (3,1) [public: Mesa `nvc0_screen.c`, the `NVC0_CB_AUX_MS_INFO` table
-//! nouveau's shaders address multisampled images with, and the surface
-//! coordinates its `nvc0_context.c` sample tables name]. Mesa notes the
-//! table "do[es] not work with _ALT modes" (`2X1_D3D`, `4X2_D3D`) on the
-//! hardware it was written for; GM20B places every sample where
+//! (3,1). GM20B places every sample where
 //! `SET_ANTI_ALIAS_SAMPLE_POSITIONS` says (see below), so storage by
 //! index is taken to hold for all modes \[assumption; only which sample a
 //! shader's fetch of sample index s reads depends on it\]. 4X4's samples
@@ -39,10 +28,8 @@
 //! GM20B's sample positions are programmable: `SET_ANTI_ALIAS_SAMPLE_POSITIONS(i)`
 //! (0x11e0, four words) holds 16 slots of a 4-bit x and y in 1/16 pixel,
 //! slot `p * n + s` being sample s of pixel p of a small pixel grid for n
-//! samples [public: NVIDIA open-gpu-doc `clb197.h`; Mesa
-//! `nvc0_state_validate.c` `gm200_validate_sample_locations`, which
-//! programs them for every sample count on GM200 and later]. NVN programs
-//! the same positions for every pixel of the grid (Minecraft's 2X1_D3D:
+//! samples [public: NVIDIA open-gpu-doc `clb197.h`]. NVN programs the
+//! same positions for every pixel of the grid (2X1_D3D:
 //! `0x44cc44cc`, sample 0 at (12/16, 12/16), sample 1 at (4/16, 4/16),
 //! Direct3D's standard 2x pattern); positions that differ between pixels
 //! are refused. One sample per pixel is at the pixel center (the 1X1 rules
@@ -191,7 +178,7 @@ mod tests {
             seen[y as usize][x as usize] = true;
         }
         assert!(Samples::from_mode(9).is_err());
-        // Minecraft's 2X1_D3D positions.
+        // The 2X1_D3D positions NVN programs.
         let two = two.with_positions([0x44cc44cc; 4]).unwrap();
         assert_eq!(two.offset(0), [0.75, 0.75]);
         assert_eq!(two.offset(1), [0.25, 0.25]);

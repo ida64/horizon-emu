@@ -6,9 +6,8 @@
 //! `i % 4 == 0`; it carries only latency/barrier hints for the hardware
 //! scheduler, which an in-order interpreter has no use for. Program
 //! counters in this module are byte offsets from the first word after the
-//! header (the base [public: Ryujinx `Decoders/Decoder.cs`] uses, so that
-//! branch targets are `pc + 8 + imm24` and a target on a scheduling word
-//! continues at the next instruction).
+//! header (so that branch targets are `pc + 8 + imm24` and a target on a
+//! scheduling word continues at the next instruction).
 //!
 //! # End of program
 //!
@@ -93,10 +92,9 @@
 //! No program of the corpus uses `TEX`, `TLD`,
 //! `TLDS`, `TLD4`, `TLD4S`, `TXQ`, `TMML`, `TXD`, `LD`, `ST`, `STG`,
 //! `LOP3`, `SEL`, `PSETP`, `P2R`, `VADD`, `VSET`, `VABSDIFF`, `FSWZADD`,
-//! `SHFL`, `PCNT` or `CONT`; those are implemented from the public sources
-//! cited at each, except `VADD`/`VSET`/`VABSDIFF`, which are outside the
-//! executed firmware subset and return [`Unmodeled`]. (`SHFL` and
-//! `FSWZADD` first ran in Minecraft's programs.)
+//! `SHFL`, `PCNT` or `CONT`; those are implemented as documented at each,
+//! except `VADD`/`VSET`/`VABSDIFF`, which are outside the executed
+//! firmware subset and return [`Unmodeled`].
 //!
 //! # Execution
 //!
@@ -244,9 +242,8 @@ impl Program {
 }
 
 /// A compute program (kernel). Unlike graphics programs it has no program
-/// header: code starts at its address [public: Ryujinx
-/// `Translation/Translator.cs`, which decodes compute programs from their
-/// address and others from address + 0x50 after the `ShaderHeader`]. The
+/// header: code starts at its address (a graphics program's starts 0x50
+/// after its address, behind the header). The
 /// end of the code is found as for [`Program`].
 #[derive(Debug, Clone)]
 pub struct Kernel {
@@ -399,11 +396,9 @@ impl Builder {
 pub struct ConstantBuffer<'a> {
     /// The leading bytes of the buffer that were read from memory.
     pub data: &'a [u8],
-    /// The bound size (0: unbound). Reads beyond it return 0 [public: eden
-    /// `shader_recompiler/backend/glsl/emit_glsl_context_get_set.cpp`
-    /// `GetCbuf`, which returns 0 for offsets outside the 64 KiB buffer
-    /// window; within the window the bound size is what the hardware's
-    /// constant buffer bounds check uses]. A read within it but past
+    /// The bound size (0: unbound). Reads beyond it return 0: the bound
+    /// size is what the hardware's constant buffer bounds check uses. A
+    /// read within it but past
     /// `data` reaches memory the GPU could not read (the buffer's tail is
     /// not mapped) and is refused: on hardware it would fault.
     pub size: usize,
@@ -438,8 +433,7 @@ pub struct Env<'a> {
 /// The attribute space of one vertex: bytes 0..0x400 as 256 words.
 /// a\[0x070..0x080) is the position, a\[0x080 + 16 * i\] generic attribute
 /// `i`, a\[0x2f8\] the instance ID, a\[0x2fc\] the vertex ID
-/// [public: Ryujinx `Translation/AttributeConsts.cs`; NVIDIA open-gpu-doc
-/// Shader-Program-Header, Imap/Omap order].
+/// [public: NVIDIA open-gpu-doc Shader-Program-Header, Imap/Omap order].
 #[derive(Clone, PartialEq, Eq)]
 pub struct Attributes(pub [u32; 256]);
 
@@ -456,11 +450,7 @@ impl Attributes {
     /// \[inference: the Mii editor's face-texture programs store only x,
     /// y and z of the position (a\[0x070..0x07c)), and with w = 0 every
     /// face part would be clipped away, leaving the preview without eyes,
-    /// eyebrows or mouth; Ryujinx `Translation/Translator.cs`
-    /// `EmitOutputsInitialization` (`InitializeOutput`,
-    /// `InitializeOutputComponent`) sets the position of a vertex program
-    /// and each generic component the next stage reads to (0, 0, 0, 1)
-    /// before the program runs\].
+    /// eyebrows or mouth\].
     pub fn vertex_outputs() -> Attributes {
         let mut words = [0; 256];
         let one = 1.0f32.to_bits();

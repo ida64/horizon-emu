@@ -1137,7 +1137,7 @@ mod tests {
         }
     }
 
-    /// Host-class increments. With Minecraft running and video capture on,
+    /// Host-class increments. With an application running and video capture on,
     /// the channel that carries the VIC's submissions sends host increment
     /// 0x10C (syncpoint 12, condition 1, OP_DONE). Each of the four
     /// conditions counts when the processor reaches it; a reserved one

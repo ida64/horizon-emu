@@ -567,9 +567,7 @@ pub struct ThreadTextures<'a> {
 
 impl ThreadTextures<'_> {
     /// Runs `f` on the texture and sampler of a handle: TIC index in bits
-    /// 19:0, TSC index in bits 31:20 [public: Ryujinx
-    /// `Ryujinx.Graphics.Shader/TextureHandle.cs`
-    /// `UnpackTextureId`/`UnpackSamplerId`]. Recently used handles are
+    /// 19:0, TSC index in bits 31:20. Recently used handles are
     /// served from this thread's list without touching shared state.
     fn with<R>(&self, handle: u32, f: impl FnOnce(&Texture, &Tsc) -> R) -> Result<R, Unmodeled> {
         {

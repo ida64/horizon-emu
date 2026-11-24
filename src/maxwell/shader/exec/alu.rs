@@ -1,7 +1,5 @@
-//! Scalar arithmetic fields follow [public: Ryujinx Decoders/InstDecoders.cs].
-//! Operations follow [public: Ryujinx Instructions/InstEmitFloatArithmetic.cs,
-//! InstEmitIntegerArithmetic.cs, InstEmitFloatComparison.cs]. Unsupported
-//! rounding and extended modes fail explicitly rather than approximate them.
+//! Scalar arithmetic: field layouts and operations. Unsupported rounding
+//! and extended modes fail explicitly rather than approximate them.
 use super::*;
 
 pub(super) fn saturate(v: f32) -> f32 {
@@ -35,7 +33,7 @@ fn round_f64(v: f64, mode: u32) -> f32 {
         r
     }
 }
-fn compare(a: f32, b: f32, c: u32) -> bool {
+pub(super) fn compare(a: f32, b: f32, c: u32) -> bool {
     let nan = a.is_nan() || b.is_nan();
     match c {
         0 => false,
@@ -129,6 +127,10 @@ impl<const L: usize> Machine<'_, L> {
             Op::ShrR => ("SHR", Form::R),
             Op::ShrI => ("SHR", Form::I),
             Op::ShrC => ("SHR", Form::C),
+            Op::ShfLR => ("SHF<", Form::R),
+            Op::ShfLI => ("SHF<", Form::I),
+            Op::ShfRR => ("SHF>", Form::R),
+            Op::ShfRI => ("SHF>", Form::I),
             Op::IscaddR => ("ISCADD", Form::R),
             Op::IscaddI => ("ISCADD", Form::I),
             Op::IscaddC => ("ISCADD", Form::C),
@@ -277,7 +279,7 @@ impl<const L: usize> Machine<'_, L> {
                     (if bit(w, 50) { saturate(v) } else { v }).to_bits()
                 }
                 // RRO is a range-reduction hint: CPU transcendental operations perform
-                // their own reduction [public: eden translate/impl/floating_point_range_reduction.cpp].
+                // their own reduction.
                 "RRO" => modify(bf, bit(w, 49), bit(w, 45)).to_bits(),
                 "FSETP" | "FSET" | "ISETP" | "ISET" => {
                     let fp = name.starts_with('F');
@@ -407,6 +409,35 @@ impl<const L: usize> Machine<'_, L> {
                         a.checked_shr(n).unwrap_or(0)
                     }
                 }
+                // Funnel shift of the 64-bit value C:A (C register 39-46
+                // the high word): left gives the high word of the shifted
+                // value, right the low word. Shift count B (register
+                // 20-27, or the 6-bit immediate at 20), maximum shift
+                // bits 38:37 (0 32, 2 64 unsigned, 3 64 signed), wrap bit
+                // 50: the count masked to the maximum minus one instead of
+                // clamped to the maximum.
+                "SHF<" | "SHF>" => {
+                    m.require(bits(w, 48, 2) == 0, "extended funnel shift")?;
+                    let maximum = bits(w, 37, 2);
+                    m.require(maximum != 1, "maximum shift 1")?;
+                    let limit = if maximum == 0 { 32 } else { 64 };
+                    let count = if form == Form::I { bits(w, 20, 6) } else { b };
+                    let n = if bit(w, 50) {
+                        count & (limit - 1)
+                    } else {
+                        count.min(limit)
+                    };
+                    let high = m.r(l, bits(w, 39, 8));
+                    let packed = u64::from(high) << 32 | u64::from(a);
+                    cc = bit(w, 47);
+                    if name == "SHF<" {
+                        (packed.checked_shl(n).unwrap_or(0) >> 32) as u32
+                    } else if maximum == 3 {
+                        ((packed as i64) >> n.min(63)) as u32
+                    } else {
+                        packed.checked_shr(n).unwrap_or(0) as u32
+                    }
+                }
                 "SEL" => {
                     if m.src_pred(l, 39) {
                         a
@@ -470,8 +501,7 @@ impl<const L: usize> Machine<'_, L> {
                 // Integer to integer: source format bits 11:10 with signed
                 // bit 13, byte selector 42:41, |b| bit 49, -b bit 45, as
                 // `I2F`; destination format bits 9:8 with signed bit 12,
-                // saturate bit 50 [public: Ryujinx `InstI2iR` field layout;
-                // eden `integer_to_integer_conversion.cpp`]. The source is
+                // saturate bit 50. The source is
                 // extended per its format, then negated or made absolute
                 // (wrapping, as 32-bit integer arithmetic does), then, with
                 // SAT, clamped to the destination's range. Only 32-bit
@@ -480,7 +510,9 @@ impl<const L: usize> Machine<'_, L> {
                 "I2I" => {
                     let destination = bits(w, 8, 2) | (bits(w, 12, 1) << 2);
                     m.require(destination & 3 == 2, "destination narrower than 32 bits")?;
-                    m.require(!bit(w, 47), "condition code write")?;
+                    // The condition code takes zero and sign of the
+                    // result.
+                    cc = bit(w, 47);
                     let fmt = bits(w, 10, 2) | (bits(w, 13, 1) << 2);
                     let selection = bits(w, 41, 2);
                     m.require(

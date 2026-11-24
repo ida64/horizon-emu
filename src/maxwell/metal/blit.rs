@@ -15,9 +15,9 @@
 //! pixels' samples as texels ([`super::super::multisample`]), and its
 //! resident holds each sample in a layer; the kernel reads and writes
 //! the layer and pixel of a texel as the packing kernel does
-//! (`PACK_SOURCE`). A sample-grid reduction (the blit games resolve a
-//! multisampled target with: Minecraft takes every second texel of its
-//! 2X1 target) so reads one layer.
+//! (`PACK_SOURCE`). A sample-grid reduction (the blit that resolves a
+//! multisampled target, taking every second texel of a 2X1 target) so
+//! reads one layer.
 //!
 //! The source must be resident already, and current with no look at
 //! guest memory (rendered to since its last write-back, or known to

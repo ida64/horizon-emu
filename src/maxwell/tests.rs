@@ -571,7 +571,7 @@ fn depth_and_stencil_clears(kind: super::RendererKind) {
             .map(|word| u32::from_le_bytes(*word))
             .collect()
     };
-    // Depth and stencil, as deko3d clears them.
+    // Depth and stencil together.
     call(&mut channel, &ram, 0, 0x19d0, 3);
     assert!(
         words(&mut channel, &ram)
@@ -1834,7 +1834,7 @@ fn multisampled_frame(
     )
 }
 
-/// Minecraft's 2X1_D3D sample positions: sample 0 at (12/16, 12/16),
+/// NVN's 2X1_D3D sample positions: sample 0 at (12/16, 12/16),
 /// sample 1 at (4/16, 4/16).
 const D3D_2X1: u32 = 0x44cc_44cc;
 

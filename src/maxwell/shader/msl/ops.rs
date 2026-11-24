@@ -1,6 +1,5 @@
 //! Arithmetic, logic, comparison and conversion instructions, written out
-//! as the interpreter executes them (`exec/alu.rs`, `exec/integer.rs`;
-//! fields [public: Ryujinx `Decoders/InstDecoders.cs`]).
+//! as the interpreter executes them (`exec/alu.rs`, `exec/integer.rs`).
 
 use super::super::decode::Op;
 use super::super::exec::{bit, bits, sext};
@@ -159,6 +158,10 @@ impl Writer<'_> {
             Op::ShrR => ("SHR", Form::R),
             Op::ShrI => ("SHR", Form::I),
             Op::ShrC => ("SHR", Form::C),
+            Op::ShfLR => ("SHF<", Form::R),
+            Op::ShfLI => ("SHF<", Form::I),
+            Op::ShfRR => ("SHF>", Form::R),
+            Op::ShfRI => ("SHF>", Form::I),
             Op::IscaddR => ("ISCADD", Form::R),
             Op::IscaddI => ("ISCADD", Form::I),
             Op::IscaddC => ("ISCADD", Form::C),
@@ -226,6 +229,10 @@ impl Writer<'_> {
                 bits(w, 43, if name == "SHL" { 1 } else { 2 }) == 0,
                 "extended shift",
             )?,
+            "SHF<" | "SHF>" => {
+                self.require(bits(w, 48, 2) == 0, "extended funnel shift")?;
+                self.require(bits(w, 37, 2) != 1, "maximum shift 1")?;
+            }
             "F2I" | "F2F" => {
                 self.require(bits(w, 10, 2) == 2, "source format")?;
                 self.require(!bit(w, 41), "high half")?;
@@ -254,7 +261,6 @@ impl Writer<'_> {
             "I2I" => {
                 let destination = bits(w, 8, 2) | (bits(w, 12, 1) << 2);
                 self.require(destination & 3 == 2, "destination narrower than 32 bits")?;
-                self.require(!bit(w, 47), "condition code write")?;
                 let format = bits(w, 10, 2) | (bits(w, 13, 1) << 2);
                 self.require(
                     (format & 3) != 2 || bits(w, 41, 2) == 0,
@@ -530,6 +536,34 @@ impl Writer<'_> {
                 self.line(&format!("uint v = {v};"));
                 cc = bit(w, 47).then_some(false);
             }
+            // `exec::alu` "SHF<" / "SHF>".
+            "SHF<" | "SHF>" => {
+                let maximum = bits(w, 37, 2);
+                let limit = if maximum == 0 { 32 } else { 64 };
+                let count = if form == Form::I {
+                    format!("{}u", bits(w, 20, 6))
+                } else {
+                    "b".to_string()
+                };
+                let n = if bit(w, 50) {
+                    format!("({count} & {}u)", limit - 1)
+                } else {
+                    format!("min({count}, {limit}u)")
+                };
+                let high = self.read(bits(w, 39, 8));
+                self.line(&format!(
+                    "uint n = {n}; ulong packed = (ulong({high}) << 32) | ulong(a);"
+                ));
+                let v = if name == "SHF<" {
+                    "uint((n >= 64u ? 0ul : packed << n) >> 32)"
+                } else if maximum == 3 {
+                    "uint(as_type<ulong>(as_type<long>(packed) >> min(n, 63u)))"
+                } else {
+                    "uint(n >= 64u ? 0ul : packed >> n)"
+                };
+                self.line(&format!("uint v = {v};"));
+                cc = bit(w, 47).then_some(false);
+            }
             "SEL" => {
                 let p = self.pred_operand(39);
                 self.line(&format!("uint v = {p} ? a : b;"));
@@ -587,6 +621,7 @@ impl Writer<'_> {
                         });
                     }
                     self.line("uint v = uint(ulong(x));");
+                    cc = bit(w, 47).then_some(false);
                 } else {
                     let mode = bits(w, 39, 2);
                     if bit(w, 45) {
@@ -610,9 +645,55 @@ impl Writer<'_> {
         Ok(true)
     }
 
+    /// `exec/integer.rs` `execute_flag_set`.
+    fn flag_set(&mut self, op: Op) -> Result<bool, String> {
+        if !matches!(op, Op::Cset | Op::Csetp | Op::Pset) {
+            return Ok(false);
+        }
+        let w = self.word;
+        let cop = bits(w, 45, 2);
+        self.require(cop < 3, "boolean operation")?;
+        let test = if op == Op::Pset {
+            let ab = bits(w, 24, 2);
+            self.require(ab < 3, "boolean operation")?;
+            let x = self.pred_operand(12);
+            let y = self.pred_operand(29);
+            boolean(&x, &y, ab)
+        } else {
+            self.condition(bits(w, 8, 5))?
+        };
+        let p = self.pred_operand(39);
+        self.line(&format!("{{ bool t = {test}; bool q = {p};"));
+        if op == Op::Csetp {
+            self.set_pred(bits(w, 3, 3), &boolean("t", "q", cop));
+            self.set_pred(bits(w, 0, 3), &boolean("!t", "q", cop));
+        } else {
+            let float = bit(w, 44);
+            let one = if float { "0x3f800000u" } else { "0xffffffffu" };
+            self.line(&format!(
+                "uint v = {} ? {one} : 0u;",
+                boolean("t", "q", cop)
+            ));
+            self.set(bits(w, 0, 8), "v");
+            if bit(w, 47) {
+                self.cc = true;
+                self.line(if float {
+                    "cc = v == 0u ? 1u : 0u;"
+                } else {
+                    "cc = v == 0u ? 1u : 2u;"
+                });
+            }
+        }
+        self.line("}");
+        Ok(true)
+    }
+
     /// `exec/integer.rs` `execute_integer`; false if `op` is not one of its
     /// instructions.
     pub(super) fn integer(&mut self, op: Op) -> Result<bool, String> {
+        if self.flag_set(op)? {
+            return Ok(true);
+        }
         let form = match op {
             Op::BfeR
             | Op::BfiR
@@ -621,6 +702,10 @@ impl Writer<'_> {
             | Op::XmadR
             | Op::ImnmxR
             | Op::IcmpR
+            | Op::FcmpR
+            | Op::PopcR
+            | Op::FloR
+            | Op::ImulR
             | Op::R2pR
             | Op::P2rR
             | Op::Psetp => Form::R,
@@ -631,6 +716,9 @@ impl Writer<'_> {
             | Op::XmadI
             | Op::ImnmxI
             | Op::IcmpI
+            | Op::PopcI
+            | Op::FloI
+            | Op::ImulI
             | Op::R2pI
             | Op::P2rI => Form::I,
             Op::BfeC
@@ -640,9 +728,17 @@ impl Writer<'_> {
             | Op::XmadC
             | Op::ImnmxC
             | Op::IcmpC
+            | Op::FcmpC
+            | Op::PopcC
+            | Op::FloC
+            | Op::ImulC
             | Op::R2pC
             | Op::P2rC => Form::C,
-            Op::BfiRc | Op::XmadRc | Op::IcmpRc => Form::Rc,
+            Op::BfiRc | Op::XmadRc | Op::IcmpRc | Op::FcmpRc | Op::LeaHiC => Form::Rc,
+            Op::FcmpI => Form::F,
+            Op::LeaR | Op::LeaHiR => Form::R,
+            Op::LeaI => Form::I,
+            Op::LeaC => Form::C,
             _ => return Ok(false),
         };
         let w = self.word;
@@ -685,6 +781,26 @@ impl Writer<'_> {
                     bits(w, 24, 2) < 3 && bits(w, 45, 2) < 3,
                     "boolean operation",
                 )?;
+            }
+            Op::FcmpR
+            | Op::FcmpI
+            | Op::FcmpC
+            | Op::FcmpRc
+            | Op::FloR
+            | Op::FloI
+            | Op::FloC
+            | Op::ImulR
+            | Op::ImulI
+            | Op::ImulC => self.require(!cc, "condition code write")?,
+            Op::LeaR | Op::LeaI | Op::LeaC | Op::LeaHiR | Op::LeaHiC => {
+                self.require(!cc, "condition code write")?;
+                self.require(bits(w, 48, 3) == super::PT, "predicate result")?;
+                let extended = match op {
+                    Op::LeaHiR => 38,
+                    Op::LeaHiC => 57,
+                    _ => 46,
+                };
+                self.require(!bit(w, extended), "X")?;
             }
             _ => {}
         }
@@ -831,6 +947,52 @@ impl Writer<'_> {
                     integer_compare(bits(w, 49, 3), "c", "0u")
                 };
                 self.line(&format!("uint v = {test} ? a : b;"));
+            }
+            Op::FcmpR | Op::FcmpI | Op::FcmpC | Op::FcmpRc => {
+                self.line(&format!(
+                    "float x = as_type<float>(c); float y = 0.0f; uint v = {} ? a : b;",
+                    float_compare(bits(w, 48, 4))
+                ));
+            }
+            Op::PopcR | Op::PopcI | Op::PopcC => {
+                let x = if bit(w, 40) { "~b" } else { "b" };
+                self.line(&format!("uint v = popcount({x});"));
+            }
+            Op::FloR | Op::FloI | Op::FloC => {
+                let x = if bit(w, 40) { "~b" } else { "b" };
+                self.line(&format!("uint x = {x};"));
+                if bit(w, 48) {
+                    self.line("x = (x >> 31) != 0u ? ~x : x;");
+                }
+                let index = if bit(w, 41) { "z" } else { "31u - z" };
+                self.line(&format!(
+                    "uint z = clz(x); uint v = z == 32u ? 0xffffffffu : {index};"
+                ));
+            }
+            Op::ImulR | Op::ImulI | Op::ImulC => {
+                self.line(if !bit(w, 39) {
+                    "uint v = a * b;"
+                } else if bit(w, 40) {
+                    "uint v = as_type<uint>(mulhi(as_type<int>(a), as_type<int>(b)));"
+                } else {
+                    "uint v = mulhi(a, b);"
+                });
+            }
+            Op::LeaR | Op::LeaI | Op::LeaC => {
+                let offset = if bit(w, 45) { "(0u - a)" } else { "a" };
+                self.line(&format!("uint v = b + ({offset} << {}u);", bits(w, 39, 5)));
+            }
+            Op::LeaHiR | Op::LeaHiC => {
+                let (base, high, scale, negate) = if op == Op::LeaHiR {
+                    ("b", "c", bits(w, 28, 5), bit(w, 37))
+                } else {
+                    ("c", "b", bits(w, 51, 5), bit(w, 56))
+                };
+                self.line(&format!("ulong o = ulong(a) | (ulong({high}) << 32);"));
+                if negate {
+                    self.line("o = 0ul - o;");
+                }
+                self.line(&format!("uint v = {base} + uint(o >> {}u);", 32 - scale));
             }
             Op::R2pR | Op::R2pI | Op::R2pC => {
                 self.line(&format!(

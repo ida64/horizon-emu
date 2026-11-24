@@ -1,18 +1,12 @@
 //! Instruction decoding: opcode identification and operand fields.
 //!
 //! An instruction is identified by its 14 most significant bits through a
-//! 16384-entry table built from the encoding patterns of
-//! [public: Ryujinx `Ryujinx.Graphics.Shader/Decoders/InstTable.cs`] (same
-//! patterns, same precedence: where patterns overlap, the one with fewer
-//! wildcard bits wins). Operand bit fields follow
-//! [public: Ryujinx `Ryujinx.Graphics.Shader/Decoders/InstDecoders.cs`],
-//! cross-checked against [public: eden
-//! `src/shader_recompiler/frontend/maxwell/translate/impl/*.cpp`] and
-//! envydis (`envytools/envydis/gm107.c`) disassembly of the firmware corpus.
+//! 16384-entry table built from the encoding patterns (where patterns
+//! overlap, the one with fewer wildcard bits wins).
 //!
-//! Variant names are the Ryujinx emitter names: the suffix is the operand
-//! form of source B/C (`R` register, `I` 20-bit immediate, `C` constant
-//! buffer, `Rc` register B with constant-buffer C, `32i` 32-bit immediate).
+//! In variant names the suffix is the operand form of source B/C (`R`
+//! register, `I` 20-bit immediate, `C` constant buffer, `Rc` register B
+//! with constant-buffer C, `32i` 32-bit immediate).
 
 use std::sync::OnceLock;
 

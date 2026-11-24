@@ -6,8 +6,7 @@
 //! # The host interface
 //!
 //! What the BPMP drives is the Falcon's public host interface, with the
-//! register layout and bit names of Switchbrew's "TSEC" register table
-//! (the same layout as the nouveau falcon registers):
+//! register layout and bit names of Switchbrew's "TSEC" register table:
 //!
 //! * interrupts: `IRQSSET`/`IRQSCLR` set and clear `IRQSTAT` bits,
 //!   `IRQMSET`/`IRQMCLR` set and clear `IRQMASK` bits, `IRQMODE` and
@@ -16,8 +15,7 @@
 //!   on this SoC (Linux's `tegra210.dtsi` gives the node none), and
 //!   neither package1ldr nor anything after it enables it \[inference\].
 //! * `MAILBOX0`/`MAILBOX1`, `ITFEN`, `BOOTVEC` hold what is written.
-//! * `IDLESTATE` bit 0 reads 1 while the processor runs (envytools
-//!   `io.rst`, STATUS).
+//! * `IDLESTATE` bit 0 reads 1 while the processor runs.
 //! * `DMACTL`: the scrubbing bits read 0, the memories are scrubbed (zero)
 //!   at once. `REQUIRE_CTX` set makes transfers refuse: there is no
 //!   context model.
@@ -25,8 +23,8 @@
 //!   every transfer completes within its command write. The external
 //!   address is `DMATRFBASE << 8` plus `DMATRFFBOFFS`, the Falcon-side
 //!   offset `DMATRFMOFFS`. A code (`IMEM`) transfer moves one 256-byte
-//!   block whatever the size field says \[inference: envytools' Falcon
-//!   DMA notes; package1ldr issues 0x10, size field 0, with a 0x100
+//!   block whatever the size field says \[inference: package1ldr issues
+//!   0x10, size field 0, with a 0x100
 //!   stride\]; a data transfer moves `4 << SIZE` bytes (size field up to
 //!   6), either way (`WRITE`). The `SEC` and `CTXDMA` fields must be 0:
 //!   secure transfers and context DMA are not modeled.
@@ -59,8 +57,8 @@
 //! What the host loads and starts runs on a Falcon version 5 core
 //! ([`crate::falcon`]): its code is IMEM, mapped page by page as the
 //! uploads say (a code transfer maps the page at the external offset, a
-//! page written through `IMEMD` at the tag in `IMEMT`; envytools
-//! `xfer.rst` and `vm.rst`), its data is DMEM, and its IO space is this
+//! page written through `IMEMD` at the tag in `IMEMT`), its data is
+//! DMEM, and its IO space is this
 //! block's registers: the processor's address `a` is the register the
 //! host has at `0x1000 + (a >> 6)`, so its mailboxes are the host's.
 //! `IRQSTAT` bits enabled in `IRQMASK` and routed to the processor by
@@ -389,7 +387,7 @@ struct Wiring {
     keys: Result<SecureBootKeys, String>,
 }
 
-/// A code page's entry in the processor's TLB (envytools `vm.rst`).
+/// A code page's entry in the processor's TLB.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Tlb {
     /// The virtual page the physical one is mapped at.
@@ -666,8 +664,7 @@ impl Tsec {
             MAILBOX0 => s.mailbox[0],
             MAILBOX1 => s.mailbox[1],
             ITFEN => s.itfen,
-            // Bit 0: the processor is running (envytools `io.rst`,
-            // STATUS).
+            // Bit 0: the processor is running.
             IDLESTATE => u32::from(s.cpu == Cpu::Running),
             CPUCTL => match s.cpu {
                 Cpu::Stopped | Cpu::Running | Cpu::Sleeping => 0,
@@ -831,8 +828,8 @@ impl Tsec {
             }
             self.dma_read(external, &mut s.imem[local..local + IMEM_BLOCK])?;
             s.imem_loaded = s.imem_loaded.max((local + IMEM_BLOCK) as u32);
-            // The page is mapped where the external offset says
-            // (envytools `xfer.rst`), and complete.
+            // The page is mapped where the external offset says, and
+            // complete.
             s.tlb[local / IMEM_BLOCK] = Tlb {
                 virt: (s.dma_external_offset >> 8) as u16,
                 flags: TLB_USABLE,
@@ -987,7 +984,7 @@ impl CoreBus<'_> {
     /// The register an address of the processor's IO space names: the one
     /// the host has at `0x1000 + (address >> 6)`. Bits 7:2 select among
     /// copies of the same register, which none modeled here has more than
-    /// one of (envytools `io.rst`).
+    /// one of.
     fn register(address: u32) -> Result<u64, String> {
         if address & 3 != 0 || address >= 0x4_0000 {
             return Err(format!("IO address {address:#x}"));

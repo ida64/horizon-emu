@@ -4,8 +4,7 @@
 //!
 //! Methods and fields [public: NVIDIA open-gpu-doc
 //! `classes/dma-copy/clb0b5.h`]. `LAUNCH_DMA` starts the operation.
-//! Semantics as the public reimplementations agree [public: eden
-//! `video_core/engines/maxwell_dma.cpp`]: with `MULTI_LINE_ENABLE`,
+//! Semantics: with `MULTI_LINE_ENABLE`,
 //! `LINE_COUNT` lines of `LINE_LENGTH_IN` elements are copied; an element
 //! is a byte, or with `REMAP_ENABLE` `NUM_DST_COMPONENTS x COMPONENT_SIZE`
 //! bytes; block-linear surfaces give width and origin x in the same units.

@@ -5,9 +5,8 @@
 //!
 //! Sources, with the confidence each deserves:
 //!
-//! * The chip ID is the value a Jetson TX1 (same GM20B) prints at boot
-//!   (`nouveau 57000000.gpu: NVIDIA GM20B (12b000a1)`, kernel log on
-//!   lore.freedesktop.org, nouveau mailing list, 2024-10-10).
+//! * The chip ID is the value a Jetson TX1 (same GM20B) reports at boot
+//!   (0x12b000a1, in a public kernel log).
 //! * Counts follow the GPU characteristics a Switch reports to its
 //!   applications (switchbrew "NV services", `GET_CHARACTERISTICS`: 1 GPC,
 //!   2 TPCs per GPC, 1 FBP, 2 LTCs per FBP, 1 slice per LTC, SM version
@@ -56,13 +55,13 @@ pub const FUSE_STATUS_OPT_ROP_L2_FBP0: u32 = 0;
 
 /// `gr_gpc0_fs_gpc`: 2 TPCs available (bits 4:0), 4 ZCULL banks (bits
 /// 20:16, nvgpu `proj_scal_litter_num_zcull_banks` = 4; consistent with
-/// the zcull geometry a Switch reports through yuzu's recorded answers).
+/// the zcull geometry a Switch reports).
 pub const GPC0_FS_GPC: u32 = 4 << 16 | 2;
 /// `gr_gpc0_gpm_pd_pes_tpc_id_mask(0)`: the GPC's single PES (nvgpu
 /// `proj_scal_litter_num_pes_per_gpc` = 1) serves both TPCs.
 pub const GPC0_PES0_TPC_MASK: u32 = 0x3;
 /// `gr_gpc0_zcull_total_ram_size`: 0x800 aliquots (the `aliquot_total` a
-/// Switch reports, as recorded by yuzu).
+/// Switch reports).
 pub const GPC0_ZCULL_TOTAL_RAM_SIZE: u32 = 0x800;
 /// `gr_gpc0_tpc0_sm_arch`: SM version 0x503 (bits 31:20), SPA version
 /// 0x503 (bits 19:8), 0x80 warps.
@@ -84,8 +83,8 @@ pub const LTCS_CBC_PARAM: u32 = 1 << 28;
 /// (nvgpu `fifo_eng_runlist__size_1` = 1, `proj_host_num_pbdma` = 1).
 pub const PBDMA_MAP_0: u32 = 1;
 
-/// The engine table, `top_device_info(i)` (layout: nvgpu `hw_top_gm20b.h`,
-/// nouveau `top/gk104.c`). One device: graphics, an `ENGINE_TYPE` entry
+/// The engine table, `top_device_info(i)` (layout: nvgpu
+/// `hw_top_gm20b.h`). One device: graphics, an `ENGINE_TYPE` entry
 /// (type 0, chained) followed by its `ENUM` entry with engine 0, runlist 0,
 /// interrupt 12 and reset 12 — PGRAPH's bit in the PMC interrupt and
 /// enable registers (nvgpu `mc_enable_pgraph_enabled_f` = 0x1000; the

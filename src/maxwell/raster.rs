@@ -313,7 +313,7 @@ pub fn snap_to_grid(value: f32) -> f32 {
 /// x-major segment, |Δx| >= |Δy|), each of its pixels widened to a run
 /// of `width` in the minor axis towards +y or +x (the same sections).
 /// Vulkan states the rule in framebuffer coordinates, whose y runs down
-/// as here; NVK selects these lines with `SET_LINE_MULTISAMPLE_OVERRIDE`
+/// as here; these lines are selected with `SET_LINE_MULTISAMPLE_OVERRIDE`
 /// (see `pipeline::line_rule`). \[assumption: the hardware implements
 /// this exact rule. Both APIs allow rules within one pixel of it, and
 /// NVIDIA's is not public. Whether `SET_WINDOW_ORIGIN` FLIP_Y, which
@@ -747,7 +747,12 @@ fn write_color(
     let texel = band.pixel_mut(x, y);
     let stored = color.format.read(texel);
     let mut value = output.colors[color.output];
-    if let Some(blend) = &color.blend {
+    // Integer targets are neither blended nor converted: blending is
+    // defined on numbers the formats' conversions give [public: OpenGL
+    // 4.6 §17.3.6.1, "Blending applies only if the color buffer has a
+    // fixed-point or floating-point format"].
+    let integer = color.format.is_integer();
+    if let Some(blend) = color.blend.as_ref().filter(|_| !integer) {
         let mut destination = stored;
         if color.srgb {
             for component in &mut destination[..3] {
@@ -762,7 +767,7 @@ fn write_color(
             zero_times_anything_is_zero: backend.blend_zero_rule,
         });
     }
-    if color.srgb {
+    if color.srgb && !integer {
         for component in &mut value[..3] {
             *component = linear_to_srgb(*component);
         }

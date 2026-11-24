@@ -397,7 +397,13 @@ fn reference_decode(raw: &[u8], tic: &Tic) -> Result<Vec<Vec<[f32; 4]>>, Unmodel
                             for (i, &b) in bytes.iter().enumerate() {
                                 word |= u128::from(b) << (i * 8);
                             }
+                            let integer = |i: usize| {
+                                matches!(tic.types[i], ComponentType::Uint | ComponentType::Sint)
+                            };
                             let mut c = [0., 0., 0., 1.];
+                            if integer(3) {
+                                c[3] = f32::from_bits(1);
+                            }
                             for (i, (shift, bits)) in fields.into_iter().enumerate() {
                                 if bits == 0 {
                                     continue;
@@ -422,7 +428,10 @@ fn reference_decode(raw: &[u8], tic: &Tic) -> Result<Vec<Vec<[f32; 4]>>, Unmodel
                                             ));
                                         }
                                     },
-                                    ComponentType::Uint | ComponentType::Sint => 0.,
+                                    ComponentType::Uint => f32::from_bits(v),
+                                    ComponentType::Sint => f32::from_bits(
+                                        ((v << (32 - bits)) as i32 >> (32 - bits)) as u32,
+                                    ),
                                 };
                                 if matches!(
                                     tic.types[i],
@@ -439,7 +448,15 @@ fn reference_decode(raw: &[u8], tic: &Tic) -> Result<Vec<Vec<[f32; 4]>>, Unmodel
                             for x in 0..f.block_width.min(width - bx * f.block_width) {
                                 let mut c = block[(y * f.block_width + x) as usize];
                                 if tic.srgb {
-                                    for v in &mut c[..3] {
+                                    for (i, v) in c[..3].iter_mut().enumerate() {
+                                        if matches!(f.encoding, Encoding::Packed(_))
+                                            && matches!(
+                                                tic.types[i],
+                                                ComponentType::Uint | ComponentType::Sint
+                                            )
+                                        {
+                                            continue;
+                                        }
                                         *v = if srgb8 {
                                             format::SRGB8_TO_LINEAR
                                                 [(*v * 255.).round().clamp(0., 255.) as usize]
@@ -451,6 +468,7 @@ fn reference_decode(raw: &[u8], tic: &Tic) -> Result<Vec<Vec<[f32; 4]>>, Unmodel
                                 let c = tic.swizzle.map(|s| match s {
                                     0 => 0.,
                                     2..=5 => c[(s - 2) as usize],
+                                    6 if tic.integer() => f32::from_bits(1),
                                     6 | 7 => 1.,
                                     _ => unreachable!(),
                                 });

@@ -25,7 +25,7 @@
 //!
 //! Sources: the method interface is NVIDIA's own [public: open-gpu-doc
 //! `classes/`]; behaviors the class headers do not define follow the
-//! open-source Switch emulators (eden, Ryujinx) or the Direct3D/OpenGL
+//! Direct3D/OpenGL
 //! rules the hardware implements, and are labelled so where they are
 //! used. Values pinned by the firmware are cited with program and address.
 

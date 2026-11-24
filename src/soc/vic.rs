@@ -39,7 +39,7 @@
 //! RGB formats 31-38, pitch-linear and block-linear (16Bx2 GOB) surfaces,
 //! the 8-bit YUV input formats 67-72 (semi-planar 4:2:0, NVDEC's pictures,
 //! and fully planar; see `Yuv`), scaling (see `taps`), the slot and output
-//! colour matrices (Ryujinx `Blender.cs` formula, MIT), soft clamp, sRGB
+//! colour matrices, soft clamp, sRGB
 //! degamma/regamma (mode 1), planar/constant alpha, the blending factor
 //! selections (libdrm `vic.h` enum names), override and mask, alpha fill
 //! modes opaque, background and composited (DXVA-HD names in libdrm
@@ -103,8 +103,8 @@
 //! picture written is the same bit for bit. A lone slot copying 8-bit RGB
 //! 1:1 then went through tables of its composed values (`Fused`) and the
 //! outputs were written a row at a time: grc's 30-a-second NV12 capture of
-//! Minecraft's frames went from about 10 ms an EXECUTE to about 5 ms on a
-//! busy host (median, title menu), the same bit for bit (the tests compare
+//! an application's frames went from about 10 ms an EXECUTE to about 5 ms
+//! on a busy host (median), the same bit for bit (the tests compare
 //! both paths). The VIC's own time for such a picture is not public for
 //! VIC 4.0; at one pixel a clock and several hundred MHz it would be a few
 //! milliseconds \[assumption\], the order of what the model now takes.
@@ -483,9 +483,9 @@ impl Rect {
 /// Byte positions of red, green, blue and alpha in a 32-bit pixel, and
 /// whether alpha is stored (X formats read as opaque). VIC format names list
 /// components from the most significant byte of the little-endian word:
-/// A8B8G8R8 (31) is stored R, G, B, A and A8R8G8B8 (32) B, G, R, A (Ryujinx
-/// `SurfaceWriter.cs`, public); the other six apply the same naming
-/// [INFERENCE]. Codes from libdrm `vic.h` / Ryujinx `PixelFormat.cs`.
+/// A8B8G8R8 (31) is stored R, G, B, A and A8R8G8B8 (32) B, G, R, A; the
+/// other six apply the same naming [INFERENCE]. Codes from libdrm
+/// `vic.h`.
 #[derive(Clone, Copy, Debug)]
 struct Format {
     rgb: [usize; 3],
@@ -536,10 +536,10 @@ enum Layout {
 /// chroma planes of the planar YUV picture it reads.
 ///
 /// Device address 0 is a plane address like any other: grc's capture
-/// EXECUTEs (Minecraft running, video capture on) read the game's frames,
+/// EXECUTEs (an application running, video capture on) read its frames,
 /// A8R8G8B8 block-linear 1280×720, from VIC addresses 0, 0x3C0000 and
 /// 0x780000 in turn — three buffers of 0x3C0000 bytes from the bottom of
-/// the VIC's address space \[inference: the game's swapchain, mapped
+/// the VIC's address space \[inference: the application's swapchain, mapped
 /// there\]. An unmapped address refuses when the surface is read.
 #[derive(Clone, Copy, Debug)]
 struct Surface {
@@ -661,7 +661,7 @@ impl Surface {
     }
 
     /// `colors` as stored, a pixel after another. X formats store the
-    /// alpha too (Ryujinx writes 35 as 31).
+    /// alpha too.
     fn encode_row(&self, colors: &[[f32; 4]], line: &mut [u8]) {
         let ([r, g, b], a) = (self.format.rgb, self.format.alpha);
         for (color, pixel) in colors
@@ -1119,7 +1119,7 @@ fn planar_subsampling(code: u32) -> Option<[u32; 2]> {
 /// the odd one's for 2 [inference: the value at that point by linear
 /// interpolation, after the clamp that ends the per-pixel pipeline; the
 /// VIC's decimation filter is not public]. Siting 3, and any but 0 on a
-/// full-resolution axis, refuse. grc's encoder input (Minecraft, video
+/// full-resolution axis, refuse. grc's encoder input (video
 /// capture on) is NV12 block-linear (2-GOB blocks), 1280×720, chroma 0
 /// horizontally and 1 vertically: the MPEG-2/H.264 default siting.
 #[derive(Clone, Copy, Debug)]
@@ -1376,8 +1376,8 @@ impl Config {
 }
 
 /// An enabled colour matrix (libdrm `MatrixStruct`): 20-bit signed
-/// coefficients `C[row][column]`, row = output component. Ryujinx
-/// `Blender.cs` (MIT) applies it to 10-bit components as
+/// coefficients `C[row][column]`, row = output component, applied to
+/// 10-bit components as
 /// `((Σ in·C >> RShift) + C3) >> 8`; the same arithmetic is done here on
 /// normalized values without the intermediate truncations (the datapath's
 /// precision is not modeled), which keeps linear-light values intact.

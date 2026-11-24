@@ -1617,10 +1617,9 @@ impl BlendTable {
 /// Where the GPU's block-linear layout puts the bytes of a surface: rows of
 /// blocks, each block one GOB wide and `block_height` GOBs high, the GOBs
 /// of a block one after the other, the blocks of a row one after the other.
-/// Inside a GOB, 16-byte pieces of two lines are interleaved. This is the
-/// layout open-source emulators of this GPU generation decode (yuzu's and
-/// Ryujinx's swizzle tables), recalled from them, not checked against the
-/// hardware; nvservices hands the controller such surfaces with the block
+/// Inside a GOB, 16-byte pieces of two lines are interleaved \[recalled,
+/// not checked against the hardware\]; nvservices hands the controller
+/// such surfaces with the block
 /// height in GOBs as a power of two (text `0x28620`).
 struct BlockLinear {
     start: u64,

@@ -6,7 +6,7 @@ use crate::{
     soc::mc::{Mc, SMMU_NVENC_ASID},
 };
 
-/// The picture setup of grc's first EXECUTE with Minecraft running (IDR
+/// The picture setup of grc's first EXECUTE with an application running (IDR
 /// picture 0, 1280×720), its first 512 bytes as words.
 const GRC_SETUP: [u32; 128] = [
     0xd0b70006, 0x02cf04ff, 0x05000500, 0x00000000, 0x00000000, 0x00000000, 0x00000e10, 0x00000000,

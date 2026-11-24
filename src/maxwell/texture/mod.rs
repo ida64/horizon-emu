@@ -1,14 +1,13 @@
 //! CPU texture storage and Maxwell texture descriptors.
 //!
 //! Descriptor fields follow [public: NVIDIA open-gpu-doc classes/3d/clb197tex.h,
-//! TEXHEAD_BL/TEXHEAD_PITCH and TEXSAMP; Ryujinx Image/TextureDescriptor.cs].
+//! TEXHEAD_BL/TEXHEAD_PITCH and TEXSAMP].
 //! Cache coherency hashes and sector promotion only control memory transactions,
 //! not texel values, and have no observable effect on this coherent CPU decoder.
 
 //! Filtering quality hints in words 3 and 6 are inactive when
 //! USE_HEADER_OPT_CONTROL is clear; otherwise parsing refuses the override.
-//! GOBS_PER_BLOCK_WIDTH is ignored by TEX (assumed one GOB)
-//! [public: envytools rnndb/graph/gm200_texture.xml].
+//! GOBS_PER_BLOCK_WIDTH is ignored by TEX (assumed one GOB).
 mod astc;
 mod bc;
 mod filtering;
@@ -44,6 +43,9 @@ fn unsupported(field: &str, value: impl std::fmt::Display) -> Unmodeled {
     Unmodeled(format!("{field}={value}"))
 }
 
+/// The integer 1 as an integer component carries it: its bits.
+const ONE_INT: f32 = f32::from_bits(1);
+
 impl Tic {
     /// The level-of-detail range sampling may select, as the interpreter
     /// clamps it (`clamp_lod`): (minimum, maximum) relative to the base
@@ -56,12 +58,27 @@ impl Tic {
             tsc.max_lod.max(resident).clamp(0., top),
         )
     }
+
+    /// Whether sampling yields integers: a component the swizzle selects
+    /// has an integer data type. Such a texture is never filtered: its
+    /// values are bits, not numbers to weigh [public: OpenGL 4.6 §8.17,
+    /// an integer texture with a filter other than NEAREST is incomplete;
+    /// here the nearest texel is taken instead].
+    pub fn integer(&self) -> bool {
+        self.swizzle.iter().any(|&source| {
+            (2..=5).contains(&source)
+                && matches!(
+                    self.types[usize::from(source - 2)],
+                    ComponentType::Sint | ComponentType::Uint
+                )
+        })
+    }
 }
 
 impl Tic {
     /// Parses the block-linear and pitch headers. Color-key, sparse, multisample,
     /// packed-component, and header-overridden filtering modes are refused.
-    /// Pitch textures have no mipmaps [public: Ryujinx Image/TexturePool.cs GetInfo].
+    /// Pitch textures have no mipmaps.
     pub fn parse(words: [u32; 8]) -> Result<Self, Unmodeled> {
         let version = (words[2] >> 21) & 7;
         if !matches!(version, 2 | 3) {
@@ -98,10 +115,8 @@ impl Tic {
         }
         // Word 6 bit 0 is COLOR_KEY_OP, read only by the colour-key header
         // versions (1, 4) refused above; the block-linear and pitch headers
-        // name it RESERVED6Y [public: envytools rnndb/graph/gm200_texture.xml
-        // TIC word 6 `COLOR_KEY_OP`, "Used if (HEADER_VERSION ==
-        // PITCH_COLORKEY || HEADER_VERSION == BLOCKLINEAR_COLORKEY)"; NVIDIA
-        // clb197tex.h `TEXHEAD_BL_RESERVED6Y` MW(192:192)]. The Mii editor's
+        // name it RESERVED6Y [public: NVIDIA clb197tex.h
+        // `TEXHEAD_BL_RESERVED6Y` MW(192:192)]. The Mii editor's
         // textures arrive with it set.
         for (index, mask) in [
             (2, 0xe11f0000u32),
@@ -120,17 +135,10 @@ impl Tic {
         if swizzle.contains(&1) {
             return Err(unsupported("TIC SOURCE", 1));
         }
-        // Integer stencil components are allowed when the swizzle never selects them.
-        for &s in &swizzle {
-            if (2..=5).contains(&s)
-                && matches!(
-                    types[(s - 2) as usize],
-                    ComponentType::Sint | ComponentType::Uint
-                )
-            {
-                return Err(unsupported("TIC selected integer DATA_TYPE", s));
-            }
-        }
+        // Integer components reach the shader as their bits: UINT
+        // zero-extended, SINT sign-extended to 32 bits, carried in the
+        // `f32` of a sampled value unchanged (`Conversion::Uint`,
+        // `Sint`), which integer shader instructions take as they are.
         if words[3] & (1 << 26) != 0 {
             return Err(unsupported("TIC USE_HEADER_OPT_CONTROL", 1));
         }
@@ -242,11 +250,9 @@ pub struct Tsc {
     pub max_lod: f32,
     pub border: [f32; 4],
     /// S_R_G_B_CONVERSION (word 0 bit 13). Texel decoding follows the TIC
-    /// sRGB bit when this is set [public: eden decodes by the TIC bit
-    /// alone; Ryujinx `TexturePool.GetForBinding` decodes when both bits
-    /// are set]. With it set, an sRGB texture's border is the 8-bit sRGB
-    /// border color of words 2-3 (eden `TSCEntry::SrgbBorderColor`), which
-    /// Ryujinx ignores; that border is refused when sampled.
+    /// sRGB bit when this is set. With it set, an sRGB texture's border
+    /// is the 8-bit sRGB border color of words 2-3; that border is
+    /// refused when sampled.
     pub srgb_conversion: bool,
     pub force_unnormalized: bool,
     pub cube_filter: u32,
@@ -257,8 +263,7 @@ impl Tsc {
     ///
     /// Word 0 bits 16:14 and 19:17 (RESERVED0A/0B in NVIDIA clb197tex.h)
     /// are FONT_FILTER_WIDTH/HEIGHT, the box filter of BITMAP_8X8 (one bit
-    /// per texel) textures only [public: envytools
-    /// rnndb/graph/g80_texture.xml TSC]. The one-bit TIC component format,
+    /// per texel) textures only. The one-bit TIC component format,
     /// R1 (0x1f), is refused by [`ImageFormat::from_tic`], so the fields
     /// cannot affect any texture this model samples. NVN's samplers set
     /// them: 0x24000 (width 2, height 3) arrives from the system applets.
@@ -407,11 +412,17 @@ impl Texture {
             Encoding::Packed(fields) => Some(Packed::new(tic, fields)?),
             _ => None,
         };
-        // Index of each output component in [R, G, B, A, 0, 1].
+        // Index of each output component in [R, G, B, A, 0, 1.0, 1].
+        // Source 7 is ONE_FLOAT; source 6, ONE_INT, is the integer 1 for
+        // a texture sampled as integers [public: NVIDIA clb197tex.h
+        // `TEXHEAD_BL_X_SOURCE` IN_ONE_INT 6, IN_ONE_FLOAT 7] and 1.0
+        // for any other \[assumption: the one of the texture's type\].
+        let one_int = if tic.integer() { 6 } else { 5 };
         let swizzle = tic.swizzle.map(|s| match s {
             0 => 4,
             2..=5 => usize::from(s - 2),
-            6 | 7 => 5,
+            7 => 5,
+            6 => one_int,
             _ => unreachable!(),
         });
         let srgb8 = matches!(
@@ -501,7 +512,7 @@ impl Texture {
                                 texels[start..start + width as usize].iter_mut().enumerate()
                             {
                                 let c = packed.texel(blocks.get(row, bx as u32, &mut split)?);
-                                let c = [c[0], c[1], c[2], c[3], 0., 1.];
+                                let c = [c[0], c[1], c[2], c[3], 0., 1., ONE_INT];
                                 *texel = swizzle.map(|i| c[i]);
                             }
                             continue;
@@ -519,7 +530,7 @@ impl Texture {
                                             *v = srgb_decode(*v, srgb8);
                                         }
                                     }
-                                    let c = [c[0], c[1], c[2], c[3], 0., 1.];
+                                    let c = [c[0], c[1], c[2], c[3], 0., 1., ONE_INT];
                                     texels[start + x as usize] = swizzle.map(|i| c[i]);
                                 }
                             }
@@ -597,9 +608,11 @@ enum Conversion {
     Uf11,
     F16,
     F32,
-    /// Integer components: never selected (`Tic::parse`), so their value
-    /// cannot affect the result.
-    Zero,
+    /// Integer components: the code as the bits of the value, zero-
+    /// extended.
+    Uint,
+    /// The same, sign-extended.
+    Sint,
 }
 
 /// One component of a packed format as sampling sees it: its field of the
@@ -627,7 +640,10 @@ impl Component {
             Conversion::Uf11 => format::uf11_to_f32(code),
             Conversion::F16 => format::f16_to_f32(code as u16),
             Conversion::F32 => f32::from_bits(code),
-            Conversion::Zero => 0.,
+            Conversion::Uint => f32::from_bits(code),
+            Conversion::Sint => {
+                f32::from_bits(((code << (32 - self.bits)) as i32 >> (32 - self.bits)) as u32)
+            }
         };
         if self.force_fp16 {
             c = format::f16_to_f32(format::f32_to_f16(c));
@@ -664,9 +680,16 @@ impl Packed {
         let srgb8 = fields[..3].iter().all(|(_, bits)| matches!(bits, 0 | 8));
         let mut channels = Vec::with_capacity(4);
         for (i, (shift, bits)) in fields.into_iter().enumerate() {
-            let srgb = (tic.srgb && i < 3).then_some(srgb8);
+            let integer = matches!(tic.types[i], ComponentType::Uint | ComponentType::Sint);
+            // Integers are not sRGB-decoded: the decoding is of a UNORM
+            // value.
+            let srgb = (tic.srgb && i < 3 && !integer).then_some(srgb8);
             if bits == 0 {
-                let default = if i == 3 { 1. } else { 0. };
+                let default = match (i, integer) {
+                    (3, true) => ONE_INT,
+                    (3, false) => 1.,
+                    _ => 0.,
+                };
                 channels.push(Channel::Constant(match srgb {
                     Some(srgb8) => srgb_decode(default, srgb8),
                     None => default,
@@ -683,7 +706,8 @@ impl Packed {
                     32 => Conversion::F32,
                     _ => return Err(unsupported("TIC FLOAT component bits", bits)),
                 },
-                ComponentType::Uint | ComponentType::Sint => Conversion::Zero,
+                ComponentType::Uint => Conversion::Uint,
+                ComponentType::Sint => Conversion::Sint,
             };
             let component = Component {
                 shift: shift.into(),
@@ -756,7 +780,7 @@ impl Packed {
         let mut lookups = Vec::with_capacity(4);
         for source in swizzle {
             lookups.push(match self.channels.get(source) {
-                None => constant(if source == 4 { 0. } else { 1. }),
+                None => constant([0., 1., ONE_INT][source - 4]),
                 Some(Channel::Constant(value)) => constant(*value),
                 Some(Channel::Table {
                     shift,

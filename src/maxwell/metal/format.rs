@@ -116,6 +116,9 @@ pub fn check_texture(tic: &Tic, tsc: &Tsc) -> Result<(), String> {
             tic.target, tic.array, tic.shape.layers
         ));
     }
+    if tic.integer() {
+        return Err("integer texture".into());
+    }
     if !tic.normalized || tsc.force_unnormalized {
         return Err("unnormalized texture coordinates".into());
     }

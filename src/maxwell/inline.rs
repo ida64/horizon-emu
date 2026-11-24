@@ -138,8 +138,8 @@ impl InlineToMemory {
         }
         let line_length = self.register(LINE_LENGTH_IN) as usize;
         let line_count = self.register(LINE_COUNT) as usize;
-        // Ryujinx (`InlineToMemoryClass.LaunchDma`) starts every line on a
-        // word boundary; eden (`engine_upload.cpp`) packs lines. The two
+        // Whether every line starts on a word boundary or lines are
+        // packed is not established. The two readings
         // agree only when a line is whole words or there is one line.
         if line_count > 1 && !line_length.is_multiple_of(4) {
             return Err(Unmodeled(format!(
@@ -223,8 +223,7 @@ impl InlineToMemory {
         let width = self.register(SET_DST_WIDTH);
         let height = self.register(SET_DST_HEIGHT);
         let layer = self.register(SET_DST_LAYER);
-        // Neither public reimplementation uses SET_DST_LAYER/SET_DST_DEPTH
-        // (eden `engine_upload.cpp`, Ryujinx `InlineToMemoryClass`), so
+        // What SET_DST_LAYER/SET_DST_DEPTH select is not established, so
         // whether a layer is a slice or an array element is unknown.
         if layer != 0 {
             return Err(Unmodeled(format!(

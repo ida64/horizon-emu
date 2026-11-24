@@ -8,11 +8,8 @@ use crate::maxwell::sampling::{FetchRequest, GatherRequest, Lod, Query, SampleRe
 impl Texture {
     /// The instruction's target must be the texture's; arrayness may
     /// differ: a non-array texture is seen as an array of one layer, and an
-    /// array texture through a non-array instruction as its layer 0
-    /// [public: eden `texture_pass.cpp` keeps the instruction's
-    /// `ColorArray2D` type and binds the 2D image as an array view;
-    /// Ryujinx `Texture.GetTargetTexture` makes a view of the shader's
-    /// target]. Layers are clamped (sample, gather) or out of range
+    /// array texture through a non-array instruction as its layer 0.
+    /// Layers are clamped (sample, gather) or out of range
     /// (fetch) as for any layer index. A scene of starter's samples a 2D
     /// texture with an array `TEXS`.
     fn validate(&self, target: Target, _array: bool) -> Result<(), Unmodeled> {
@@ -143,11 +140,13 @@ impl Texture {
             return Err(unsupported("TEX LOD", raw));
         }
         let lod = self.clamp_lod(tsc, raw);
-        let linear = if raw <= 0. {
-            tsc.mag_linear
-        } else {
-            tsc.min_filter != 1
-        };
+        let integer = self.tic.integer();
+        let linear = !integer
+            && if raw <= 0. {
+                tsc.mag_linear
+            } else {
+                tsc.min_filter != 1
+            };
         let level = if tsc.mip_filter == 1 {
             0
         } else if tsc.mip_filter == 2 {
@@ -164,7 +163,7 @@ impl Texture {
             request.compare,
             linear,
         )?;
-        if tsc.mip_filter != 3 || lod.fract() == 0. {
+        if tsc.mip_filter != 3 || lod.fract() == 0. || integer {
             return Ok(a);
         }
         let b = self.filtered(
@@ -179,8 +178,8 @@ impl Texture {
         Ok(std::array::from_fn(|i| a[i] + (b[i] - a[i]) * lod.fract()))
     }
 
-    /// TIC MIN_LOD_CLAMP is the minimum resident mip [public: envytools
-    /// rnndb/graph/gm200_texture.xml]. It applies after sampler LOD clamps.
+    /// TIC MIN_LOD_CLAMP is the minimum resident mip. It applies after
+    /// sampler LOD clamps.
     fn clamp_lod(&self, tsc: &Tsc, lod: f32) -> f32 {
         let resident = ((self.tic.words[7] >> 12) & 4095) as f32 / 256.;
         lod.clamp(tsc.min_lod, tsc.max_lod)
@@ -379,8 +378,7 @@ impl Texture {
     }
 
     /// TXQ dimensions and visible mip count. Non-dimension modes are refused:
-    /// the public translator documents only the sample-count component of type,
-    /// not the other returned fields [public: Ryujinx InstEmitTexture.cs EmitTxq].
+    /// the other returned fields are not established.
     pub fn query(&self, query: Query) -> Result<[u32; 4], Unmodeled> {
         match query {
             Query::Dimension { level } => {

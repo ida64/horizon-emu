@@ -447,8 +447,7 @@ pub fn color_target(
     let memory = r.get(base + 0x14);
     let pitch = memory & (1 << 12) != 0;
     // Pitch-linear targets give their pitch in bytes in place of the
-    // width [public: Ryujinx `TextureCache.FindOrCreateTexture`,
-    // `WidthOrStride`].
+    // width.
     let width_field = r.get(base + 0x08) & 0x0FFF_FFFF;
     let bpp = format.bytes_per_pixel();
     let width = if pitch {
@@ -598,8 +597,8 @@ impl Multisample {
 /// beyond one (supersampling), target-independent rasterization
 /// (`SET_TIR`), sample masks that drop samples (`SET_SAMPLE_MASK` with
 /// RASTER_OUT or COLOR_TARGET and the masks it enables) and coverage to
-/// color. Minecraft's world rendering sets none of them (2X1_D3D; TIR
-/// off, one pass, all masks 0xffff).
+/// color. NVN's 2X1_D3D rendering sets none of them (TIR off, one pass,
+/// all masks 0xffff).
 pub fn multisample(r: Registers<'_>) -> Result<Multisample, Unmodeled> {
     let samples = sample_mode(r)?;
     if samples.is_single() {
@@ -653,10 +652,9 @@ pub fn multisample(r: Registers<'_>) -> Result<Multisample, Unmodeled> {
 /// State this model refuses rather than ignore: features whose effect is
 /// not implemented. Checked at every draw.
 fn check_unmodeled_state(r: Registers<'_>) -> Result<(), Unmodeled> {
-    // SET_WINDOW_ORIGIN MODE: only UPPER_LEFT. With LOWER_LEFT the public
-    // reimplementations flip y about different axes (Ryujinx flips scissors
-    // about the surface clip height but viewports about their own center),
-    // so the hardware rule is not established.
+    // SET_WINDOW_ORIGIN MODE: only UPPER_LEFT. With LOWER_LEFT, what y is
+    // flipped about (the surface clip or each viewport) is not
+    // established.
     require(r, "window origin lower-left", SET_WINDOW_ORIGIN, 1, 0)?;
     require(r, "window offset x", SET_WINDOW_OFFSET_X, !0, 0)?;
     require(r, "window offset y", SET_WINDOW_OFFSET_Y, !0, 0)?;
@@ -908,8 +906,8 @@ pub fn f16_to_f32(half: u16) -> f32 {
 ///
 /// An attribute whose `SET_VERTEX_ATTRIBUTE_A` SOURCE is INACTIVE is not
 /// fetched: the hardware supplies a constant for it, the per-attribute
-/// value of the immediate-mode methods (envytools `gf100_3d.xml`:
-/// `VERTEX_ATTRIB_FORMAT` bit 6 `CONST`, values from `VTX_ATTR_DEFINE`
+/// value of the immediate-mode methods (`VERTEX_ATTRIB_FORMAT` bit 6
+/// `CONST`, values from `VTX_ATTR_DEFINE`
 /// 0x114c / `VTX_ATTR_DATA` 0x1150). NVN writes neither \[inference: the
 /// Settings Mii editor's channel never calls them, nor does its
 /// method-init list set them, in a capture of the session\], and what
@@ -1243,8 +1241,8 @@ pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result
             continue;
         }
         let mut inputs = Attributes([0; 256]);
-        // Per-instance attributes count from the base instance [public:
-        // eden `DrawManager` `base_instance`, OpenGL `baseinstance`].
+        // Per-instance attributes count from the base instance (OpenGL
+        // `baseinstance`).
         let fetch_instance = batch.instance.wrapping_add(batch.base_instance);
         fetch.fetch(context.memory, index, fetch_instance, &mut inputs)?;
         inputs.0[0x2F8 / 4] = batch.instance;
@@ -1288,8 +1286,7 @@ pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result
 /// software renderer, costs little for a quad or two, while the CPU
 /// vertex stage and per-triangle setup of anything larger cost more than
 /// a native draw \[assumption: a threshold, chosen so single UI quads (4
-/// or 6 elements) stay on the exact path; Minecraft's HUD and chunk draws
-/// do not\].
+/// or 6 elements) stay on the exact path\].
 const NATIVE_MINIMUM: usize = 7;
 
 /// Buffers the vertex streams of native draws are read into, kept from
@@ -1834,10 +1831,7 @@ fn fragments(context: &Context<'_>, pixel: &Arc<Program>) -> Result<Fragments, U
             // the linear colors nn::mii gives for sRGB targets, then samples
             // it with sRGB decoding and composes into an sRGB target, again
             // with the register 0; without the encodings the skin shows
-            // decoded once too often (orange). eden and Ryujinx
-            // render to sRGB formats with Vulkan, whose sRGB attachments
-            // always encode, and apply the register only on OpenGL as
-            // `GL_FRAMEBUFFER_SRGB`.\]
+            // decoded once too often (orange).\]
             srgb: format.is_srgb(),
         });
     }
@@ -1847,10 +1841,7 @@ fn fragments(context: &Context<'_>, pixel: &Arc<Program>) -> Result<Fragments, U
     // of the APIs NVN implements [public: OpenGL 4.6 core, 17.3.4 Depth
     // Buffer Test (with no depth buffer the test behaves as if it always
     // passes and nothing is written); Vulkan, Fragment Operations, Depth
-    // Test (no depth attachment: the test is skipped)]. eden and Ryujinx
-    // reach the same result by binding no depth attachment and leaving the
-    // test enabled (eden `fixed_pipeline_state.cpp`: `depth_enabled` from
-    // `zeta_enable`, `depth_test_enable` passed through). NVIDIA documents
+    // Test (no depth attachment: the test is skipped)]. NVIDIA documents
     // nothing for the combination [assumption: the hardware follows the
     // APIs]. The stencil test likewise needs a target of a format with
     // stencil (17.3.3: without a stencil buffer it passes and writes
@@ -1917,13 +1908,10 @@ fn fragments(context: &Context<'_>, pixel: &Arc<Program>) -> Result<Fragments, U
     // open-gpu-doc `clb197.h`]: the fragment's output 0 alpha, as the pixel
     // program leaves it, is compared with the reference and the fragment
     // is discarded where the comparison fails, before the depth test and
-    // blending (the OpenGL compatibility-profile alpha test NVN exposes;
-    // eden `emit_spirv_special.cpp` `AlphaTest` and Ryujinx
-    // `EmitterContext.PrepareForReturn` emit it at the end of the pixel
-    // program the same way). A program that does not write output 0 alpha
-    // is tested against nothing: Ryujinx skips the test then, eden reads
-    // an undefined output; it is refused unless the function is NEVER or
-    // ALWAYS, which do not read it.
+    // blending (the OpenGL compatibility-profile alpha test NVN exposes).
+    // A program that does not write output 0 alpha is tested against
+    // nothing; it is refused unless the function is NEVER or ALWAYS,
+    // which do not read it.
     let alpha_test = if r.enabled(SET_ALPHA_TEST) {
         let compare = Compare::from_raw(r.get(SET_ALPHA_FUNC))?;
         if !matches!(compare, Compare::Never | Compare::Always)
@@ -2151,12 +2139,8 @@ fn rasterize(
 /// "Depth Bias"]. r, the format's least representable value, is 2^-n for
 /// n-bit UNORM depth, and for float depth 2^(e - 23) with e the exponent
 /// of the primitive's largest depth (`SET_DEPTH_BIAS_CONTROL`
-/// DEPTH_FORMAT_DEPENDENT), or 2^-24 without it [public: NVK
-/// `nvk_cmd_draw.c` passes Vulkan's constant factor, slope factor and
-/// clamp unscaled, and maps `VK_EXT_depth_bias_control`'s
-/// LEAST_REPRESENTABLE_VALUE_FORMAT to DEPTH_FORMAT_DEPENDENT_TRUE and
-/// LEAST_REPRESENTABLE_VALUE_FORCE_UNORM (r of a 24-bit UNORM) to
-/// FALSE]. The offset applies to the interpolated depth only: a depth the
+/// DEPTH_FORMAT_DEPENDENT), or 2^-24 without it (r of a 24-bit UNORM).
+/// The offset applies to the interpolated depth only: a depth the
 /// pixel program writes is used as written, and the program's own depth
 /// input (a\[0x78\]) is the unbiased one.
 fn depth_bias(
@@ -2226,7 +2210,7 @@ fn depth_bias_parameters(
 /// `ZPASS`, `SET_BACK_STENCIL_FUNC` (0x1598-0x15a4) and
 /// `SET_BACK_STENCIL_FUNC_REF`, `_MASK`, `_FUNC_MASK` (0x0f54-0x0f5c, the
 /// write mask before the compare mask) [public: NVIDIA open-gpu-doc
-/// `clb197.h`; Ryujinx `StencilBackMasks` reads the same order].
+/// `clb197.h`].
 fn stencil_state(r: Registers<'_>) -> Result<raster::Stencil, Unmodeled> {
     let op = |offset: u32| {
         let raw = r.get(offset);
@@ -2393,9 +2377,9 @@ impl Clip {
             );
         }
         // User clip planes (SET_USER_CLIP_ENABLE bit i) whose clip distance
-        // a[0x2c0 + 4i] the last vertex-pipeline shader writes [public:
-        // Ryujinx `AttributeConsts.ClipDistance0`]. A plane whose distance
-        // is not written has nothing to clip against; it is left out.
+        // a[0x2c0 + 4i] the last vertex-pipeline shader writes. A plane
+        // whose distance is not written has nothing to clip against; it
+        // is left out.
         let user_enable = r.get(SET_USER_CLIP_ENABLE) & 0xFF;
         let user: Vec<usize> = (0..8)
             .filter(|&i| {
@@ -2534,10 +2518,7 @@ fn setup_triangles(
     };
     // SET_WINDOW_ORIGIN FLIP_Y says which way the rows count when the
     // orientation is taken: with it they count up, as OpenGL window
-    // coordinates do, without it down [public: Ryujinx
-    // `StateUpdater.UpdateFrontFace` keeps the front face on a host with
-    // rows up (OpenGL's lower-left clip origin) only with
-    // `TriangleRastFlip` and inverts it otherwise] [inference, from the
+    // coordinates do, without it down [inference, from the
     // firmware: under the opposite rule every triangle drawn with culling
     // on was culled, in Settings (FLIP_Y clear) as in the Mii editor's
     // full-screen composition strip (FLIP_Y set), which left the editor's
@@ -2621,14 +2602,12 @@ enum LineRule {
 
 /// The line rule the draw's state selects.
 ///
-/// The rasterizer has three line modes. Mesa's NVK (nouveau's Vulkan
-/// driver) selects them as follows [public: Mesa
-/// `src/nouveau/vulkan/nvk_cmd_draw.c`]. It enables multisample
-/// rasterization (`SET_ANTI_ALIAS_ENABLE`) even for one sample ("this
-/// way we get strict lines and rectangular line support"). Rectangular
-/// lines are `SET_LINE_MULTISAMPLE_OVERRIDE` and `SET_ANTI_ALIASED_LINE`
-/// both off. Bresenham lines are the override on. Smooth rectangular
-/// lines are both on.
+/// The rasterizer has three line modes. Multisample rasterization
+/// (`SET_ANTI_ALIAS_ENABLE`), which may be on even for one sample, gives
+/// strict and rectangular lines. Rectangular lines are
+/// `SET_LINE_MULTISAMPLE_OVERRIDE` and `SET_ANTI_ALIASED_LINE` both off.
+/// Bresenham lines are the override on. Smooth rectangular lines are
+/// both on.
 ///
 /// - Rectangular lines (multisample rasterization on, override and
 ///   smooth off) cover the sample points inside a rectangle of the line
@@ -2637,23 +2616,20 @@ enum LineRule {
 ///   ([`multisample`]; one sample: the pixel center). Samples exactly on
 ///   the rectangle's edges go by the top-left rule of the two triangles
 ///   the rectangle is drawn as \[assumption: the hardware's tie rule is
-///   not public\]. The width is `SET_LINE_WIDTH_FLOAT`: nouveau's OpenGL
-///   driver writes that register for smooth or multisampled lines and
-///   `SET_ALIASED_LINE_WIDTH_FLOAT` for the others, with
-///   `SET_ALIASED_LINE_WIDTH_ENABLE` set at init [public: Mesa
-///   `nvc0_state.c` `nvc0_rasterizer_state_create`, `nvc0_screen.c`].
+///   not public\]. The width is `SET_LINE_WIDTH_FLOAT`, the register for
+///   smooth or multisampled lines; the others take
+///   `SET_ALIASED_LINE_WIDTH_FLOAT` with `SET_ALIASED_LINE_WIDTH_ENABLE`.
 /// - Non-antialiased lines (multisample rasterization off, or the
 ///   override on; smooth off) follow OpenGL's diamond-exit rule, the
 ///   width rounded to the nearest integer, 0 counting as 1 (see
 ///   [`raster::aliased_line`]). The width is
 ///   `SET_ALIASED_LINE_WIDTH_FLOAT` with `SET_ALIASED_LINE_WIDTH_ENABLE`,
-///   else `SET_LINE_WIDTH_FLOAT` \[inference: envytools `gf100_3d.xml`
-///   names 0x20c `LINE_WIDTH_SEPARATE`\]. The firmware's touch screen
+///   else `SET_LINE_WIDTH_FLOAT` \[inference: 0x20c enables a separate
+///   aliased line width\]. The firmware's touch screen
 ///   test (Settings, Test Input Devices) draws its strokes this way:
 ///   multisample rasterization off, width 1.
 ///
-/// Widths beyond 10, the widest line nouveau's OpenGL driver advertises
-/// (`max_line_width`), are refused: the hardware's limit and what it
+/// Widths beyond 10 are refused: the hardware's limit and what it
 /// does past it are not established. Endpoints are snapped to
 /// `SET_SNAP_GRID_LINE`, here only the 1/256 pixel grid with RTNE
 /// rounding that triangles use.
@@ -2789,9 +2765,8 @@ struct PointSquare {
 /// (same section). Without point sprites but with multisample
 /// rasterization the point is a circle there; that is refused, as are
 /// smooth points (`SET_ANTI_ALIASED_POINT`) and `SET_POINT_CENTER_MODE`
-/// D3D, whose effect is not documented. Sizes beyond 63, the largest
-/// point nouveau's OpenGL driver advertises (`max_point_size`, Mesa
-/// `nvc0_screen.c`), are refused like wide lines.
+/// D3D, whose effect is not documented. Sizes beyond 63 are refused like
+/// wide lines.
 fn point_rule(r: Registers<'_>, x: f32, y: f32, size: f32) -> Result<PointSquare, Unmodeled> {
     require(r, "smooth points", SET_ANTI_ALIASED_POINT, 1, 0)?;
     require(r, "point center mode D3D", SET_POINT_CENTER_MODE, !0, 0)?;
@@ -2831,8 +2806,8 @@ fn point_rule(r: Registers<'_>, x: f32, y: f32, size: f32) -> Result<PointSquare
 
 /// The size of a point: the last vertex-pipeline shader's point size
 /// output a\[0x6c\] with `SET_ATTRIBUTE_POINT_SIZE` ENABLE, else
-/// `SET_POINT_SIZE` [public: envytools `gf100_3d.xml` `VP_POINT_SIZE`;
-/// NVK enables it with SLOT 0 for shaders that write the point size].
+/// `SET_POINT_SIZE` (the attribute is enabled with SLOT 0 for shaders
+/// that write the point size).
 /// Other SLOT values, and the attribute enabled for a shader that does
 /// not write it, are refused: what either selects is not established.
 fn point_size(r: Registers<'_>, last: &Program, vertex: &Shaded) -> Result<f32, Unmodeled> {

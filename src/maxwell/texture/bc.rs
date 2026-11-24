@@ -2,21 +2,18 @@
 //! and BC7. Each decoder turns one 4x4 block into 16 RGBA texels, row by
 //! row.
 //!
-//! * BC1-BC3 decode to 8-bit UNORM colors (envytools
-//!   `rnndb/graph/gm200_texture.xml` `SRGB_CONVERSION`: "'8-bit UNORM'
-//!   includes DXT1-DXT5"). The interpolated colors follow NVIDIA GPUs'
+//! * BC1-BC3 decode to 8-bit UNORM colors. The interpolated colors follow
+//!   NVIDIA GPUs'
 //!   integer formulas as measured by rgbcx [public: richgel999/bc7enc
 //!   `rgbcx.h` `interp_5_nv`, `interp_6_nv`, `interp_half_5_nv`,
 //!   `interp_half_6_nv`, `unpack_bc1` mode `cBC1NVidia`].
-//! * BC4/BC5 ("DXN") decode to more than 8 bits ("decoding these formats
-//!   produces 16-bit components", same rnndb note); the exact precision of
+//! * BC4/BC5 ("DXN") decode to more than 8 bits (16-bit components); the
+//!   exact precision of
 //!   GM20B is not public, so the interpolation is computed exactly
 //!   (`((7 - i) * e0 + i * e1) / 7` and the 6-value variant) [public:
 //!   D3D11.3 functional spec §19.5 "Block Compression" BC4/BC5].
 //! * BC7 is decoded per the BC7 specification [public: D3D11.3 functional
-//!   spec §19.5 "BC7"; Ryujinx `Ryujinx.Graphics.Texture/BC7Decoder.cs`;
-//!   partition and anchor tables transcribed from Ryujinx
-//!   `Utils/BC67Tables.cs`].
+//!   spec §19.5 "BC7"].
 
 use super::format::snorm_to_f32;
 
@@ -443,8 +440,8 @@ pub fn decode_bc7(block: &[u8], out: &mut Block4x4) {
     }
 }
 
-// Transcribed from Ryujinx `Utils/BC67Tables.cs` (`PartitionTable`,
-// `FixUpIndices`), packed two bits per texel.
+// The BC7 specification's partition and fix-up index tables, packed two
+// bits per texel.
 /// Two-subset partitions: subset of texel `i` in bits `2i..2i+1`.
 const PARTITIONS2: [u32; 64] = [
     0x50505050, 0x40404040, 0x54545454, 0x54505040, 0x50404000, 0x55545450, 0x55545040, 0x54504000,

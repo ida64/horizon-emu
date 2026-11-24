@@ -109,7 +109,7 @@
 //! Metal texture whose levels are filled from those residents on the GPU
 //! each time they were rendered to, and from guest memory for the other
 //! levels. Guest memory is not involved: no write-back, decode or upload
-//! of the rendered levels (Minecraft draws level 0 of its block atlas
+//! of the rendered levels (a guest may draw level 0 of a texture atlas
 //! every frame). A draw that renders to a level it samples reads guest
 //! memory instead, after the write-back of what was rendered before it.
 
@@ -130,7 +130,7 @@
 //! texture with the guest's sample positions
 //! (`MTLRenderPassDescriptor::setSamplePositions`) would issue it once
 //! and run the vertex stage and the rasterizer once; that is not done.
-//! \[measurement, Minecraft in-world (2X1_D3D targets) on an M5, `sample`
+//! \[measurement, a guest drawing with 2X1_D3D targets on an M5, `sample`
 //! of the channel's thread: with the frame committed pass by pass, the
 //! thread waits for the GPU at the frame's last signal only, 0.9 ms a
 //! frame at 47 fps on a loaded host and 2.7 ms at the guest's 60 fps,
@@ -326,7 +326,7 @@ const RESIDENT_BUDGET: usize = 512 << 20;
 /// GPU starts on a pass only once it is committed, so a frame drawn in
 /// one long pass would leave it idle until the frame is recorded, while
 /// each pass boundary costs it a store and a load of the attachments.
-/// \[measurement, Minecraft in-world at the guest's 60 fps on an M5,
+/// \[measurement, a guest drawing at its 60 fps on an M5,
 /// share of the channel's thread spent waiting for the GPU in `sample`
 /// runs of 8 s: 52% at 16 draws a pass, 33-37% at 32, 29-32% at 64 (three
 /// runs), 28-44% at 128, 42-55% at 256, 45% with passes never split\]
@@ -617,14 +617,17 @@ impl Renderer {
     }
 
     /// Counts a draw left to the software renderer; each reason is
-    /// reported once on stderr when first seen.
+    /// reported on stderr when first seen and again at every tenfold
+    /// count, so the reasons that cost most stand out.
     fn fall_back(&self, reason: String) -> Result<bool, Unmodeled> {
         let mut state = self.state.lock().unwrap();
         let count = state.fallbacks.entry(reason.clone()).or_default();
-        if *count == 0 {
-            eprintln!("Metal renderer: left to the software renderer: {reason}");
-        }
         *count += 1;
+        if *count == 1 {
+            eprintln!("Metal renderer: left to the software renderer: {reason}");
+        } else if count.is_multiple_of(10) && count.ilog10() == (*count - 1).ilog10() + 1 {
+            eprintln!("Metal renderer: left to the software renderer {count} times: {reason}");
+        }
         Ok(false)
     }
 
@@ -2793,8 +2796,8 @@ struct PackWords {
 /// [`PACK_SOURCE`] `guest_offset` computes it: bands of 8 rows one after
 /// the other; in a block-linear band the GOBs left to right, 512 bytes
 /// each, a 16-byte unit of byte column c and row r at ((c & 0x20) << 3) |
-/// ((r & 6) << 5) | ((c & 0x10) << 1) | ((r & 1) << 4) [public: Ryujinx
-/// `BlockLinearLayout.cs`, as `surface::Window`]; in a pitch band 8 rows of
+/// ((r & 6) << 5) | ((c & 0x10) << 1) | ((r & 1) << 4) (as
+/// `surface::Window`); in a pitch band 8 rows of
 /// `pitch` bytes (the mirror's rows, without the surface's padding).
 fn guest_offset(p: &PackWords, x: u32, y: u32) -> u32 {
     let band = (y >> 3) * p.band_bytes;
@@ -3166,12 +3169,12 @@ enum Sampled {
 }
 
 /// Composites kept \[assumption: a guest renders into a handful of the
-/// textures it samples (Minecraft: its block atlas); a dropped one is made
+/// textures it samples (a texture atlas); a dropped one is made
 /// again when next sampled\].
 const COMPOSITE_LIMIT: usize = 16;
 
 /// A texture some of whose levels are render targets held on the GPU
-/// (Minecraft draws level 0 of its four-level block atlas every frame and
+/// (a guest may draw level 0 of a four-level atlas every frame and
 /// samples it right away): a Metal texture as [`upload_texture`] makes,
 /// whose levels that are residents are filled from them on the GPU
 /// ([`State::convert`], whenever they were rendered to since) and the

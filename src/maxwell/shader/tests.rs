@@ -175,7 +175,7 @@ fn environment(textures: &Textures) -> Env<'_> {
         y_direction: 1.0,
     }
 }
-/// Instruction bit layouts [public: Ryujinx Decoders/InstDecoders.cs].
+/// Programs from instruction encodings.
 /// The scheduling word is deliberately zero: it does not affect values.
 fn assembled(words: &[u64]) -> Program {
     let mut header = [0; 0x50];

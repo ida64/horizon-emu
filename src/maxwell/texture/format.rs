@@ -202,6 +202,11 @@ enum Numeric {
     Unorm,
     Snorm,
     Float,
+    /// Unsigned integers: a component is its bits, carried in the `f32`
+    /// of a color unchanged ([`ColorFormat::read`], [`ColorFormat::write`]).
+    Uint,
+    /// Signed integers, the same way, sign-extended to 32 bits.
+    Sint,
 }
 
 /// What the unused bits of an `X` format receive on write.
@@ -210,8 +215,7 @@ enum Filler {
     /// No `X` bits.
     None,
     /// `Xn` formats: the hardware leaves the bits unspecified; the alpha
-    /// value is written there, as Ryujinx (`Engine/Types/ColorFormat.cs`
-    /// maps every `X` format to its `A` counterpart) does.
+    /// value is written there \[assumption\].
     Alpha,
     /// `Zn` formats: zeros.
     Zero,
@@ -223,14 +227,18 @@ enum Filler {
 /// and the 2D engine's `SET_SRC_FORMAT`/`SET_DST_FORMAT` registers encode
 /// them [public: NVIDIA open-gpu-doc `classes/3d/clb197.h`
 /// `NVB197_SET_COLOR_TARGET_FORMAT_V_*`, `classes/twod/cl902d.h`
-/// `NV902D_SET_DST_FORMAT_V_*` (same codes); Ryujinx
-/// `Engine/Types/ColorFormat.cs`].
+/// `NV902D_SET_DST_FORMAT_V_*` (same codes)].
 ///
 /// Names list components in memory order, lowest address first (the NVIDIA
 /// names list a packed word from its most significant bits, so NVIDIA
-/// `A8B8G8R8` is [`ColorFormat::Rgba8Unorm`] here). Integer formats and the
-/// alpha-only/VCAA variants (0x40-0x47, `R32` 0xFF) are not modeled:
-/// [`ColorFormat::from_raw`] returns `None` for them.
+/// `A8B8G8R8` is [`ColorFormat::Rgba8Unorm`] here). The alpha-only/VCAA
+/// variants (0x40-0x47, `R32` 0xFF) and `AU2BU10GU10RU10` (0xD2) are not
+/// modeled: [`ColorFormat::from_raw`] returns `None` for them.
+///
+/// Integer formats (`RSn`, `RUn`): a fragment program's output register
+/// holds the integer, and it is stored clamped to the component's range
+/// \[recalled: D3D11.3 functional spec §3.2.4 "Integer Conversion", a
+/// wider integer converted to a narrower one is clamped\].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorFormat {
     /// `RF32_GF32_BF32_AF32` (0xC0).
@@ -309,6 +317,46 @@ pub enum ColorFormat {
     Bgrz8Unorm,
     /// `O8R8G8B8` (0xFE): the X byte written as 0xFF.
     Bgro8Unorm,
+    /// `RS32_GS32_BS32_AS32` (0xC1).
+    Rgba32Sint,
+    /// `RU32_GU32_BU32_AU32` (0xC2).
+    Rgba32Uint,
+    /// `RS32_GS32_BS32_X32` (0xC4).
+    Rgbx32Sint,
+    /// `RU32_GU32_BU32_X32` (0xC5).
+    Rgbx32Uint,
+    /// `RS16_GS16_BS16_AS16` (0xC8).
+    Rgba16Sint,
+    /// `RU16_GU16_BU16_AU16` (0xC9).
+    Rgba16Uint,
+    /// `RS32_GS32` (0xCC).
+    Rg32Sint,
+    /// `RU32_GU32` (0xCD).
+    Rg32Uint,
+    /// `AS8BS8GS8RS8` (0xD8).
+    Rgba8Sint,
+    /// `AU8BU8GU8RU8` (0xD9).
+    Rgba8Uint,
+    /// `RS16_GS16` (0xDC).
+    Rg16Sint,
+    /// `RU16_GU16` (0xDD).
+    Rg16Uint,
+    /// `RS32` (0xE3).
+    R32Sint,
+    /// `RU32` (0xE4).
+    R32Uint,
+    /// `GS8RS8` (0xEC).
+    Rg8Sint,
+    /// `GU8RU8` (0xED).
+    Rg8Uint,
+    /// `RS16` (0xF0).
+    R16Sint,
+    /// `RU16` (0xF1).
+    R16Uint,
+    /// `RS8` (0xF5).
+    R8Sint,
+    /// `RU8` (0xF6).
+    R8Uint,
 }
 
 /// Bit position and width of R, G, B, A in a texel's little-endian word
@@ -369,6 +417,26 @@ impl ColorFormat {
             0xfc => Bgr5O1Unorm,
             0xfd => Bgrz8Unorm,
             0xfe => Bgro8Unorm,
+            0xc1 => Rgba32Sint,
+            0xc2 => Rgba32Uint,
+            0xc4 => Rgbx32Sint,
+            0xc5 => Rgbx32Uint,
+            0xc8 => Rgba16Sint,
+            0xc9 => Rgba16Uint,
+            0xcc => Rg32Sint,
+            0xcd => Rg32Uint,
+            0xd8 => Rgba8Sint,
+            0xd9 => Rgba8Uint,
+            0xdc => Rg16Sint,
+            0xdd => Rg16Uint,
+            0xe3 => R32Sint,
+            0xe4 => R32Uint,
+            0xec => Rg8Sint,
+            0xed => Rg8Uint,
+            0xf0 => R16Sint,
+            0xf1 => R16Uint,
+            0xf5 => R8Sint,
+            0xf6 => R8Uint,
             _ => return None,
         })
     }
@@ -547,6 +615,47 @@ impl ColorFormat {
                 (Filler::One, 24, 8),
                 false,
             ),
+            Rgba32Sint | Rgba32Uint | Rgbx32Sint | Rgbx32Uint | Rgba16Sint | Rgba16Uint
+            | Rg32Sint | Rg32Uint | Rgba8Sint | Rgba8Uint | Rg16Sint | Rg16Uint | R32Sint
+            | R32Uint | Rg8Sint | Rg8Uint | R16Sint | R16Uint | R8Sint | R8Uint => {
+                let (bits, count, signed, filler): (u8, u8, bool, bool) = match self {
+                    Rgba32Sint => (32, 4, true, false),
+                    Rgba32Uint => (32, 4, false, false),
+                    Rgbx32Sint => (32, 3, true, true),
+                    Rgbx32Uint => (32, 3, false, true),
+                    Rgba16Sint => (16, 4, true, false),
+                    Rgba16Uint => (16, 4, false, false),
+                    Rg32Sint => (32, 2, true, false),
+                    Rg32Uint => (32, 2, false, false),
+                    Rgba8Sint => (8, 4, true, false),
+                    Rgba8Uint => (8, 4, false, false),
+                    Rg16Sint => (16, 2, true, false),
+                    Rg16Uint => (16, 2, false, false),
+                    R32Sint => (32, 1, true, false),
+                    R32Uint => (32, 1, false, false),
+                    Rg8Sint => (8, 2, true, false),
+                    Rg8Uint => (8, 2, false, false),
+                    R16Sint => (16, 1, true, false),
+                    R16Uint => (16, 1, false, false),
+                    R8Sint => (8, 1, true, false),
+                    _ => (8, 1, false, false),
+                };
+                let mut fields = [(0, 0); 4];
+                for (index, field) in fields.iter_mut().enumerate().take(count.into()) {
+                    *field = (index as u8 * bits, bits);
+                }
+                (
+                    u32::from(bits / 8) * if filler { 4 } else { u32::from(count) },
+                    if signed { Sint } else { Uint },
+                    fields,
+                    if filler {
+                        (Filler::Alpha, 3 * bits, bits)
+                    } else {
+                        NO_FILL
+                    },
+                    false,
+                )
+            }
         };
         ColorLayout {
             bytes,
@@ -570,13 +679,23 @@ impl ColorFormat {
         self.layout().srgb
     }
 
+    /// Whether the components are integers: neither blended nor
+    /// converted, see the type's documentation.
+    pub fn is_integer(self) -> bool {
+        matches!(self.layout().numeric, Numeric::Uint | Numeric::Sint)
+    }
+
     /// Reads one pixel. Components the format lacks read as 0 (RGB) and
-    /// 1 (alpha), D3D's defaults for missing components [public: D3D11.3
-    /// functional spec §19.1.3.3 "Defaults for Missing Components"].
+    /// 1 (alpha; the integer 1 for an integer format), D3D's defaults for
+    /// missing components [public: D3D11.3 functional spec §19.1.3.3
+    /// "Defaults for Missing Components"].
     pub fn read(self, texel: &[u8]) -> [f32; 4] {
         let layout = self.layout();
         let word = load_word(&texel[..layout.bytes as usize]);
         let mut out = [0.0, 0.0, 0.0, 1.0];
+        if self.is_integer() {
+            out[3] = f32::from_bits(1);
+        }
         for (slot, &(shift, bits)) in out.iter_mut().zip(&layout.fields) {
             if bits == 0 {
                 continue;
@@ -586,6 +705,10 @@ impl ColorFormat {
                 Numeric::Unorm => unorm_to_f32(raw, u32::from(bits)),
                 Numeric::Snorm => snorm_to_f32(raw, u32::from(bits)),
                 Numeric::Float => decode_float(raw, bits),
+                Numeric::Uint => f32::from_bits(raw),
+                Numeric::Sint => {
+                    f32::from_bits(((raw << (32 - bits)) as i32 >> (32 - bits)) as u32)
+                }
             };
         }
         out
@@ -606,6 +729,8 @@ impl ColorFormat {
                 Numeric::Unorm => f32_to_unorm(v, u32::from(bits)),
                 Numeric::Snorm => f32_to_snorm(v, u32::from(bits)),
                 Numeric::Float => encode_float(v, bits),
+                Numeric::Uint => encode_integer(v, bits, false),
+                Numeric::Sint => encode_integer(v, bits, true),
             };
             put(raw, shift, bits);
         }
@@ -615,6 +740,8 @@ impl ColorFormat {
             Filler::One => u32::MAX,
             Filler::Alpha => match layout.numeric {
                 Numeric::Float => encode_float(value[3], bits),
+                Numeric::Uint => encode_integer(value[3], bits, false),
+                Numeric::Sint => encode_integer(value[3], bits, true),
                 _ => f32_to_unorm(value[3], u32::from(bits)),
             },
         };
@@ -650,17 +777,30 @@ fn encode_float(value: f32, bits: u8) -> u32 {
     }
 }
 
+/// The integer whose bits `value` carries, clamped to a component of
+/// `bits` bits.
+fn encode_integer(value: f32, bits: u8, signed: bool) -> u32 {
+    let raw = value.to_bits();
+    if bits == 32 {
+        raw
+    } else if signed {
+        let limit = 1i32 << (bits - 1);
+        (raw as i32).clamp(-limit, limit - 1) as u32
+    } else {
+        raw.min((1u32 << bits) - 1)
+    }
+}
+
 /// Depth/stencil ("zeta") formats as the 3D engine's `SET_ZT_FORMAT`
 /// encodes them [public: NVIDIA open-gpu-doc `classes/3d/clb197.h`
-/// `NVB197_SET_ZT_FORMAT_V_*`; Ryujinx `Engine/Types/ZetaFormat.cs`].
+/// `NVB197_SET_ZT_FORMAT_V_*`].
 ///
 /// Packed names list the 32-bit word from its most significant bits, as
 /// for the color formats: `Z24S8` keeps stencil in bits 0-7 and depth in
 /// bits 8-31; `S8Z24` keeps depth in bits 0-23 and stencil in 24-31. The
-/// TIC component types the public tables pair with the same-named texture
-/// formats agree (eden `video_core/texture_cache/format_lookup_table.cpp`:
+/// TIC component types of the same-named texture formats agree:
 /// `Z24S8` has a UINT R (stencil) and UNORM G (depth), `S8Z24` a UNORM R
-/// and UINT G). `ZF32_X24S8` is a float32 depth word followed by a word
+/// and UINT G. `ZF32_X24S8` is a float32 depth word followed by a word
 /// with stencil in bits 0-7. The stencil-only `S8` and the VCAA formats
 /// are not modeled ([`DepthFormat::from_raw`] returns `None`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -4,8 +4,8 @@
 //! A launch is the queue meta data (QMD) the driver writes to memory,
 //! handed over with `SEND_PCAS_A` (QMD address >> 8) followed by
 //! `SEND_SIGNALING_PCAS_B` with `SCHEDULE` set [public: NVIDIA
-//! open-gpu-doc `classes/compute/clb1c0.h`; eden `KeplerCompute` launches
-//! on the same method]. The QMD is version 01_07 [public: NVIDIA
+//! open-gpu-doc `classes/compute/clb1c0.h`]. The QMD is version 01_07
+//! [public: NVIDIA
 //! open-gpu-doc `classes/compute/clb1c0qmd.h`, the only version that
 //! header defines for the class; field names below are its
 //! `NVB1C0_QMDV01_07_*`]. [`Qmd::parse`] decodes the fields a launch

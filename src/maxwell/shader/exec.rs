@@ -27,9 +27,8 @@
 //! with its kind; `SYNC` pops an `SSY` entry and jumps to it; `BRK` pops
 //! up to and including the innermost `PBK` entry (dropping inner `SSY`
 //! entries the breaking lane leaves behind) and jumps to it; `CONT` does
-//! the same for `PCNT`. That is the warp-level reconvergence stack of
-//! [public: Ryujinx `Decoders/Decoder.cs` (`PushOpInfo`, `IsPopBranch`)]
-//! seen from one lane. These three, like `SSY`/`PBK`/`PCNT`, may be
+//! the same for `PCNT`. That is the warp-level reconvergence stack seen
+//! from one lane. These three, like `SSY`/`PBK`/`PCNT`, may be
 //! predicated or CC-conditional; a lane that does not take them falls
 //! through.
 //!
@@ -42,11 +41,8 @@
 //! A geometry shader thread sees one input primitive and writes output
 //! vertices through opaque handles [public: NVIDIA open-gpu-doc
 //! Shader-Program-Header, `MaxOutputVertexCount`, "ALD.O is disallowed"
-//! for geometry shaders; envytools `envydis/gm107.c` `isberd`, `out`;
-//! eden `translate/impl/output_geometry.cpp`; Ryujinx
-//! `Instructions/InstEmitAttribute.cs` `Isberd`]. As the NVN compiler
-//! uses them (ocean archive of the corpus, and the language scene of
-//! starter):
+//! for geometry shaders]. As the NVN compiler uses them (the language
+//! scene of starter):
 //!
 //! * `S2R SR_INVOCATION_INFO` gives the vertices per input primitive in
 //!   bits 16-23 and the primitive's position in the internal stage buffer
@@ -60,8 +56,7 @@
 //!
 //! Handle values are the hardware's own; this model fills the ISBE with
 //! one primitive at a time (position 0, other bits of
-//! `SR_INVOCATION_INFO` 0, as Ryujinx returns), lets entry `i` hold input
-//! handle `i` (the identity eden and Ryujinx use for `ISBERD`), and
+//! `SR_INVOCATION_INFO` 0), lets entry `i` hold input handle `i`, and
 //! numbers output handles by the vertices emitted so far. A program that
 //! uses a handle it was not given (another ISBE entry, a made-up vertex)
 //! is refused, so the choice of values cannot show. An emitted vertex
@@ -187,9 +182,8 @@ pub(super) fn sext(value: u32, width: u32) -> i32 {
 }
 
 /// The byte offset a branch at `pc` with `word` lands on: `pc + 8 +
-/// imm24` [public: Ryujinx `Decoders/InstOp.cs` `GetAbsoluteAddress`]; a
-/// target on a scheduling word continues at the next instruction
-/// [public: Ryujinx `Decoders/Decoder.cs` `FillBlock`].
+/// imm24`; a target on a scheduling word continues at the next
+/// instruction.
 pub(super) fn branch_target(word: u64, pc: u32) -> Option<u32> {
     let target = i64::from(pc) + 8 + i64::from(sext(bits(word, 20, 24), 24));
     let target = u32::try_from(target).ok()?;
@@ -351,6 +345,17 @@ impl Shared {
     }
 }
 
+/// A thread's local memory, grown as the thread stores to it.
+#[derive(Default)]
+struct Local {
+    bytes: Vec<u8>,
+}
+
+/// The most local memory a program can declare: its size fields have 24
+/// bits [public: NVIDIA open-gpu-doc Shader-Program-Header,
+/// `ShaderLocalMemoryLowSize`, `ShaderLocalMemoryHighSize`].
+const LOCAL_LIMIT: usize = 1 << 24;
+
 struct Machine<'a, const L: usize> {
     code: &'a [Option<Inst>],
     env: &'a Env<'a>,
@@ -362,6 +367,8 @@ struct Machine<'a, const L: usize> {
     pc: u32,
     /// Instructions executed so far.
     steps: u64,
+    /// Each lane's local memory.
+    local: [Local; L],
 }
 
 pub(super) fn run_vertex(
@@ -390,6 +397,7 @@ pub(super) fn run_vertex(
         word: 0,
         pc: 0,
         steps: 0,
+        local: Default::default(),
     };
     machine.run()?;
     if machine.lanes[0].state == State::Killed {
@@ -427,6 +435,7 @@ pub(super) fn run_geometry(
         word: 0,
         pc: 0,
         steps: 0,
+        local: Default::default(),
     };
     machine.run()?;
     if machine.lanes[0].state == State::Killed {
@@ -466,6 +475,7 @@ pub(super) fn run_fragment(
         word: 0,
         pc: 0,
         steps: 0,
+        local: Default::default(),
     };
     if !quad.front_facing {
         // Nothing in the modeled instruction set reads the facing of the
@@ -475,11 +485,7 @@ pub(super) fn run_fragment(
     // Outputs: each render target with any enabled component takes four
     // consecutive registers from R0 (component c at base + c), in target
     // order; the depth follows one register after the colors, after the
-    // (unmodeled) sample-mask register [public: eden
-    // `frontend/maxwell/translate/impl/exit_program.cpp` `ExitFragment`;
-    // Ryujinx `Translation/EmitterContext.cs` `PrepareForReturn` agrees on
-    // colors, its `TranslatorContext.GetDepthRegister` (popcount of the
-    // whole Omap + 1) differs only for targets with partial masks].
+    // (unmodeled) sample-mask register.
     for (index, lane) in machine.lanes.iter().enumerate() {
         let out = &mut quad.outputs[index];
         *out = FragmentOutput::default();
@@ -540,6 +546,7 @@ pub(super) fn run_grid(
                 word: 0,
                 pc: 0,
                 steps: 0,
+                local: std::array::from_fn(|_| Local::default()),
             })
         })
         .collect();
@@ -555,6 +562,9 @@ pub(super) fn run_grid(
                         }
                     }
                     machine.steps = 0;
+                    for local in &mut machine.local {
+                        local.bytes.clear();
+                    }
                     if let Io::Compute(compute) = &mut machine.io {
                         compute.cta = [x, y, z];
                     }
@@ -569,7 +579,10 @@ pub(super) fn run_grid(
 }
 
 /// Runs the warps of one thread block to completion, releasing them from
-/// each barrier once all have reached it.
+/// each barrier once all that still run have reached it. Threads that
+/// exited do not hold a barrier back \[inference: a barrier waiting for
+/// them would never release, and shipped compute programs let all but
+/// one thread of a block exit before a `BAR.SYNC` the last one reaches\].
 fn run_block(machines: &mut [Box<Machine<'_, WARP>>]) -> Result<(), Unmodeled> {
     loop {
         for machine in machines.iter_mut() {
@@ -577,7 +590,6 @@ fn run_block(machines: &mut [Box<Machine<'_, WARP>>]) -> Result<(), Unmodeled> {
         }
         // Every lane has exited, is absent, or waits at a barrier.
         let mut waiting = None;
-        let mut exited = 0;
         for lane in machines.iter().flat_map(|m| m.lanes.iter()) {
             match lane.state {
                 State::Barrier => match waiting {
@@ -591,8 +603,7 @@ fn run_block(machines: &mut [Box<Machine<'_, WARP>>]) -> Result<(), Unmodeled> {
                     }
                     Some(_) => {}
                 },
-                State::Exited => exited += 1,
-                State::Absent => {}
+                State::Exited | State::Absent => {}
                 State::Running | State::Killed => {
                     return Err(Unmodeled(format!(
                         "shader: compute lane stopped {:?}",
@@ -601,14 +612,8 @@ fn run_block(machines: &mut [Box<Machine<'_, WARP>>]) -> Result<(), Unmodeled> {
                 }
             }
         }
-        let Some(pc) = waiting else {
+        if waiting.is_none() {
             return Ok(());
-        };
-        if exited != 0 {
-            return Err(Unmodeled(format!(
-                "shader: BAR.SYNC (continuing at {pc:#x}) waits for {exited} threads of the \
-                 block that exited: undefined"
-            )));
         }
         for lane in machines.iter_mut().flat_map(|m| m.lanes.iter_mut()) {
             if lane.state == State::Barrier {
@@ -693,8 +698,7 @@ impl<'a, const L: usize> Machine<'a, L> {
 
     #[inline]
     fn r(&self, lane: usize, index: u32) -> u32 {
-        // Vector operands may run past R254; RZ and beyond read 0
-        // [public: Ryujinx `Instructions/InstEmitTexture.cs` `Ra()`/`Rb()`].
+        // Vector operands may run past R254; RZ and beyond read 0.
         if index >= RZ {
             0
         } else {
@@ -800,8 +804,7 @@ impl<'a, const L: usize> Machine<'a, L> {
         self.src_pred(lane, 16)
     }
 
-    /// Condition code test of field `Ccc` [public: Ryujinx
-    /// `Instructions/InstEmitConditionCode.cs` `GetCondition`].
+    /// Condition code test of field `Ccc`.
     fn condition(&self, lane: usize, ccc: u32) -> Result<bool, Unmodeled> {
         let cc = self.lanes[lane].cc;
         let z = cc & CC_Z != 0;
@@ -843,9 +846,8 @@ impl<'a, const L: usize> Machine<'a, L> {
         let next = next_pc(self.pc);
         // SSY, PBK and PCNT have no guard predicate: their encoding is
         // the target (bits 20-43) and CA (bit 5) only, bits 16-19 are not
-        // a field [public: Ryujinx `Decoders/InstDecoders.cs` `InstSsy`,
-        // `InstPbk`, `InstPcnt`]. Compilers leave them as they please
-        // (0, read as P0, in a scene of starter's).
+        // a field. Compilers leave them as they please (0, read as P0, in
+        // a scene of starter's).
         let unpredicated = matches!(self.op, Op::Ssy | Op::Pbk | Op::Pcnt);
         let mut active: Mask = 0;
         for lane in 0..L {
@@ -1013,6 +1015,8 @@ impl<'a, const L: usize> Machine<'a, L> {
             }
             Op::Lds => self.shared_access(active, false),
             Op::Sts => self.shared_access(active, true),
+            Op::Ldl => self.local_access(active, false),
+            Op::Stl => self.local_access(active, true),
             Op::Isberd => self.isberd(active),
             Op::OutR | Op::OutI | Op::OutC => self.out(active),
             Op::Ldc => self.ldc(active),
@@ -1022,6 +1026,7 @@ impl<'a, const L: usize> Machine<'a, L> {
             ),
             Op::Ldg | Op::Ld => self.load_global(active),
             Op::Stg | Op::St => self.store_global(active),
+            Op::Red | Op::Atom => self.atomic(active),
             Op::Ald => self.ald(active),
             Op::Ast => self.ast(active),
             Op::Ipa => self.ipa(active),
@@ -1031,13 +1036,10 @@ impl<'a, const L: usize> Machine<'a, L> {
         }
     }
 
-    /// `S2R`: dest 0-7, register 20-27 [public: Ryujinx
-    /// `Decoders/InstDecoders.cs` `InstS2r`, `SReg`; eden
-    /// `translate/impl/move_special_register.cpp`]: SR_LANEID (0),
-    /// SR_Y_DIRECTION (18), SR_INVOCATION_INFO (29, see the module
-    /// documentation), SR_TID (32: x in bits 0-15, y from bit 16, z from
-    /// bit 26, as both sources pack it), SR_TID.X/Y/Z (33-35),
-    /// SR_CTAID.X/Y/Z (37-39).
+    /// `S2R`: dest 0-7, register 20-27: SR_LANEID (0), SR_Y_DIRECTION
+    /// (18), SR_INVOCATION_INFO (29, see the module documentation),
+    /// SR_TID (32: x in bits 0-15, y from bit 16, z from bit 26),
+    /// SR_TID.X/Y/Z (33-35), SR_CTAID.X/Y/Z (37-39).
     fn special_register(&self, lane: usize, sr: u32) -> Result<u32, Unmodeled> {
         Ok(match (&self.io, sr) {
             (Io::Compute(compute), 0 | 32..=35 | 37..=39) => {
@@ -1061,9 +1063,7 @@ impl<'a, const L: usize> Machine<'a, L> {
     /// `BAR` in a compute program: mode 32-34, reduction 35-36, predicate
     /// operand 39-41 negated by 42, `B` (thread count) immediate flag 43,
     /// `A` (barrier) immediate flag 44, barrier 8-15 or register A,
-    /// thread count 20-31 or register B [public: eden
-    /// `translate/impl/barrier_operations.cpp` `BAR`, Ryujinx
-    /// `Decoders/InstDecoders.cs` `InstBar`]. Only `BAR.SYNC 0` with the
+    /// thread count 20-31 or register B. Only `BAR.SYNC 0` with the
     /// default count (0: every thread of the block), which is what
     /// `__syncthreads()`/GLSL `barrier()` compile to, is modeled.
     fn barrier(&mut self, active: Mask) -> Result<(), Unmodeled> {
@@ -1093,18 +1093,15 @@ impl<'a, const L: usize> Machine<'a, L> {
 
     /// `LDS`/`STS`: data register 0-7, address register 8-15, offset 20-43
     /// (signed, unsigned when the address register is RZ), size 48-50
-    /// (as `LDG`), `LDS.U` bit 44 [public: Ryujinx
-    /// `Decoders/InstDecoders.cs` `InstLds`/`InstSts`, eden
-    /// `translate/impl/load_store_local_shared.cpp` `Offset`].
+    /// (as `LDG`), `LDS.U` bit 44. `U` is taken to load the same bytes
+    /// \[inference: shipped compute programs set it (0xef4d10000287ff0c)
+    /// on plain loads of shared memory\].
     fn shared_access(&mut self, active: Mask, store: bool) -> Result<(), Unmodeled> {
         let w = self.word;
         let Io::Compute(compute) = &self.io else {
             return self.fail("outside a compute program");
         };
         let shared = compute.shared;
-        if !store {
-            self.require(!bit(w, 44), "U")?;
-        }
         let size = bits(w, 48, 3);
         let width = global_width(size).ok_or_else(|| self.unmodeled(&format!("size {size}")))?;
         let count = width.div_ceil(4) as u32;
@@ -1136,6 +1133,60 @@ impl<'a, const L: usize> Machine<'a, L> {
             }
             let loaded = shared.borrow().load(address as usize, &mut bytes[..width]);
             loaded.map_err(|what| m.unmodeled(&what))?;
+            m.write_loaded(lane, rd, size, &bytes);
+            Ok(())
+        })
+    }
+
+    /// `LDL`/`STL`: the fields of `LDS`/`STS`, on the thread's local
+    /// memory, which is private to the thread. A byte the thread has not
+    /// stored has no defined value and reads 0 here \[assumption: programs
+    /// do not depend on such bytes; compilers load them as the padding of
+    /// wider loads, as the fourth word of a three-word vector stored in
+    /// a 16-byte slot\].
+    fn local_access(&mut self, active: Mask, store: bool) -> Result<(), Unmodeled> {
+        let w = self.word;
+        let size = bits(w, 48, 3);
+        let width = global_width(size).ok_or_else(|| self.unmodeled(&format!("size {size}")))?;
+        let count = width.div_ceil(4) as u32;
+        let (rd, ra) = (bits(w, 0, 8), bits(w, 8, 8));
+        self.require(
+            rd == RZ || rd.is_multiple_of(count),
+            "vector register not aligned",
+        )?;
+        let immediate = bits(w, 20, 24);
+        let offset = if ra == RZ {
+            immediate
+        } else {
+            sext(immediate, 24) as u32
+        };
+        self.each(active, |m, lane| {
+            let address = m.r(lane, ra).wrapping_add(offset) as usize;
+            m.require(
+                address.is_multiple_of(width),
+                format_args!("unaligned address {address:#x}"),
+            )?;
+            let end = address + width;
+            m.require(
+                end <= LOCAL_LIMIT,
+                format_args!("address {address:#x} outside local memory"),
+            )?;
+            let mut bytes = [0u8; 16];
+            if store {
+                for i in 0..count {
+                    let at = i as usize * 4;
+                    bytes[at..at + 4].copy_from_slice(&m.r(lane, rd + i).to_le_bytes());
+                }
+                let local = &mut m.local[lane].bytes;
+                if local.len() < end {
+                    local.resize(end, 0);
+                }
+                local[address..end].copy_from_slice(&bytes[..width]);
+                return Ok(());
+            }
+            let local = &m.local[lane].bytes;
+            let stored = local.len().min(end).saturating_sub(address);
+            bytes[..stored].copy_from_slice(&local[address..address + stored]);
             m.write_loaded(lane, rd, size, &bytes);
             Ok(())
         })
@@ -1179,9 +1230,7 @@ impl<'a, const L: usize> Machine<'a, L> {
     }
 
     /// `LDC`: dest 0-7, address register 8-15, offset 20-35 (signed),
-    /// slot 36-40, address mode 44-45, size 48-50 [public: Ryujinx
-    /// `Decoders/InstDecoders.cs` `InstLdc`, `Instructions/InstEmitMemory.cs`
-    /// `Ldc`].
+    /// slot 36-40, address mode 44-45, size 48-50.
     fn ldc(&mut self, active: Mask) -> Result<(), Unmodeled> {
         let w = self.word;
         self.require(bits(w, 44, 2) == 0, "address mode IL/IS/ISL")?;
@@ -1223,8 +1272,7 @@ impl<'a, const L: usize> Machine<'a, L> {
     /// Address, size code and register of `LDG`/`STG` (address register
     /// 8-15, offset 20-43 signed, `E` (64-bit address) bit 45, size 48-50)
     /// or `LD`/`ST` (offset 20-51, `E` bit 52, size 53-55, predicate
-    /// 58-60) [public: Ryujinx `Decoders/InstDecoders.cs` `InstLdg`,
-    /// `InstStg`, `InstLd`, `InstSt`].
+    /// 58-60).
     fn global_access(&self, lane: usize) -> Result<(u64, u32), Unmodeled> {
         let w = self.word;
         let generic = matches!(self.op, Op::Ld | Op::St);
@@ -1253,10 +1301,8 @@ impl<'a, const L: usize> Machine<'a, L> {
     fn check_global(&self) -> Result<(), Unmodeled> {
         let w = self.word;
         if matches!(self.op, Op::Ld | Op::St) {
-            // LD/ST through the generic address space reach global memory
-            // [public: Ryujinx `Instructions/InstEmitMemory.cs` `Ld`/`St`
-            // (`MemoryRegion.Global`)]; a non-PT predicate operand is not
-            // modeled.
+            // LD/ST through the generic address space reach global
+            // memory; a non-PT predicate operand is not modeled.
             self.require(bits(w, 58, 3) == PT, "predicate operand")?;
         }
         let ra = bits(w, 8, 8);
@@ -1271,12 +1317,10 @@ impl<'a, const L: usize> Machine<'a, L> {
         )
     }
 
-    /// `LDG`/`LD`. Size code 7 (`u b128` in envydis `gm107.c` `tabeed0sz`,
-    /// `UB128` in Ryujinx, `U128 // ???` in eden) loads 128 bits like B128
-    /// in both emulators
-    /// \[inference: what the `U` adds is not documented; at a 16-byte
-    /// aligned address, which is required here, a 128-bit load reads the
-    /// same bytes whatever it means\].
+    /// `LDG`/`LD`. Size code 7 (an unsigned form of B128) loads 128 bits
+    /// like B128 \[inference: what the `U` adds is not documented; at a
+    /// 16-byte aligned address, which is required here, a 128-bit load
+    /// reads the same bytes whatever it means\].
     fn load_global(&mut self, active: Mask) -> Result<(), Unmodeled> {
         self.check_global()?;
         let rd = bits(self.word, 0, 8);
@@ -1337,10 +1381,89 @@ impl<'a, const L: usize> Machine<'a, L> {
         })
     }
 
+    /// `RED` and `ATOM`: an atomic read-modify-write of a 32-bit word of
+    /// global memory, `ATOM` returning what the word held. `RED`: source
+    /// 0-7, address register 8-15, type 20-22, operation 23-25, offset
+    /// 28-47 signed, `E` (64-bit address) bit 48. `ATOM`: dest 0-7,
+    /// address register 8-15, source 20-27, offset 28-47, `E` bit 48,
+    /// type 49-51, operation 52-55 \[`E` of `RED`: inference from a
+    /// shipped program's 0xebf9000001070806, whose address register pair
+    /// holds a 40-bit mapped address\]. Types U32
+    /// (0) and S32 (1); operations ADD (0), MIN (1), MAX (2), AND (5),
+    /// OR (6), XOR (7) and, for `ATOM`, EXCH (8). Lanes run one after
+    /// another, and programs running on other threads are kept out by
+    /// one lock, so each update is atomic.
+    fn atomic(&mut self, active: Mask) -> Result<(), Unmodeled> {
+        static UPDATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let w = self.word;
+        let returns = matches!(self.op, Op::Atom);
+        let (source, e, kind, operation) = if returns {
+            (bits(w, 20, 8), bit(w, 48), bits(w, 49, 3), bits(w, 52, 4))
+        } else {
+            (bits(w, 0, 8), bit(w, 48), bits(w, 20, 3), bits(w, 23, 3))
+        };
+        let ra = bits(w, 8, 8);
+        self.require(
+            !e || ra.is_multiple_of(2) || ra == RZ,
+            "64-bit address in an odd register",
+        )?;
+        self.require(kind < 2, format_args!("type {kind}"))?;
+        self.require(
+            matches!(operation, 0..=2 | 5..=7) || (returns && operation == 8),
+            format_args!("operation {operation}"),
+        )?;
+        let offset = i64::from(sext(bits(w, 28, 20), 20));
+        let covered = match self.io {
+            Io::Fragment { covered, .. } => Some(covered),
+            Io::Vertex { .. } | Io::Geometry(_) | Io::Compute(_) => None,
+        };
+        self.each(active, |m, lane| {
+            // Helper lanes (outside the primitive) do not write memory.
+            if covered.is_some_and(|covered| !covered[lane]) {
+                return Ok(());
+            }
+            let base = if e {
+                u64::from(m.r(lane, ra)) | (u64::from(m.r(lane, ra + 1)) << 32)
+            } else {
+                u64::from(m.r(lane, ra))
+            };
+            let address = base.wrapping_add(offset as u64);
+            m.require(
+                address.is_multiple_of(4),
+                format_args!("unaligned address {address:#x}"),
+            )?;
+            let value = m.r(lane, source);
+            let _update = UPDATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut bytes = [0u8; 4];
+            if m.env.memory.read(address, &mut bytes).is_none() {
+                return m.fail(&format!("atomic update of unmapped {address:#x}"));
+            }
+            let old = u32::from_le_bytes(bytes);
+            let signed = kind == 1;
+            let new = match operation {
+                0 => old.wrapping_add(value),
+                1 if signed => (old as i32).min(value as i32) as u32,
+                1 => old.min(value),
+                2 if signed => (old as i32).max(value as i32) as u32,
+                2 => old.max(value),
+                5 => old & value,
+                6 => old | value,
+                7 => old ^ value,
+                _ => value,
+            };
+            if m.env.memory.write(address, &new.to_le_bytes()).is_none() {
+                return m.fail(&format!("atomic update of unmapped {address:#x}"));
+            }
+            if returns {
+                m.set(lane, bits(w, 0, 8), old);
+            }
+            Ok(())
+        })
+    }
+
     /// `ALD`: dest 0-7, index register 8-15, offset 20-30, `P` (patch)
     /// bit 31, `O` (read outputs) bit 32, vertex register 39-46, size
-    /// 47-48 (1-4 words) [public: eden
-    /// `translate/impl/load_store_attribute.cpp` `ALD`]. In a geometry
+    /// 47-48 (1-4 words). In a geometry
     /// program the vertex register holds an input vertex handle. An
     /// executed read of an inactive vertex attribute refuses (see
     /// `pipeline::VertexFetch`); a program that only names one in its
@@ -1405,8 +1528,7 @@ impl<'a, const L: usize> Machine<'a, L> {
     }
 
     /// `AST`: source 0-7, index register 8-15, offset 20-30, `P` bit 31,
-    /// vertex register 39-46, size 47-48 [public: eden
-    /// `translate/impl/load_store_attribute.cpp` `AST`]. In a geometry
+    /// vertex register 39-46, size 47-48. In a geometry
     /// program the vertex register holds the current output handle.
     fn ast(&mut self, active: Mask) -> Result<(), Unmodeled> {
         let w = self.word;
@@ -1449,8 +1571,8 @@ impl<'a, const L: usize> Machine<'a, L> {
     }
 
     /// `ISBERD`: dest 0-7, address register 8-15, `SKEW` bit 31, `O` bit
-    /// 32, mode 33-34 (default, patch, prim, attr), size 47-48 [public:
-    /// envytools `envydis/gm107.c` `isberd`]. Only the default form, which
+    /// 32, mode 33-34 (default, patch, prim, attr), size 47-48. Only the
+    /// default form, which
     /// reads the input vertex handle of an ISBE entry (see the module
     /// documentation), is modeled.
     fn isberd(&mut self, active: Mask) -> Result<(), Unmodeled> {
@@ -1459,8 +1581,7 @@ impl<'a, const L: usize> Machine<'a, L> {
             return self.fail("outside a geometry program");
         };
         let vertices = geometry.inputs.len() as u32;
-        // Bits 20-30 are no field in envytools; eden reads an offset
-        // from 24-31.
+        // Bits 20-30 are not a known field.
         self.require(bits(w, 20, 11) == 0, "bits 20-30")?;
         self.require(bits(w, 31, 4) == 0, "SKEW, O or a mode")?;
         self.require(bits(w, 47, 2) == 0, "size")?;
@@ -1477,8 +1598,7 @@ impl<'a, const L: usize> Machine<'a, L> {
     }
 
     /// `OUT`: dest 0-7, handle register 8-15, stream operand B, `EMIT` bit
-    /// 39, `CUT` bit 40 [public: envytools `envydis/gm107.c` `out`, eden
-    /// `translate/impl/output_geometry.cpp`]. Emits beyond
+    /// 39, `CUT` bit 40. Emits beyond
     /// `MaxOutputVertexCount` are no-ops (Shader-Program-Header). Only
     /// stream 0 is modeled.
     fn out(&mut self, active: Mask) -> Result<(), Unmodeled> {
@@ -1524,19 +1644,17 @@ impl<'a, const L: usize> Machine<'a, L> {
     /// `IPA`: dest 0-7, index register 8-15 with `IDX` bit 38, multiplier
     /// 20-27, attribute 28-37, sample-mode register 39-46, predicate
     /// 47-50, `SAT` bit 51, sample mode 52-53, mode 54-55 (PASS, MULTIPLY,
-    /// CONSTANT, SC) [public: Ryujinx `Decoders/InstDecoders.cs` `InstIpa`,
-    /// eden `translate/impl/load_store_attribute.cpp` `IPA`].
+    /// CONSTANT, SC).
     ///
     /// PASS yields the plane value at the pixel center, MULTIPLY that value
     /// times the multiplier register (the compiler passes w, from
-    /// `MUFU.RCP` of `IPA.PASS a[0x7c]`, for perspective inputs). Neither
-    /// public source defines CONSTANT or SC; they, indexed reads, the
-    /// OFFSET sample mode and the predicate operand are not modeled.
+    /// `MUFU.RCP` of `IPA.PASS a[0x7c]`, for perspective inputs). SC,
+    /// indexed reads, the OFFSET sample mode and the predicate operand
+    /// are not modeled.
     /// CENTROID (sample mode 1) evaluates at the lane's centroid
     /// ([`Quad::centroids`](super::Quad::centroids)): the pixel center
     /// with one sample per pixel or all samples covered, else a covered
-    /// sample's position (`raster::centroid`) [public: Ryujinx and eden
-    /// translate CENTROID to the API's `centroid` qualifier].
+    /// sample's position (`raster::centroid`).
     fn ipa(&mut self, active: Mask) -> Result<(), Unmodeled> {
         let w = self.word;
         let Io::Fragment {
@@ -1549,11 +1667,12 @@ impl<'a, const L: usize> Machine<'a, L> {
         else {
             return self.fail("outside a fragment program");
         };
+        // CONSTANT reads an input that is constant across the primitive
+        // (one the header declares so has a plane without slope, see
+        // `pipeline`'s flat planes): the provoking vertex's word as it
+        // is, the plane's base.
         let mode = bits(w, 54, 2);
-        self.require(
-            mode <= 1,
-            format_args!("mode {}", ["", "", "CONSTANT", "SC"][mode as usize]),
-        )?;
+        self.require(mode <= 2, "mode SC")?;
         self.require(!bit(w, 38), "IDX")?;
         self.require(bits(w, 52, 2) <= 1, "sample mode OFFSET")?;
         self.require(bits(w, 47, 4) == PT, "predicate operand")?;
@@ -1562,6 +1681,10 @@ impl<'a, const L: usize> Machine<'a, L> {
         self.require(attribute.is_multiple_of(4), "unaligned attribute")?;
         self.require(attribute != 0x3fc, "front-facing attribute")?;
         let plane = planes[(attribute / 4) as usize];
+        self.require(
+            mode != 2 || (plane.dx == 0.0 && plane.dy == 0.0),
+            "mode CONSTANT of an interpolated input",
+        )?;
         let (rd, rb) = (bits(w, 0, 8), bits(w, 20, 8));
         let sat = bit(w, 51);
         let centroid = bits(w, 52, 2) == 1;
@@ -1573,7 +1696,11 @@ impl<'a, const L: usize> Machine<'a, L> {
             };
             let px = (x + (lane as u32 & 1)) as f32 + ox;
             let py = (y + (lane as u32 >> 1)) as f32 + oy;
-            let mut value = plane.base + plane.dx * px + plane.dy * py;
+            let mut value = if mode == 2 {
+                plane.base
+            } else {
+                plane.base + plane.dx * px + plane.dy * py
+            };
             if mode == 1 {
                 value *= m.rf(lane, rb);
             }
@@ -1587,8 +1714,7 @@ impl<'a, const L: usize> Machine<'a, L> {
 
     /// `SHFL`: dest 0-7, A 8-15, B register 20-27 or (bit 28) immediate
     /// 20-24, C register 39-46 or (bit 29) immediate 34-46, mode 30-31
-    /// (IDX, UP, DOWN, BFLY), destination predicate 48-50 [public: Ryujinx
-    /// `Decoders/InstDecoders.cs` `InstShfl`, `InstEmitWarp.cs`]. Each
+    /// (IDX, UP, DOWN, BFLY), destination predicate 48-50. Each
     /// lane reads A of the lane [`shuffle_lane`] picks, or its own where
     /// that lane is out of range, and sets the predicate to whether it was
     /// in range. Compute warps are the hardware's warps (lane `i` of a
@@ -1634,12 +1760,11 @@ impl<'a, const L: usize> Machine<'a, L> {
 
     /// `FSWZADD`: dest 0-7, A 8-15, B 20-27, per-lane operation 28-35 (two
     /// bits for each lane of the quad), NDV bit 38, rounding 39-40, FTZ
-    /// bit 44, CC bit 47 [public: Ryujinx `InstFswzadd`]. Quad lane `i`
+    /// bit 44, CC bit 47. Quad lane `i`
     /// computes `A * ka + B * kb` with (ka, kb) from its operation: (1, 1),
     /// (-1, 1), (1, -1), (0, 1), the two products added with one rounding
-    /// (the products by ±1 and 0 are exact) [public: eden
-    /// `emit_spirv_floating_point.cpp` `EmitFSwizzleAdd`, `fswzadd_lut_a`
-    /// / `_b`; Ryujinx `SwizzleAdd`]. Compilers pair it with `SHFL.BFLY`
+    /// (the products by ±1 and 0 are exact). Compilers pair it with
+    /// `SHFL.BFLY`
     /// for fine derivatives (operations 0x99: the right lane minus the
     /// left one). Only round-to-nearest without NDV or CC is modeled.
     fn fswzadd(&mut self, active: Mask) -> Result<(), Unmodeled> {

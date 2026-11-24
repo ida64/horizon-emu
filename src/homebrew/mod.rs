@@ -98,10 +98,9 @@
 //! it uses those: libusbhsfs asks the service manager whether a service
 //! exists (`sm:` request 65100), Nintendo's `sm` closes the session on a
 //! request it does not know, and every later look-up of a service by
-//! that program fails. NX-Shell 4.01 does this while starting, cannot
-//! reach `nvdrv:a` afterwards, and dies in Mesa's handling of the failed
-//! `eglInitialize` (a second `free` of the device, in
-//! `nouveau_device_new`'s error path). That is the program's dependence,
+//! that program fails. A program that does this while starting cannot
+//! reach `nvdrv:a` afterwards, and dies in its own handling of the failed
+//! `eglInitialize`. That is the program's dependence,
 //! not something missing here.
 
 pub mod firmware;

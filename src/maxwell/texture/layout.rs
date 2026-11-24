@@ -8,11 +8,9 @@
 //! another, then one slice of blocks after another); within a block, GOBs
 //! are stacked vertically, then in depth; within a GOB, bytes follow the
 //! 16-byte-sector pattern of [`gob_offset`].
-//! [public: Ryujinx `Ryujinx.Graphics.Texture/BlockLinearLayout.cs`,
-//! `BlockLinearConstants.cs`; NVIDIA open-gpu-doc `classes/3d/clb197tex.h`
-//! `GOBS_PER_BLOCK_HEIGHT`/`GOBS_PER_BLOCK_DEPTH` (one GOB wide only:
-//! envytools `rnndb/graph/gm200_texture.xml` "GOBS_PER_BLOCK_WIDTH ...
-//! IGNORED BY TEX (ASSUMED ONE_GOB)")]
+//! [public: NVIDIA open-gpu-doc `classes/3d/clb197tex.h`
+//! `GOBS_PER_BLOCK_HEIGHT`/`GOBS_PER_BLOCK_DEPTH`; blocks are one GOB
+//! wide]
 //!
 //! Sizes here are in bytes and rows of *format blocks* (a 4x4 BC block or
 //! an ASTC footprint counts as one "texel" of `bytes_per_block` bytes).
@@ -40,11 +38,6 @@ impl BlockLinear {
     /// height halves while the level fits in half a block
     /// (`rows <= GOB_HEIGHT << (block_height_log2 - 1)`), the depth halves
     /// while `depth <= 1 << (block_depth_log2 - 1)`.
-    /// [public: eden `video_core/texture_cache/util.cpp` `AdjustMipBlockSize`
-    /// (both dimensions, loops); Ryujinx `SizeCalculator.cs`
-    /// `GetBlockLinearTextureSize` (height identical; depth halved at most
-    /// once per level there, which agrees with eden whenever each level at
-    /// most halves the depth, i.e. for every mip chain)]
     pub fn for_level(self, rows: u32, depth: u32) -> BlockLinear {
         let mut block = self;
         while block.block_height_log2 > 0 && rows <= GOB_HEIGHT << (block.block_height_log2 - 1) {
@@ -194,13 +187,9 @@ pub struct BlockLinearImage {
 /// follow each other within a layer, each with the block [`BlockLinear::for_level`]
 /// gives it (starting from the TIC's block at level 0); layers follow each
 /// other, each padded to a whole level-0 block.
-/// [public: Ryujinx `SizeCalculator.cs` `GetBlockLinearTextureSize`,
-/// `AlignLayerSize`; eden `video_core/texture_cache/util.cpp`
-/// `CalculateLevelSize`, `AlignLayerSize`]
 ///
 /// The TIC's block describes level 0. If level 0 itself would shrink under
-/// the mip rule, the public sources disagree on what the hardware does
-/// (Ryujinx shrinks it, eden keeps it for single-level textures), so that
+/// the mip rule, what the hardware does is not established, so that
 /// case is refused.
 pub fn block_linear_image(
     shape: &ImageShape,

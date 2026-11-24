@@ -3,8 +3,8 @@
 //!
 //! A window covers whole bands of 8 rows: for block-linear surfaces a band
 //! is one row of GOBs (64 bytes x 8 rows, 512 contiguous bytes each
-//! [public: Tegra X1 TRM "Block Linear" layout as modeled by Ryujinx
-//! `BlockLinearLayout.cs`]), for pitch-linear surfaces 8 consecutive rows.
+//! [public: Tegra X1 TRM "Block Linear" layout]), for pitch-linear
+//! surfaces 8 consecutive rows.
 //! Bands are disjoint in memory, so they can be split across threads.
 
 use std::ops::Range;
@@ -129,8 +129,7 @@ fn in_runs(
 }
 
 /// Offset in a GOB of the 16-byte unit at byte column `x` (a multiple of
-/// 16 below 64) of row `row` (below 8) [public: Ryujinx
-/// BlockLinearLayout.cs, as in [`Band::offset`]].
+/// 16 below 64) of row `row` (below 8), as in [`Band::offset`].
 fn gob_unit(x: usize, row: usize) -> usize {
     ((x & 0x20) << 3) | ((row & 0x6) << 5) | ((x & 0x10) << 1) | ((row & 1) << 4)
 }
@@ -474,7 +473,7 @@ impl Window {
     /// (`x·bpp / 64` from the window's first) × 512 + the offset inside the
     /// GOB, `x` bits of the byte column 3:0 → 3:0, row bit 0 → 4, byte
     /// column bit 4 → 5, row bits 2:1 → 7:6, byte column bit 5 → 8 (row
-    /// counted within the band) [public: Ryujinx BlockLinearLayout.cs].
+    /// counted within the band).
     /// Pitch: band start + row within the band × row bytes + the byte
     /// column from the window's first.
     pub fn texel_offset(&self, x: u32, y: u32) -> usize {
@@ -609,7 +608,7 @@ impl Band<'_> {
             Layout::BlockLinear(_) => {
                 let x_bytes = x * bpp;
                 let gob = (x_bytes / GOB_WIDTH - self.column0) as usize;
-                // Inside a GOB [public: Ryujinx BlockLinearLayout.cs]: x
+                // Inside a GOB: x
                 // bits 3:0 -> 3:0, y bit 0 -> 4, x bit 4 -> 5, y bits 2:1 ->
                 // 7:6, x bit 5 -> 8.
                 let x = x_bytes % GOB_WIDTH;

@@ -1,6 +1,5 @@
-//! Constant-buffer access bounds for draw-time snapshots. Operand fields
-//! [public: Ryujinx Decoders/InstDecoders.cs]; LDC's slot is at bit 36,
-//! unlike the ordinary constant operand's slot at bit 34.
+//! Constant-buffer access bounds for draw-time snapshots. LDC's slot is
+//! at bit 36, unlike the ordinary constant operand's slot at bit 34.
 use super::{
     Program,
     decode::Op,

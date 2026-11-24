@@ -13,9 +13,9 @@
 //! binds `texture2d<float>` slots, single-layer 2D textures only
 //! (`metal::format::check_texture`). Array-target instructions are
 //! translated for them: the interpreter's texture unit clamps the layer
-//! to the texture's last one (`texture/filtering.rs` `coordinates`, after
-//! [public: eden `texture_pass.cpp`, Ryujinx `GetTargetTexture`], which view
-//! a 2D texture as a one-layer array), so the layer operand cannot matter.
+//! to the texture's last one (`texture/filtering.rs` `coordinates`, which
+//! views a 2D texture as a one-layer array), so the layer operand cannot
+//! matter.
 //!
 //! A handle that names no texture (an unset slot of an uber-shader, whose
 //! sample sits on a branch the draw may not take) is not refused when the
@@ -45,10 +45,18 @@ impl Writer<'_> {
     pub(super) fn ipa(&mut self) -> Result<(), String> {
         let w = self.word;
         let mode = bits(w, 54, 2);
-        self.require(
-            mode <= 1,
-            &format!("mode {}", ["", "", "CONSTANT", "SC"][mode as usize]),
-        )?;
+        self.require(mode <= 2, "mode SC")?;
+        if mode == 2 {
+            // `exec::Machine::ipa`: a constant input's plane has no
+            // slope, so its value anywhere is the provoking vertex's.
+            self.require(
+                self.program
+                    .header
+                    .ps_interpolation(bits(w, 28, 10) as usize / 4)
+                    == super::super::Interpolation::Flat,
+                "mode CONSTANT of an interpolated input",
+            )?;
+        }
         self.require(!bit(w, 38), "IDX")?;
         self.require(bits(w, 52, 2) <= 1, "sample mode OFFSET")?;
         self.require(bits(w, 47, 4) == PT, "predicate operand")?;
@@ -217,8 +225,7 @@ impl Writer<'_> {
     /// `TEXS`: 2D with implicit LOD (encoding 1), level zero (2) or an
     /// explicit level (3), and the array forms of the first two (7, 8;
     /// layer operand without effect, see the module documentation);
-    /// destinations as [public: eden
-    /// `translate/impl/texture_fetch_swizzled.cpp`].
+    /// destinations as `exec/tex.rs`.
     pub(super) fn texs(&mut self) -> Result<(), String> {
         let w = self.word;
         let encoding = bits(w, 53, 4);

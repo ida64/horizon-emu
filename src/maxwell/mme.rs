@@ -6,10 +6,7 @@
 //! method calls into the engine that invoked it, so its effects are part of
 //! the method stream and must be interpreted, not guessed.
 //!
-//! Instruction semantics [public: eden `video_core/macro.cpp`
-//! `MacroInterpreterImpl`, Ryujinx `Ryujinx.Graphics.Gpu/Engine/MME/
-//! MacroInterpreter.cs`, envytools `envydis/macro.c`; the two emulators
-//! agree on everything below]:
+//! Instruction semantics:
 //!
 //! * 32-bit instructions; 8 registers, `r0` reads as 0 and ignores
 //!   writes. A call starts with every register 0 except `r1`, which holds
@@ -38,14 +35,12 @@ use serde::{Deserialize, Serialize};
 use super::Unmodeled;
 
 /// Entries of the start address RAM: macro `j` of `CALL_MME_MACRO(j)` is
-/// taken modulo this [public: Ryujinx `GPFifoProcessor.MacrosCount` 0x80,
-/// eden `macro_positions` modulo its size].
+/// taken modulo this.
 pub const MACRO_COUNT: usize = 0x80;
 
 /// Instruction RAM words accepted. The GM20B's macro RAM size is not
-/// documented publicly; Ryujinx models 0x10000 words
-/// (`GPFifoClass.MacroCodeSize`). Uploads beyond it are refused rather than
-/// wrapped.
+/// documented publicly; 0x10000 words are modeled \[assumption\]. Uploads
+/// beyond it are refused rather than wrapped.
 pub const CODE_WORDS: usize = 0x10000;
 
 /// Instructions one call may execute between parameter arrivals. Real
@@ -336,9 +331,9 @@ impl Call {
             },
             1 => a.wrapping_add(immediate),
             2 => (a & !(mask << destination_bit)) | (((b >> source_bit) & mask) << destination_bit),
-            // Register-supplied shift counts of 32 or more: the public
-            // reimplementations disagree (C# masks the count, C++ leaves it
-            // undefined), so they are refused.
+            // Register-supplied shift counts of 32 or more: what the
+            // hardware does with them is not established, so they are
+            // refused.
             3 if a < 32 => ((b >> a) & mask) << destination_bit,
             4 if a < 32 => ((b >> source_bit) & mask) << a,
             3 | 4 => {

@@ -21,7 +21,7 @@
 //! # Methods
 //!
 //! grc (`0100000000000035`, 23.5.0) records video for applications that
-//! allow capture (Minecraft): nvnflinger's frames go through the VIC to
+//! allow capture: nvnflinger's frames go through the VIC to
 //! NV12 and then, 30 times a second, to NVENC. Its H.264 submission
 //! (`0x214740`) sends through THI words 0x10/0x11 (Linux
 //! `hw_host1x04_uclass.h`, as for the VIC and NVDEC):
@@ -77,8 +77,8 @@
 //! from the input pictures' timestamps (`CalculateDynamicFrameRate`,
 //! `0x1f8b90`: `(u32)(10000000.0 / average_delta + 0.5)`, timestamps in
 //! 100 ns) and hands each new value to the H.264 encoder, so the setup's
-//! frame rate follows the game's: 30 at first, 15 later, and 0 once
-//! pictures come more than 2 s apart (creating a world in Minecraft),
+//! frame rate follows the application's: 30 at first, 15 later, and 0 once
+//! pictures come more than 2 s apart (a long load),
 //! with the per-picture rate `R` (+0x40 of `nvenc_h264_rc_s`) then
 //! 0x7FFFFFFF. Every picture is still encoded. The bit rate and frame
 //! rate are set on the running host session when they change (a new

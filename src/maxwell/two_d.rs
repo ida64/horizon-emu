@@ -3,12 +3,11 @@
 //!
 //! Methods and fields [public: NVIDIA open-gpu-doc
 //! `classes/twod/cl902d.h`]. The blit is triggered by
-//! `PIXELS_FROM_MEMORY_SRC_Y0_INT` (0x8DC), the last method of the block
-//! [public: eden `Fermi2D::CallMethod`, Ryujinx
-//! `TwodClass.PixelsFromMemorySrcY0Int`]. Destination pixel `i` samples
+//! `PIXELS_FROM_MEMORY_SRC_Y0_INT` (0x8DC), the last method of the block.
+//! Destination pixel `i` samples
 //! the source at `src_x0 + (i + 0.5) * du_dx` with `ORIGIN_CENTER` and at
-//! `src_x0 + i * du_dx` with `ORIGIN_CORNER` (Ryujinx's reading of the
-//! origin modes: with CORNER the API adds half a step itself); `src_x0`,
+//! `src_x0 + i * du_dx` with `ORIGIN_CORNER` (with CORNER the API adds
+//! half a step itself); `src_x0`,
 //! `du_dx` and their y counterparts are 32.32 fixed point.
 //!
 //! On a channel that renders with Metal, a blit that only moves texels'
@@ -135,8 +134,11 @@ impl TwoD {
     fn surface(&self, base: u32) -> Result<(Surface, ColorFormat), Unmodeled> {
         let r = |offset: u32| self.registers[m(base + offset)];
         let raw = r(0x00);
-        let format =
-            ColorFormat::from_raw(raw).ok_or_else(|| refuse(m(base), raw, "surface format"))?;
+        // The class has no integer formats [public: NVIDIA open-gpu-doc
+        // `classes/twod/cl902d.h` `NV902D_SET_DST_FORMAT_V_*`].
+        let format = ColorFormat::from_raw(raw)
+            .filter(|format| !format.is_integer())
+            .ok_or_else(|| refuse(m(base), raw, "surface format"))?;
         let bpp = format.bytes_per_pixel();
         // SET_*_MEMORY_LAYOUT: 0 block linear, 1 pitch.
         let layout = if r(0x04) & 1 != 0 {
@@ -697,10 +699,11 @@ mod tests {
         }
     }
 
-    /// The `FORMAT` codes [`ColorFormat::from_raw`] accepts.
+    /// The `FORMAT` codes the class has among those
+    /// [`ColorFormat::from_raw`] accepts.
     fn format_codes() -> Vec<u32> {
         (0xc0..=0xff)
-            .filter(|&raw| ColorFormat::from_raw(raw).is_some())
+            .filter(|&raw| ColorFormat::from_raw(raw).is_some_and(|format| !format.is_integer()))
             .collect()
     }
 
@@ -1001,7 +1004,7 @@ mod tests {
         compare(0xB17, 1500, &eight_bit);
     }
 
-    /// The MSAA 2x1 sample-grid reduction Minecraft blits every frame: a
+    /// The MSAA 2x1 sample-grid reduction NVN applications blit: a
     /// 2560x720 A8R8G8B8 block-linear surface at 0 to a 1280x720 one at
     /// 8 MiB, du 2, u0 0.5, bilinear, origin centre.
     fn sample_grid_reduction() -> TwoD {

@@ -1,6 +1,5 @@
-//! Integer and predicate fields [public: Ryujinx Decoders/InstDecoders.cs].
-//! XMAD modes [public: Instructions/InstEmitIntegerArithmetic.cs EmitXmad];
-//! IADD3 halves and 33-bit shift [public: eden translate/impl/integer_add_three_input.cpp].
+//! Integer and predicate instructions: field layouts, XMAD modes, IADD3
+//! halves and 33-bit shift.
 use super::*;
 fn half(v: u32, high: bool, signed: bool) -> u32 {
     let v = if high { v >> 16 } else { v };
@@ -35,7 +34,54 @@ fn boolean(a: bool, b: bool, op: u32) -> bool {
     }
 }
 impl<const L: usize> Machine<'_, L> {
+    /// `CSET`, `CSETP` and `PSET`: a condition-code test (bits 12:8), or
+    /// for `PSET` the boolean operation 25:24 of the predicates at 12 and
+    /// 29, combined with the predicate at 39 by the operation 46:45. The
+    /// outcome goes to a register as all ones, or 1.0 with BF (bit 44),
+    /// and 0 otherwise (`CSET`, `PSET`), with the condition code's zero
+    /// and (without BF) sign from it if bit 47 asks and carry and
+    /// overflow reset; or, for `CSETP`, to the predicate at 3, and
+    /// combined from the test's negation to the predicate at 0.
+    fn execute_flag_set(&mut self, active: Mask) -> Result<bool, Unmodeled> {
+        let (w, op) = (self.word, self.op);
+        if !matches!(op, Op::Cset | Op::Csetp | Op::Pset) {
+            return Ok(false);
+        }
+        let cop = bits(w, 45, 2);
+        self.require(cop < 3, "boolean operation")?;
+        self.each(active, |m, l| {
+            let test = if matches!(op, Op::Pset) {
+                let ab = bits(w, 24, 2);
+                m.require(ab < 3, "boolean operation")?;
+                boolean(m.src_pred(l, 12), m.src_pred(l, 29), ab)
+            } else {
+                m.condition(l, bits(w, 8, 5))?
+            };
+            let p = m.src_pred(l, 39);
+            if matches!(op, Op::Csetp) {
+                m.set_pred(l, bits(w, 3, 3), boolean(test, p, cop));
+                m.set_pred(l, bits(w, 0, 3), boolean(!test, p, cop));
+                return Ok(());
+            }
+            let float = bit(w, 44);
+            let v = match (boolean(test, p, cop), float) {
+                (false, _) => 0,
+                (true, false) => u32::MAX,
+                (true, true) => 1f32.to_bits(),
+            };
+            m.set(l, bits(w, 0, 8), v);
+            if bit(w, 47) {
+                m.lanes[l].cc = (u8::from(v == 0) * CC_Z) | (u8::from(v != 0 && !float) * CC_S);
+            }
+            Ok(())
+        })?;
+        Ok(true)
+    }
+
     pub(super) fn execute_integer(&mut self, active: Mask) -> Result<bool, Unmodeled> {
+        if self.execute_flag_set(active)? {
+            return Ok(true);
+        }
         let form = match self.op {
             Op::BfeR
             | Op::BfiR
@@ -44,6 +90,10 @@ impl<const L: usize> Machine<'_, L> {
             | Op::XmadR
             | Op::ImnmxR
             | Op::IcmpR
+            | Op::FcmpR
+            | Op::PopcR
+            | Op::FloR
+            | Op::ImulR
             | Op::R2pR
             | Op::P2rR
             | Op::Psetp => Form::R,
@@ -54,6 +104,9 @@ impl<const L: usize> Machine<'_, L> {
             | Op::XmadI
             | Op::ImnmxI
             | Op::IcmpI
+            | Op::PopcI
+            | Op::FloI
+            | Op::ImulI
             | Op::R2pI
             | Op::P2rI => Form::I,
             Op::BfeC
@@ -63,9 +116,17 @@ impl<const L: usize> Machine<'_, L> {
             | Op::XmadC
             | Op::ImnmxC
             | Op::IcmpC
+            | Op::FcmpC
+            | Op::PopcC
+            | Op::FloC
+            | Op::ImulC
             | Op::R2pC
             | Op::P2rC => Form::C,
-            Op::BfiRc | Op::XmadRc | Op::IcmpRc => Form::Rc,
+            Op::BfiRc | Op::XmadRc | Op::IcmpRc | Op::FcmpRc | Op::LeaHiC => Form::Rc,
+            Op::FcmpI => Form::F,
+            Op::LeaR | Op::LeaHiR => Form::R,
+            Op::LeaI => Form::I,
+            Op::LeaC => Form::C,
             _ => return Ok(false),
         };
         let w = self.word;
@@ -226,6 +287,80 @@ impl<const L: usize> Machine<'_, L> {
                         a
                     } else {
                         b
+                    }
+                }
+                // `FCMP`: as `ICMP`, the comparison (bits 51:48) of float
+                // C with 0.0.
+                Op::FcmpR | Op::FcmpI | Op::FcmpC | Op::FcmpRc => {
+                    m.require(!cc, "condition code write")?;
+                    if super::alu::compare(f32::from_bits(c), 0.0, bits(w, 48, 4)) {
+                        a
+                    } else {
+                        b
+                    }
+                }
+                // `POPC`: the set bits of B, complemented first with bit
+                // 40.
+                Op::PopcR | Op::PopcI | Op::PopcC => (if bit(w, 40) { !b } else { b }).count_ones(),
+                // `FLO`: the index of the most significant set bit of B
+                // (complemented first with bit 40; signed with bit 48:
+                // the most significant bit differing from the sign), all
+                // ones if there is none; with SH (bit 41) counted from
+                // bit 31 instead.
+                Op::FloR | Op::FloI | Op::FloC => {
+                    m.require(!cc, "condition code write")?;
+                    let b = if bit(w, 40) { !b } else { b };
+                    let b = if bit(w, 48) && b >> 31 != 0 { !b } else { b };
+                    match b.leading_zeros() {
+                        32 => u32::MAX,
+                        zeros if bit(w, 41) => zeros,
+                        zeros => 31 - zeros,
+                    }
+                }
+                // `IMUL`: the low 32 bits of A times B, or with HI (bit
+                // 39) the high 32 of the 64-bit product, signed with bit
+                // 40.
+                Op::ImulR | Op::ImulI | Op::ImulC => {
+                    m.require(!cc, "condition code write")?;
+                    if !bit(w, 39) {
+                        a.wrapping_mul(b)
+                    } else if bit(w, 40) {
+                        ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32
+                    } else {
+                        ((u64::from(a) * u64::from(b)) >> 32) as u32
+                    }
+                }
+                // `LEA`: B plus A shifted left by the scale (bits 43:39),
+                // A negated first with bit 45. `LEA.HI`: the base (B, or
+                // the constant buffer word) plus the bits above the low
+                // 32 of the 64-bit offset (A low, register 39 high;
+                // negated first) shifted left by the scale (bits 32:28
+                // with NEG 37 and X 38, or 55:51, 56 and 57 for the
+                // constant buffer form). X (carry in), the predicate
+                // result (bits 50:48) and CC are not modeled.
+                Op::LeaR | Op::LeaI | Op::LeaC | Op::LeaHiR | Op::LeaHiC => {
+                    m.require(!cc, "condition code write")?;
+                    m.require(bits(w, 48, 3) == PT, "predicate result")?;
+                    let (base, high, scale, negate, extended) = match op {
+                        Op::LeaHiR => (b, Some(c), bits(w, 28, 5), bit(w, 37), bit(w, 38)),
+                        Op::LeaHiC => (c, Some(b), bits(w, 51, 5), bit(w, 56), bit(w, 57)),
+                        _ => (b, None, bits(w, 39, 5), bit(w, 45), bit(w, 46)),
+                    };
+                    m.require(!extended, "X")?;
+                    match high {
+                        None => {
+                            let offset = if negate { a.wrapping_neg() } else { a };
+                            base.wrapping_add(offset << scale)
+                        }
+                        Some(high) => {
+                            let offset = u64::from(a) | u64::from(high) << 32;
+                            let offset = if negate {
+                                offset.wrapping_neg()
+                            } else {
+                                offset
+                            };
+                            base.wrapping_add((offset >> (32 - scale)) as u32)
+                        }
                     }
                 }
                 Op::R2pR | Op::R2pI | Op::R2pC => {

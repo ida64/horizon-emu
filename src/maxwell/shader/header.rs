@@ -1,7 +1,6 @@
 //! The shader program header (SPH): the first 0x50 bytes of every program.
 //!
-//! Layout [public: NVIDIA open-gpu-doc Shader-Program-Header, tables 1-24;
-//! cross-checked with Ryujinx `Ryujinx.Graphics.Shader/Translation/ShaderHeader.cs`]:
+//! Layout [public: NVIDIA open-gpu-doc Shader-Program-Header, tables 1-24]:
 //!
 //! * `CommonWord0` (byte 0x00): `SphType` bits 0-4 (1 = VTG, 2 = PS),
 //!   `Version` 5-9, `ShaderType` 10-13 (1 vertex, 2 tessellation init,
