@@ -400,3 +400,45 @@ fn software_and_metal_lines_agree() {
         );
     }
 }
+
+/// Points of odd and even sizes, and point sprites, at positions on and
+/// next to pixel centers and edges (sprites of size 1 and 2 centered on
+/// pixel corners and centers put pixel centers on their edges, which the
+/// top-left rule decides): Metal draws them with its vertex stage (no
+/// CPU vertices) and covers the pixels the software renderer does.
+#[test]
+fn software_and_metal_points_agree() {
+    let points: &[[f32; 2]] = &[
+        [10.3, 20.7],
+        [30.5, 40.5],
+        [50.0, 10.0],
+        [5.49, 55.51],
+        [44.75, 30.25],
+        [20.0, 50.5],
+    ];
+    for (size, sprite) in [
+        (1.0f32, false),
+        (1.6, false),
+        (3.2, false),
+        (4.0, false),
+        (1.0, true),
+        (2.0, true),
+        (2.5, true),
+        (3.3, true),
+    ] {
+        let image = |kind: RendererKind| {
+            let mut frame = line_frame(kind);
+            frame.method(0x1518, size.to_bits()); // SET_POINT_SIZE
+            frame.method(0x1520, u32::from(sprite)); // SET_POINT_SPRITE
+            draw(&mut frame, 0, points);
+            if let Some(metal) = &frame.channel.hooks.metal {
+                assert_eq!(metal.fallbacks(), (1, vec![]), "size {size}");
+                assert_eq!(metal.cpu_vertices(), vec![], "size {size}");
+            }
+            drawn(&frame)
+        };
+        let software = image(Software);
+        assert!(software.len() >= points.len(), "size {size} sprite {sprite}");
+        assert_eq!(image(Metal), software, "size {size} sprite {sprite}");
+    }
+}

@@ -1490,7 +1490,7 @@ fn vertex_programs_match_the_interpreter() {
             continue;
         }
         // The GPU.
-        let native = NativeVertex::new(&t, &fetches, &[], &[], false, true)
+        let native = NativeVertex::new(&t, &fetches, &[], &[], false, None, true)
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         let source = format!("{}{}", super::PRELUDE, native.source);
         let options = MTLCompileOptions::new();

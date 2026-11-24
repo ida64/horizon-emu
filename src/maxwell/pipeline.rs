@@ -1460,6 +1460,8 @@ fn native(
         .iter()
         .any(|(_, mode)| matches!(mode, Interpolation::Flat));
     let listed;
+    // Points drawn as Metal's: their size and whether they are sprites.
+    let mut points = None;
     let indexed = batch
         .run
         .as_ref()
@@ -1474,8 +1476,21 @@ fn native(
                 }
                 None => batch,
             };
-            let Primitives::Triangles(list) = assemble(batch.topology, &batch.elements) else {
-                return fall_back("points or lines");
+            let list: Vec<u32> = match assemble(batch.topology, &batch.elements) {
+                Primitives::Triangles(list) => list
+                    .iter()
+                    .flat_map(|&[a, b, c]| if provoking_last { [c, a, b] } else { [a, b, c] })
+                    .map(|i| i as u32)
+                    .collect(),
+                Primitives::Points(list) => {
+                    let point = match native_point(r, vertex, pixel, fragments) {
+                        Ok(point) => point,
+                        Err(reason) => return fall_back(&format!("points: {reason}")),
+                    };
+                    points = Some(point);
+                    list.iter().map(|&i| i as u32).collect()
+                }
+                _ => return fall_back("lines"),
             };
             let (mut low, mut high) = (u32::MAX, 0);
             let mut elements = Vec::with_capacity(2 * batch.elements.len());
@@ -1489,15 +1504,7 @@ fn native(
                     Element::Restart => elements.extend([0, 0]),
                 }
             }
-            let indices: Vec<u32> = list
-                .iter()
-                .flat_map(
-                    |&[a, b, c]| {
-                        if provoking_last { [c, a, b] } else { [a, b, c] }
-                    },
-                )
-                .map(|i| i as u32)
-                .collect();
+            let indices = list;
             (
                 NativeVertices::Listed(elements),
                 NativeIndices::Positions(indices),
@@ -1664,6 +1671,7 @@ fn native(
         front_clockwise: flip == front_ccw,
         depth_clip,
         depth_bias,
+        point: points,
     };
     let draw = super::metal::Draw {
         program: pixel,
@@ -2843,6 +2851,50 @@ fn point_rule(r: Registers<'_>, x: f32, y: f32, size: f32) -> Result<PointSquare
             ));
         }
     })
+}
+
+/// How Metal draws the points of a draw as [`setup_points`] does
+/// (`metal::NativeDraw::point`): their size, and whether they are point
+/// sprites (else [`point_rule`]'s non-multisampled squares, the size
+/// rounded), when they are of `SET_POINT_SIZE` (as [`point_size`] takes
+/// it for every vertex), into single-sample targets, without generated
+/// sprite coordinates; else what is not so.
+fn native_point(
+    r: Registers<'_>,
+    vertex: &Program,
+    pixel: &Program,
+    fragments: &Fragments,
+) -> Result<(f32, bool), &'static str> {
+    let control = r.get(SET_ATTRIBUTE_POINT_SIZE);
+    if control & 1 != 0
+        && (control >> 4 & 0xFF != 0 || vertex.header().vtg_output_used(0x6C / 4))
+    {
+        return Err("size from the vertex program");
+    }
+    if [0x2E0 / 4, 0x2E4 / 4]
+        .iter()
+        .any(|&word| pixel.header().ps_interpolation(word) != Interpolation::Unused)
+    {
+        return Err("sprite coordinates read");
+    }
+    let sprite = r.enabled(SET_POINT_SPRITE);
+    if sprite && r.get(SET_POINT_SPRITE_SELECT) & 0x1FF8 != 0 {
+        return Err("sprite coordinate generation");
+    }
+    if (!sprite && r.enabled(SET_ANTI_ALIAS_ENABLE))
+        || r.get(SET_ANTI_ALIASED_POINT) != 0
+        || !fragments.multisample.samples.is_single()
+    {
+        return Err("multisampled or smooth points");
+    }
+    if r.get(SET_POINT_CENTER_MODE) != 0 {
+        return Err("center mode");
+    }
+    let size = r.float(SET_POINT_SIZE);
+    if !(size > 0.0 && size <= 63.0) {
+        return Err("size outside 0..63");
+    }
+    Ok((if sprite { size } else { size.round().max(1.0) }, sprite))
 }
 
 /// The size of a point: the last vertex-pipeline shader's point size

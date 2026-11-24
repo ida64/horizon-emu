@@ -622,8 +622,9 @@ struct PipelineKey {
 
 /// What a native draw's vertex function is made from: its program, the
 /// constant buffer 1 its translation was made for, the attributes it
-/// fetches and the output words of its clip distances.
-type NativeKey = (usize, Option<Vec<u8>>, Vec<msl::Fetch>, Vec<u32>);
+/// fetches, the output words of its clip distances and the size of its
+/// points (bits) if it draws points.
+type NativeKey = (usize, Option<Vec<u8>>, Vec<msl::Fetch>, Vec<u32>, Option<(u32, bool)>);
 
 /// Where a draw's fragments come from.
 pub enum Geometry<'a> {
@@ -672,6 +673,10 @@ pub struct NativeDraw<'a> {
     pub depth_clip: bool,
     /// The polygon offset words of `native_depth_bias` (MSL prelude).
     pub depth_bias: [f32; 4],
+    /// Points instead of triangles, each index naming one: their size
+    /// (pixels) and whether they are point sprites, drawn as
+    /// `pipeline::point_rule`'s squares.
+    pub point: Option<(f32, bool)>,
 }
 
 /// How Metal's vertex ID gives a vertex's fetch index and vertex ID.
@@ -1962,6 +1967,7 @@ impl Renderer {
                     translated.constant_buffer_1.clone(),
                     native.fetches.clone(),
                     native.clip_words.clone(),
+                    native.point.map(|(size, sprite)| (size.to_bits(), sprite)),
                 )
             }),
             count_passed: draw.count_passed,
@@ -1987,6 +1993,7 @@ impl Renderer {
                             &varyings,
                             &native.clip_words,
                             layered,
+                            native.point,
                             false,
                         ) {
                             Ok(source) => Some(source),
@@ -2472,7 +2479,11 @@ impl Renderer {
                         )?;
                         encoder
                             .drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount(
-                                MTLPrimitiveType::Triangle,
+                                if native.point.is_some() {
+                                    MTLPrimitiveType::Point
+                                } else {
+                                    MTLPrimitiveType::Triangle
+                                },
                                 *count,
                                 *index_type,
                                 indices,

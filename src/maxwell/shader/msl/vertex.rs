@@ -287,12 +287,28 @@ impl NativeVertex {
     /// perspective input is handed on as its value times 1/w and a\[0x7c\]
     /// as 1/w, all interpolated linearly in the window, which is what
     /// `IPA` reads of them (the planes of `pipeline::primitive_planes`).
+    ///
+    /// With `point` (a size in pixels, and whether point sprites) each
+    /// vertex is a point: Metal's square, placed as `pipeline::point_rule`
+    /// places the software pipeline's. Without sprites (a whole size) its
+    /// center is the center of the window pixel holding the vertex for
+    /// odd sizes, the pixel corner nearest it for even ones: the square's
+    /// edges fall between pixel centers. A sprite is a square of the size
+    /// around the vertex, center and corners snapped to the sub-pixel grid
+    /// (`raster::snap_to_grid`, round half to even: `rint`) as the
+    /// software pipeline's triangles are; moved up and left by 1/1024 of a
+    /// pixel, so that a pixel center on its top or left edge is inside
+    /// and one on its bottom or right edge is not, as the top-left rule
+    /// decides (corners on the grid are 1/256 apart from pixel centers,
+    /// or on them).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         vertex: &TranslatedVertex,
         fetches: &[Fetch],
         varyings: &[(u32, Interpolation)],
         clip_words: &[u32],
         layered: bool,
+        point: Option<(f32, bool)>,
         kernel: bool,
     ) -> Result<NativeVertex, String> {
         let mut s = String::from(VERTEX_PRELUDE);
@@ -301,6 +317,9 @@ impl NativeVertex {
             s,
             "struct Varyings {{\n    float4 position [[position]];\n    float inv_w [[center_no_perspective]];\n    float depth [[center_no_perspective]];"
         );
+        if point.is_some() {
+            let _ = writeln!(s, "    float point_size [[point_size]];");
+        }
         for (k, &(word, mode)) in varyings.iter().enumerate() {
             let qualifier = match mode {
                 Interpolation::Perspective | Interpolation::Linear => "center_no_perspective",
@@ -454,6 +473,28 @@ impl NativeVertex {
                 s,
                 "    Varyings out;\n    const float cw = {w}; const float cz = {z};\n    out.position = float4((({x} * view[0]) + cw * view[3]) * view[6] - cw, cw - (({y} * view[1]) + cw * view[4]) * view[7], view[8] != 0.0f ? (cz + cw) * 0.5f : cz, cw);\n    out.inv_w = 1.0f / cw;\n    out.depth = ((cz * out.inv_w) * view[2]) + view[5];"
             );
+            if let Some((size, sprite)) = point {
+                // The window position as `pipeline::Clip::window` takes it,
+                // moved as `point_rule` does, and back to Metal's.
+                let (snap, extent) = if sprite {
+                    (
+                        format!(
+                            "rint((rint(p * 256.0f) / 256.0f - {half:?}f) * 256.0f) / 256.0f, rint((rint(p * 256.0f) / 256.0f + {half:?}f) * 256.0f) / 256.0f",
+                            half = size / 2.0
+                        ),
+                        true,
+                    )
+                } else if size % 2.0 == 1.0 {
+                    (format!("floor(p) + 0.5f - {:?}f, floor(p) + 0.5f + {:?}f", size / 2.0, size / 2.0), false)
+                } else {
+                    (format!("floor(p + 0.5f) - {:?}f, floor(p + 0.5f) + {:?}f", size / 2.0, size / 2.0), false)
+                };
+                let shift = if extent { " - 1.0f / 1024.0f" } else { "" };
+                let _ = writeln!(
+                    s,
+                    "    {{\n    float p = {x} * out.inv_w * view[0] + view[3];\n    const float2 ex = float2({snap});\n    p = {y} * out.inv_w * view[1] + view[4];\n    const float2 ey = float2({snap});\n    out.position.x = ((ex.x + ex.y) * 0.5f{shift}) * view[6] * cw - cw;\n    out.position.y = cw - ((ey.x + ey.y) * 0.5f{shift}) * view[7] * cw;\n    out.point_size = ex.y - ex.x;\n    }}"
+                );
+            }
             if layered {
                 let _ = writeln!(s, "    out.layer = as_type<uint>(view[9]);");
             }
