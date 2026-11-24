@@ -5,9 +5,10 @@
 //! backlight is lit, and darkness otherwise. It is redrawn from the
 //! machine's state at the host display's pace, whatever the guest is doing.
 //! Holding the left mouse button on the picture touches the screen there.
-//! The keyboard is the pair of Joy-Con: J slides them onto the rails or
-//! off, and [`KEYS`] are their buttons. [`POWER_KEY`] is the console's
-//! power button.
+//! The keyboard is the pair of Joy-Con: [`RAILS_KEY`] slides them onto the
+//! rails or off, [`KEYS`] are their buttons and [`STICK_KEYS`] push their
+//! sticks (WASD the left one, IJKL the right one, all the way).
+//! [`POWER_KEY`] is the console's power button.
 //!
 //! AppKit only lets a process's first thread own windows, so the window
 //! belongs to the thread that called `main` and the machine runs on others.
@@ -17,7 +18,10 @@ use std::{collections::VecDeque, sync::Mutex};
 use font8x8::legacy::BASIC_LEGACY;
 use horizon_emu::{
     machine::Machine,
-    soc::{dc::NoFrame, joycon::Button},
+    soc::{
+        dc::NoFrame,
+        joycon::{Button, Stick},
+    },
 };
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
 
@@ -39,7 +43,7 @@ const LOG_COLOR: u32 = 0x00E8_E8E8;
 
 /// Which key holds which button of the Joy-Con.
 const KEYS: [(Key, Button); 18] = [
-    (Key::A, Button::A),
+    (Key::Space, Button::A),
     (Key::B, Button::B),
     (Key::X, Button::X),
     (Key::Y, Button::Y),
@@ -61,6 +65,15 @@ const KEYS: [(Key, Button); 18] = [
 
 /// The key that holds the console's power button.
 const POWER_KEY: Key = Key::P;
+
+/// The key that slides the Joy-Con onto the rails or off.
+const RAILS_KEY: Key = Key::Tab;
+
+/// Which keys push which stick: up, down, left, right.
+const STICK_KEYS: [(Stick, [Key; 4]); 2] = [
+    (Stick::Left, [Key::W, Key::S, Key::A, Key::D]),
+    (Stick::Right, [Key::I, Key::K, Key::J, Key::L]),
+];
 
 /// The emulator's own log lines, drawn over the top right corner of the
 /// window's picture. They are the host talking, not something the
@@ -132,6 +145,8 @@ pub struct ScreenWindow {
     held: [bool; KEYS.len()],
     /// Whether [`POWER_KEY`] was down, as the machine was told.
     power_held: bool,
+    /// Where the keys last pushed each stick, as the machine was told.
+    sticks: [(i8, i8); 2],
 }
 
 impl ScreenWindow {
@@ -153,6 +168,7 @@ impl ScreenWindow {
             touching: None,
             held: [false; KEYS.len()],
             power_held: false,
+            sticks: [(0, 0); 2],
         })
     }
 
@@ -206,7 +222,7 @@ impl ScreenWindow {
         if finger != self.touching && machine.set_touch(finger) {
             self.touching = finger;
         }
-        if self.window.is_key_pressed(Key::J, KeyRepeat::No) {
+        if self.window.is_key_pressed(RAILS_KEY, KeyRepeat::No) {
             machine.seat_joycons(!machine.joycons_seated());
         }
         for ((key, button), held) in KEYS.into_iter().zip(&mut self.held) {
@@ -220,6 +236,16 @@ impl ScreenWindow {
         if down != self.power_held {
             machine.press_power(down);
             self.power_held = down;
+        }
+        for ((stick, [up, down, left, right]), last) in STICK_KEYS.into_iter().zip(&mut self.sticks) {
+            let axis = |positive: Key, negative: Key| {
+                i8::from(self.window.is_key_down(positive)) - i8::from(self.window.is_key_down(negative))
+            };
+            let now = (axis(right, left), axis(up, down));
+            if now != *last {
+                machine.set_stick(stick, f32::from(now.0), f32::from(now.1));
+                *last = now;
+            }
         }
         true
     }

@@ -993,6 +993,12 @@ impl Machine {
         self.soc.joycons.press(button, held);
     }
 
+    /// Pushes an analog stick to `x`, `y` (each -1 to 1, right and up
+    /// positive), see [`crate::soc::joycon::Controls::set_stick`].
+    pub fn set_stick(&self, stick: crate::soc::joycon::Stick, x: f32, y: f32) {
+        self.soc.joycons.set_stick(stick, x, y);
+    }
+
     /// Holds an NFC tag over the right Joy-Con's reader, or takes it away.
     pub fn place_tag(&self, tag: Option<crate::soc::ntag::Ntag215>) {
         self.soc.joycons.place_tag(tag);

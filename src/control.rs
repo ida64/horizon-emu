@@ -43,6 +43,9 @@
 //!     took it (it does not before the firmware starts scanning)
 //! {"op":"joycons","seated":true}
 //!     slides both Joy-Con onto the rails, or off
+//! {"op":"stick","stick":"left","x":0.0,"y":1.0}
+//!     pushes the left or right stick to x, y (each -1 to 1, right and up
+//!     positive) and leaves it there; 0, 0 lets go
 //! {"op":"amiibo","path":"/tmp/tag.bin","writable":false}
 //!     holds the NTAG215 dumped in that file over the right Joy-Con's
 //!     reader (with "writable", what is written to it goes back to the
@@ -117,6 +120,11 @@ enum Request {
     },
     Joycons {
         seated: bool,
+    },
+    Stick {
+        stick: String,
+        x: f32,
+        y: f32,
     },
     Amiibo {
         path: Option<String>,
@@ -385,6 +393,17 @@ fn answer(request: Request, controlled: &Controlled) -> Result<Value, String> {
         Request::Joycons { seated } => {
             console
                 .with(|machine| machine.seat_joycons(seated))
+                .ok_or(RESTARTING)?;
+            Ok(json!({}))
+        }
+        Request::Stick { stick, x, y } => {
+            let which = horizon_emu::soc::joycon::Stick::named(&stick)
+                .ok_or_else(|| format!("stick: \"left\" or \"right\", not {stick:?}"))?;
+            if !((-1.0..=1.0).contains(&x) && (-1.0..=1.0).contains(&y)) {
+                return Err("stick: x and y from -1 to 1".into());
+            }
+            console
+                .with(|machine| machine.set_stick(which, x, y))
                 .ok_or(RESTARTING)?;
             Ok(json!({}))
         }

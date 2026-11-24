@@ -177,6 +177,30 @@ pub struct Controls {
     /// Told the level of each rail's CTS line whenever it may have
     /// changed: the board wiring of those lines.
     cts: Mutex<Option<CtsLines>>,
+    /// Where each stick is pushed ([`Stick`] as an index): the offsets
+    /// from its centre in 12-bit units, x in the low half, y (up
+    /// positive) in the high half, as two `i16`. Centred by default; not
+    /// kept in a snapshot (a restored machine's sticks are let go).
+    sticks: [AtomicU32; 2],
+}
+
+/// One of the two analog sticks: the left Joy-Con's or the right one's
+/// (the Pro Controller's left and right).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stick {
+    Left,
+    Right,
+}
+
+impl Stick {
+    /// `left` or `right`, as scripts and the control socket name them.
+    pub fn named(name: &str) -> Option<Self> {
+        match name {
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            _ => None,
+        }
+    }
 }
 
 /// The rails' CTS lines: the rail, and whether its line is high.
@@ -211,6 +235,26 @@ impl Controls {
     /// The buttons held, as a mask of [`Button`] bits.
     pub fn held(&self) -> u32 {
         self.buttons.load(Ordering::SeqCst)
+    }
+
+    /// Pushes `stick` to `x`, `y`, each from -1 to 1 (right and up
+    /// positive; 0, 0 lets go), as a fraction of the travel the stick's
+    /// calibration data gives ([`Identity::STICK_TRAVEL`]).
+    pub fn set_stick(&self, stick: Stick, x: f32, y: f32) {
+        let units = |value: f32| {
+            (value.clamp(-1.0, 1.0) * f32::from(Identity::STICK_TRAVEL)).round() as i16 as u16
+        };
+        let packed = u32::from(units(x)) | u32::from(units(y)) << 16;
+        self.sticks[stick as usize].store(packed, Ordering::SeqCst);
+    }
+
+    /// The 12-bit raw position of `stick` as a report carries it.
+    fn stick_raw(&self, stick: Stick) -> [u16; 2] {
+        let packed = self.sticks[stick as usize].load(Ordering::SeqCst);
+        let axis = |offset: u16| {
+            (i32::from(Identity::STICK_CENTER) + i32::from(offset as i16)).clamp(0, 0xFFF) as u16
+        };
+        [axis(packed as u16), axis((packed >> 16) as u16)]
     }
 
     /// Holds `tag` over the right Joy-Con's NFC reader, or takes the one
@@ -737,12 +781,13 @@ impl JoyCon {
         let side = self.side.index();
         let own = [LEFT_BUTTONS, RIGHT_BUTTONS, PRO_BUTTONS][side];
         let buttons = self.controls.buttons.load(Ordering::SeqCst) & own;
-        // The stick is at its centre; the other side's is not there.
-        let stick = pack12(&[Identity::STICK_CENTER, Identity::STICK_CENTER]);
+        // Each Joy-Con reports its own stick; the other side's is not there.
+        let left = pack12(&self.controls.stick_raw(Stick::Left));
+        let right = pack12(&self.controls.stick_raw(Stick::Right));
         let sticks = match self.side {
-            Side::Left => [stick, vec![0; 3]],
-            Side::Right => [vec![0; 3], stick],
-            Side::Pro => [stick.clone(), stick],
+            Side::Left => [left, vec![0; 3]],
+            Side::Right => [vec![0; 3], right],
+            Side::Pro => [left, right],
         };
         // Per side: vibration enabled, and room for more of it. Seen in
         // the notes' captures: 7 while off, 0xC while on. The Pro

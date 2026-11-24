@@ -183,6 +183,9 @@ enum Step {
         every: Duration,
     },
     Joycons(bool),
+    /// A stick pushed to `x`, `y` (each -1 to 1, right and up positive)
+    /// and left there; `0 0` lets go.
+    Stick(horizon_emu::soc::joycon::Stick, f32, f32),
     /// An NFC tag held over the right Joy-Con's reader, or taken away.
     Amiibo(Option<Box<Ntag215>>),
     Screenshot(String),
@@ -379,6 +382,10 @@ impl Script {
                     machine.seat_joycons(*seated);
                     self.finish(&mut report);
                 }
+                Step::Stick(stick, x, y) => {
+                    machine.set_stick(*stick, *x, *y);
+                    self.finish(&mut report);
+                }
                 Step::Amiibo(tag) => {
                     machine.place_tag(tag.as_deref().cloned());
                     self.finish(&mut report);
@@ -553,6 +560,13 @@ fn parse_step(line: &str) -> Option<Step> {
             "off" => false,
             _ => return None,
         }),
+        "stick" => {
+            let stick = horizon_emu::soc::joycon::Stick::named(words.next()?)?;
+            let x: f32 = words.next()?.parse().ok()?;
+            let y: f32 = words.next()?.parse().ok()?;
+            ((-1.0..=1.0).contains(&x) && (-1.0..=1.0).contains(&y)).then_some(())?;
+            Step::Stick(stick, x, y)
+        }
         "amiibo" => match (words.next()?, words.next_if_eq(&"writable")) {
             ("off", None) => Step::Amiibo(None),
             (file, writable) => Step::Amiibo(Some(Box::new(

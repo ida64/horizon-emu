@@ -294,6 +294,9 @@ options:
                         type TEXT            the rest of the line, key by key
                                              on the open on-screen keyboard
                         joycons on|off
+                        stick left|right X Y  push a stick to X, Y (-1 to 1,
+                                             right and up positive) and leave
+                                             it there; 0 0 lets go
                         amiibo FILE [writable]    the tag dumped in FILE over
                                              the right Joy-Con's reader
                         amiibo off           take it away
