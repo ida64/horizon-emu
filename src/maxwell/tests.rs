@@ -209,7 +209,9 @@ fn top_left_rule_on_pixel_centers() {
     assert!(tiny.is_none_or(|t| coverage(&[t], 4).iter().all(|&c| c == 0)));
 }
 
-/// Writes method `offset` (byte offset) on subchannel `subchannel`.
+/// Writes method `offset` (byte offset) on subchannel `subchannel`. A
+/// batch the 3D engine holds back for its next instances is drawn at
+/// once, so a test finds its draws done when the methods are.
 pub fn call(
     channel: &mut Channel,
     memory: &dyn GpuMemory,
@@ -219,6 +221,7 @@ pub fn call(
 ) {
     channel
         .call(subchannel, offset / 4, value, memory)
+        .and_then(|()| channel.draw_held(memory))
         .unwrap_or_else(|e| panic!("method {offset:#x} = {value:#x}: {}", e.0));
 }
 
@@ -1534,6 +1537,7 @@ fn unset_texture_draw(kind: super::RendererKind, skip_sample: bool) -> (Frame, R
     let end = frame
         .channel
         .call(0, 0x1614 / 4, 0, &frame.ram)
+        .and_then(|()| frame.channel.draw_held(&frame.ram))
         .map_err(|e| e.0);
     (frame, end)
 }
@@ -2065,6 +2069,119 @@ fn native_draws_match_software() {
                 "origin {origin:#x} front {front_face:#x}: {same} pixels equal"
             );
         }
+    }
+}
+
+/// A frame of four instances of one quad, each moved along x by its
+/// element of a per-instance stream (divisor 1), drawn by `kind`: as the
+/// guest sends them, one batch per instance with nothing between
+/// (`held`), or each drawn before the next begins. The color target after
+/// a write-back, and how many draws Metal made.
+fn instanced_frame(kind: super::RendererKind, held: bool) -> (Vec<u8>, u64) {
+    let mut frame = Frame::sized_with(SIZE, SIZE, kind);
+    let vs = program_bytes(
+        0x0401,
+        // Imap: attribute 0 x, y, z and attribute 1 x; Omap: position x,
+        // y, z.
+        &[(0x18, 0x17), (0x35, 0x70)],
+        &[
+            0,
+            0xefd8_7f80_0807_ff00, // ALD R0, a[0x80]
+            0xefd8_7f80_0847_ff01, // ALD R1, a[0x84]
+            0xefd8_7f80_0887_ff02, // ALD R2, a[0x88]
+            0,
+            0xefd8_7f80_0907_ff03, // ALD R3, a[0x90]
+            0x5c58_0000_0037_0000, // FADD R0, R0, R3
+            0xeff0_7f80_0707_ff00, // AST a[0x70], R0
+            0,
+            0xeff0_7f80_0747_ff01, // AST a[0x74], R1
+            0xeff0_7f80_0787_ff02, // AST a[0x78], R2
+            0xe300_0000_0007_000f, // EXIT
+            0,
+            0xe240_0fff_ff07_000f, // BRA to itself
+            0x50b0_0000_0007_0f00, // NOP
+            0x50b0_0000_0007_0f00, // NOP
+        ],
+    );
+    let mov = |rd: u64, v: f32| 0x010000000007f000u64 | (u64::from(v.to_bits()) << 20) | rd;
+    let ps = program_bytes(
+        0x1402,
+        &[(0x48, 15)],
+        &[
+            0,
+            mov(0, 1.0),
+            mov(1, 0.5),
+            mov(2, 0.25),
+            0,
+            mov(3, 1.0),
+            0xe300_0000_0007_000f, // EXIT
+            0xe240_0fff_ff07_000f, // BRA to itself
+        ],
+    );
+    frame.program(1, 0, &vs);
+    frame.program(5, 0x800, &ps);
+    let (x0, x1, y0, y1) = (-0.9, -0.6, -0.3, 0.3);
+    let quad = [
+        x0, y0, 0.0, x1, y0, 0.0, x1, y1, 0.0, x0, y0, 0.0, x1, y1, 0.0, x0, y1, 0.0,
+    ];
+    frame.vertices(0x40_0000, 12, &quad, &[(0, 0x02)]);
+    // Stream 1: one float per instance, read by attribute 1.
+    let offsets = floats(&[0.0, 0.5, 1.0, 1.4]);
+    frame.ram.put(0x41_0000, &offsets);
+    for (offset, value) in [
+        (0x1c10, 1 << 12 | 4),
+        (0x1c14, 0),
+        (0x1c18, 0x41_0000),
+        (0x1c1c, 1),
+        (0x1f08, 0),
+        (0x1f0c, 0x41_0000 + offsets.len() as u32 - 1),
+        (0x1884, 1),
+        (0x1164, 1 | 0x12 << 21 | 7 << 27),
+    ] {
+        frame.method(offset, value);
+    }
+    for instance in 0..4 {
+        let subsequent = u32::from(instance != 0) << 26;
+        for (offset, value) in [(0x1618, 4 | subsequent), (0x0d74, 0), (0x0d78, 6), (0x1614, 0)] {
+            if held {
+                frame.channel.call(0, offset / 4, value, &frame.ram).unwrap();
+            } else {
+                frame.method(offset, value);
+            }
+        }
+    }
+    frame.channel.flush(&frame.ram).unwrap();
+    let draws = frame.channel.hooks.metal.as_ref().map_or(0, |metal| {
+        assert_eq!(metal.cpu_vertices(), vec![], "on the native path");
+        metal.fallbacks().0
+    });
+    (frame.ram.bytes(TARGET, (SIZE * SIZE * 4) as usize), draws)
+}
+
+/// The instances of an instanced draw, which arrive as one batch each,
+/// are one Metal draw, and it draws what the instances drawn one by one
+/// draw, on Metal and on the software renderer: each instance where its
+/// element of the per-instance stream puts it.
+#[test]
+fn instances_are_one_draw_that_draws_each() {
+    use super::RendererKind::{Metal, Software};
+    let software = instanced_frame(Software, true).0;
+    let pixel = |frame: &[u8], x: u32, y: u32| frame[((y * SIZE + x) * 4) as usize..][..4].to_vec();
+    let color = [255, 128, 64, 255];
+    for x in [8, 24, 40, 52] {
+        assert_eq!(pixel(&software, x, 32), color, "instance at {x}");
+    }
+    assert_ne!(pixel(&software, 16, 32), color, "between instances");
+    if !super::metal::available() {
+        return;
+    }
+    let (together, draws) = instanced_frame(Metal, true);
+    assert_eq!(draws, 1, "one draw of four instances");
+    let (apart, draws) = instanced_frame(Metal, false);
+    assert_eq!(draws, 4, "four draws of one instance");
+    assert_eq!(together, apart);
+    for x in [8, 16, 24, 40, 52] {
+        assert_eq!(pixel(&together, x, 32), pixel(&software, x, 32), "at {x}");
     }
 }
 

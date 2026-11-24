@@ -502,9 +502,12 @@ pub struct NativeDraw<'a> {
     pub indices: NativeIndices<'a>,
     /// The viewport words of `msl::NativeVertex::new` (without the layer).
     pub view: [f32; 9],
-    /// The instance ID and the instance per-instance streams step by.
+    /// The instance ID of the first instance, the instance per-instance
+    /// streams step by for it, and how many instances are drawn (each
+    /// the one after the last).
     pub instance: u32,
     pub fetch_instance: u32,
+    pub instances: u32,
     /// Output words of the user clip distances.
     pub clip_words: Vec<u32>,
     /// Culled faces: 0 none, 1 front, 2 back.
@@ -1777,12 +1780,13 @@ impl Renderer {
                             1,
                         )?;
                         encoder
-                            .drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset(
+                            .drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount(
                                 MTLPrimitiveType::Triangle,
                                 *count,
                                 *index_type,
                                 indices,
                                 *offset,
+                                native.instances as usize,
                             );
                     }
                     _ => {

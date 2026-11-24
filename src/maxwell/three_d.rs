@@ -133,6 +133,12 @@ pub struct ThreeD {
     batch: Option<Batch>,
     /// Instance of the current/last `BEGIN`.
     instance: u32,
+    /// The batch last ended and how many instances of it are to be
+    /// drawn, held back while each batch that ends is its next instance
+    /// ([`ThreeD::end`]). Nothing is held when a snapshot is taken
+    /// (`Engines::settle`).
+    #[serde(skip)]
+    held: Option<(Batch, u32)>,
     #[serde(skip)]
     caches: Caches,
     /// Graphics-engine priv registers written through `SET_FALCON04`:
@@ -154,10 +160,33 @@ impl Default for ThreeD {
             render_enable: true,
             batch: None,
             instance: 0,
+            held: None,
             caches: Caches::default(),
             priv_registers: Default::default(),
         }
     }
+}
+
+/// Whether `method` is one of those a batch is made of: `BEGIN`, `END`,
+/// and the methods that add vertices between them with the registers
+/// that only say which. None changes what an earlier batch draws.
+fn draws_instance(method: u32) -> bool {
+    matches!(
+        method,
+        BEGIN
+            | END
+            | SET_VERTEX_ARRAY_START
+            | DRAW_VERTEX_ARRAY
+            | SET_INDEX_BUFFER_F
+            | DRAW_INDEX_BUFFER
+            | DRAW_INLINE_INDEX
+            | DRAW_INLINE_INDEX2X16
+            | DRAW_INLINE_INDEX4X8
+            | DRAW_VERTEX_ARRAY_BEGIN_END_INSTANCE_FIRST
+            | DRAW_VERTEX_ARRAY_BEGIN_END_INSTANCE_SUBSEQUENT
+            | DRAW_INDEX_BUFFER32_BEGIN_END_INSTANCE_FIRST
+                ..=DRAW_INDEX_BUFFER8_BEGIN_END_INSTANCE_SUBSEQUENT
+    )
 }
 
 fn refuse(method: u32, argument: u32, what: &str) -> Unmodeled {
@@ -295,6 +324,9 @@ impl ThreeD {
         mme: &mut Mme,
         hooks: &Hooks,
     ) -> Result<(), Unmodeled> {
+        if self.held.is_some() && !draws_instance(method) {
+            self.draw_held(memory, hooks)?;
+        }
         if self.inline.busy() && method != m(0x01b4) {
             return Err(refuse(
                 method,
@@ -801,6 +833,15 @@ impl ThreeD {
         Ok(())
     }
 
+    /// `END`: the batch is drawn. A guest draws the instances of an
+    /// instanced draw as one batch each, the same but for the instance
+    /// \[observed: an application's instanced draws arrive as `BEGIN`
+    /// with INSTANCE_ID SUBSEQUENT, the draw and `END`, once per
+    /// instance, with no other method between them\]. So a batch is held
+    /// back, and one that follows as its next instance, with nothing
+    /// between them that could change what is drawn
+    /// ([`draws_instance`]), joins it: the pipeline then draws them
+    /// together.
     fn end(&mut self, memory: &dyn GpuMemory, hooks: &Hooks) -> Result<(), Unmodeled> {
         let mut batch = self
             .batch
@@ -810,6 +851,25 @@ impl ThreeD {
             return Ok(());
         }
         batch.base_instance = self.registers[SET_GLOBAL_BASE_INSTANCE_INDEX as usize];
+        if let Some((held, instances)) = &mut self.held
+            && held.instance.checked_add(*instances) == Some(batch.instance)
+            && held.same_draw(&batch)
+        {
+            *instances += 1;
+            return Ok(());
+        }
+        self.draw_held(memory, hooks)?;
+        self.held = Some((batch, 1));
+        Ok(())
+    }
+
+    /// Draws the batch held back ([`ThreeD::end`]), if one is. The state
+    /// is what it was when its instances ended: any method that could
+    /// change it draws the batch first.
+    pub fn draw_held(&mut self, memory: &dyn GpuMemory, hooks: &Hooks) -> Result<(), Unmodeled> {
+        let Some((batch, instances)) = self.held.take() else {
+            return Ok(());
+        };
         let context = Context {
             registers: Registers(&self.registers),
             bindings: &self.bindings,
@@ -817,7 +877,7 @@ impl ThreeD {
             metal: hooks.metal.as_deref(),
             writes: &hooks.writes,
         };
-        pipeline::draw(&context, &mut self.caches, &batch)
+        pipeline::draw(&context, &mut self.caches, &batch, instances)
     }
 
     /// `CLEAR_SURFACE`: Z_ENABLE 0, STENCIL_ENABLE 1, R/G/B/A_ENABLE 5:2,

@@ -313,11 +313,13 @@ impl NativeVertex {
             "constant float* view [[buffer(1)]]".to_string(),
             "constant uint* draw [[buffer(29)]]".to_string(),
         ];
-        parameters.push(if kernel {
-            "uint vid [[thread_position_in_grid]]".to_string()
+        // `iid`: the instance among the draw's (the test kernel runs one).
+        if kernel {
+            parameters.push("uint vid [[thread_position_in_grid]]".to_string());
         } else {
-            "uint vid [[vertex_id]]".to_string()
-        });
+            parameters.push("uint vid [[vertex_id]]".to_string());
+            parameters.push("uint iid [[instance_id]]".to_string());
+        }
         let slots: BTreeSet<u32> = vertex
             .constants
             .iter()
@@ -365,15 +367,18 @@ impl NativeVertex {
                 parameters.join(", ")
             );
         }
+        if kernel {
+            let _ = writeln!(s, "    const uint iid = 0u;");
+        }
         let _ = writeln!(
             s,
-            "    const bool indexed = draw[{INDEXED_WORD}u] != 0u;\n    const uint fetch = indexed ? vid + elements[0] : elements[2u * vid]; const uint vertex_id = indexed ? vid + elements[1] : elements[2u * vid + 1u]; (void)fetch; (void)vertex_id;"
+            "    const bool indexed = draw[{INDEXED_WORD}u] != 0u;\n    const uint fetch = indexed ? vid + elements[0] : elements[2u * vid]; const uint vertex_id = indexed ? vid + elements[1] : elements[2u * vid + 1u]; (void)fetch; (void)vertex_id; (void)iid;"
         );
         // Inputs.
         let mut fetched = BTreeSet::new();
         for &word in &vertex.inputs {
             let value = match word {
-                INSTANCE_ID => "draw[0]".to_string(),
+                INSTANCE_ID => "(draw[0] + iid)".to_string(),
                 VERTEX_ID => "vertex_id".to_string(),
                 0x20..0xA0 => {
                     let attribute = (word - 0x20) / 4;
@@ -518,7 +523,7 @@ fn fetch_code(fetch: &Fetch) -> Result<String, String> {
     // `divisor` instances.
     let _ = writeln!(
         s,
-        "    uint4 a{a} = uint4(0u, 0u, 0u, {one:#x}u);\n    {{ const uint divisor = draw[4u + 3u * {slot}u]; const uint element = divisor != 0u ? draw[1] / divisor : fetch;\n      const uint at = (element - draw[2u + 3u * {slot}u]) * draw[3u + 3u * {slot}u] + {offset}u;"
+        "    uint4 a{a} = uint4(0u, 0u, 0u, {one:#x}u);\n    {{ const uint divisor = draw[4u + 3u * {slot}u]; const uint element = divisor != 0u ? (draw[1] + iid) / divisor : fetch;\n      const uint at = (element - draw[2u + 3u * {slot}u]) * draw[3u + 3u * {slot}u] + {offset}u;"
     );
     let words = size.div_ceil(4);
     for k in 0..words {

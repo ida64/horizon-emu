@@ -228,6 +228,26 @@ impl Image {
 }
 
 impl Channel {
+    /// Draws what the 3D engine holds back (`ThreeD::draw_held`), with
+    /// memory as its methods see it.
+    fn draw_held(&mut self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+        let tracked = resources::Tracked {
+            memory,
+            writes: &self.hooks.writes,
+        };
+        match &self.hooks.metal {
+            Some(renderer) => self.three_d.draw_held(
+                &metal::Coherent {
+                    memory: &tracked,
+                    renderer,
+                    writes: &self.hooks.writes,
+                },
+                &self.hooks,
+            ),
+            None => self.three_d.draw_held(&tracked, &self.hooks),
+        }
+    }
+
     /// A channel drawing with the renderer chosen by [`select_renderer`].
     pub fn new() -> Channel {
         Self::with_renderer(if RENDERER.load(std::sync::atomic::Ordering::Relaxed) {
@@ -386,6 +406,10 @@ impl Engines for Channel {
                 method * 4
             )));
         }
+        // What another engine does comes after the draws before it.
+        if class != THREE_D {
+            self.three_d.draw_held(memory, &self.hooks)?;
+        }
         match class {
             THREE_D => self
                 .three_d
@@ -421,6 +445,7 @@ impl Engines for Channel {
     }
 
     fn flush(&mut self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+        self.draw_held(memory)?;
         let tracked = resources::Tracked {
             memory,
             writes: &self.hooks.writes,
@@ -429,6 +454,7 @@ impl Engines for Channel {
     }
 
     fn settle(&mut self, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+        self.draw_held(memory)?;
         let tracked = resources::Tracked {
             memory,
             writes: &self.hooks.writes,

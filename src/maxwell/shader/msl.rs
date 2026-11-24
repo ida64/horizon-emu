@@ -1051,6 +1051,38 @@ impl Translated {
             (None, Some(_)) => "(((coverage_mask >> layer) & 1u) != 0u)",
             (None, None) => "covers(tri, px, py)",
         };
+        let (registers, depth_register) = output_registers(program);
+        // The fragment depth of a program that does not write one: window
+        // z where Metal samples, offset (see `NativeVertex::depth_bias`),
+        // or the depth plane at the sample or the pixel center.
+        let plane_depth = match (multisample, native) {
+            (_, Some(_)) => "in.depth + native_depth_bias(depth_bias, in.depth, zslope)",
+            (Some(stage), None) if !stage.center_depth => {
+                "(as_type<float>(tri[9]) + as_type<float>(tri[7]) * ((px - 0.5f) + float(sample_positions[layer] & 0xffu) / 16.0f)) + as_type<float>(tri[8]) * ((py - 0.5f) + float(sample_positions[layer] >> 8) / 16.0f)"
+            }
+            (_, None) => {
+                "(as_type<float>(tri[9]) + as_type<float>(tri[7]) * px) + as_type<float>(tri[8]) * py"
+            }
+        };
+        // A quad none of whose fragments would pass the depth test does
+        // not run the program: every fragment of it is discarded whatever
+        // the program computes, when the program leaves the depth to the
+        // plane and stores nothing in global memory, and a failing
+        // fragment changes no stencil. (A quad with one passing fragment
+        // runs whole: the others give it its derivatives.) What is lost
+        // is the record of a sample of an unbound texture by fragments
+        // that fail the test (`texture.rs`), which the interpreter,
+        // testing after the program, refuses.
+        if let Some((_, read, _, None)) = depth
+            && depth_register.is_none()
+            && !self.stores
+            && (multisample.is_none() || native.is_some())
+        {
+            let _ = writeln!(
+                s,
+                "    {{ float z = {plane_depth};\n      const float lo = as_type<float>(depth_test[1]); const float hi = as_type<float>(depth_test[2]);\n      z = z < lo ? lo : (z > hi ? hi : z);\n      uint alive = (({live}) && compare(depth_test[0], z, {read})) ? 1u : 0u;\n      alive |= quad_shuffle_xor(alive, 1u); alive |= quad_shuffle_xor(alive, 2u);\n      if (alive == 0u) {{ discard_fragment(); Output none = {{}}; return none; }} }}"
+            );
+        }
         let _ = writeln!(s, "#define GM_LIVE {live}");
         if !self.globals.is_empty() {
             let _ = writeln!(s, "{GLOBAL_WORD}\n#define GT(i) gt[i]");
@@ -1077,7 +1109,6 @@ impl Translated {
             (None, None) => "!covers(tri, px, py)",
         };
         let _ = writeln!(s, "    if (killed || {covered}) {{ discard_fragment(); }}");
-        let (registers, depth_register) = output_registers(program);
         // Output 0 alpha (the draw refuses an alpha test or alpha to
         // coverage that needs it when the program does not write it).
         let alpha = match registers[0] {
@@ -1101,13 +1132,9 @@ impl Translated {
         }
         let _ = writeln!(s, "    Output out;");
         if let Some((words, read, write, stencil)) = depth {
-            let incoming = match (depth_register, multisample, native) {
-                (Some(register), _, _) => format!("as_type<float>(r{register})"),
-                // Window z where Metal samples, offset (see
-                // `NativeVertex::depth_bias`).
-                (None, _, Some(_)) => "in.depth + native_depth_bias(depth_bias, in.depth, zslope)".into(),
-                (None, Some(stage), None) if !stage.center_depth => "(as_type<float>(tri[9]) + as_type<float>(tri[7]) * ((px - 0.5f) + float(sample_positions[layer] & 0xffu) / 16.0f)) + as_type<float>(tri[8]) * ((py - 0.5f) + float(sample_positions[layer] >> 8) / 16.0f)".into(),
-                (None, _, None) => "(as_type<float>(tri[9]) + as_type<float>(tri[7]) * px) + as_type<float>(tri[8]) * py".into(),
+            let incoming = match depth_register {
+                Some(register) => format!("as_type<float>(r{register})"),
+                None => plane_depth.to_string(),
             };
             let _ = writeln!(
                 s,

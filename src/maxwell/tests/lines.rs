@@ -337,7 +337,10 @@ fn points_cover_their_squares() {
     frame.method(0x1618, 0);
     frame.method(0x0d74, 0);
     frame.method(0x0d78, 1);
-    let end = frame.channel.call(0, 0x1614 / 4, 0, &frame.ram);
+    let end = frame
+        .channel
+        .call(0, 0x1614 / 4, 0, &frame.ram)
+        .and_then(|()| frame.channel.draw_held(&frame.ram));
     assert!(end.unwrap_err().0.contains("round"));
 }
 
@@ -353,7 +356,10 @@ fn unmodeled_line_state_is_refused() {
         frame.method(0x1618, 1);
         frame.method(0x0d74, 0);
         frame.method(0x0d78, 2);
-        let end = frame.channel.call(0, 0x1614 / 4, 0, &frame.ram);
+        let end = frame
+            .channel
+            .call(0, 0x1614 / 4, 0, &frame.ram)
+            .and_then(|()| frame.channel.draw_held(&frame.ram));
         assert!(end.unwrap_err().0.contains(what), "{what}");
     }
 }

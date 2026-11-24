@@ -142,7 +142,7 @@ pub fn indexed_element(index: u32, restart: Option<u32>, base_vertex: u32, id_ba
 /// A run of the index buffer as a draw names it, kept as the buffer's
 /// bytes: a batch that is one run is drawn from them without a list of
 /// its elements ([`Batch::run`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexRun {
     /// The indices, `size` bytes each, little-endian.
     pub bytes: Vec<u8>,
@@ -212,6 +212,15 @@ impl Batch {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Whether `other` draws the vertices this batch draws, the same
+    /// way: all but the instance.
+    pub fn same_draw(&self, other: &Batch) -> bool {
+        self.topology == other.topology
+            && self.base_instance == other.base_instance
+            && self.elements == other.elements
+            && self.run == other.run
     }
 
     /// Lists the elements of `run`, if the batch is one.
@@ -1169,8 +1178,16 @@ fn clip_polygon(polygon: Vec<ClipVertex>, plane: ClipPlane) -> Vec<ClipVertex> {
     out
 }
 
-/// Runs a batch through the pipeline into the bound targets.
-pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result<(), Unmodeled> {
+/// Runs a batch through the pipeline into the bound targets, `instances`
+/// times: as the instance the batch names and those after it. The
+/// instances are one draw where Metal runs the vertex stage (see
+/// `native`), and each a draw of its own otherwise.
+pub fn draw(
+    context: &Context<'_>,
+    caches: &mut Caches,
+    batch: &Batch,
+    instances: u32,
+) -> Result<(), Unmodeled> {
     let r = context.registers;
     check_unmodeled_state(r)?;
     let vertex = program(context, caches, VERTEX_PIPELINE)?.ok_or_else(|| {
@@ -1203,18 +1220,28 @@ pub fn draw(context: &Context<'_>, caches: &mut Caches, batch: &Batch) -> Result
     let textures = DrawTextures::new(context.memory, pools, &caches.textures, context.writes);
 
     // The vertex stage on the host GPU, when the draw is large enough for
-    // it to matter (or its vertex program addresses global memory) and
-    // Metal can run it (see `native`).
+    // it to matter (or has several instances, or its vertex program
+    // addresses global memory) and Metal can run it (see `native`).
     if let (Some(metal), Some(pixel), None) = (context.metal, &pixel, &geometry)
         && r.get(SET_RASTER_ENABLE) & 1 != 0
-        && (batch.len() >= NATIVE_MINIMUM || vertex.addresses_global_memory())
+        && (batch.len() >= NATIVE_MINIMUM || instances > 1 || vertex.addresses_global_memory())
     {
         let fragments = fragments(context, pixel)?;
         if native(
-            context, metal, &vertex, &fetch, pixel, &textures, batch, &fragments,
+            context, metal, &vertex, &fetch, pixel, &textures, batch, instances, &fragments,
         )? {
             return Ok(());
         }
+    }
+    if instances > 1 {
+        for instance in 0..instances {
+            let one = Batch {
+                instance: batch.instance.wrapping_add(instance),
+                ..batch.clone()
+            };
+            draw(context, caches, &one, 1)?;
+        }
+        return Ok(());
     }
     // The elements listed, for the stages that take them one by one.
     let listed;
@@ -1407,6 +1434,7 @@ fn native(
     pixel: &Arc<Program>,
     textures: &DrawTextures<'_>,
     batch: &Batch,
+    instances: u32,
     fragments: &Fragments,
 ) -> Result<bool, Unmodeled> {
     use super::metal::{Geometry, NativeDraw, NativeIndices, NativeStream, NativeVertices};
@@ -1526,6 +1554,9 @@ fn native(
 
     // Streams: per slot, the bytes of the elements the draw fetches.
     let fetch_instance = batch.instance.wrapping_add(batch.base_instance);
+    let Some(last_instance) = fetch_instance.checked_add(instances - 1) else {
+        return fall_back("instances past 2^32");
+    };
     let mut slots: Vec<usize> = Vec::new();
     for &(_, _, stream) in &fetch.attributes {
         if !slots.contains(&stream) {
@@ -1542,7 +1573,7 @@ fn native(
     for &index in &slots {
         let stream = fetch.streams[index];
         let (first, last) = match fetch_instance.checked_div(stream.divisor) {
-            Some(element) => (element, element),
+            Some(element) => (element, last_instance / stream.divisor),
             None => (low, high),
         };
         let end = fetch
@@ -1623,6 +1654,7 @@ fn native(
         ],
         instance: batch.instance,
         fetch_instance,
+        instances,
         clip_words: clip.user.iter().map(|&i| 0x2C0 / 4 + i as u32).collect(),
         cull,
         // Metal's winding is as seen in its framebuffer, rows down like
