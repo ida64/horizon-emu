@@ -109,9 +109,10 @@ pub fn border_color(tsc: &Tsc) -> Option<MTLSamplerBorderColor> {
 /// slot declares and a sampler state with the interpreter's results:
 /// normalized textures of the slot's target (one layer for a 2D slot,
 /// six for a cube); wrap, mirror, clamp-to-edge, border (with a border
-/// color Metal has) and mirror-once-clamp-to-edge addressing; no depth
-/// compare. Anisotropic filtering is Metal's, with the sampler's limit:
-/// GM20B's tap placement is not documented.
+/// color Metal has) and mirror-once-clamp-to-edge addressing. A depth
+/// comparison is the translated program's own (`compare_sample`), so the
+/// sampler state has none. Anisotropic filtering is Metal's, with the
+/// sampler's limit: GM20B's tap placement is not documented.
 pub fn check_texture(tic: &Tic, tsc: &Tsc, kind: TextureKind) -> Result<(), String> {
     let fits = match kind {
         TextureKind::Flat => {
@@ -132,9 +133,6 @@ pub fn check_texture(tic: &Tic, tsc: &Tsc, kind: TextureKind) -> Result<(), Stri
     }
     if !tic.normalized || tsc.force_unnormalized {
         return Err("unnormalized texture coordinates".into());
-    }
-    if tsc.compare {
-        return Err("depth compare sampler".into());
     }
     let axes = match kind {
         TextureKind::Volume => 3,
@@ -214,6 +212,9 @@ pub fn native_format(tic: &Tic, kind: TextureKind) -> Option<MTLPixelFormat> {
         (Encoding::SharedExponent, ComponentType::Float) if !srgb => F::RGB9E5Float,
         (Encoding::Packed(_), _) => match (format.raw, first) {
             (0x08, ComponentType::Unorm) => pick(F::RGBA8Unorm, F::RGBA8Unorm_sRGB),
+            // Depth buffers sampled as textures: ZF32 and Z16.
+            (0x2f, ComponentType::Float) if !srgb => F::R32Float,
+            (0x3a, ComponentType::Unorm) if !srgb => F::R16Unorm,
             _ if srgb => return None,
             (0x01, ComponentType::Float) => F::RGBA32Float,
             (0x03, ComponentType::Unorm) => F::RGBA16Unorm,

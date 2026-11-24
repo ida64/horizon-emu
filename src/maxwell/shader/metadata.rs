@@ -140,7 +140,10 @@ pub(super) fn constant_buffer_extent(code: &[Option<Inst>], slot: usize) -> Opti
         if bits(w, 34, 5) as usize == slot {
             let offset = bits(w, 20, 14) as usize * 4;
             extent = extent.max(offset + width);
-            if global && matches!(inst.op, Op::MovC | Op::IaddC) && offset.is_multiple_of(8) {
+            if global
+                && matches!(inst.op, Op::MovC | Op::IaddC | Op::IscaddC)
+                && offset.is_multiple_of(8)
+            {
                 extent = extent.max(offset + 12);
             }
         }

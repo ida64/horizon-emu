@@ -290,10 +290,12 @@ impl<const L: usize> Machine<'_, L> {
                     }
                 }
                 // `FCMP`: as `ICMP`, the comparison (bits 51:48) of float
-                // C with 0.0.
+                // C with 0.0; bit 47 is FTZ, a denormal C taken as zero
+                // \[recalled: the instruction has no CC bit\].
                 Op::FcmpR | Op::FcmpI | Op::FcmpC | Op::FcmpRc => {
-                    m.require(!cc, "condition code write")?;
-                    if super::alu::compare(f32::from_bits(c), 0.0, bits(w, 48, 4)) {
+                    let value = super::alu::flush(f32::from_bits(c), cc);
+                    cc = false;
+                    if super::alu::compare(value, 0.0, bits(w, 48, 4)) {
                         a
                     } else {
                         b

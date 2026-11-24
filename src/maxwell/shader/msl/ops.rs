@@ -645,6 +645,71 @@ impl Writer<'_> {
         Ok(true)
     }
 
+    /// `VMNMX` (`exec/video.rs` `execute_vmnmx`).
+    pub(super) fn vmnmx(&mut self) -> Result<(), String> {
+        let w = self.word;
+        let sa = bits(w, 36, 3) | (bits(w, 48, 1) << 3);
+        let sb = bits(w, 28, 3) | (bits(w, 49, 1) << 3);
+        let operation = bits(w, 51, 3);
+        self.require(!bit(w, 47), "CC")?;
+        self.require(!bit(w, 55), "SAT")?;
+        self.require(matches!(operation, 5 | 6), &format!("operation {operation}"))?;
+        // `exec/video.rs` `select`: a byte, half or the word of the
+        // register, sign- or zero-extended.
+        let operand = |value: &str, selector: u32| {
+            let (shift, width) = match selector & 7 {
+                0..=3 => ((selector & 3) * 8, 8),
+                4 | 5 => ((selector & 1) * 16, 16),
+                6 => (0, 32),
+                _ => return None,
+            };
+            Some(if width == 32 {
+                value.to_string()
+            } else if selector & 8 != 0 {
+                format!(
+                    "as_type<uint>(as_type<int>({value} << {}u) >> {}u)",
+                    32 - width - shift,
+                    32 - width
+                )
+            } else {
+                format!("(({value} >> {shift}u) & {:#x}u)", (1u32 << width) - 1)
+            })
+        };
+        let a = self.read(bits(w, 8, 8));
+        let Some(a) = operand(&a, sa) else {
+            return self.refuse("A selector");
+        };
+        let b = if bit(w, 50) {
+            let b = self.read(bits(w, 20, 8));
+            match operand(&b, sb) {
+                Some(b) => b,
+                None => return self.refuse("B selector"),
+            }
+        } else if sb & 8 != 0 {
+            format!("{:#x}u", bits(w, 20, 16) as i16 as i32 as u32)
+        } else {
+            format!("{:#x}u", bits(w, 20, 16))
+        };
+        let c = self.read(bits(w, 39, 8));
+        // The one of `x` and `y` that is less (or, `max`, not less).
+        let pick = |x: &str, y: &str, signed: bool, max: bool| {
+            let less = if signed {
+                format!("(as_type<int>({x}) < as_type<int>({y}))")
+            } else {
+                format!("({x} < {y})")
+            };
+            format!("({less} != {max} ? {x} : {y})")
+        };
+        self.line(&format!(
+            "{{ uint a = {a}; uint b = {b}; uint c = {c}; uint f = {}; uint v = {};",
+            pick("a", "b", sb & 8 != 0, bit(w, 56)),
+            pick("f", "c", bit(w, 54), operation == 6)
+        ));
+        self.set(bits(w, 0, 8), "v");
+        self.line("}");
+        Ok(())
+    }
+
     /// `exec/integer.rs` `execute_flag_set`.
     fn flag_set(&mut self, op: Op) -> Result<bool, String> {
         if !matches!(op, Op::Cset | Op::Csetp | Op::Pset) {
@@ -782,16 +847,9 @@ impl Writer<'_> {
                     "boolean operation",
                 )?;
             }
-            Op::FcmpR
-            | Op::FcmpI
-            | Op::FcmpC
-            | Op::FcmpRc
-            | Op::FloR
-            | Op::FloI
-            | Op::FloC
-            | Op::ImulR
-            | Op::ImulI
-            | Op::ImulC => self.require(!cc, "condition code write")?,
+            Op::FloR | Op::FloI | Op::FloC | Op::ImulR | Op::ImulI | Op::ImulC => {
+                self.require(!cc, "condition code write")?
+            }
             Op::LeaR | Op::LeaI | Op::LeaC | Op::LeaHiR | Op::LeaHiC => {
                 self.require(!cc, "condition code write")?;
                 self.require(bits(w, 48, 3) == super::PT, "predicate result")?;
@@ -949,8 +1007,11 @@ impl Writer<'_> {
                 self.line(&format!("uint v = {test} ? a : b;"));
             }
             Op::FcmpR | Op::FcmpI | Op::FcmpC | Op::FcmpRc => {
+                // Bit 47 is FTZ here, not a condition code write.
+                let x = flush("as_type<float>(c)", cc);
+                cc = false;
                 self.line(&format!(
-                    "float x = as_type<float>(c); float y = 0.0f; uint v = {} ? a : b;",
+                    "float x = {x}; float y = 0.0f; uint v = {} ? a : b;",
                     float_compare(bits(w, 48, 4))
                 ));
             }

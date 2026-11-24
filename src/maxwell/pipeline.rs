@@ -2035,6 +2035,7 @@ fn rasterize(
         // of Metal's work is made visible before it starts.
         metal.settle(context.memory, context.writes)?;
     }
+    let started = std::time::Instant::now();
     let texels = samples.texels(bounds);
     for (surface, _) in &targets {
         windows.push(Window::load(context.memory, *surface, texels)?);
@@ -2122,6 +2123,9 @@ fn rasterize(
     }
     if let Some(window) = &mut depth_window {
         window.store(context.memory)?;
+    }
+    if let Some(metal) = context.metal {
+        metal.software_time(started.elapsed());
     }
     Ok(())
 }

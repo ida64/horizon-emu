@@ -212,11 +212,37 @@ impl Writer<'_> {
                 self.textures.push(handle);
                 self.kinds.push(kind);
                 self.implicit_lod.push(false);
+                self.compare.push(false);
                 self.textures.len() - 1
             }
         };
         self.implicit_lod[slot] |= implicit;
         slot
+    }
+
+    /// The depth comparison of texture `slot` (2D or 2D array) at
+    /// `coordinates` with the reference in register `reference`, at the
+    /// level of detail `lod` (before the sampler's clamp): every tap
+    /// compared, then filtered (`compare_sample`), by the sampler's
+    /// function, filters and range of levels the draw gives (`CMP_CFG`,
+    /// `CMP_MIN`, `CMP_MAX`).
+    fn compare_call(
+        &mut self,
+        slot: usize,
+        coordinates: &str,
+        layer: Option<&str>,
+        reference: u32,
+        lod: &str,
+    ) -> String {
+        self.compare[slot] = true;
+        let reference = self.read(reference);
+        let layer = match layer {
+            Some(layer) => format!("min({layer}, uint(t{slot}.get_array_size()) - 1u), "),
+            None => String::new(),
+        };
+        format!(
+            "compare_sample(t{slot}, s{slot}, {coordinates}, {layer}as_type<float>({reference}), CMP_CFG({slot}u), {lod}, CMP_MIN({slot}u), CMP_MAX({slot}u))"
+        )
     }
 
     /// The sample of texture `slot` at `coordinates` (two components, or
@@ -250,12 +276,11 @@ impl Writer<'_> {
         let w = self.word;
         let encoding = bits(w, 53, 4);
         let kind = match encoding {
-            1..=3 => TextureKind::Flat,
-            7 | 8 => TextureKind::Array,
+            1..=6 => TextureKind::Flat,
+            7..=9 => TextureKind::Array,
             10 | 11 => TextureKind::Volume,
             12 | 13 => TextureKind::Cube,
             0 => return self.refuse("1D target"),
-            4..=6 | 9 => return self.refuse("depth compare"),
             _ => return self.refuse("target encoding"),
         };
         let a = bits(w, 8, 8);
@@ -286,16 +311,16 @@ impl Writer<'_> {
                 "unaligned second destination",
             )?;
         }
-        let implicit = matches!(encoding, 1 | 7 | 10 | 12);
+        let implicit = matches!(encoding, 1 | 4 | 7 | 10 | 12);
         let slot = self.texture_slot(bits(w, 36, 13) * 4, implicit, kind);
         let float = |writer: &mut Self, register: u32| {
             format!("as_type<float>({})", writer.read(register))
         };
         let coordinates = match encoding {
             1 | 2 => format!("float2({}, {})", float(self, a), float(self, b)),
-            3 => format!("float2({}, {})", float(self, a), float(self, a + 1)),
+            3..=6 => format!("float2({}, {})", float(self, a), float(self, a + 1)),
             // Array: layer in `a`, coordinates in `a + 1` and `b`.
-            7 | 8 => format!("float2({}, {})", float(self, a + 1), float(self, b)),
+            7..=9 => format!("float2({}, {})", float(self, a + 1), float(self, b)),
             _ => format!(
                 "float3({}, {}, {})",
                 float(self, a),
@@ -310,7 +335,20 @@ impl Writer<'_> {
             13 => format!("level({})", float(self, b + 1)),
             _ => "level(0.0f)".into(),
         };
-        let sample = Self::sample_call(slot, &coordinates, layer.as_deref(), &option);
+        // The level of detail a comparison takes: the quad's (with the
+        // sampler's bias), the register's, or zero.
+        let implicit_lod =
+            format!("(t{slot}.calculate_unclamped_lod(s{slot}, {coordinates}) + lod_bias[{slot}])");
+        let sample = match encoding {
+            4 => self.compare_call(slot, &coordinates, None, b, &implicit_lod),
+            6 => self.compare_call(slot, &coordinates, None, b, "0.0f"),
+            5 => {
+                let lod = float(self, b);
+                self.compare_call(slot, &coordinates, None, b + 1, &lod)
+            }
+            9 => self.compare_call(slot, &coordinates, layer.as_deref(), b + 1, "0.0f"),
+            _ => Self::sample_call(slot, &coordinates, layer.as_deref(), &option),
+        };
         self.note_sample(slot);
         self.line(&format!("{{ float4 v = {sample};"));
         let mut index = 0;
@@ -353,7 +391,11 @@ impl Writer<'_> {
         let lod_mode = bits(w, 55, 3);
         self.require(matches!(lod_mode, 0 | 1 | 2 | 3 | 6 | 7), "LOD mode")?;
         self.require(!bit(w, 54), "AOFFI (texel offsets)")?;
-        self.require(!bit(w, 50), "depth compare")?;
+        let compare = bit(w, 50);
+        self.require(
+            !compare || matches!(kind, TextureKind::Flat | TextureKind::Array),
+            "depth compare of a cube or 3D texture",
+        )?;
         let (a, b, d) = (bits(w, 8, 8), bits(w, 20, 8), bits(w, 0, 8));
         let mask = bits(w, 31, 4);
         let slot = self.texture_slot(bits(w, 36, 13) * 4, matches!(lod_mode, 0 | 2 | 6), kind);
@@ -374,7 +416,29 @@ impl Writer<'_> {
             2 | 6 => format!("bias(lod_bias[{slot}] + as_type<float>({}))", self.read(b)),
             _ => format!("level(as_type<float>({}))", self.read(b)),
         };
-        let sample = Self::sample_call(slot, &coordinates, layer.as_deref(), &option);
+        let sample = if compare {
+            let lod = match lod_mode {
+                0 => format!(
+                    "(t{slot}.calculate_unclamped_lod(s{slot}, {coordinates}) + lod_bias[{slot}])"
+                ),
+                1 => "0.0f".to_string(),
+                2 | 6 => format!(
+                    "(t{slot}.calculate_unclamped_lod(s{slot}, {coordinates}) + lod_bias[{slot}] + as_type<float>({}))",
+                    self.read(b)
+                ),
+                _ => format!("as_type<float>({})", self.read(b)),
+            };
+            // The reference follows the level or bias register.
+            self.compare_call(
+                slot,
+                &coordinates,
+                layer.as_deref(),
+                b + u32::from(lod_mode > 1),
+                &lod,
+            )
+        } else {
+            Self::sample_call(slot, &coordinates, layer.as_deref(), &option)
+        };
         self.note_sample(slot);
         self.line(&format!("{{ float4 v = {sample};"));
         let mut index = 0;
@@ -385,6 +449,45 @@ impl Writer<'_> {
                 index += 1;
             }
         }
+        self.line("}");
+        Ok(())
+    }
+
+    /// `TMML` (bound handle): the level of detail a sample at the
+    /// coordinates would take, clamped to the texture's levels and
+    /// unclamped, each times 256 as an integer
+    /// (`exec/texture_vector.rs`). The level is Metal's, of its own
+    /// footprint estimate, plus the sampler's bias [known difference:
+    /// the interpreter's is the larger of the two derivatives'
+    /// lengths, clamped by the sampler's range too].
+    pub(super) fn tmml(&mut self) -> Result<(), String> {
+        let w = self.word;
+        let dim = bits(w, 28, 3);
+        let kind = match dim {
+            2 => TextureKind::Flat,
+            3 => TextureKind::Array,
+            4 => TextureKind::Volume,
+            6 => TextureKind::Cube,
+            _ => return self.refuse("target"),
+        };
+        let (a, d) = (bits(w, 8, 8), bits(w, 0, 8));
+        let mask = bits(w, 31, 4);
+        self.require(mask & 12 == 0, "LOD components Z/W")?;
+        let slot = self.texture_slot(bits(w, 36, 13) * 4, true, kind);
+        let first = a + u32::from(kind == TextureKind::Array);
+        let s = self.read(first);
+        let t = self.read(first + 1);
+        let coordinates = if matches!(kind, TextureKind::Volume | TextureKind::Cube) {
+            let r = self.read(first + 2);
+            format!("float3(as_type<float>({s}), as_type<float>({t}), as_type<float>({r}))")
+        } else {
+            format!("float2(as_type<float>({s}), as_type<float>({t}))")
+        };
+        self.note_sample(slot);
+        self.line(&format!(
+            "{{ const float raw = t{slot}.calculate_unclamped_lod(s{slot}, {coordinates}) + lod_bias[{slot}]; const float top = float(t{slot}.get_num_mip_levels()) - 1.0f; float4 v = float4(as_type<float>(as_type<uint>(int(clamp(raw, 0.0f, top) * 256.0f))), as_type<float>(as_type<uint>(int(raw * 256.0f))), 0.0f, 0.0f);"
+        ));
+        self.store_sample(mask, d, None);
         self.line("}");
         Ok(())
     }

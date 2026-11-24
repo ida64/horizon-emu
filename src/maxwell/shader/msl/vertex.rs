@@ -26,7 +26,9 @@ use super::super::Program;
 use super::super::decode::Op;
 use super::super::exec::{bit, bits};
 use super::super::header::{Interpolation, ShaderType};
-use super::{DONE, RZ, STACK_DEPTH, Stage, Writer, flow};
+use super::{
+    DONE, GLOBAL_WORD, RZ, STACK_DEPTH, Stage, VERTEX_GLOBAL_BUFFER, Writer, flow, memory,
+};
 use crate::maxwell::shader::Attributes;
 
 /// Output word of clip-space x (a\[0x70\]); y, z, w follow.
@@ -50,6 +52,8 @@ pub struct TranslatedVertex {
     pub indirect: BTreeSet<u32>,
     /// As [`super::Translated::constant_buffer_1`].
     pub constant_buffer_1: Option<Vec<u8>>,
+    /// As [`super::Translated::globals`].
+    pub globals: Vec<(u32, u32)>,
 }
 
 /// Translates a vertex program, or says why it cannot be.
@@ -72,9 +76,10 @@ pub fn translate_vertex(
         textures: Vec::new(),
         kinds: Vec::new(),
         implicit_lod: Vec::new(),
+        compare: Vec::new(),
         constants: BTreeSet::new(),
         indirect: BTreeSet::new(),
-        globals: Vec::new(),
+        globals: memory::candidates(program, &flow.pcs),
         inputs: BTreeSet::new(),
         outputs: BTreeSet::new(),
         word: 0,
@@ -132,6 +137,7 @@ pub fn translate_vertex(
         constants: writer.constants,
         indirect: writer.indirect,
         constant_buffer_1: flow.jump_tables.then(|| constant_buffer_1.to_vec()),
+        globals: writer.globals,
     })
 }
 
@@ -327,6 +333,14 @@ impl NativeVertex {
                 STREAM_BUFFER + slot as usize
             ));
         }
+        if !vertex.globals.is_empty() {
+            if kernel {
+                return Err("global memory in the test kernel".into());
+            }
+            parameters.push(format!(
+                "device atomic_uint* gm [[buffer({VERTEX_GLOBAL_BUFFER})]]"
+            ));
+        }
         if kernel {
             parameters.push("device uint* result [[buffer(30)]]".to_string());
             let _ = writeln!(s, "kernel void vertex_kernel({}) {{", parameters.join(", "));
@@ -379,7 +393,14 @@ impl NativeVertex {
         for &word in &outputs {
             let _ = writeln!(s, "    uint o{word} = {:#x}u;", defaults.0[word as usize]);
         }
+        // Every vertex is the draw's (`memory.rs`).
+        if !vertex.globals.is_empty() {
+            let _ = writeln!(s, "#define GM_LIVE true\n{GLOBAL_WORD}");
+        }
         s.push_str(&vertex.body);
+        if !vertex.globals.is_empty() {
+            let _ = writeln!(s, "#undef GM_LIVE\n#undef GM");
+        }
         if kernel {
             for &word in &outputs {
                 let _ = writeln!(s, "    result[256u * vid + {word}u] = o{word};");

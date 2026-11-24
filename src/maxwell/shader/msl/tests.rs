@@ -354,14 +354,24 @@ impl TextureUnit for Texels {
     }
 }
 
-struct NoMemory;
+/// Global memory of a run: one region at an address. Writes are kept.
+struct Region {
+    address: u64,
+    bytes: std::sync::Mutex<Vec<u8>>,
+}
 
-impl GpuMemory for NoMemory {
-    fn read(&self, _: u64, _: &mut [u8]) -> Option<()> {
-        None
+impl GpuMemory for Region {
+    fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
+        let bytes = self.bytes.lock().unwrap();
+        let start = usize::try_from(address.checked_sub(self.address)?).ok()?;
+        buffer.copy_from_slice(bytes.get(start..start + buffer.len())?);
+        Some(())
     }
-    fn write(&self, _: u64, _: &[u8]) -> Option<()> {
-        None
+    fn write(&self, address: u64, data: &[u8]) -> Option<()> {
+        let mut bytes = self.bytes.lock().unwrap();
+        let start = usize::try_from(address.checked_sub(self.address)?).ok()?;
+        bytes.get_mut(start..start + data.len())?.copy_from_slice(data);
+        Some(())
     }
 }
 
@@ -382,6 +392,11 @@ struct Inputs {
     planes: [Plane; 256],
     buffers: Vec<Vec<u8>>,
     texels: Vec<[f32; 4]>,
+    /// Global memory at an address (none: no memory is mapped).
+    memory: Option<(u64, Vec<u8>)>,
+    /// What the two sides left in that memory: the interpreter, then
+    /// Metal.
+    stored: std::cell::RefCell<[Vec<u8>; 2]>,
 }
 
 fn inputs(t: &Translated, seed: u64) -> Inputs {
@@ -433,6 +448,8 @@ fn inputs(t: &Translated, seed: u64) -> Inputs {
         planes,
         buffers,
         texels,
+        memory: None,
+        stored: Default::default(),
     }
 }
 
@@ -443,13 +460,28 @@ fn interpret(program: &Program, input: &Inputs) -> Result<Vec<FragmentOutput>, U
     for (slot, data) in input.buffers.iter().enumerate() {
         const_buffers[slot] = ConstantBuffer::whole(data);
     }
+    let (address, bytes) = input.memory.clone().unwrap_or_default();
+    let memory = Region {
+        address,
+        bytes: bytes.into(),
+    };
     let env = Env {
         const_buffers,
         textures: &unit,
         texture_buffer_index: TEXTURE_SLOT,
-        memory: &NoMemory,
+        memory: &memory,
         y_direction: 1.0,
     };
+    let result = interpret_quads(program, &env, input);
+    input.stored.borrow_mut()[0] = memory.bytes.into_inner().unwrap();
+    result
+}
+
+fn interpret_quads(
+    program: &Program,
+    env: &Env<'_>,
+    input: &Inputs,
+) -> Result<Vec<FragmentOutput>, Unmodeled> {
     let mut pixels = vec![FragmentOutput::default(); WIDTH * HEIGHT];
     for y in (0..HEIGHT).step_by(2) {
         for x in (0..WIDTH).step_by(2) {
@@ -501,7 +533,24 @@ fn render(
             planes.extend([p.dx, p.dy, p.base]);
         }
     }
-    let biases = vec![0.0f32; t.textures.len() + 1];
+    let biases = vec![0.0f32; 4 * t.textures.len() + 1];
+    // The global memory buffer as the renderer makes it (`memory.rs`):
+    // every place of the constants a descriptor of the run's region.
+    let global = (!t.globals.is_empty()).then(|| {
+        let (_, region) = input.memory.clone().expect("a region");
+        let table = 1 + 4 * t.globals.len();
+        let mut words = vec![0u32; table];
+        for (index, &(slot, offset)) in t.globals.iter().enumerate() {
+            let at = offset as usize;
+            let descriptor = &input.buffers[slot as usize][at..at + 12];
+            let word = |i: usize| u32::from_le_bytes(descriptor[4 * i..4 * i + 4].try_into().unwrap());
+            words[1 + 4 * index..5 + 4 * index]
+                .copy_from_slice(&[word(0), word(1), word(2), table as u32]);
+        }
+        let mut content = bytes(&words);
+        content.extend_from_slice(&region);
+        gpu.buffer(&content)
+    });
     let sizes: Vec<u32> = input.buffers.iter().map(|b| b.len() as u32).collect();
     let usage = MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead;
     let attachments: Vec<_> = outputs
@@ -611,6 +660,9 @@ fn render(
         encoder.setFragmentBuffer_offset_atIndex(Some(&buffers[21]), 0, 20);
         encoder.setFragmentBuffer_offset_atIndex(Some(&buffers[22]), 0, 21);
         encoder.setFragmentBuffer_offset_atIndex(Some(&buffers[23]), 0, 24);
+        if let Some(global) = &global {
+            encoder.setFragmentBuffer_offset_atIndex(Some(global), 0, super::GLOBAL_BUFFER);
+        }
         for (i, texture) in textures.iter().enumerate() {
             encoder.setFragmentTexture_atIndex(Some(texture), i);
             encoder.setFragmentSamplerState_atIndex(Some(&sampler), i);
@@ -620,6 +672,19 @@ fn render(
     encoder.endEncoding();
     command.commit();
     command.waitUntilCompleted();
+    if let (Some(global), Some((_, region))) = (&global, &input.memory) {
+        let table = 4 * (1 + 4 * t.globals.len());
+        // SAFETY: the buffer holds the table and the region; the GPU
+        // finished.
+        let now = unsafe {
+            std::slice::from_raw_parts(
+                global.contents().as_ptr().cast::<u8>(),
+                table + region.len(),
+            )
+        };
+        assert_eq!(now[..4], [0; 4], "global memory fault");
+        input.stored.borrow_mut()[1] = now[table..].to_vec();
+    }
     Ok(attachments
         .iter()
         .map(|texture| {
@@ -1054,6 +1119,83 @@ fn gathers_and_fetches_match_interpreter() {
     }
 }
 
+/// `LDG`, `STG` and `RED` through a buffer descriptor in a constant
+/// buffer address the bytes the interpreter addresses: loads of every
+/// size (bytes and halves extended), a store read back, and an atomic
+/// add that every fragment makes once.
+#[test]
+fn global_memory_matches_interpreter() {
+    const ADDRESS: u64 = 0x5_0000_1000;
+    let exit = 0xe30000000007000f;
+    let mov_c = |rd: u64, offset: u64| 0x4c98_0780_0007_0000 | rd | (offset / 4) << 20;
+    let pointer = [mov_c(4, 0x10), mov_c(5, 0x14)];
+    let ldg = |rd: u64, offset: u64, size: u64| {
+        0xeed0_2000_0007_0000 | size << 48 | rd | 4 << 8 | offset << 20
+    };
+    let programs = [
+        assembled(&[pointer[0], pointer[1], ldg(0, 0x10, 6), exit]),
+        assembled(&[
+            pointer[0],
+            pointer[1],
+            ldg(0, 8, 4),
+            ldg(1, 0x21, 1),
+            ldg(2, 0x22, 2),
+            ldg(3, 0x26, 3),
+            exit,
+        ]),
+        assembled(&[
+            pointer[0],
+            pointer[1],
+            mov(6, 0x1122_3344),
+            // STG [R4:R5 + 0x30] = R6.
+            0xeedc_2000_0007_0000 | 6 | 4 << 8 | 0x30 << 20,
+            // RED.ADD [R4:R5 + 0x40] += R6.
+            0xebf9_0000_0007_0000 | 6 | 4 << 8 | 0x40 << 28,
+            ldg(0, 0x30, 4),
+            exit,
+        ]),
+    ];
+    let gpu = Gpu::new();
+    for (index, program) in programs.iter().enumerate() {
+        let t = translate(program, &[]).unwrap_or_else(|e| panic!("program {index}: {e}"));
+        assert_eq!(t.globals, [(0, 0x10)], "program {index}");
+        let mut input = inputs(&t, 5);
+        let region: Vec<u8> = (0..0x80u32).map(|i| (i * 37 + 11) as u8).collect();
+        input.buffers[0].resize(0x1c, 0);
+        input.buffers[0][0x10..0x18].copy_from_slice(&ADDRESS.to_le_bytes());
+        input.buffers[0][0x18..0x1c].copy_from_slice(&(region.len() as u32).to_le_bytes());
+        input.memory = Some((ADDRESS, region.clone()));
+        let expected = interpret(program, &input).expect("interprets")[0].colors[0].map(f32::to_bits);
+        let word = |at: usize| u32::from_le_bytes(region[at..at + 4].try_into().unwrap());
+        match index {
+            0 => assert_eq!(expected, [word(0x10), word(0x14), word(0x18), word(0x1c)]),
+            1 => assert_eq!(
+                expected,
+                [
+                    word(8),
+                    region[0x21] as i8 as u32,
+                    u32::from(u16::from_le_bytes([region[0x22], region[0x23]])),
+                    i16::from_le_bytes([region[0x26], region[0x27]]) as u32,
+                ]
+            ),
+            _ => assert_eq!(expected[0], 0x1122_3344),
+        }
+        let Some(gpu) = &gpu else {
+            continue;
+        };
+        let colors = render(gpu, program, &t, &input).expect("renders");
+        for pixel in &colors[0] {
+            assert_eq!(pixel.map(f32::to_bits), expected, "program {index}");
+        }
+        let stored = input.stored.borrow();
+        assert_eq!(stored[0], stored[1], "program {index}: memory");
+        if index == 2 {
+            let sum = word(0x40).wrapping_add(0x1122_3344u32.wrapping_mul(64));
+            assert_eq!(stored[1][0x40..0x44], sum.to_le_bytes());
+        }
+    }
+}
+
 /// `SHFL` with immediate operands: mode, destination, source, lane or
 /// offset `b`, clamp and segment mask `c`, destination predicate `pd`.
 fn shfl(mode: u64, rd: u64, ra: u64, b: u64, c: u64, pd: u64) -> u64 {
@@ -1289,11 +1431,15 @@ fn vertex_programs_match_the_interpreter() {
             const_buffers[slot] = ConstantBuffer::whole(data);
         }
         let unit = Texels(Vec::new());
+        let memory = Region {
+            address: 0,
+            bytes: Vec::new().into(),
+        };
         let env = Env {
             const_buffers,
             textures: &unit,
             texture_buffer_index: TEXTURE_SLOT,
-            memory: &NoMemory,
+            memory: &memory,
             y_direction: 1.0,
         };
         let mut expected = Vec::with_capacity(VERTICES);

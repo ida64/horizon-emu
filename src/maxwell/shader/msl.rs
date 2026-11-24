@@ -170,22 +170,35 @@ pub struct Translated {
     /// Which texture slots are sampled with implicit level of detail (and
     /// so with the sampler's LOD bias).
     pub implicit_lod: Vec<bool>,
+    /// Which texture slots are sampled with a depth comparison: the draw
+    /// gives each one's function and filter (after the LOD biases, as
+    /// the bits of a float: function in bits 2:0, bit 3 linear).
+    pub compare: Vec<bool>,
     /// The constant buffer 1 content the targets of `BRX` (indirect
     /// branches through a jump table there) were taken from; `None` if the
     /// program has none. The translation is valid only for draws whose
     /// constant buffer 1 has this content.
     pub constant_buffer_1: Option<Vec<u8>>,
-    /// Where the buffers `LDG` reads may be named: (constant buffer slot,
-    /// byte offset) of each 64-bit address the program loads into a
-    /// register pair (see `memory.rs`). The draw binds the memory each
-    /// names, in this order, at [`GLOBAL_BUFFER`].
+    /// Where the buffers `LDG`, `STG` and `RED` address may be named:
+    /// (constant buffer slot, byte offset) of each 64-bit address the
+    /// program loads into a register pair (see `memory.rs`). The draw
+    /// binds the memory each names, in this order, at [`GLOBAL_BUFFER`].
     pub globals: Vec<(u32, u32)>,
+    /// The program stores to that memory (`STG`, `RED`): the renderer
+    /// writes it back to guest memory.
+    pub stores: bool,
+    /// The program updates that memory with `RED`, once per fragment:
+    /// not to be run once per sample.
+    pub atomics: bool,
 }
 
-/// The fragment buffer index of the global memory a program reads (see
-/// `memory.rs`); the one after it holds the word a load outside that
-/// memory sets.
+/// The fragment buffer index of the global memory a program addresses
+/// (see `memory.rs`).
 pub const GLOBAL_BUFFER: usize = 28;
+/// The vertex buffer index of the same for a vertex program.
+pub const VERTEX_GLOBAL_BUFFER: usize = 30;
+/// A word of the bound global memory, in a translated program's body.
+const GLOBAL_WORD: &str = "#define GM(i) atomic_load_explicit(&gm[i], memory_order_relaxed)";
 
 /// Register value expressions.
 fn r(index: u32) -> String {
@@ -245,6 +258,7 @@ struct Writer<'a> {
     textures: Vec<u32>,
     kinds: Vec<TextureKind>,
     implicit_lod: Vec<bool>,
+    compare: Vec<bool>,
     constants: BTreeSet<(u32, u32)>,
     indirect: BTreeSet<u32>,
     globals: Vec<(u32, u32)>,
@@ -489,7 +503,24 @@ impl Writer<'_> {
             (Stage::Pixel, Op::Tld4s) => self.tld4s(),
             (Stage::Pixel, Op::Tlds) => self.tlds(),
             (Stage::Pixel, Op::Tld) => self.tld(),
-            (Stage::Pixel, Op::Ldg) => self.ldg(),
+            (_, Op::Ldg) => self.ldg(),
+            (Stage::Pixel, Op::Stg) => self.stg(),
+            (Stage::Pixel, Op::Red) => self.red(),
+            (Stage::Pixel, Op::Ldl) => self.local(false),
+            (Stage::Pixel, Op::Stl) => self.local(true),
+            (Stage::Pixel, Op::Vmnmx) => self.vmnmx(),
+            (Stage::Pixel, Op::Tmml) => self.tmml(),
+            // SR_Y_DIRECTION: 1.0, as the interpreter's (`pipeline`'s
+            // `env`).
+            (Stage::Pixel, Op::S2r) if bits(self.word, 20, 8) == 18 => {
+                self.set(bits(self.word, 0, 8), "0x3f800000u");
+                Ok(())
+            }
+            // SR_THREAD_KILL (`exec::Machine::special_register`).
+            (Stage::Pixel, Op::S2r) if bits(self.word, 20, 8) == 19 => {
+                self.set(bits(self.word, 0, 8), "(GM_LIVE ? 0u : 0xffffffffu)");
+                Ok(())
+            }
             (Stage::Vertex, Op::Ald) => self.ald(),
             (Stage::Vertex, Op::Ast) => self.ast(),
             (_, Op::Ldc) => self.ldc(),
@@ -513,6 +544,49 @@ static inline float ftz(float v) {
 static inline float sat(float v) {
     return isnan(v) ? 0.0f : (v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v));
 }
+/// The depth comparison `function` (NEVER, LESS, EQUAL, LEQUAL, GREATER,
+/// NOTEQUAL, GEQUAL, ALWAYS) of the reference with each of `d`.
+static inline float4 compare_taps(float4 d, float r, uint function) {
+    switch (function & 7u) {
+        case 0u: return float4(0.0f);
+        case 1u: return float4(float4(r) < d);
+        case 2u: return float4(float4(r) == d);
+        case 3u: return float4(float4(r) <= d);
+        case 4u: return float4(float4(r) > d);
+        case 5u: return float4(float4(r) != d);
+        case 6u: return float4(float4(r) >= d);
+        default: return float4(1.0f);
+    }
+}
+/// A depth comparison as the interpreter samples one
+/// (`texture/filtering.rs` `sample`, `filtered`, `tap`): `cfg` holds the
+/// function (bits 2:0), whether the filter is linear (bit 3) and the mip
+/// filter (bits 5:4: 1 none, 2 nearest, 3 linear); `raw` is the level of
+/// detail before the clamp to `lmin`..`lmax`. Each tap is one texel of
+/// the level, taken at its center, compared, and then weighed.
+#define COMMA ,
+#define COMPARE_FUNCTIONS(TEX, LAYER_PARAMETER, LAYER) \
+static inline float4 compare_level(TEX t, sampler s, float2 uv LAYER_PARAMETER, float r, uint cfg, float lv) { \
+    if ((cfg & 8u) == 0u) { return compare_taps(float4(t.sample(s, uv LAYER, level(lv)).x), r, cfg); } \
+    const float2 size = float2(t.get_width(uint(lv)), t.get_height(uint(lv))); \
+    const float2 at = uv * size - 0.5f; \
+    const float2 p = floor(at) + 0.5f; \
+    const float2 f = at - floor(at); \
+    const float4 d = float4(t.sample(s, p / size LAYER, level(lv)).x, t.sample(s, (p + float2(1.0f, 0.0f)) / size LAYER, level(lv)).x, t.sample(s, (p + float2(0.0f, 1.0f)) / size LAYER, level(lv)).x, t.sample(s, (p + 1.0f) / size LAYER, level(lv)).x); \
+    const float4 c = compare_taps(d, r, cfg); \
+    return float4(mix(mix(c.x, c.y, f.x), mix(c.z, c.w, f.x), f.y)); \
+} \
+static inline float4 compare_sample(TEX t, sampler s, float2 uv LAYER_PARAMETER, float r, uint cfg, float raw, float lmin, float lmax) { \
+    const float lod = clamp(raw, lmin, lmax); \
+    const uint mip = (cfg >> 4) & 3u; \
+    const float lv = mip == 1u ? 0.0f : (mip == 2u ? round(lod) : floor(lod)); \
+    const float4 a = compare_level(t, s, uv LAYER, r, cfg, lv); \
+    if (mip != 3u || lod == lv) { return a; } \
+    const float top = float(t.get_num_mip_levels()) - 1.0f; \
+    return mix(a, compare_level(t, s, uv LAYER, r, cfg, min(lv + 1.0f, top)), lod - lv); \
+}
+COMPARE_FUNCTIONS(texture2d<float>, , )
+COMPARE_FUNCTIONS(texture2d_array<float>, COMMA uint layer, COMMA layer)
 static inline float next_down(float v) { return nextafter(v, as_type<float>(0xff800000u)); }
 static inline float next_up(float v) { return nextafter(v, as_type<float>(0x7f800000u)); }
 /// x * y * scale rounded in direction `mode` (1 down, 2 up, 3 to zero).
@@ -845,11 +919,7 @@ impl Translated {
         }
         if !self.globals.is_empty() {
             parameters.push(format!(
-                "const device uint* gm [[buffer({GLOBAL_BUFFER})]]"
-            ));
-            parameters.push(format!(
-                "device atomic_uint* gm_fault [[buffer({})]]",
-                GLOBAL_BUFFER + 1
+                "device atomic_uint* gm [[buffer({GLOBAL_BUFFER})]]"
             ));
         }
         if alpha_test {
@@ -927,22 +997,38 @@ impl Translated {
             };
             let _ = writeln!(s, "#define IPA{k} {center}\n#define IPAC{k} {centroid}");
         }
+        // CMP_CFG(i), CMP_MIN(i), CMP_MAX(i): the depth comparison of
+        // texture slot i and its range of levels.
+        let n = self.textures.len();
+        let _ = writeln!(
+            s,
+            "#define CMP_CFG(i) as_type<uint>(lod_bias[{}u + (i)])\n#define CMP_MIN(i) lod_bias[{}u + (i)]\n#define CMP_MAX(i) lod_bias[{}u + (i)]",
+            n + 1,
+            2 * n + 1,
+            3 * n + 1
+        );
         // GM_LIVE: whether this fragment is one of the primitive's (a
-        // global memory access of any other reports nothing).
+        // global memory access of any other reports and stores nothing);
+        // GM(i): word i of the bound memory.
+        let live = match (native, multisample) {
+            (Some(_), _) => "!simd_is_helper_thread()",
+            (None, Some(_)) => "(((coverage_mask >> layer) & 1u) != 0u)",
+            (None, None) => "covers(tri, px, py)",
+        };
+        let _ = writeln!(s, "#define GM_LIVE {live}");
         if !self.globals.is_empty() {
-            let live = match (native, multisample) {
-                (Some(_), _) => "!simd_is_helper_thread()",
-                (None, Some(_)) => "(((coverage_mask >> layer) & 1u) != 0u)",
-                (None, None) => "covers(tri, px, py)",
-            };
-            let _ = writeln!(s, "#define GM_LIVE {live}");
+            let _ = writeln!(s, "{GLOBAL_WORD}");
         }
         s.push_str(&self.body);
         for k in 0..self.ipa_words.len() {
             let _ = writeln!(s, "#undef IPA{k}\n#undef IPAC{k}");
         }
+        let _ = writeln!(
+            s,
+            "#undef GM_LIVE\n#undef CMP_CFG\n#undef CMP_MIN\n#undef CMP_MAX"
+        );
         if !self.globals.is_empty() {
-            let _ = writeln!(s, "#undef GM_LIVE");
+            let _ = writeln!(s, "#undef GM");
         }
         let covered = match (native, multisample) {
             (Some(_), _) => "false",
@@ -1089,6 +1175,7 @@ pub fn translate(program: &Program, constant_buffer_1: &[u8]) -> Result<Translat
         textures: Vec::new(),
         kinds: Vec::new(),
         implicit_lod: Vec::new(),
+        compare: Vec::new(),
         constants: BTreeSet::new(),
         indirect: BTreeSet::new(),
         globals: memory::candidates(program, &flow.pcs),
@@ -1132,6 +1219,13 @@ pub fn translate(program: &Program, constant_buffer_1: &[u8]) -> Result<Translat
     if writer.cc {
         let _ = writeln!(body, "    uint cc = 0u;");
     }
+    let local = memory::local_words(program, &flow.pcs);
+    if local != 0 {
+        let _ = writeln!(
+            body,
+            "    const uint LM_WORDS = {local}u; uint lm[{local}] = {{}};"
+        );
+    }
     let _ = writeln!(body, "    bool killed = false;");
     if flow.linear {
         let _ = writeln!(body, "    do {{");
@@ -1156,7 +1250,13 @@ pub fn translate(program: &Program, constant_buffer_1: &[u8]) -> Result<Translat
         constants: writer.constants,
         indirect: writer.indirect,
         globals: writer.globals,
+        stores: memory::stores(program, &flow.pcs),
+        atomics: flow
+            .pcs
+            .iter()
+            .any(|&pc| program.code[(pc / 8) as usize].expect("instruction").op == Op::Red),
         implicit_lod: writer.implicit_lod,
+        compare: writer.compare,
         constant_buffer_1: flow.jump_tables.then(|| constant_buffer_1.to_vec()),
     })
 }

@@ -1037,7 +1037,9 @@ impl<'a, const L: usize> Machine<'a, L> {
     }
 
     /// `S2R`: dest 0-7, register 20-27: SR_LANEID (0), SR_Y_DIRECTION
-    /// (18), SR_INVOCATION_INFO (29, see the module documentation),
+    /// (18), SR_THREAD_KILL (19: all ones for a fragment outside the
+    /// primitive, a helper of its quad, else 0 \[recalled\]),
+    /// SR_INVOCATION_INFO (29, see the module documentation),
     /// SR_TID (32: x in bits 0-15, y from bit 16, z from bit 26),
     /// SR_TID.X/Y/Z (33-35), SR_CTAID.X/Y/Z (37-39).
     fn special_register(&self, lane: usize, sr: u32) -> Result<u32, Unmodeled> {
@@ -1055,6 +1057,13 @@ impl<'a, const L: usize> Machine<'a, L> {
             }
             (Io::Compute(_), _) => return self.fail(&format!("special register {sr}")),
             (_, 18) => self.env.y_direction.to_bits(),
+            (Io::Fragment { covered, .. }, 19) => {
+                if covered[lane] {
+                    0
+                } else {
+                    u32::MAX
+                }
+            }
             (Io::Geometry(geometry), 29) => (geometry.inputs.len() as u32) << 16,
             _ => return self.fail(&format!("special register {sr}")),
         })

@@ -354,6 +354,11 @@ struct State {
     /// Reasons draws shaded their vertices on the CPU (`pipeline::native`),
     /// counted.
     cpu_vertices: HashMap<String, u64>,
+    /// The reason of the last draw left to the software renderer, and
+    /// the time that renderer took by reason
+    /// ([`Renderer::software_time`]).
+    last_fallback: Option<String>,
+    software_time: HashMap<String, std::time::Duration>,
     /// Compiled MSL by source: programs drawn with different attachment
     /// formats or blending share their functions.
     libraries: Lru<String, Retained<Library>>,
@@ -396,9 +401,12 @@ struct State {
     /// Bytes of global memory uploaded since the last wait: buffers
     /// replaced meanwhile live on until the work using them is done.
     globals_pending: usize,
-    /// The word a global memory load outside the bound memory sets (made
-    /// once, looked at after every wait).
-    global_fault: Option<Retained<MetalBuffer>>,
+    /// The global memory buffers pixel programs stored to since they
+    /// were last written back, by their regions.
+    dirty_globals: Vec<Vec<(u64, u32)>>,
+    /// The global memory buffers draws bound since their fault words
+    /// (the first word of each) were last looked at.
+    globals_bound: Vec<Retained<MetalBuffer>>,
     /// The packing kernels (`State::pack`), plain and layered.
     pack_pipelines: HashMap<bool, Retained<ComputePipeline>>,
     /// The 2D blit kernel (`blit`), made once.
@@ -422,6 +430,8 @@ impl Default for State {
             samplers: Lru::new(SAMPLER_LIMIT),
             clock: 0,
             fallbacks: HashMap::new(),
+            last_fallback: None,
+            software_time: HashMap::new(),
             draws: 0,
             faults: Vec::new(),
             placeholders: HashMap::new(),
@@ -430,7 +440,8 @@ impl Default for State {
             arena: Arena::default(),
             globals: Lru::new(GLOBAL_BUDGET),
             globals_pending: 0,
-            global_fault: None,
+            dirty_globals: Vec::new(),
+            globals_bound: Vec::new(),
             pack_pipelines: HashMap::new(),
             composites: HashMap::new(),
             versions: 0,
@@ -650,7 +661,25 @@ impl Renderer {
         } else if count.is_multiple_of(10) && count.ilog10() == (*count - 1).ilog10() + 1 {
             eprintln!("Metal renderer: left to the software renderer {count} times: {reason}");
         }
+        state.last_fallback = Some(reason);
         Ok(false)
+    }
+
+    /// Adds the time the software renderer took for the draw last left
+    /// to it; a reason is reported on stderr each time its total doubles
+    /// (from one second on).
+    pub fn software_time(&self, elapsed: std::time::Duration) {
+        let mut state = self.state.lock().unwrap();
+        let Some(reason) = state.last_fallback.take() else {
+            return;
+        };
+        let total = state.software_time.entry(reason.clone()).or_default();
+        let before = total.as_secs();
+        *total += elapsed;
+        let after = total.as_secs();
+        if after >= 1 && (before == 0 || after.ilog2() > before.ilog2()) {
+            eprintln!("Metal renderer: {after} s on the software renderer: {reason}");
+        }
     }
 
     /// Counts a draw left to the software renderer by its caller.
@@ -733,7 +762,18 @@ impl Renderer {
                     }
             })
             .collect();
-        if !wanted.contains(&true) {
+        let wanted_globals: Vec<Vec<(u64, u32)>> = state
+            .dirty_globals
+            .iter()
+            .filter(|key| match scope {
+                Scope::Range(start, end) => key.iter().any(|&(address, size)| {
+                    size != 0 && overlap((address, address + u64::from(size)), (start, end))
+                }),
+                _ => true,
+            })
+            .cloned()
+            .collect();
+        if !wanted.contains(&true) && wanted_globals.is_empty() {
             // Nothing for guest memory: the GPU goes on with what is
             // recorded, and nothing waits for it, unless a draw's texture
             // faults are to be looked at or the recorded draws' data has
@@ -807,18 +847,59 @@ impl Renderer {
                 }
             }
         }
-        if let Some(fault) = &state.global_fault {
-            let word = fault.contents().cast::<u32>();
-            // SAFETY: the buffer holds the word; the GPU finished.
+        for bound in std::mem::take(&mut state.globals_bound) {
+            let word = bound.contents().cast::<u32>();
+            // SAFETY: the buffer starts with the fault word; the GPU
+            // finished.
             if unsafe { word.read() } != 0 {
                 // SAFETY: as above.
                 unsafe { word.write(0) };
                 self.writing_back.store(false, Ordering::Relaxed);
                 return Err(Unmodeled(
-                    "pixel program: global memory load outside the buffers its constants name"
+                    "shader: global memory access outside the buffers the program's constants \
+                     name"
                         .into(),
                 ));
             }
+        }
+        // Global memory pixel programs stored to: what changed goes to
+        // guest memory, and the buffer is the copy of it from now on.
+        for key in &wanted_globals {
+            state.dirty_globals.retain(|k| k != key);
+            let Some(held) = state.globals.get_mut(key) else {
+                continue;
+            };
+            // SAFETY: the buffer holds `content.len()` bytes; the GPU
+            // finished.
+            let now = unsafe {
+                std::slice::from_raw_parts(
+                    held.buffer.contents().as_ptr().cast::<u8>(),
+                    held.content.len(),
+                )
+            };
+            for (index, &(address, size)) in key.iter().enumerate() {
+                let entry = 4 + 16 * index;
+                let word = |at: usize| {
+                    u32::from_le_bytes(held.content[at..at + 4].try_into().expect("4 bytes"))
+                };
+                // A region that was not mapped has no bytes.
+                if size == 0 || word(entry + 8) == 0 {
+                    continue;
+                }
+                let start = 4 * word(entry + 12) as usize;
+                let range = start..start + size as usize;
+                if now[range.clone()] != held.content[range.clone()]
+                    && memory.write(address, &now[range]).is_none()
+                {
+                    self.writing_back.store(false, Ordering::Relaxed);
+                    return Err(Unmodeled(format!(
+                        "Metal: global memory write-back to unmapped {address:#x}"
+                    )));
+                }
+            }
+            held.content = now.to_vec();
+            held.dirty = false;
+            held.stamp = writes.stamp();
         }
         let mut result = Ok(());
         for ((resident, &wanted), pack) in state.residents.iter_mut().zip(&wanted).zip(packs) {
@@ -835,7 +916,8 @@ impl Renderer {
             }
         }
         self.writing_back.store(false, Ordering::Relaxed);
-        let any_dirty = state.residents.iter().any(|r| r.dirty.is_some());
+        let any_dirty =
+            state.residents.iter().any(|r| r.dirty.is_some()) || !state.dirty_globals.is_empty();
         self.any_dirty.store(any_dirty, Ordering::Relaxed);
         let stamp = writes.stamp();
         for ((resident, current), wanted) in state.residents.iter_mut().zip(current).zip(wanted) {
@@ -867,6 +949,9 @@ impl Renderer {
                 .residents
                 .iter()
                 .any(|r| r.dirty.is_some() && overlap(r.extent(), range))
+                || state.dirty_globals.iter().flatten().any(|&(a, size)| {
+                    size != 0 && overlap((a, a + u64::from(size)), range)
+                })
         };
         if overlaps {
             self.write_back(memory, writes, Scope::Range(range.0, range.1))?;
@@ -1104,6 +1189,16 @@ impl Renderer {
             if matches!(sampled, Sampled::Composite(_)) && kind != TextureKind::Flat {
                 return self.fall_back(format!("rendered texture in a {kind:?} slot"));
             }
+            if translated.compare[slot] {
+                // The translated comparison has one filter for both
+                // magnification and minification (`msl` `compare_sample`).
+                if !tsc.compare {
+                    return self.fall_back("depth comparison without a compare sampler".into());
+                }
+                if tsc.mag_linear != (tsc.min_filter != 1) {
+                    return self.fall_back("depth comparison with two filters".into());
+                }
+            }
             let bias = if translated.implicit_lod[slot] {
                 tsc.lod_bias
             } else {
@@ -1111,10 +1206,29 @@ impl Renderer {
             };
             bound.push(Some((sampled, tic, tsc, bias, kind)));
         }
+        if translated.atomics && !samples.is_single() {
+            return self.fall_back("atomic update of global memory with several samples".into());
+        }
         let global_memory = if translated.globals.is_empty() {
             None
         } else {
-            Some(self.global_memory(memory, writes, draw.constants, &translated.globals)?)
+            Some(self.global_memory(
+                memory,
+                writes,
+                draw.constants,
+                &translated.globals,
+                translated.stores,
+            )?)
+        };
+        let vertex_memory = match &vertex {
+            Some((native, vertex, ..)) if !vertex.globals.is_empty() => Some(self.global_memory(
+                memory,
+                writes,
+                native.constants,
+                &vertex.globals,
+                false,
+            )?),
+            _ => None,
         };
         let residents = self.residents(memory, writes, &targets, samples.log2, false)?;
 
@@ -1326,10 +1440,27 @@ impl Renderer {
                 planes.extend_from_slice(&[plane.dx, plane.dy, plane.base]);
             }
         }
+        // The LOD bias of each slot and a spare one; then, for depth
+        // comparisons, each slot's function, filter (bit 3 linear) and
+        // mip filter (bits 5:4) as the bits of a float, each slot's
+        // least level of detail, and each slot's greatest.
+        let of = |value: &dyn Fn(&Tic, &Tsc) -> f32| -> Vec<f32> {
+            bound
+                .iter()
+                .map(|b| b.as_ref().map_or(0.0, |(_, tic, tsc, ..)| value(tic, tsc)))
+                .collect()
+        };
         let biases: Vec<f32> = bound
             .iter()
             .map(|b| b.as_ref().map_or(0.0, |b| b.3))
             .chain([0.0])
+            .chain(of(&|_, tsc| {
+                f32::from_bits(
+                    tsc.compare_func | u32::from(tsc.mag_linear) << 3 | (tsc.mip_filter & 3) << 4,
+                )
+            }))
+            .chain(of(&|tic, tsc| tic.lod_range(tsc).0))
+            .chain(of(&|tic, tsc| tic.lod_range(tsc).1))
             .collect();
         // Texture fault words: word 2i marks slot i unbound.
         let mut fault_words = vec![0u32; 2 * translated.textures.len()];
@@ -1553,25 +1684,32 @@ impl Renderer {
                 encoder.setFragmentTexture_atIndex(Some(texture), i);
                 encoder.setFragmentSamplerState_atIndex(Some(sampler), i);
             }
-            if let Some(global_memory) = &global_memory {
-                let fault = match &state.global_fault {
-                    Some(fault) => fault.clone(),
-                    None => {
-                        let fault = buffer(gpu, &[0; 4])?;
-                        state.global_fault = Some(fault.clone());
-                        fault
-                    }
+            for (bound, stage) in [
+                (&global_memory, Stage::Fragment),
+                (&vertex_memory, Stage::Vertex),
+            ] {
+                let Some(bound) = bound else {
+                    continue;
                 };
-                encoder.setFragmentBuffer_offset_atIndex(
-                    Some(global_memory),
-                    0,
-                    msl::GLOBAL_BUFFER,
-                );
-                encoder.setFragmentBuffer_offset_atIndex(
-                    Some(&fault),
-                    0,
-                    msl::GLOBAL_BUFFER + 1,
-                );
+                match stage {
+                    Stage::Fragment => encoder.setFragmentBuffer_offset_atIndex(
+                        Some(bound),
+                        0,
+                        msl::GLOBAL_BUFFER,
+                    ),
+                    Stage::Vertex => encoder.setVertexBuffer_offset_atIndex(
+                        Some(bound),
+                        0,
+                        msl::VERTEX_GLOBAL_BUFFER,
+                    ),
+                }
+                if !state
+                    .globals_bound
+                    .iter()
+                    .any(|b| Retained::as_ptr(b) == Retained::as_ptr(bound))
+                {
+                    state.globals_bound.push(bound.clone());
+                }
             }
             if !unbound.is_empty() {
                 let faults = buffer(gpu, bytes_of_u32(&fault_words))?;
@@ -1909,7 +2047,9 @@ impl Renderer {
         writes: &Writes,
         constants: &[(Vec<u8>, usize)],
         places: &[(u32, u32)],
+        store: bool,
     ) -> Result<Retained<MetalBuffer>, Unmodeled> {
+        use std::sync::atomic::Ordering;
         let mut total = 0;
         let regions: Vec<(u64, u32)> = places
             .iter()
@@ -1935,13 +2075,24 @@ impl Renderer {
                 .iter()
                 .all(|&(address, size)| writes.unchanged(stamp, address, address + u64::from(size)))
         };
-        if let Some(held) = self.state.lock().unwrap().globals.get(&regions)
-            && unchanged(held.stamp)
         {
-            return Ok(held.buffer.clone());
+            let mut state = self.state.lock().unwrap();
+            // A buffer programs stored to holds what memory is to hold.
+            if let Some(held) = state.globals.get_mut(&regions)
+                && (held.dirty || unchanged(held.stamp))
+            {
+                let buffer = held.buffer.clone();
+                if store && !held.dirty {
+                    held.dirty = true;
+                    state.dirty_globals.push(regions);
+                    self.any_dirty.store(true, Ordering::Relaxed);
+                }
+                return Ok(buffer);
+            }
         }
-        // Read outside the lock: a read may write residents back.
-        let table = 4 * regions.len();
+        // Read outside the lock: a read may write residents back. The
+        // fault word comes first, then the table.
+        let table = 1 + 4 * regions.len();
         let mut words = vec![0u32; table];
         let mut bytes: Vec<u8> = Vec::with_capacity(total);
         for (index, &(address, size)) in regions.iter().enumerate() {
@@ -1957,7 +2108,7 @@ impl Renderer {
                 bytes.truncate(start);
                 continue;
             }
-            words[4 * index..4 * index + 4].copy_from_slice(&[
+            words[1 + 4 * index..5 + 4 * index].copy_from_slice(&[
                 address as u32,
                 (address >> 32) as u32,
                 size,
@@ -1968,28 +2119,46 @@ impl Renderer {
         content.extend_from_slice(&bytes);
         let stamp = writes.stamp();
         let mut state = self.state.lock().unwrap();
-        if let Some(held) = state.globals.get_mut(&regions)
-            && held.content == content
-        {
-            held.stamp = stamp;
-            return Ok(held.buffer.clone());
+        let same = state
+            .globals
+            .get(&regions)
+            .is_some_and(|held| held.content == content);
+        if !same {
+            // What this replaces lives on until the work using it is
+            // done; a buffer stored to is not dropped before it is
+            // written back.
+            if state.globals_pending + content.len() > GLOBAL_PENDING {
+                state.wait();
+            }
+            if !state.dirty_globals.is_empty()
+                && state.globals.cost() + content.len() > GLOBAL_BUDGET
+            {
+                drop(state);
+                self.settle(memory, writes)?;
+                state = self.state.lock().unwrap();
+            }
+            state.globals_pending += content.len();
+            let buffer = buffer(Self::gpu(), &content)?;
+            let cost = content.len();
+            state.globals.insert(
+                regions.clone(),
+                GlobalMemory {
+                    content,
+                    stamp,
+                    buffer,
+                    dirty: false,
+                },
+                cost,
+            );
         }
-        // What this replaces lives on until the work using it is done.
-        if state.globals_pending + content.len() > GLOBAL_PENDING {
-            state.wait();
+        let held = state.globals.get_mut(&regions).expect("held above");
+        held.stamp = stamp;
+        let buffer = held.buffer.clone();
+        if store {
+            held.dirty = true;
+            state.dirty_globals.push(regions);
+            self.any_dirty.store(true, Ordering::Relaxed);
         }
-        state.globals_pending += content.len();
-        let buffer = buffer(Self::gpu(), &content)?;
-        let cost = content.len();
-        state.globals.insert(
-            regions,
-            GlobalMemory {
-                content,
-                stamp,
-                buffer: buffer.clone(),
-            },
-            cost,
-        );
         Ok(buffer)
     }
 
@@ -3538,6 +3707,9 @@ struct GlobalMemory {
     /// When the regions were last known to equal guest memory.
     stamp: Stamp,
     buffer: Retained<MetalBuffer>,
+    /// A pixel program stored to the buffer since it was last equal to
+    /// guest memory: it is what memory is to hold, and is written back.
+    dirty: bool,
 }
 
 /// A texture some of whose levels are render targets held on the GPU
@@ -4049,25 +4221,34 @@ pub struct Coherent<'a> {
     pub writes: &'a Writes,
 }
 
+impl Coherent<'_> {
+    /// The write-back an access needs. An access can only fail as
+    /// unmapped, so what a failed write-back refused is said here.
+    fn before(&self, address: u64, length: usize) -> Option<()> {
+        self.renderer
+            .before_access(self.memory, self.writes, address, length)
+            .map_err(|Unmodeled(reason)| {
+                eprintln!(
+                    "Metal renderer: write-back before an access of {address:#x} failed: {reason}"
+                );
+            })
+            .ok()
+    }
+}
+
 impl GpuMemory for Coherent<'_> {
     fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
-        self.renderer
-            .before_access(self.memory, self.writes, address, buffer.len())
-            .ok()?;
+        self.before(address, buffer.len())?;
         self.memory.read(address, buffer)
     }
 
     fn write(&self, address: u64, data: &[u8]) -> Option<()> {
-        self.renderer
-            .before_access(self.memory, self.writes, address, data.len())
-            .ok()?;
+        self.before(address, data.len())?;
         self.memory.write(address, data)
     }
 
     fn probe(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
-        self.renderer
-            .before_access(self.memory, self.writes, address, buffer.len())
-            .ok()?;
+        self.before(address, buffer.len())?;
         self.memory.probe(address, buffer)
     }
 }
