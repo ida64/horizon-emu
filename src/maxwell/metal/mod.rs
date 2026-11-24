@@ -494,14 +494,9 @@ struct State {
     /// that bound placeholders, with each unbound slot and the refusal a
     /// sample of it is (see `shader::msl` `texture.rs`).
     faults: Vec<Faults>,
-    /// The trap word of fragment functions (`msl::Translated::traps`)
-    /// and after it the count of samples that passed
-    /// ([`Draw::count_passed`]), made when first bound, and whether a
-    /// draw that may trap was given it since it was last looked at.
-    trap: Option<(Retained<MetalBuffer>, bool)>,
-    /// A draw that counts was recorded since the count was last taken
-    /// ([`Renderer::take_passed`]).
-    passed_bound: bool,
+    /// What fragment functions tell the renderer ([`Feedback`]), made
+    /// when first needed.
+    feedback: Option<Feedback>,
     /// What an unbound texture slot of each kind is bound to: a 1x1
     /// texture and a sampler, never read into a result that reaches
     /// guest memory.
@@ -524,7 +519,6 @@ impl Default for State {
             frame: None,
             submitted: None,
             pass_draws: 0,
-            passed_bound: false,
             programs: HashMap::new(),
             vertex_programs: HashMap::new(),
             cpu_vertices: HashMap::new(),
@@ -539,7 +533,7 @@ impl Default for State {
             software_time: HashMap::new(),
             draws: 0,
             faults: Vec::new(),
-            trap: None,
+            feedback: None,
             placeholders: HashMap::new(),
             native: HashMap::new(),
             texture_bytes: 0,
@@ -712,34 +706,67 @@ pub struct Draw<'a> {
     /// Samples per pixel of the targets (see `pipeline::multisample`).
     pub multisample: super::pipeline::Multisample,
     /// `SET_ZPASS_PIXEL_COUNT` is enabled: the samples that pass the
-    /// stencil and depth tests are counted ([`Renderer::take_passed`]).
+    /// stencil and depth tests are counted ([`Renderer::report_passed`]).
     pub count_passed: bool,
 }
 
 impl Renderer {
-    /// The samples that passed the stencil and depth tests of the draws
-    /// that count them ([`Draw::count_passed`]) since this was last
-    /// asked, once the GPU has done every draw recorded. The count is
-    /// kept in 32 bits between two askings \[assumption: a guest asks,
-    /// with a report or a reset of its counter, before 2^32 samples
-    /// pass\].
-    pub fn take_passed(&self) -> u64 {
+    /// `CLEAR_REPORT_VALUE` of ZPASS_PIXEL_CNT: the draws from here on
+    /// count from zero.
+    pub fn reset_passed(&self, memory: &dyn GpuMemory, writes: &Writes) -> Result<(), Unmodeled> {
+        self.next_slot(memory, writes)?;
         let mut state = self.state.lock().unwrap();
-        if !std::mem::take(&mut state.passed_bound) {
-            return 0;
+        let feedback = state.feedback()?;
+        feedback.span = feedback.slot;
+        feedback.base = 0;
+        Ok(())
+    }
+
+    /// A report of ZPASS_PIXEL_CNT at `address`: `counted` (what the
+    /// software renderer counted since the reset) and what the draws
+    /// recorded since the reset count on the GPU, as one word or as a
+    /// 64-bit value followed by `time`. The GPU has yet to draw them, so
+    /// the report is written when a write-back next waits for it: at
+    /// the channel's next signal, or before an engine of the channel
+    /// accesses the report's memory ([`Coherent`]).
+    pub fn report_passed(
+        &self,
+        memory: &dyn GpuMemory,
+        writes: &Writes,
+        address: u64,
+        one_word: bool,
+        time: u64,
+        counted: u64,
+    ) -> Result<(), Unmodeled> {
+        {
+            let mut state = self.state.lock().unwrap();
+            let feedback = state.feedback()?;
+            feedback.pending.push(Report {
+                address,
+                one_word,
+                time,
+                base: feedback.base + counted,
+                slots: feedback.span..feedback.slot + 1,
+            });
         }
-        state.wait();
-        let Some((trap, _)) = &state.trap else {
-            return 0;
-        };
-        // SAFETY: the buffer holds the trap word and the count; the GPU
-        // finished.
-        unsafe {
-            let word = trap.contents().cast::<u32>().as_ptr().add(1);
-            let count = word.read();
-            word.write(0);
-            u64::from(count)
+        self.any_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.next_slot(memory, writes)
+    }
+
+    /// Gives the draws from here on the next slot of the feedback
+    /// buffer; a buffer whose slots are all used is read first
+    /// ([`resolve_feedback`]), which starts it over.
+    fn next_slot(&self, memory: &dyn GpuMemory, writes: &Writes) -> Result<(), Unmodeled> {
+        {
+            let mut state = self.state.lock().unwrap();
+            let feedback = state.feedback()?;
+            if feedback.slot + 1 < FEEDBACK_SLOTS {
+                feedback.slot += 1;
+                return Ok(());
+            }
         }
+        self.write_back(memory, writes, Scope::All)
     }
 }
 
@@ -913,7 +940,19 @@ impl Renderer {
             })
             .map(|(key, _)| *key)
             .collect();
-        if !wanted.contains(&true) && wanted_globals.is_empty() {
+        // Reports that wait for their counts, and a feedback buffer with
+        // no slot left, are read once the GPU is done.
+        let reports = state.feedback.as_ref().is_some_and(|feedback| {
+            feedback.slot + 1 >= FEEDBACK_SLOTS
+                || match scope {
+                    Scope::Range(start, end) => feedback
+                        .pending
+                        .iter()
+                        .any(|report| overlap(report.extent(), (start, end))),
+                    _ => !feedback.pending.is_empty(),
+                }
+        });
+        if !wanted.contains(&true) && wanted_globals.is_empty() && !reports {
             // Nothing for guest memory: the GPU goes on with what is
             // recorded, and nothing waits for it, unless a draw's texture
             // faults are to be looked at or the recorded draws' data has
@@ -975,27 +1014,10 @@ impl Renderer {
         }
         state.wait();
         // An executed instruction neither renderer models is the
-        // interpreter's refusal.
-        if let Some((trap, bound)) = &mut state.trap
-            && std::mem::take(bound)
-        {
-            let word = trap.contents().cast::<u32>();
-            // SAFETY: the buffer holds the word; the GPU finished.
-            let trapped = unsafe { word.read() };
-            if trapped != 0 {
-                // SAFETY: as above.
-                unsafe { word.write(0) };
-                self.writing_back.store(false, Ordering::Relaxed);
-                let what = if trapped & 0x4000_0000 != 0 {
-                    "a query of a texture slot that names no texture"
-                } else {
-                    "an instruction that is not modeled"
-                };
-                return Err(Unmodeled(format!(
-                    "pixel program: {what} was executed at {:#x}",
-                    trapped & 0x3fff_ffff
-                )));
-            }
+        // interpreter's refusal; the reports get their counts.
+        if let Err(refusal) = resolve_feedback(&mut state, memory) {
+            self.writing_back.store(false, Ordering::Relaxed);
+            return Err(refusal);
         }
         // An executed sample of an unbound texture is the interpreter's
         // refusal; nothing of the work is written back.
@@ -1074,7 +1096,11 @@ impl Renderer {
             || state
                 .globals
                 .iter()
-                .any(|globals| globals.regions.values().any(|region| region.dirty));
+                .any(|globals| globals.regions.values().any(|region| region.dirty))
+            || state
+                .feedback
+                .iter()
+                .any(|feedback| !feedback.pending.is_empty());
         self.any_dirty.store(any_dirty, Ordering::Relaxed);
         let stamp = writes.stamp();
         for ((resident, current), wanted) in state.residents.iter_mut().zip(current).zip(wanted) {
@@ -1111,6 +1137,12 @@ impl Renderer {
                         .regions
                         .iter()
                         .any(|(key, region)| region.dirty && overlap(global_extent(*key), range))
+                })
+                || state.feedback.iter().any(|feedback| {
+                    feedback
+                        .pending
+                        .iter()
+                        .any(|report| overlap(report.extent(), range))
                 })
         };
         if overlaps {
@@ -1864,19 +1896,10 @@ impl Renderer {
                 )?;
             }
             if translated.traps || draw.count_passed {
-                let trap = match &mut state.trap {
-                    Some((trap, bound)) => {
-                        *bound |= translated.traps;
-                        trap.clone()
-                    }
-                    None => {
-                        let trap = buffer(gpu, &[0; 8])?;
-                        state.trap = Some((trap.clone(), translated.traps));
-                        trap
-                    }
-                };
-                state.passed_bound |= draw.count_passed;
-                encoder.setFragmentBuffer_offset_atIndex(Some(&trap), 0, msl::TRAP_BUFFER);
+                let feedback = state.feedback()?;
+                feedback.trapped |= translated.traps;
+                let (words, offset) = (feedback.buffer.clone(), 8 * feedback.slot);
+                encoder.setFragmentBuffer_offset_atIndex(Some(&words), offset, msl::TRAP_BUFFER);
             }
             for (i, (texture, sampler)) in vertex_textures.iter().enumerate() {
                 encoder.setVertexTexture_atIndex(Some(texture), i);
@@ -3196,6 +3219,21 @@ impl State {
         Ok((metal, sampler))
     }
 
+    /// The feedback buffer, made when first asked for.
+    fn feedback(&mut self) -> Result<&mut Feedback, Unmodeled> {
+        if self.feedback.is_none() {
+            self.feedback = Some(Feedback {
+                buffer: buffer(Renderer::gpu(), &[0; 8 * FEEDBACK_SLOTS])?,
+                slot: 0,
+                trapped: false,
+                span: 0,
+                base: 0,
+                pending: Vec::new(),
+            });
+        }
+        Ok(self.feedback.as_mut().expect("made above"))
+    }
+
     /// The global memory buffer, made when first asked for.
     fn globals(&mut self) -> Result<&mut Globals, Unmodeled> {
         if self.globals.is_none() {
@@ -4085,6 +4123,111 @@ struct GlobalRegion {
 /// The addresses of a global memory region (address, size).
 fn global_extent((address, size): (u64, u32)) -> (u64, u64) {
     (address, address + u64::from(size))
+}
+
+/// Slots of the feedback buffer ([`Feedback`]): the reports of
+/// ZPASS_PIXEL_CNT a channel can make between two write-backs that wait
+/// for the GPU; one more makes such a write-back.
+const FEEDBACK_SLOTS: usize = 2048;
+
+/// What fragment functions tell the renderer, in a buffer of
+/// [`FEEDBACK_SLOTS`] slots of two words (`msl::TRAP_BUFFER`): the trap
+/// word (`msl::Translated::traps`) and the count of samples that passed
+/// ([`Draw::count_passed`]). A draw is given the slot current when it is
+/// recorded; a report of the count ends the slot, so that the counts of
+/// the draws before and after it stay apart until the GPU has drawn
+/// them and the report can be written ([`resolve_feedback`]).
+struct Feedback {
+    buffer: Retained<MetalBuffer>,
+    /// The slot draws are given now.
+    slot: usize,
+    /// A draw that may trap was given a slot since the trap words were
+    /// last looked at.
+    trapped: bool,
+    /// The first slot of the draws recorded since the counter was last
+    /// reset, and what the slots before it counted since then (slots are
+    /// used again once read).
+    span: usize,
+    base: u64,
+    /// The reports that wait for their counts.
+    pending: Vec<Report>,
+}
+
+/// A report of ZPASS_PIXEL_CNT to be written ([`Renderer::report_passed`]).
+struct Report {
+    address: u64,
+    one_word: bool,
+    time: u64,
+    /// What is counted apart from `slots`.
+    base: u64,
+    /// The slots whose counts it adds up.
+    slots: std::ops::Range<usize>,
+}
+
+impl Report {
+    /// The addresses it is written to.
+    fn extent(&self) -> (u64, u64) {
+        (self.address, self.address + if self.one_word { 4 } else { 16 })
+    }
+}
+
+/// Reads the feedback buffer once the GPU has done every draw recorded:
+/// refuses a trap (the address of an instruction neither renderer models
+/// that was executed, or bit 30 with the address of a texture query of a
+/// handle that names no texture), writes the reports that waited for
+/// their counts to guest memory, and frees the slots.
+fn resolve_feedback(state: &mut State, memory: &dyn GpuMemory) -> Result<(), Unmodeled> {
+    let Some(feedback) = &mut state.feedback else {
+        return Ok(());
+    };
+    // SAFETY: the buffer holds two words per slot; the GPU finished, and
+    // nothing else reads or writes it meanwhile (the state is held).
+    let words = unsafe {
+        std::slice::from_raw_parts_mut(
+            feedback.buffer.contents().cast::<u32>().as_ptr(),
+            2 * (feedback.slot + 1),
+        )
+    };
+    if std::mem::take(&mut feedback.trapped)
+        && let Some(trapped) = words.iter().step_by(2).copied().find(|&word| word != 0)
+    {
+        words.iter_mut().step_by(2).for_each(|word| *word = 0);
+        let what = if trapped & 0x4000_0000 != 0 {
+            "a query of a texture slot that names no texture"
+        } else {
+            "an instruction that is not modeled"
+        };
+        return Err(Unmodeled(format!(
+            "pixel program: {what} was executed at {:#x}",
+            trapped & 0x3fff_ffff
+        )));
+    }
+    let counted = |slots: std::ops::Range<usize>| -> u64 {
+        slots.map(|slot| u64::from(words[2 * slot + 1])).sum()
+    };
+    for report in feedback.pending.drain(..) {
+        let count = report.base + counted(report.slots.clone());
+        let low = (count as u32).to_le_bytes();
+        let written = if report.one_word {
+            memory.write(report.address, &low)
+        } else {
+            let mut bytes = [0; 16];
+            bytes[..8].copy_from_slice(&count.to_le_bytes());
+            bytes[8..].copy_from_slice(&report.time.to_le_bytes());
+            memory.write(report.address, &bytes)
+        };
+        if written.is_none() {
+            return Err(Unmodeled(format!(
+                "report write to unmapped GPU address {:#x}",
+                report.address
+            )));
+        }
+    }
+    feedback.base += counted(feedback.span..feedback.slot + 1);
+    words.fill(0);
+    feedback.span = 0;
+    feedback.slot = 0;
+    Ok(())
 }
 
 /// A texture some of whose levels are render targets held on the GPU

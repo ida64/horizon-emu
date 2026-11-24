@@ -606,6 +606,7 @@ impl<'a> DrawTextures<'a> {
         ThreadTextures {
             draw: self,
             recent: RefCell::new(Vec::new()),
+            queried: RefCell::new(None),
         }
     }
 }
@@ -614,6 +615,9 @@ impl<'a> DrawTextures<'a> {
 pub struct ThreadTextures<'a> {
     draw: &'a DrawTextures<'a>,
     recent: RefCell<Vec<(u32, Arc<Texture>, Tsc)>>,
+    /// The handle last queried and its header (a program asks about the
+    /// same texture from every thread).
+    queried: RefCell<Option<(u32, Tic)>>,
 }
 
 impl ThreadTextures<'_> {
@@ -660,8 +664,16 @@ impl TextureUnit for ThreadTextures<'_> {
 
     /// From the header: a query reads nothing of the texture.
     fn query(&self, handle: u32, query: Query) -> Result<[u32; 4], Unmodeled> {
+        let mut queried = self.queried.borrow_mut();
+        if let Some((known, tic)) = &*queried
+            && *known == handle
+        {
+            return super::texture::query_header(tic, query);
+        }
         let (tic, _) = self.draw.header(handle)?;
-        super::texture::query_header(&tic, query)
+        let answer = super::texture::query_header(&tic, query);
+        *queried = Some((handle, tic));
+        answer
     }
 
     fn lod(

@@ -479,7 +479,9 @@ impl ThreeD {
                 if argument & 0x1F != 1 {
                     return Err(refuse(method, argument, "reset of a counter not modeled"));
                 }
-                self.passed(hooks);
+                if let Some(metal) = &hooks.metal {
+                    metal.reset_passed(memory, &hooks.writes)?;
+                }
                 *self.passed.get_mut() = 0;
             }
             CLEAR_SURFACE => {
@@ -708,18 +710,36 @@ impl ThreeD {
             // (0x15) [public: NVIDIA `clb197.h`
             // `SET_REPORT_SEMAPHORE_D_REPORT`]: the count, in one word or
             // as a 64-bit value followed by a 64-bit timestamp (the
-            // layout `SET_RENDER_ENABLE_C` reads). A report tells the
-            // guest the GPU has come this far, as a release does.
+            // layout `SET_RENDER_ENABLE_C` reads). The Metal renderer
+            // writes the report once the GPU has drawn what it counts
+            // (`metal::Renderer::report_passed`), by the channel's next
+            // signal; without one it is written here, after a signal as
+            // a release makes: the report tells the guest the GPU has
+            // come this far.
             (2, 2 | 0x15) => {
-                let count = self.passed(hooks);
+                let time = if one_word {
+                    0
+                } else {
+                    let timer = hooks.timer.as_ref().ok_or_else(|| {
+                        Unmodeled("four-word report without a GPU timer connected".into())
+                    })?;
+                    timer()
+                };
+                let count = self.passed.load(std::sync::atomic::Ordering::Relaxed);
+                if let Some(metal) = &hooks.metal {
+                    return metal.report_passed(
+                        memory,
+                        &hooks.writes,
+                        address,
+                        one_word,
+                        time,
+                        count,
+                    );
+                }
                 hooks.signal(memory)?;
                 if one_word {
                     return write_words(memory, address, &[count as u32]);
                 }
-                let timer = hooks.timer.as_ref().ok_or_else(|| {
-                    Unmodeled("four-word report without a GPU timer connected".into())
-                })?;
-                let time = timer();
                 write_words(
                     memory,
                     address,
@@ -733,15 +753,6 @@ impl ThreeD {
             }
             _ => Err(refuse(SET_REPORT_SEMAPHORE_D, control, "report or counter")),
         }
-    }
-
-    /// ZPASS_PIXEL_CNT now: what the software renderer counted and what
-    /// the Metal renderer has, which waits for the GPU to have drawn
-    /// everything recorded.
-    fn passed(&self, hooks: &Hooks) -> u64 {
-        use std::sync::atomic::Ordering::Relaxed;
-        let metal = hooks.metal.as_ref().map_or(0, |metal| metal.take_passed());
-        self.passed.fetch_add(metal, Relaxed) + metal
     }
 
     fn begin(&mut self, argument: u32) -> Result<(), Unmodeled> {

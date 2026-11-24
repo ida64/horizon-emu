@@ -959,10 +959,11 @@ fn position_xyz_quad(kind: super::RendererKind) -> [u8; 4] {
     counted_xyz_quad(kind, false).0
 }
 
-/// [`position_xyz_quad`]'s pixel; with `count`, also what a one-word
-/// report of ZPASS_PIXEL_CNT gives after the quad, the counter enabled
-/// and reset before it.
-fn counted_xyz_quad(kind: super::RendererKind, count: bool) -> ([u8; 4], u32) {
+/// [`position_xyz_quad`]'s pixel; with `count`, also what three one-word
+/// reports of ZPASS_PIXEL_CNT hold after the channel signaled: one after
+/// the quad, the counter enabled and reset before it; one after the quad
+/// drawn again; and one after a reset and the quad drawn a third time.
+fn counted_xyz_quad(kind: super::RendererKind, count: bool) -> ([u8; 4], [u32; 3]) {
     const REPORT: u64 = 0x48_0000;
     let mut frame = Frame::sized_with(SIZE, SIZE, kind);
     let vs = program_bytes(
@@ -1009,25 +1010,37 @@ fn counted_xyz_quad(kind: super::RendererKind, count: bool) -> ([u8; 4], u32) {
         frame.method(0x1514, 1); // SET_ZPASS_PIXEL_COUNT ENABLE
         frame.method(0x1530, 1); // CLEAR_REPORT_VALUE ZPASS_PIXEL_CNT
     }
-    frame.method(0x1618, 7);
-    frame.method(0x0d74, 0);
-    frame.method(0x0d78, 4);
-    frame.method(0x1614, 0);
-    let mut counted = 0;
-    if count {
-        // SET_REPORT_SEMAPHORE: REPORT_ONLY of ZPASS_PIXEL_CNT, one word.
-        frame.method(0x1b00, (REPORT >> 32) as u32);
-        frame.method(0x1b04, REPORT as u32);
+    let quad = |frame: &mut Frame| {
+        frame.method(0x1618, 7);
+        frame.method(0x0d74, 0);
+        frame.method(0x0d78, 4);
+        frame.method(0x1614, 0);
+    };
+    // SET_REPORT_SEMAPHORE: REPORT_ONLY of ZPASS_PIXEL_CNT, one word.
+    let report = |frame: &mut Frame, index: u64| {
+        let address = REPORT + 4 * index;
+        frame.method(0x1b00, (address >> 32) as u32);
+        frame.method(0x1b04, address as u32);
         frame.method(0x1b08, 0);
         frame.method(0x1b0c, 2 | 2 << 23 | 1 << 28);
-        counted = frame.ram.word(REPORT);
+    };
+    quad(&mut frame);
+    if count {
+        report(&mut frame, 0);
+        quad(&mut frame);
+        report(&mut frame, 1);
+        frame.method(0x1530, 1);
+        quad(&mut frame);
+        report(&mut frame, 2);
     }
     frame.channel.flush(&frame.ram).unwrap();
+    let counted = [0, 1, 2].map(|index| frame.ram.word(REPORT + 4 * index));
     (frame.pixel(20, 20), counted)
 }
 
-/// ZPASS_PIXEL_CNT counts the pixels of a quad (24 by 40 of them), in
-/// both renderers.
+/// ZPASS_PIXEL_CNT counts the pixels of a quad (24 by 40 of them) each
+/// time it is drawn, from the last reset to each report, in both
+/// renderers.
 #[test]
 fn passed_samples_are_counted() {
     for kind in [super::RendererKind::Software, super::RendererKind::Metal] {
@@ -1036,7 +1049,7 @@ fn passed_samples_are_counted() {
         }
         assert_eq!(
             counted_xyz_quad(kind, true),
-            ([255, 128, 64, 255], 24 * 40),
+            ([255, 128, 64, 255], [960, 1920, 960]),
             "{kind:?}"
         );
     }
