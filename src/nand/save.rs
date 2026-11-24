@@ -1863,8 +1863,14 @@ impl Layers {
         };
 
         // Duplex: the master bitmap picks level-1 blocks, level 1 data
-        // blocks. The duplex index picks the master bitmap and, as the
-        // saves pair them, the master hashes.
+        // blocks. The duplex index picks the master bitmap only. The master
+        // hashes of the two integrity layers are always read from copy A:
+        // across the 103 system saves the guest's FS committed on three
+        // consoles' images (`wk/emu`, a UI machine, a fresh install), every
+        // one checks out with the A hashes and the bitmap the index picks,
+        // while pairing the index with the hashes failed every save whose
+        // index was 1 and whose B hashes differ (journal integrity level 1
+        // block 0). [inference: the B hashes are the previous commit's.]
         if &header[DUPLEX_HEADER..DUPLEX_HEADER + 4] != b"DPFS" {
             return Err(SaveError::BadMagic("duplex"));
         }
@@ -1876,7 +1882,10 @@ impl Layers {
             (L_IVFC_MASTER_A, HASH_SIZE),
             (L_FAT_IVFC_MASTER_A, HASH_SIZE),
         ]
-        .map(|(a, size)| (offset(a + selected), offset(a + 1 - selected), size));
+        .map(|(a, size)| {
+            let current = if a == L_DUPLEX_MASTER_A { selected } else { 0 };
+            (offset(a + current), offset(a + 1 - current), size)
+        });
         for (current, other, size) in masters {
             if [current, other]
                 .iter()

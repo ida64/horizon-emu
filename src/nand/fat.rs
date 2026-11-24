@@ -1180,16 +1180,22 @@ impl<S: Sectors> Fat32<S> {
             directory = match self.find(directory, name)? {
                 Some((true, cluster)) => cluster,
                 Some((false, _)) => return Err(FatError::NotADirectory(path.into())),
-                None if create => self.make_directory(directory, name, path)?,
+                None if create => self.make_directory(directory, name, path, ATTRIBUTE_DIRECTORY)?,
                 None => return Err(FatError::NotFound(path.into())),
             };
         }
         Ok(directory)
     }
 
-    fn make_directory(&mut self, parent: u32, name: &str, path: &str) -> Result<u32, FatError> {
+    fn make_directory(
+        &mut self,
+        parent: u32,
+        name: &str,
+        path: &str,
+        attributes: u8,
+    ) -> Result<u32, FatError> {
         let cluster = self.allocate(None, 1)?.start;
-        let added = self.add_entry(parent, name, path, ATTRIBUTE_DIRECTORY, cluster, 0);
+        let added = self.add_entry(parent, name, path, attributes, cluster, 0);
         if let Err(error) = added {
             self.release(cluster)?;
             return Err(error);
@@ -1251,6 +1257,51 @@ impl<S: Sectors> Fat32<S> {
             self.release(first)?;
         }
         written
+    }
+
+    /// Makes `path` the way FS's concatenation file system stores a file
+    /// that may be larger than FAT32 allows: a directory with the archive
+    /// attribute set, holding parts `00`, `01`, … of `part_size` bytes each
+    /// (the last shorter) that together are the `size` bytes `contents`
+    /// yields. NCM creates its content files this way (`CreateFile` with
+    /// option 1, BigFile: NCM `0x38F20` → `0x13360`); the layout and the
+    /// part size FS uses, 0xFFFF0000, are LibHac's `ConcatenationFileSystem`
+    /// \[public, not checked against FS\].
+    pub fn write_concatenated(
+        &mut self,
+        path: &str,
+        contents: &mut dyn Read,
+        size: u64,
+        part_size: u64,
+    ) -> Result<(), FatError> {
+        let mut components = path.split('/').filter(|component| !component.is_empty());
+        let name = components
+            .next_back()
+            .ok_or_else(|| FatError::InvalidName(path.into()))?;
+        let parent = self.walk(path, components, false)?;
+        validate_name(name)?;
+        if self.find(parent, name)?.is_some() {
+            return Err(FatError::Exists(path.into()));
+        }
+        if size.div_ceil(self.cluster_bytes() as u64) > self.free_clusters.into() {
+            return Err(FatError::NoSpace);
+        }
+        self.make_directory(
+            parent,
+            name,
+            path,
+            ATTRIBUTE_DIRECTORY | ATTRIBUTE_ARCHIVE,
+        )?;
+        let parts = size.div_ceil(part_size).max(1);
+        for part in 0..parts {
+            let length = part_size.min(size - part * part_size);
+            self.write_file(
+                &format!("{path}/{part:02}"),
+                &mut (&mut *contents).take(length),
+                length,
+            )?;
+        }
+        Ok(())
     }
 
     /// Chains clusters for `size` bytes of `contents` and fills them,

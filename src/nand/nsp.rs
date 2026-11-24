@@ -61,6 +61,9 @@ pub const NS_RECORD_SAVE: u64 = 0x8000_0000_0000_0040;
 /// Where in the user partition NCM keeps the contents of `BuiltInUser`.
 pub const USER_REGISTERED: &str = "/Contents/registered";
 pub const USER_PLACEHOLDERS: &str = "/Contents/placehld";
+/// Size of each part of a concatenation file: LibHac's
+/// `ConcatenationFileSystem` default, 0xFFFF0000 \[public\].
+const CONCATENATION_PART: u64 = 0xFFFF_0000;
 
 const META_TYPE_APPLICATION: u8 = 0x80;
 const META_TYPE_ADD_ON_CONTENT: u8 = 0x82;
@@ -1020,12 +1023,23 @@ pub fn install(
         let existing = match user.list(parent) {
             Ok(files) => files
                 .into_iter()
-                .find(|file| !file.directory && file.name.eq_ignore_ascii_case(name)),
+                .find(|file| file.name.eq_ignore_ascii_case(name)),
             Err(FatError::NotFound(_)) => None,
             Err(error) => return Err(filesystem(USER.partition)(error)),
         };
         if let Some(file) = existing {
-            if u64::from(file.size) != content.info.size {
+            // A concatenation file: a directory of parts.
+            let size = if file.directory {
+                user.list(&path)
+                    .map_err(filesystem(USER.partition))?
+                    .iter()
+                    .filter(|part| !part.directory)
+                    .map(|part| u64::from(part.size))
+                    .sum()
+            } else {
+                u64::from(file.size)
+            };
+            if size != content.info.size {
                 return Err(InstallError::ContentSize { path });
             }
             kept_paths.push(path);
@@ -1061,8 +1075,15 @@ pub fn install(
             total,
             progress: &mut progress,
         };
-        user.write_file(&path, &mut reader, content.info.size)
-            .map_err(filesystem(USER.partition))?;
+        // FAT32 holds files below 4 GiB; a larger content is stored the way
+        // FS's concatenation file system splits it, which is how NCM itself
+        // creates every content (see `Fat32::write_concatenated`).
+        if content.info.size > u64::from(u32::MAX) {
+            user.write_concatenated(&path, &mut reader, content.info.size, CONCATENATION_PART)
+        } else {
+            user.write_file(&path, &mut reader, content.info.size)
+        }
+        .map_err(filesystem(USER.partition))?;
     }
     user.finish().map_err(filesystem(USER.partition))?;
 
