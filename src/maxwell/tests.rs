@@ -886,6 +886,95 @@ fn alpha_test_discards_failing_fragments() {
     }
 }
 
+/// The target's memory after a quad drawn into the 64x64 target, then
+/// one of another color into a 32x32 target at the same memory, which
+/// covers it in part: what memory held of the first one stays where the
+/// second draws nothing. Each target pitch (`None`) or block linear with
+/// blocks of the given log2 GOBs high. The Metal renderer's fallback
+/// reasons.
+fn reshaped_target_frame(
+    kind: super::RendererKind,
+    first: Option<u32>,
+    second: Option<u32>,
+) -> (Vec<u8>, Vec<(String, u64)>) {
+    let elf = std::fs::read(STARTER).expect("starter ELF (fw_elf) must be present");
+    let mut frame = Frame::sized_with(SIZE, SIZE, kind);
+    frame.program(1, 0, starter_program(&elf, 0x4c0e00));
+    frame.program(5, 0x800, starter_program(&elf, 0x4be400));
+    frame.constants(0, 3, 0x30_0000, &ui2d_vertex_constants(&[]));
+    let quad = |frame: &mut Frame, color: [f32; 4], corners: [f32; 4], at: u64| {
+        frame.constants(4, 3, 0x30_1000 + at, &floats(&color));
+        let [x0, y0, x1, y1] = corners;
+        let quad = [x0, y0, 0.0, x1, y0, 0.0, x1, y1, 0.0, x0, y1, 0.0];
+        frame.vertices(0x40_0000 + at, 12, &quad, &[(0, 0x02)]);
+        frame.method(0x1618, 7);
+        frame.method(0x0d74, 0);
+        frame.method(0x0d78, 4);
+        frame.method(0x1614, 0);
+    };
+    if let Some(log2) = first {
+        frame.method(0x808, SIZE);
+        frame.method(0x814, log2 << 4);
+    }
+    quad(&mut frame, [0.25, 0.5, 1.0, 1.0], [-0.9, -0.8, 0.7, 0.6], 0);
+    // A semaphore release: the first target's write-back is recorded,
+    // and in memory once the GPU is done (the target the frame was
+    // cleared in, of another layout, before it).
+    frame.method(0x1b00, 0);
+    frame.method(0x1b04, 0x48_0000);
+    frame.method(0x1b08, 1);
+    frame.method(0x1b0c, 1 << 28);
+    bind_color_target(&mut frame.channel, &frame.ram, TARGET, 32, 32);
+    if let Some(log2) = second {
+        frame.method(0x808, 32);
+        frame.method(0x814, log2 << 4);
+    }
+    quad(&mut frame, [1.0, 0.25, 0.0, 1.0], [-0.6, -0.5, 0.2, 0.3], 0x100);
+    frame.channel.settle(&frame.ram).unwrap();
+    let fallbacks = frame
+        .channel
+        .hooks
+        .metal
+        .as_ref()
+        .map(|metal| metal.fallbacks().1)
+        .unwrap_or_default();
+    (frame.ram.bytes(TARGET, (SIZE * SIZE * 4) as usize), fallbacks)
+}
+
+/// A target drawn to at the memory of a rendered one of another shape
+/// takes its texels on the GPU and leaves memory as the software
+/// renderer does, pitch or block linear on either side.
+#[test]
+fn targets_of_another_shape_take_the_texels() {
+    use super::RendererKind::{Metal, Software};
+    for (first, second) in [
+        (None, None),
+        (None, Some(0)),
+        (None, Some(2)),
+        (Some(1), None),
+        (Some(1), Some(2)),
+        (Some(3), Some(0)),
+    ] {
+        let what = format!("{first:?} then {second:?}");
+        let software = reshaped_target_frame(Software, first, second).0;
+        let mut colors: Vec<&[u8]> = software.chunks(4).collect();
+        colors.sort();
+        colors.dedup();
+        assert!(colors.len() >= 3, "{what}: {colors:?}");
+        if !super::metal::available() {
+            continue;
+        }
+        let (metal, fallbacks) = reshaped_target_frame(Metal, first, second);
+        assert!(fallbacks.is_empty(), "{fallbacks:?}");
+        let differing = software
+            .chunks(4)
+            .zip(metal.chunks(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(differing, 0, "{what}: texels differ");
+    }
+}
+
 /// The ui2d solid quad (pixels 16..40 x 16..56, its corners counter-
 /// clockwise with the target's rows counted as y up) drawn by `kind` with
 /// back faces culled, `SET_WINDOW_ORIGIN` = `origin` and `OGL_SET_FRONT_FACE`
@@ -1226,6 +1315,125 @@ fn depth_test_matches_software() {
             }
         }
     }
+}
+
+/// With the tests mandated first (`SET_API_MANDATED_EARLY_Z`), a fragment
+/// the program kills after passing them keeps its depth update and is
+/// counted (`ZPASS_PIXEL_CNT`), its colors unwritten: a quad whose
+/// program kills every fragment, then a crossing quad behind it in part,
+/// over a ZF32 buffer of far depths. The color target, the depth buffer
+/// and the reports after each quad.
+fn mandated_kill_frame(kind: super::RendererKind) -> (Vec<u8>, Vec<u8>, [u32; 2]) {
+    const REPORT: u64 = 0x48_0000;
+    let elf = std::fs::read(STARTER).expect("starter ELF (fw_elf) must be present");
+    let mut frame = Frame::sized_with(SIZE, SIZE, kind);
+    let fill: Vec<u8> = (0..SIZE * SIZE).flat_map(|_| 0.95f32.to_le_bytes()).collect();
+    frame.ram.put(DEPTH, &fill);
+    frame.program(1, 0, starter_program(&elf, 0x4c0e00));
+    frame.constants(0, 3, 0x30_0000, &ui2d_vertex_constants(&[]));
+    for (offset, value) in [
+        (0x0fe0, (DEPTH >> 32) as u32),
+        (0x0fe4, DEPTH as u32),
+        (0x0fe8, 0x0a),
+        (0x0fec, 0),
+        (0x1228, SIZE),
+        (0x122c, SIZE),
+        (0x1230, 1),
+        (0x1538, 1),
+        (0x12cc, 1),
+        (0x130c, 0x201),
+        (0x12e8, 1),
+        (0x0210, 1),
+        (0x1514, 1),
+        (0x1530, 1),
+    ] {
+        frame.method(offset, value);
+    }
+    let kill = program_bytes(
+        0x1402,
+        &[(0x48, 15)],
+        &[
+            0,
+            0xe330_0000_0007_000f, // KIL
+            0xe300_0000_0007_000f, // EXIT
+            0xe240_0fff_ff07_000f, // BRA to itself
+        ],
+    );
+    let report = |frame: &mut Frame, index: u64| {
+        let address = REPORT + 4 * index;
+        frame.method(0x1b00, (address >> 32) as u32);
+        frame.method(0x1b04, address as u32);
+        frame.method(0x1b08, 0);
+        frame.method(0x1b0c, 2 | 2 << 23 | 1 << 28);
+    };
+    for (i, depths) in [[-0.9f32, 0.7, 0.1, -0.2], [0.8, -0.6, -0.1, 0.3]]
+        .into_iter()
+        .enumerate()
+    {
+        if i == 0 {
+            frame.program(5, 0x800, &kill);
+        } else {
+            frame.program(5, 0x900, starter_program(&elf, 0x4be400));
+            frame.constants(4, 3, 0x30_1000, &floats(&[1.0, 0.25, 0.0, 1.0]));
+        }
+        let corners = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
+        let quad: Vec<f32> = corners
+            .iter()
+            .zip(depths)
+            .flat_map(|(&[x, y], z)| [x, y, z])
+            .collect();
+        frame.vertices(0x40_0000 + 0x100 * i as u64, 12, &quad, &[(0, 0x02)]);
+        frame.method(0x1618, 7);
+        frame.method(0x0d74, 0);
+        frame.method(0x0d78, 4);
+        frame.method(0x1614, 0);
+        report(&mut frame, i as u64);
+    }
+    frame.channel.settle(&frame.ram).unwrap();
+    if let Some(metal) = &frame.channel.hooks.metal {
+        assert_eq!(metal.fallbacks().1, vec![], "Metal drew both quads");
+    }
+    (
+        frame.ram.bytes(TARGET, (SIZE * SIZE * 4) as usize),
+        frame.ram.bytes(DEPTH, fill.len()),
+        [0, 1].map(|index| frame.ram.word(REPORT + 4 * index)),
+    )
+}
+
+#[test]
+fn mandated_early_tests_hold_killed_fragments() {
+    use super::RendererKind::{Metal, Software};
+    let software = mandated_kill_frame(Software);
+    // The killed quad wrote depth everywhere, no color; the second quad
+    // shows where it is in front of it, and only there.
+    let mut colors: Vec<&[u8]> = software.0.chunks(4).collect();
+    colors.sort();
+    colors.dedup();
+    assert_eq!(colors.len(), 2, "{colors:?}");
+    assert_eq!(software.2[0], SIZE * SIZE, "every fragment of the killed quad counted");
+    // The counter is not reset between the reports.
+    let second = software.2[1] - software.2[0];
+    assert!(second > 0 && second < SIZE * SIZE, "{second}");
+    if !super::metal::available() {
+        return;
+    }
+    let metal = mandated_kill_frame(Metal);
+    let differing: Vec<(usize, &[u8], &[u8])> = software
+        .0
+        .chunks(4)
+        .zip(metal.0.chunks(4))
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(i, (a, b))| (i, a, b))
+        .collect();
+    assert!(
+        differing.is_empty(),
+        "{} colors differ: {:?}",
+        differing.len(),
+        &differing[..differing.len().min(4)]
+    );
+    assert!(software.1 == metal.1, "depth buffers differ");
+    assert_eq!(software.2, metal.2, "counts differ");
 }
 
 /// The 64x64 frame drawn by `kind` with a block-linear depth buffer of

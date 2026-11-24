@@ -206,6 +206,8 @@ pub struct Translated {
     /// The program updates that memory with `RED`, once per fragment:
     /// not to be run once per sample.
     pub atomics: bool,
+    /// The program may kill its fragment (`KIL`).
+    pub kills: bool,
     /// The program has instructions the interpreter refuses when they
     /// are executed (`VOTE`, `S2R` of a register a fragment has not, a
     /// `TXQ` of a handle that names no texture): the function takes the
@@ -1075,6 +1077,20 @@ impl Translated {
                 parameters.push("constant float* depth_bias [[buffer(27)]]".to_string());
             }
         }
+        // With the tests mandated first and passing fragments' depth
+        // written, a fragment the program drops afterwards keeps its
+        // depth update: it is held rather than discarded, and writes the
+        // colors the targets hold (no target blends then: `metal`).
+        let held = mandated
+            && depth.is_some_and(|(_, _, write, _)| write.is_some())
+            && (self.kills
+                || alpha_test
+                || multisample.is_some_and(|stage| stage.alpha_to_coverage));
+        if held {
+            for attachment in 0..outputs.len() {
+                parameters.push(format!("float4 fb{attachment} [[color({attachment})]]"));
+            }
+        }
         if multisample.is_some() && native.is_none() {
             parameters.push("uint layer [[render_target_array_index]]".to_string());
             parameters.push("constant uint* sample_positions [[buffer(26)]]".to_string());
@@ -1202,7 +1218,14 @@ impl Translated {
         {
             let _ = writeln!(
                 s,
-                "    {{ float z = {plane_depth};\n      const float lo = as_type<float>(depth_test[1]); const float hi = as_type<float>(depth_test[2]);\n      z = z < lo ? lo : (z > hi ? hi : z);\n      early_passed = compare(depth_test[0], z, {read});\n      uint alive = (({live}) && early_passed) ? 1u : 0u;\n      alive |= quad_shuffle_xor(alive, 1u); alive |= quad_shuffle_xor(alive, 2u);\n      if (alive == 0u) {{ discard_fragment(); Output none = {{}}; return none; }} }}"
+                "    {{ float z = {plane_depth};\n      const float lo = as_type<float>(depth_test[1]); const float hi = as_type<float>(depth_test[2]);\n      z = z < lo ? lo : (z > hi ? hi : z);\n      early_passed = compare(depth_test[0], z, {read});{}\n      uint alive = (({live}) && early_passed) ? 1u : 0u;\n      alive |= quad_shuffle_xor(alive, 1u); alive |= quad_shuffle_xor(alive, 2u);\n      if (alive == 0u) {{ discard_fragment(); Output none = {{}}; return none; }} }}",
+                // With the tests mandated first, a fragment passing them
+                // is counted whatever the program does with it.
+                if mandated && zpass {
+                    format!("\n      if (early_passed && ({live})) {{ atomic_fetch_add_explicit(&trap[1], 1u, memory_order_relaxed); }}")
+                } else {
+                    String::new()
+                }
             );
         }
         // With the test mandated first, a fragment that fails it is none
@@ -1237,13 +1260,19 @@ impl Translated {
             (None, None) => "!covers(tri, px, py)",
         };
         // A fragment counted as passing must have been dropped nowhere.
-        let discard = if zpass {
+        let discard = if held {
+            let _ = writeln!(s, "    bool held = false;");
+            "held = true;"
+        } else if zpass && !mandated {
             let _ = writeln!(s, "    bool dropped = false;");
             "discard_fragment(); dropped = true;"
         } else {
             "discard_fragment();"
         };
-        let _ = writeln!(s, "    if (killed || {covered}) {{ {discard} }}");
+        let _ = writeln!(
+            s,
+            "    if ({covered}) {{ discard_fragment(); }}\n    if (killed) {{ {discard} }}"
+        );
         // Output 0 alpha (the draw refuses an alpha test or alpha to
         // coverage that needs it when the program does not write it).
         let alpha = match registers[0] {
@@ -1304,7 +1333,7 @@ impl Translated {
             };
             let _ = writeln!(s, "      if (!passed) {{ {failed} }}\n      out.z = w; }}");
         }
-        if zpass {
+        if zpass && !mandated {
             let _ = writeln!(
                 s,
                 "    if (!dropped && ({live})) {{ atomic_fetch_add_explicit(&trap[1], 1u, memory_order_relaxed); }}"
@@ -1335,6 +1364,11 @@ impl Translated {
                 value
             };
             let _ = writeln!(s, "    out.c{attachment} = {value};");
+        }
+        if held {
+            for attachment in 0..outputs.len() {
+                let _ = writeln!(s, "    if (held) {{ out.c{attachment} = fb{attachment}; }}");
+            }
         }
         let _ = writeln!(s, "    return out;\n}}");
         s
@@ -1465,6 +1499,10 @@ pub fn translate(program: &Program, constant_buffer_1: &[u8]) -> Result<Translat
             .pcs
             .iter()
             .any(|&pc| program.code[(pc / 8) as usize].expect("instruction").op == Op::Red),
+        kills: flow.pcs.iter().any(|&pc| {
+            let inst = program.code[(pc / 8) as usize].expect("instruction");
+            inst.op == Op::Kil && !flow::inert(inst.word)
+        }),
         implicit_lod: writer.implicit_lod,
         compare: writer.compare,
         constant_buffer_1: flow.jump_tables.then(|| constant_buffer_1.to_vec()),

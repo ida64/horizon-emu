@@ -176,6 +176,7 @@
 pub mod blit;
 pub mod compute;
 mod format;
+mod relayout;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -544,6 +545,8 @@ struct State {
     dirty_extents: Vec<(u64, u64)>,
     /// The packing kernels (`State::pack`), plain and layered.
     pack_pipelines: HashMap<bool, Retained<ComputePipeline>>,
+    /// The relayout kernel ([`relayout`]), made when first needed.
+    relayout_pipeline: Option<Retained<ComputePipeline>>,
     /// The 2D blit kernel (`blit`), made once.
     blit_pipeline: Option<Retained<ComputePipeline>>,
 }
@@ -579,6 +582,7 @@ impl Default for State {
             globals: None,
             dirty_extents: Vec::new(),
             pack_pipelines: HashMap::new(),
+            relayout_pipeline: None,
             composites: HashMap::new(),
             versions: 0,
             convert_pipelines: [None, None],
@@ -1090,13 +1094,106 @@ impl Renderer {
                 faults,
                 bound,
                 extents,
-                release,
+                release: Some(release),
             });
             self.pending_count.store(state.pending.len(), Ordering::Relaxed);
             self.any_dirty.store(true, Ordering::Relaxed);
             self.extents_stale.store(true, Ordering::Relaxed);
             return Ok(None);
         }
+    }
+
+    /// Writes residents `indices` (those dirty) back as a signal does
+    /// ([`Renderer::release`]), with no release: the write-back is
+    /// finished once the GPU has done the work so far, and the residents
+    /// may be dropped meanwhile. One held on demand is written only where
+    /// memory still holds its mirror, as `write_back` does. `false` if
+    /// a resident cannot be packed on the GPU (nothing was changed then).
+    fn write_back_later(
+        &self,
+        memory: &dyn GpuMemory,
+        writes: &Writes,
+        indices: &[usize],
+    ) -> Result<bool, Unmodeled> {
+        use std::sync::atomic::Ordering;
+        // On-demand targets: has the guest reused the memory? (Compared
+        // without the state held: a read may write back.)
+        let mut wanted = Vec::with_capacity(indices.len());
+        for &index in indices {
+            let check = {
+                let state = self.state.lock().unwrap();
+                let resident = &state.residents[index];
+                if resident.dirty.is_none() {
+                    continue;
+                }
+                let (start, end) = resident.extent();
+                (resident.on_demand()
+                    && !resident
+                        .stamp
+                        .is_some_and(|stamp| writes.unchanged(stamp, start, end)))
+                .then_some(resident.surface)
+            };
+            if let Some(surface) = check {
+                let mirror = std::mem::replace(
+                    &mut self.state.lock().unwrap().residents[index].mirror,
+                    Window::empty(surface),
+                );
+                // Memory as it is, not as this resident's own write-back
+                // would make it ([`Coherent`] would write it back first).
+                self.writing_back.store(true, Ordering::Relaxed);
+                let same = matches!(mirror.matches(memory), Ok(true));
+                self.writing_back.store(false, Ordering::Relaxed);
+                let mut state = self.state.lock().unwrap();
+                state.residents[index].mirror = mirror;
+                if !same {
+                    // Forgotten: the memory has a new owner.
+                    let resident = &mut state.residents[index];
+                    resident.dirty = None;
+                    resident.stamp = None;
+                    continue;
+                }
+            }
+            wanted.push(index);
+        }
+        if wanted.is_empty() {
+            return Ok(true);
+        }
+        let mut state = self.state.lock().unwrap();
+        let mut packs = Vec::with_capacity(wanted.len());
+        for &index in &wanted {
+            match state.pack(index)? {
+                Some(packed) => packs.push((index, packed)),
+                None => return Ok(false),
+            }
+        }
+        let mut residents = Vec::with_capacity(packs.len());
+        let mut extents = Vec::with_capacity(packs.len());
+        for (index, packed) in packs {
+            let resident = &mut state.residents[index];
+            extents.push(resident.extent());
+            residents.push(PendingResident {
+                surface: resident.surface,
+                log2: resident.log2,
+                packed,
+            });
+            resident.dirty = None;
+            resident.pending += 1;
+        }
+        state.submit();
+        let command = state.submitted.clone();
+        state.pending.push_back(Pending {
+            command,
+            residents,
+            regions: Vec::new(),
+            reports: Vec::new(),
+            faults: Vec::new(),
+            bound: false,
+            extents,
+            release: None,
+        });
+        self.pending_count.store(state.pending.len(), Ordering::Relaxed);
+        self.any_dirty.store(true, Ordering::Relaxed);
+        Ok(true)
     }
 
     /// Finishes the write-backs of signals the GPU has done the work
@@ -1108,12 +1205,41 @@ impl Renderer {
         writes: &Writes,
         wait: bool,
     ) -> Result<(), Unmodeled> {
+        self.complete_over(memory, writes, wait, None)
+    }
+
+    /// [`Renderer::complete`]; with `range`, waiting for those up to the
+    /// last one that writes memory in it (none if none does).
+    fn complete_over(
+        &self,
+        memory: &dyn GpuMemory,
+        writes: &Writes,
+        wait: bool,
+        range: Option<(u64, u64)>,
+    ) -> Result<(), Unmodeled> {
         use objc2_metal::MTLCommandBufferStatus;
         use std::sync::atomic::Ordering;
         if self.pending_count.load(Ordering::Relaxed) == 0 {
             return Ok(());
         }
+        let mut remaining = match range {
+            Some(range) => {
+                let state = self.state.lock().unwrap();
+                state
+                    .pending
+                    .iter()
+                    .rposition(|pending| {
+                        pending.extents.iter().any(|&extent| overlap(extent, range))
+                    })
+                    .map_or(0, |last| last + 1)
+            }
+            None => usize::MAX,
+        };
         loop {
+            if remaining == 0 {
+                return Ok(());
+            }
+            remaining -= 1;
             let pending = {
                 let mut state = self.state.lock().unwrap();
                 let Some(front) = state.pending.front() else {
@@ -1142,17 +1268,18 @@ impl Renderer {
                 pending
             };
             match pending.release {
-                Release::Write { address, bytes } => {
+                Some(Release::Write { address, bytes }) => {
                     memory.write(address, &bytes).ok_or_else(|| {
                         Unmodeled(format!(
                             "semaphore write to unmapped GPU address {address:#x}"
                         ))
                     })?;
                 }
-                Release::Increment(index) => {
+                Some(Release::Increment(index)) => {
                     let increment = self.increment.lock().unwrap().clone();
                     increment.expect("checked when held")(index);
                 }
+                None => {}
             }
         }
     }
@@ -1180,7 +1307,11 @@ impl Renderer {
     ) -> Result<(), Unmodeled> {
         use std::sync::atomic::Ordering;
         // Earlier signals' write-backs come first.
-        self.complete(memory, writes, true)?;
+        let range = match scope {
+            Scope::Range(start, end) => Some((start, end)),
+            _ => None,
+        };
+        self.complete_over(memory, writes, true, range)?;
         let mut state = self.state.lock().unwrap();
         let mut wanted: Vec<bool> = state
             .residents
@@ -1395,13 +1526,7 @@ impl Renderer {
         }
         let range = (address, address + length as u64);
         // Memory a signal's write-back has yet to write.
-        let pending = self.pending_count.load(Ordering::Relaxed) != 0
-            && self.state.lock().unwrap().pending.iter().any(|pending| {
-                pending.extents.iter().any(|&extent| overlap(extent, range))
-            });
-        if pending {
-            self.complete(memory, writes, true)?;
-        }
+        self.complete_over(memory, writes, true, Some(range))?;
         let overlaps = {
             let mut state = self.state.lock().unwrap();
             if self.extents_stale.swap(false, Ordering::Relaxed) {
@@ -1609,8 +1734,12 @@ impl Renderer {
         // Tests mandated to come first (`raster::DepthOutput::early`) the
         // fragment function cannot make as the software renderer does:
         // the stencil test, the samples of a pixel of the plane path, or
-        // a fragment dropped after its depth was to be written or it was
-        // to be counted.
+        // a fragment dropped after its depth was written into blended
+        // targets (the function holds such a fragment, writing the
+        // colors the targets hold, `Translated::source`, which blending
+        // would change) \[assumption: reading a target in the fragment
+        // function and writing what was read stores the same bits, for
+        // the formats targets have here\].
         if let Some((_, depth)) = draw.depth
             && depth.early
         {
@@ -1623,9 +1752,10 @@ impl Renderer {
             let drops = draw.alpha_test.is_some()
                 || draw.multisample.alpha_to_coverage
                 || draw.program.mnemonics().any(|mnemonic| mnemonic == "KIL");
-            if drops && (depth.write || draw.count_passed) {
+            if drops && depth.write && draw.colors.iter().any(|color| color.blend.is_some()) {
                 return self.fall_back(
-                    "mandated early tests of fragments dropped afterwards".into(),
+                    "mandated early tests of fragments dropped afterwards into blended targets"
+                        .into(),
                 );
             }
         }
@@ -2846,7 +2976,31 @@ impl Renderer {
                 }))
             };
             if stale {
-                if !covered {
+                let indices: Vec<usize> = {
+                    let state = self.state.lock().unwrap();
+                    (0..state.residents.len())
+                        .filter(|&i| {
+                            let r = &state.residents[i];
+                            other(r, surface, format) && overlap(r.extent(), target)
+                        })
+                        .collect()
+                };
+                // A color target drawn to takes the residents' texels on
+                // the GPU ([`relayout`]).
+                if !covered
+                    && !overwrite
+                    && matches!(format, Content::Color(_))
+                    && log2 == [0, 0]
+                    && self.take_over(memory, writes, surface, format, &indices)?
+                {
+                    continue;
+                }
+                // Under a target replaced whole, what the residents hold
+                // beyond it reaches memory once the GPU is done, with no
+                // wait now; otherwise the target is loaded from memory
+                // holding it.
+                let later = !covered && overwrite && self.write_back_later(memory, writes, &indices)?;
+                if !covered && !later {
                     self.write_back(memory, writes, Scope::Range(target.0, target.1))?;
                 }
                 let mut state = self.state.lock().unwrap();
@@ -2945,12 +3099,14 @@ impl Renderer {
                     let on_demand = matches!(format, Content::Depth(_)) || log2 != [0, 0];
                     let texture =
                         new_target(Self::gpu(), pixel_format, full.x1, full.y1, layout.count())?;
-                    // A target the caller replaces whole is not uploaded,
-                    // and its mirror reads only GOBs it covers in part (one
-                    // held on demand needs a mirror equal to memory, as
-                    // above).
+                    // A target the caller replaces whole is neither read
+                    // nor uploaded: its mirror holds zeros, which a
+                    // write-back stores where its GOBs (pitch rows) reach
+                    // past the surface \[assumption: those bytes are the
+                    // surface's padding, which nothing reads\]. (One held
+                    // on demand needs a mirror equal to memory, as above.)
                     let (window, stamp) = if overwrite && !on_demand {
-                        (Window::load_to_overwrite(memory, surface, texels)?, None)
+                        (Window::blank(surface, texels), None)
                     } else {
                         let mut window = Window::load(memory, surface, texels)?;
                         let stamp = writes.stamp();
@@ -4595,7 +4751,9 @@ struct Pending {
     bound: bool,
     /// The memory written.
     extents: Vec<(u64, u64)>,
-    release: Release,
+    /// The release made once they are done (none for a write-back of
+    /// targets being dropped, [`Renderer::write_back_later`]).
+    release: Option<Release>,
 }
 
 struct PendingResident {
