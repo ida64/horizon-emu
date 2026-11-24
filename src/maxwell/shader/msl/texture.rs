@@ -1,7 +1,8 @@
 //! Inputs of a pixel program besides registers: interpolated attributes
-//! (`IPA`), indexed constant buffer reads (`LDC`) and texture samples
-//! (`TEXS`, `TEX`), as the interpreter executes them (`exec.rs`,
-//! `exec/tex.rs`, `exec/texture_vector.rs`).
+//! (`IPA`), indexed constant buffer reads (`LDC`), texture samples
+//! (`TEXS`, `TEX`) and the registers of the quad's other lanes (`SHFL`),
+//! as the interpreter executes them (`exec.rs`, `exec/tex.rs`,
+//! `exec/texture_vector.rs`).
 //!
 //! Textures are bound per handle offset: the instruction's 13-bit index
 //! times 4 is the byte offset of the 32-bit handle in the bound-texture
@@ -32,13 +33,14 @@
 //! (`spirv_msl.cpp`, `needs_frag_discard_checks`), which suggests they are
 //! performed [unverified].
 
-use super::super::exec::{bit, bits, sext};
+use super::super::exec::{bit, bits, fswzadd_factors, quad_shuffle_lane, sext};
 use super::{PT, RZ, SLOTS, Writer};
 
 impl Writer<'_> {
-    /// `IPA`: the attribute's plane at the pixel center (`position.xy` of a
-    /// single-sample fragment is the center), optionally multiplied by a
-    /// register, optionally saturated.
+    /// `IPA`: the attribute's plane at the pixel center (`position.xy`)
+    /// or, CENTROID, at the centroid (`cpx`, `cpy`, see
+    /// `Translated::source` and `exec::Machine::ipa`), optionally
+    /// multiplied by a register, optionally saturated.
     pub(super) fn ipa(&mut self) -> Result<(), String> {
         let w = self.word;
         let mode = bits(w, 54, 2);
@@ -47,7 +49,7 @@ impl Writer<'_> {
             &format!("mode {}", ["", "", "CONSTANT", "SC"][mode as usize]),
         )?;
         self.require(!bit(w, 38), "IDX")?;
-        self.require(bits(w, 52, 2) == 0, "sample mode")?;
+        self.require(bits(w, 52, 2) <= 1, "sample mode OFFSET")?;
         self.require(bits(w, 47, 4) == PT, "predicate operand")?;
         self.require(bits(w, 39, 8) == RZ, "sample-offset register")?;
         let attribute = bits(w, 28, 10);
@@ -62,7 +64,12 @@ impl Writer<'_> {
             }
         };
         let (rd, rb) = (bits(w, 0, 8), bits(w, 20, 8));
-        let mut value = format!("plane(planes, plane_base + {plane}u, px, py)");
+        let (x, y) = if bits(w, 52, 2) == 1 {
+            ("cpx", "cpy")
+        } else {
+            ("px", "py")
+        };
+        let mut value = format!("plane(planes, plane_base + {plane}u, {x}, {y})");
         if mode == 1 {
             let b = self.read(rb);
             value = format!("({value} * as_type<float>({b}))");
@@ -71,6 +78,71 @@ impl Writer<'_> {
             value = format!("sat({value})");
         }
         self.set(rd, &format!("as_type<uint>({value})"));
+        Ok(())
+    }
+
+    /// `SHFL` with immediate lane and mask operands (`exec::Machine::shfl`):
+    /// the quad lane each lane reads is fixed by them
+    /// (`exec::quad_shuffle_lane`), and read with `quad_shuffle`, whose
+    /// lane `(x & 1) | (y & 1) << 1` of a fragment quad is the
+    /// interpreter's lane order [the `shfl_matches_interpreter` test
+    /// checks it on the GPU].
+    pub(super) fn shfl(&mut self) -> Result<(), String> {
+        let w = self.word;
+        self.require(bit(w, 28) && bit(w, 29), "lane or mask in a register")?;
+        let (mode, b, c) = (bits(w, 30, 2), bits(w, 20, 5), bits(w, 34, 13));
+        let mut sources = Vec::with_capacity(4);
+        for lane in 0..4 {
+            let Some(picked) = quad_shuffle_lane(mode, lane, b, c) else {
+                return self.refuse("across the quads of a warp");
+            };
+            // 4: out of range, the lane's own value.
+            sources.push(format!("{}u", picked.unwrap_or(4)));
+        }
+        let a = self.read(bits(w, 8, 8));
+        let (rd, pd) = (bits(w, 0, 8), bits(w, 48, 3));
+        self.line(&format!(
+            "{{ const uint shfl_q = (uint(px) & 1u) | ((uint(py) & 1u) << 1u); const uint shfl_s = shfl_q == 0u ? {} : shfl_q == 1u ? {} : shfl_q == 2u ? {} : {}; const uint shfl_v = quad_shuffle({a}, ushort(shfl_s < 4u ? shfl_s : shfl_q));",
+            sources[0], sources[1], sources[2], sources[3]
+        ));
+        self.set(rd, "shfl_v");
+        self.set_pred(pd, "shfl_s < 4u");
+        self.line("}");
+        Ok(())
+    }
+
+    /// `FSWZADD` (`exec::Machine::fswzadd`): each lane's factors by its
+    /// quad lane, numbered as `shfl`'s.
+    pub(super) fn fswzadd(&mut self) -> Result<(), String> {
+        let w = self.word;
+        self.require(!bit(w, 38), "NDV")?;
+        self.require(bits(w, 39, 2) == 0, "rounding mode")?;
+        self.require(!bit(w, 47), "condition code write")?;
+        let ftz = |value: &str| {
+            if bit(w, 44) {
+                format!("ftz({value})")
+            } else {
+                value.to_string()
+            }
+        };
+        let a = ftz(&format!("as_type<float>({})", self.read(bits(w, 8, 8))));
+        let b = ftz(&format!("as_type<float>({})", self.read(bits(w, 20, 8))));
+        let factors = |i: usize| {
+            (0..4)
+                .map(|lane| {
+                    let pair = fswzadd_factors((bits(w, 28, 8) >> (2 * lane)) & 3);
+                    format!("{:?}f", if i == 0 { pair.0 } else { pair.1 })
+                })
+                .collect::<Vec<_>>()
+        };
+        let (ka, kb) = (factors(0), factors(1));
+        self.line(&format!(
+            "{{ const uint fswz_q = (uint(px) & 1u) | ((uint(py) & 1u) << 1u); const float fswz_ka = fswz_q == 0u ? {} : fswz_q == 1u ? {} : fswz_q == 2u ? {} : {}; const float fswz_kb = fswz_q == 0u ? {} : fswz_q == 1u ? {} : fswz_q == 2u ? {} : {};",
+            ka[0], ka[1], ka[2], ka[3], kb[0], kb[1], kb[2], kb[3]
+        ));
+        let value = ftz(&format!("{a} * fswz_ka + {b} * fswz_kb"));
+        self.set(bits(w, 0, 8), &format!("as_type<uint>({value})"));
+        self.line("}");
         Ok(())
     }
 

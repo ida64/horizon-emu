@@ -13,6 +13,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::blend::{Blend, Factor, Operation};
+use super::multisample::Samples;
 use super::raster::{self, Backend, BandSet, ColorOutput, Compare, DepthOutput, Triangle};
 use super::resources::{DrawTextures, Pools, ProgramCache, TextureCache};
 use super::shader::{self, Attributes, Env, Interpolation, Plane, Program};
@@ -175,7 +176,13 @@ const SET_SCISSOR_VERTICAL: u32 = 0x0e08;
 const SET_VIEWPORT_Z_CLIP: u32 = 0x0d7c;
 const SET_FRONT_POLYGON_MODE: u32 = 0x0dac;
 const SET_BACK_POLYGON_MODE: u32 = 0x0db0;
+const SET_POLY_OFFSET_POINT: u32 = 0x0dc0;
+const SET_POLY_OFFSET_LINE: u32 = 0x0dc4;
 const SET_POLY_OFFSET_FILL: u32 = 0x0dc8;
+const SET_DEPTH_BIAS_CONTROL: u32 = 0x1110;
+const SET_SLOPE_SCALE_DEPTH_BIAS: u32 = 0x156c;
+const SET_DEPTH_BIAS: u32 = 0x15bc;
+const SET_DEPTH_BIAS_CLAMP: u32 = 0x187c;
 const SET_SINGLE_CT_WRITE_CONTROL: u32 = 0x0f90;
 const SET_CT_MRT_ENABLE: u32 = 0x0fac;
 const SET_ZT_A: u32 = 0x0fe0;
@@ -202,6 +209,10 @@ const SET_BLEND_SEPARATE_FOR_ALPHA: u32 = 0x133c;
 const SET_BLEND_COLOR_OP: u32 = 0x1340;
 const SET_BLEND: u32 = 0x1360;
 const SET_STENCIL_TEST: u32 = 0x1380;
+const SET_STENCIL_OP_FAIL: u32 = 0x1384;
+const SET_BACK_STENCIL_FUNC_REF: u32 = 0x0f54;
+const SET_TWO_SIDED_STENCIL_TEST: u32 = 0x1594;
+const SET_BACK_STENCIL_OP_FAIL: u32 = 0x1598;
 const SET_PS_SATURATE: u32 = 0x13a8;
 const SET_WINDOW_ORIGIN: u32 = 0x13ac;
 const SET_USER_CLIP_ENABLE: u32 = 0x1510;
@@ -252,6 +263,15 @@ const SET_ANTI_ALIASED_POINT: u32 = 0x1658;
 const SET_POINT_CENTER_MODE: u32 = 0x165c;
 const SET_LINE_STIPPLE: u32 = 0x166c;
 const SET_ATTRIBUTE_POINT_SIZE: u32 = 0x1910;
+const SET_HYBRID_ANTI_ALIAS_CONTROL: u32 = 0x0754;
+const SET_SAMPLE_MASK: u32 = 0x0fa4;
+const SET_COLOR_TARGET_SAMPLE_MASK: u32 = 0x0fa8;
+const SET_NONMULTISAMPLED_Z: u32 = 0x0fb0;
+const SET_TIR: u32 = 0x0fb4;
+const SET_SAMPLE_MASK_X0_Y0: u32 = 0x0fbc;
+const SET_ANTI_ALIAS_SAMPLE_POSITIONS: u32 = 0x11e0;
+const SET_COVERAGE_TO_COLOR: u32 = 0x11f8;
+const SET_ANTI_ALIAS_ALPHA_CONTROL: u32 = 0x153c;
 
 /// Pipeline stages (`SET_PIPELINE_*(j)`): 0 vertex A (cull before fetch),
 /// 1 vertex B, 2 tessellation init, 3 tessellation, 4 geometry, 5 pixel.
@@ -384,6 +404,121 @@ pub fn scissor(r: Registers<'_>) -> Option<Rect> {
     })
 }
 
+/// The sample mode of the bound targets (`SET_ANTI_ALIAS` SAMPLES), with
+/// every sample at the pixel center: what clears, which write every
+/// sample of a pixel, need of it.
+pub fn sample_mode(r: Registers<'_>) -> Result<Samples, Unmodeled> {
+    let mode = r.get(SET_ANTI_ALIAS) & 0xF;
+    Samples::from_mode(mode).map_err(|what| refuse(what, SET_ANTI_ALIAS, r.get(SET_ANTI_ALIAS)))
+}
+
+/// How a draw rasterizes into multisampled targets.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Multisample {
+    pub samples: Samples,
+    /// `SET_NONMULTISAMPLED_Z` AT_PIXEL_CENTER: every sample takes the
+    /// depth at the pixel center, not at its own position.
+    pub center_depth: bool,
+    /// `SET_ANTI_ALIAS_ALPHA_CONTROL` ALPHA_TO_COVERAGE: output 0 alpha
+    /// limits the samples a fragment covers
+    /// ([`super::raster::alpha_coverage`]).
+    pub alpha_to_coverage: bool,
+    /// ALPHA_TO_ONE: then every output's alpha is 1.
+    pub alpha_to_one: bool,
+}
+
+impl Multisample {
+    /// One sample at the pixel center, nothing else.
+    pub const SINGLE: Multisample = Multisample {
+        samples: Samples::SINGLE,
+        center_depth: false,
+        alpha_to_coverage: false,
+        alpha_to_one: false,
+    };
+}
+
+/// The multisample state of a draw [public: NVIDIA open-gpu-doc
+/// `clb197.h` for the registers; see [`super::multisample`] for layout
+/// and positions].
+///
+/// With more than one sample per pixel, coverage is taken at each
+/// sample's position (`SET_ANTI_ALIAS_SAMPLE_POSITIONS`), or with
+/// multisample rasterization off (`SET_ANTI_ALIAS_ENABLE`) at the pixel
+/// center for all of them [public: OpenGL 4.6 core, 14.3.1
+/// "Multisampling": with MULTISAMPLE disabled the pixel's samples all
+/// take the single-sample coverage and values]. The pixel program runs
+/// once per covered pixel (`SET_HYBRID_ANTI_ALIAS_CONTROL` PASSES 1: one
+/// shading pass, the pixel rate), its inputs at the pixel center or, for
+/// `IPA` CENTROID, at the centroid ([`super::raster::centroid`]). Depth,
+/// stencil and blending run per covered sample, depth taken at the
+/// sample (`SET_NONMULTISAMPLED_Z` PER_SAMPLE) or at the pixel center
+/// (AT_PIXEL_CENTER) [public: Direct3D 11 functional specification, 3.5
+/// "Multisample" (per-sample depth, pixel-rate shading)].
+///
+/// With multisample rasterization on, `SET_ANTI_ALIAS_ALPHA_CONTROL`
+/// ALPHA_TO_COVERAGE drops samples by output 0 alpha and ALPHA_TO_ONE
+/// then sets every output's alpha to 1, after the alpha test [public:
+/// OpenGL 4.6 core, 17.3.1 "Alpha To Coverage" (applied only with
+/// multisampling on and a multisampled framebuffer; alpha to one
+/// replaces the alpha of every color output)]; the coverage is
+/// [`super::raster::alpha_coverage`].
+///
+/// Refused with more than one sample, as not modeled: shading passes
+/// beyond one (supersampling), target-independent rasterization
+/// (`SET_TIR`), sample masks that drop samples (`SET_SAMPLE_MASK` with
+/// RASTER_OUT or COLOR_TARGET and the masks it enables) and coverage to
+/// color. Minecraft's world rendering sets none of them (2X1_D3D; TIR
+/// off, one pass, all masks 0xffff).
+pub fn multisample(r: Registers<'_>) -> Result<Multisample, Unmodeled> {
+    let samples = sample_mode(r)?;
+    if samples.is_single() {
+        return Ok(Multisample::SINGLE);
+    }
+    let n = samples.count() as u32;
+    let all = (1u32 << n) - 1;
+    require(r, "target-independent rasterization", SET_TIR, 3, 0)?;
+    let hybrid = r.get(SET_HYBRID_ANTI_ALIAS_CONTROL);
+    if hybrid & 0xF > 1 || hybrid & 0x20 != 0 {
+        return Err(refuse(
+            "multisample shading passes",
+            SET_HYBRID_ANTI_ALIAS_CONTROL,
+            hybrid,
+        ));
+    }
+    let mask_control = r.get(SET_SAMPLE_MASK);
+    if mask_control & 1 != 0 {
+        for i in 0..4 {
+            let offset = SET_SAMPLE_MASK_X0_Y0 + 4 * i;
+            if r.get(offset) & all != all {
+                return Err(refuse("raster sample mask", offset, r.get(offset)));
+            }
+        }
+    }
+    if mask_control & 0x10 != 0 && r.get(SET_COLOR_TARGET_SAMPLE_MASK) & all != all {
+        return Err(refuse(
+            "color target sample mask",
+            SET_COLOR_TARGET_SAMPLE_MASK,
+            r.get(SET_COLOR_TARGET_SAMPLE_MASK),
+        ));
+    }
+    require(r, "coverage to color", SET_COVERAGE_TO_COLOR, 1, 0)?;
+    let multisampling = r.enabled(SET_ANTI_ALIAS_ENABLE);
+    let samples = if multisampling {
+        samples.with_positions(std::array::from_fn(|i| {
+            r.get(SET_ANTI_ALIAS_SAMPLE_POSITIONS + 4 * i as u32)
+        }))?
+    } else {
+        samples
+    };
+    let alpha = r.get(SET_ANTI_ALIAS_ALPHA_CONTROL);
+    Ok(Multisample {
+        samples,
+        center_depth: r.enabled(SET_NONMULTISAMPLED_Z),
+        alpha_to_coverage: multisampling && alpha & 1 != 0,
+        alpha_to_one: multisampling && alpha & 0x10 != 0,
+    })
+}
+
 /// State this model refuses rather than ignore: features whose effect is
 /// not implemented. Checked at every draw.
 fn check_unmodeled_state(r: Registers<'_>) -> Result<(), Unmodeled> {
@@ -395,15 +530,14 @@ fn check_unmodeled_state(r: Registers<'_>) -> Result<(), Unmodeled> {
     require(r, "window offset x", SET_WINDOW_OFFSET_X, !0, 0)?;
     require(r, "window offset y", SET_WINDOW_OFFSET_Y, !0, 0)?;
     require(r, "window clip", SET_WINDOW_CLIP_ENABLE, 1, 0)?;
-    require(r, "stencil test", SET_STENCIL_TEST, 1, 0)?;
+    // SET_STENCIL_TEST: applied in `rasterize` (`stencil_state`).
     require(r, "depth bounds test", SET_DEPTH_BOUNDS_TEST, 1, 0)?;
     require(r, "logic operation", SET_LOGIC_OP, 1, 0)?;
     // SET_USER_CLIP_ENABLE: applied in `setup` to the clip distances the
     // vertex shader writes. NVN's init blast enables all eight.
-    require(r, "polygon offset (fill)", SET_POLY_OFFSET_FILL, 1, 0)?;
+    // SET_POLY_OFFSET_*: applied in `rasterize` (`depth_bias`).
     require(r, "stream output", SET_STREAM_OUTPUT, 1, 0)?;
-    // SET_ANTI_ALIAS SAMPLES: only 1X1 (0).
-    require(r, "multisampling", SET_ANTI_ALIAS, 0xF, 0)?;
+    // SET_ANTI_ALIAS: applied in `rasterize` (`multisample`).
     // SET_FRONT/BACK_POLYGON_MODE: only FILL (0x1B02).
     require(r, "front polygon mode", SET_FRONT_POLYGON_MODE, !0, 0x1B02)?;
     require(r, "back polygon mode", SET_BACK_POLYGON_MODE, !0, 0x1B02)?;
@@ -1181,41 +1315,64 @@ fn rasterize(
     // test enabled (eden `fixed_pipeline_state.cpp`: `depth_enabled` from
     // `zeta_enable`, `depth_test_enable` passed through). NVIDIA documents
     // nothing for the combination [assumption: the hardware follows the
-    // APIs].
-    let depth_target = if r.enabled(SET_DEPTH_TEST) {
+    // APIs]. The stencil test likewise needs a target of a format with
+    // stencil (17.3.3: without a stencil buffer it passes and writes
+    // nothing).
+    let depth_test = r.enabled(SET_DEPTH_TEST);
+    let stencil_test = r.enabled(SET_STENCIL_TEST);
+    let depth_target = if depth_test || stencil_test {
         depth_target(r)?
     } else {
         None
     };
-    let depth = if let Some((surface, format)) = depth_target {
-        let control = r.get(SET_VIEWPORT_CLIP_CONTROL);
-        // PIXEL_MIN_Z / PIXEL_MAX_Z: CLAMP (1) only.
-        if control & 0x18 != 0x18 {
-            return Err(refuse(
-                "per-pixel depth clipping",
-                SET_VIEWPORT_CLIP_CONTROL,
-                control,
-            ));
+    let depth = match depth_target {
+        Some((surface, format)) if depth_test || format.has_stencil() => {
+            let clamp = if depth_test {
+                let control = r.get(SET_VIEWPORT_CLIP_CONTROL);
+                // PIXEL_MIN_Z / PIXEL_MAX_Z: CLAMP (1) only.
+                if control & 0x18 != 0x18 {
+                    return Err(refuse(
+                        "per-pixel depth clipping",
+                        SET_VIEWPORT_CLIP_CONTROL,
+                        control,
+                    ));
+                }
+                if control & 1 != 0 {
+                    (0.0, 1.0)
+                } else {
+                    (
+                        r.float(SET_VIEWPORT_CLIP_MIN_Z),
+                        r.float(SET_VIEWPORT_CLIP_MAX_Z),
+                    )
+                }
+            } else {
+                (0.0, 1.0)
+            };
+            let (compare, write) = if depth_test {
+                (
+                    Compare::from_raw(r.get(SET_DEPTH_FUNC))?,
+                    r.enabled(SET_DEPTH_WRITE),
+                )
+            } else {
+                (Compare::Always, false)
+            };
+            let stencil = if stencil_test && format.has_stencil() {
+                Some(stencil_state(r)?)
+            } else {
+                None
+            };
+            Some((
+                surface,
+                DepthOutput {
+                    format,
+                    compare,
+                    write,
+                    clamp,
+                    stencil,
+                },
+            ))
         }
-        let clamp = if control & 1 != 0 {
-            (0.0, 1.0)
-        } else {
-            (
-                r.float(SET_VIEWPORT_CLIP_MIN_Z),
-                r.float(SET_VIEWPORT_CLIP_MAX_Z),
-            )
-        };
-        Some((
-            surface,
-            DepthOutput {
-                format,
-                compare: Compare::from_raw(r.get(SET_DEPTH_FUNC))?,
-                write: r.enabled(SET_DEPTH_WRITE),
-                clamp,
-            },
-        ))
-    } else {
-        None
+        _ => None,
     };
 
     // SET_ALPHA_TEST, SET_ALPHA_REF (0x1310, a float), SET_ALPHA_FUNC
@@ -1245,8 +1402,26 @@ fn rasterize(
     } else {
         None
     };
+    let multisample = multisample(r)?;
+    // Alpha to coverage reads output 0 alpha, as the alpha test does.
+    if multisample.alpha_to_coverage && pixel.header().ps_color_mask(0) & 8 == 0 {
+        return Err(refuse(
+            "alpha to coverage of a pixel program that writes no output 0 alpha",
+            SET_ANTI_ALIAS_ALPHA_CONTROL,
+            r.get(SET_ANTI_ALIAS_ALPHA_CONTROL),
+        ));
+    }
+    let samples = multisample.samples;
     // Clipping, viewport transform and primitive setup.
-    let triangles = setup(r, batch, vertices, &varyings, vertex, pixel, clip)?;
+    let mut triangles = setup(r, batch, vertices, &varyings, vertex, pixel, clip)?;
+    if let Some((_, output)) = &depth
+        && let Some(bias) = depth_bias(r, batch.topology, output.format)
+    {
+        for triangle in &mut triangles {
+            let offset = bias(&triangle.depth, triangle.max_depth());
+            triangle.depth.base += offset;
+        }
+    }
     if triangles.is_empty() || (colors.is_empty() && depth.is_none()) {
         return Ok(());
     }
@@ -1266,21 +1441,14 @@ fn rasterize(
         })
         .unwrap_or(clip);
     bounds = bounds.intersect(&clip);
-    for (surface, _) in &targets {
-        bounds = bounds.intersect(&Rect {
-            x0: 0,
-            y0: 0,
-            x1: surface.width,
-            y1: surface.height,
-        });
-    }
-    if let Some((surface, _)) = &depth {
-        bounds = bounds.intersect(&Rect {
-            x0: 0,
-            y0: 0,
-            x1: surface.width,
-            y1: surface.height,
-        });
+    // Targets hold their samples as texels (see `multisample`): bounds
+    // are pixels, windows the texels of their samples.
+    for surface in targets
+        .iter()
+        .map(|(s, _)| s)
+        .chain(depth.iter().map(|(s, _)| s))
+    {
+        bounds = bounds.intersect(&samples.pixels(surface));
     }
     if bounds.is_empty() {
         return Ok(());
@@ -1300,6 +1468,7 @@ fn rasterize(
             texture_buffer_index: r.get(SET_BINDLESS_TEXTURE) & 0x1F,
             alpha_test,
             depth,
+            multisample,
         };
         if metal.draw(context.memory, context.writes, &draw)? {
             return Ok(());
@@ -1308,11 +1477,12 @@ fn rasterize(
         // of Metal's work is made visible before it starts.
         metal.flush(context.memory, context.writes)?;
     }
+    let texels = samples.texels(bounds);
     for (surface, _) in &targets {
-        windows.push(Window::load(context.memory, *surface, bounds)?);
+        windows.push(Window::load(context.memory, *surface, texels)?);
     }
     let mut depth_window = match &depth {
-        Some((surface, _)) => Some(Window::load(context.memory, *surface, bounds)?),
+        Some((surface, _)) => Some(Window::load(context.memory, *surface, texels)?),
         None => None,
     };
 
@@ -1325,6 +1495,7 @@ fn rasterize(
         // SET_BLEND_FLOAT_OPTION (0x19c0) ZERO_TIMES_ANYTHING_IS_ZERO.
         blend_zero_rule: r.get(0x19c0) & 1 != 0,
         clip: bounds,
+        multisample,
     };
 
     // Bands of all windows, grouped by row.
@@ -1395,6 +1566,119 @@ fn rasterize(
         window.store(context.memory)?;
     }
     Ok(())
+}
+
+/// Polygon offset (depth bias) of a draw's primitives, if enabled for
+/// their kind (`SET_POLY_OFFSET_FILL` for triangles, `_LINE` for lines,
+/// `_POINT` for points; the polygon mode is always FILL): a function of
+/// a primitive's depth plane and its largest depth giving the offset
+/// added to its depth before the depth test.
+///
+/// The offset is `SET_DEPTH_BIAS` × r + `SET_SLOPE_SCALE_DEPTH_BIAS` ×
+/// max(|∂z/∂x|, |∂z/∂y|), clamped to `SET_DEPTH_BIAS_CLAMP` when that is
+/// not 0 (a positive clamp bounds it from above, a negative one from
+/// below) [public: Vulkan 1.3, 28.10.7 "Depth Bias"; Direct3D 11,
+/// "Depth Bias"]. r, the format's least representable value, is 2^-n for
+/// n-bit UNORM depth, and for float depth 2^(e - 23) with e the exponent
+/// of the primitive's largest depth (`SET_DEPTH_BIAS_CONTROL`
+/// DEPTH_FORMAT_DEPENDENT), or 2^-24 without it [public: NVK
+/// `nvk_cmd_draw.c` passes Vulkan's constant factor, slope factor and
+/// clamp unscaled, and maps `VK_EXT_depth_bias_control`'s
+/// LEAST_REPRESENTABLE_VALUE_FORMAT to DEPTH_FORMAT_DEPENDENT_TRUE and
+/// LEAST_REPRESENTABLE_VALUE_FORCE_UNORM (r of a 24-bit UNORM) to
+/// FALSE]. The offset applies to the interpolated depth only: a depth the
+/// pixel program writes is used as written, and the program's own depth
+/// input (a\[0x78\]) is the unbiased one.
+fn depth_bias(
+    r: Registers<'_>,
+    topology: Topology,
+    format: DepthFormat,
+) -> Option<impl Fn(&Plane, f32) -> f32> {
+    let enable = match topology {
+        Topology::Points => SET_POLY_OFFSET_POINT,
+        Topology::Lines | Topology::LineLoop | Topology::LineStrip => SET_POLY_OFFSET_LINE,
+        _ => SET_POLY_OFFSET_FILL,
+    };
+    if !r.enabled(enable) {
+        return None;
+    }
+    let constant = r.float(SET_DEPTH_BIAS);
+    let slope = r.float(SET_SLOPE_SCALE_DEPTH_BIAS);
+    let clamp = r.float(SET_DEPTH_BIAS_CLAMP);
+    let format_dependent = r.enabled(SET_DEPTH_BIAS_CONTROL);
+    let unit = match format {
+        DepthFormat::Z16Unorm => Some(2f32.powi(-16)),
+        DepthFormat::Z24S8 | DepthFormat::X8Z24 | DepthFormat::S8Z24 => Some(2f32.powi(-24)),
+        DepthFormat::Z32Float | DepthFormat::Z32FloatX24S8 => {
+            (!format_dependent).then(|| 2f32.powi(-24))
+        }
+    };
+    Some(move |plane: &Plane, max_depth: f32| {
+        let r = unit.unwrap_or_else(|| {
+            // 2^(exponent of the largest depth - 23); 0 for a zero or
+            // subnormal depth.
+            let exponent = (max_depth.abs().to_bits() >> 23) as i32 - 127;
+            if exponent < -126 {
+                0.0
+            } else {
+                2f32.powi(exponent - 23)
+            }
+        });
+        let bias = constant * r + slope * plane.dx.abs().max(plane.dy.abs());
+        if clamp > 0.0 {
+            bias.min(clamp)
+        } else if clamp < 0.0 {
+            bias.max(clamp)
+        } else {
+            bias
+        }
+    })
+}
+
+/// The stencil test state. Front: `SET_STENCIL_OP_FAIL` / `ZFAIL` /
+/// `ZPASS`, `SET_STENCIL_FUNC`, `_FUNC_REF`, `_FUNC_MASK`, `_MASK`
+/// (0x1384-0x139c, one word apart). Back, used for back faces only with
+/// `SET_TWO_SIDED_STENCIL_TEST`: `SET_BACK_STENCIL_OP_FAIL` / `ZFAIL` /
+/// `ZPASS`, `SET_BACK_STENCIL_FUNC` (0x1598-0x15a4) and
+/// `SET_BACK_STENCIL_FUNC_REF`, `_MASK`, `_FUNC_MASK` (0x0f54-0x0f5c, the
+/// write mask before the compare mask) [public: NVIDIA open-gpu-doc
+/// `clb197.h`; Ryujinx `StencilBackMasks` reads the same order].
+fn stencil_state(r: Registers<'_>) -> Result<raster::Stencil, Unmodeled> {
+    let op = |offset: u32| {
+        let raw = r.get(offset);
+        raster::StencilOp::from_raw(raw).ok_or_else(|| refuse("stencil operation", offset, raw))
+    };
+    let compare = |offset: u32| {
+        let raw = r.get(offset);
+        Compare::from_raw(raw).map_err(|_| refuse("stencil function", offset, raw))
+    };
+    let byte = |offset: u32| r.get(offset) as u8;
+    let f = SET_STENCIL_OP_FAIL;
+    let front = raster::StencilFace {
+        fail: op(f)?,
+        depth_fail: op(f + 4)?,
+        pass: op(f + 8)?,
+        compare: compare(f + 0xc)?,
+        reference: byte(f + 0x10),
+        compare_mask: byte(f + 0x14),
+        write_mask: byte(f + 0x18),
+    };
+    let back = if r.enabled(SET_TWO_SIDED_STENCIL_TEST) {
+        let b = SET_BACK_STENCIL_OP_FAIL;
+        let m = SET_BACK_STENCIL_FUNC_REF;
+        raster::StencilFace {
+            fail: op(b)?,
+            depth_fail: op(b + 4)?,
+            pass: op(b + 8)?,
+            compare: compare(b + 0xc)?,
+            reference: byte(m),
+            write_mask: byte(m + 4),
+            compare_mask: byte(m + 8),
+        }
+    } else {
+        front
+    };
+    Ok(raster::Stencil { front, back })
 }
 
 /// The blend state of render target `target`.
@@ -1765,8 +2049,8 @@ enum LineRule {
 /// - Rectangular lines (multisample rasterization on, override and
 ///   smooth off) cover the sample points inside a rectangle of the line
 ///   width centered on the segment [public: Vulkan 1.3, "Basic Line
-///   Segment Rasterization"]. `SET_ANTI_ALIAS` 1X1 (checked at every
-///   draw) puts the one sample at the pixel center. Samples exactly on
+///   Segment Rasterization"], at the draw's sample positions
+///   ([`multisample`]; one sample: the pixel center). Samples exactly on
 ///   the rectangle's edges go by the top-left rule of the two triangles
 ///   the rectangle is drawn as \[assumption: the hardware's tie rule is
 ///   not public\]. The width is `SET_LINE_WIDTH_FLOAT`: nouveau's OpenGL

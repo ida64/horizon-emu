@@ -224,7 +224,7 @@ fn corpus_translates_and_compiles() {
             Ok(t) => {
                 if let Some(gpu) = &gpu {
                     let outputs = targets(program);
-                    let source = t.source(program, &outputs, false, None);
+                    let source = t.source(program, &outputs, false, None, None);
                     let start = std::time::Instant::now();
                     if let Err(e) = gpu.pipeline(&source, outputs.len()) {
                         panic!("{name}: {e}\n{source}");
@@ -439,6 +439,7 @@ fn interpret(program: &Program, input: &Inputs) -> Result<Vec<FragmentOutput>, U
                 x: x as u32,
                 y: y as u32,
                 covered: [true; 4],
+                centroids: [[0.5; 2]; 4],
                 front_facing: true,
                 outputs: [FragmentOutput::default(); 4],
             };
@@ -459,7 +460,10 @@ fn render(
     input: &Inputs,
 ) -> Result<Vec<Vec<[f32; 4]>>, String> {
     let outputs = targets(program);
-    let pipeline = gpu.pipeline(&t.source(program, &outputs, false, None), outputs.len())?;
+    let pipeline = gpu.pipeline(
+        &t.source(program, &outputs, false, None, None),
+        outputs.len(),
+    )?;
     let positions: [[f32; 4]; 6] = [
         [-1.0, -1.0, 0.0, 1.0],
         [1.0, -1.0, 0.0, 1.0],
@@ -843,4 +847,106 @@ fn integer_conversions_match_interpreter() {
     for pixel in &colors[0] {
         assert_eq!(pixel.map(f32::to_bits), words);
     }
+}
+
+/// `SHFL` with immediate operands: mode, destination, source, lane or
+/// offset `b`, clamp and segment mask `c`, destination predicate `pd`
+/// [public: Ryujinx `InstShfl`].
+fn shfl(mode: u64, rd: u64, ra: u64, b: u64, c: u64, pd: u64) -> u64 {
+    0xef10_0000_0007_0000 | rd | ra << 8 | b << 20 | 3 << 28 | mode << 30 | c << 34 | pd << 48
+}
+
+/// `FSWZADD` R`rd` = R`ra` and R`rb` by the per-lane operations `ops`
+/// [public: Ryujinx `InstFswzadd`].
+fn fswzadd(rd: u64, ra: u64, rb: u64, ops: u64) -> u64 {
+    0x50f8_0000_0007_0000 | rd | ra << 8 | rb << 20 | ops << 28
+}
+
+/// Quad shuffles (butterfly, indexed, up and down within the quad, and
+/// the in-range predicate) read on Metal the lanes the interpreter reads:
+/// `quad_shuffle`'s lane numbering is the interpreter's `(x & 1) | (y &
+/// 1) << 1`. `FSWZADD` picks each lane's operation by the same numbering
+/// (fine derivatives as compilers pair it with `SHFL.BFLY`). A shuffle
+/// reaching another quad of the warp is refused by both.
+#[test]
+fn shfl_matches_interpreter() {
+    const IPA_X: u64 = 0xe003ff870ff7ff04; // IPA R4, a[0x70] (window x)
+    const IPA_Y: u64 = 0xe003ff874ff7ff05; // IPA R5, a[0x74] (window y)
+    const QUAD: u64 = 0x1c03; // segments of four lanes, clamp 3
+    let guarded_mov = |rd: u64, v: u32, p: u64| mov(rd, v) & !0x7_0000 | p << 16;
+    let programs = [
+        assembled(&[
+            IPA_X,
+            IPA_Y,
+            shfl(3, 0, 4, 1, QUAD, 7),   // BFLY 1: x neighbour
+            shfl(3, 1, 5, 2, QUAD, 7),   // BFLY 2: y neighbour
+            shfl(0, 2, 4, 3, QUAD, 7),   // IDX 3
+            shfl(1, 3, 5, 1, 0x1c00, 7), // UP 1
+            0xe30000000007000f,          // EXIT
+        ]),
+        assembled(&[
+            IPA_X,
+            IPA_Y,
+            shfl(2, 0, 4, 1, QUAD, 0), // DOWN 1, P0 in range
+            mov(1, 0),
+            guarded_mov(1, 1f32.to_bits(), 0),
+            shfl(0, 2, 5, 1, 0x1e01, 1), // IDX 1 in segments of two
+            mov(3, 0),
+            guarded_mov(3, 1f32.to_bits(), 1),
+            0xe30000000007000f,
+        ]),
+        assembled(&[
+            IPA_X,
+            IPA_Y,
+            shfl(3, 6, 4, 1, QUAD, 7),
+            fswzadd(0, 4, 6, 0x99), // dFdx(x)
+            shfl(3, 7, 5, 2, QUAD, 7),
+            fswzadd(1, 5, 7, 0xa5), // dFdy(y)
+            fswzadd(2, 4, 5, 0x00), // x + y
+            fswzadd(3, 4, 5, 0xff), // y
+            0xe30000000007000f,
+        ]),
+    ];
+    let gpu = Gpu::new();
+    for (index, program) in programs.iter().enumerate() {
+        let t = translate(program, &[]).unwrap_or_else(|e| panic!("program {index}: {e}"));
+        let mut input = inputs(&t, 1);
+        input.planes[0x70 / 4] = Plane {
+            dx: 1.0,
+            dy: 0.0,
+            base: 0.0,
+        };
+        input.planes[0x74 / 4] = Plane {
+            dx: 0.0,
+            dy: 1.0,
+            base: 0.0,
+        };
+        let expected = interpret(program, &input).expect("interprets");
+        if index == 0 {
+            // Pixel (0, 0): x of (1, 0), y of (0, 1), x of (1, 1), its own y.
+            assert_eq!(expected[0].colors[0], [1.5, 1.5, 1.5, 0.5]);
+            // Pixel (1, 1): UP 1 reads lane 2, (0, 1).
+            assert_eq!(expected[WIDTH + 1].colors[0][3], 1.5);
+        }
+        if index == 2 {
+            assert_eq!(expected[WIDTH + 1].colors[0], [1.0, 1.0, 3.0, 1.5]);
+        }
+        let Some(gpu) = &gpu else {
+            continue;
+        };
+        let colors = render(gpu, program, &t, &input).expect("renders");
+        for (pixel, output) in expected.iter().enumerate() {
+            assert_eq!(
+                colors[0][pixel].map(f32::to_bits),
+                output.colors[0].map(f32::to_bits),
+                "program {index} pixel {pixel}"
+            );
+        }
+    }
+    // BFLY 4 reads the next quad of the warp.
+    let across = assembled(&[IPA_X, shfl(3, 0, 4, 4, 0x1c07, 7), 0xe30000000007000f]);
+    assert!(translate(&across, &[]).is_err());
+    let plain = assembled(&[IPA_X, 0xe30000000007000f]);
+    let input = inputs(&translate(&plain, &[]).unwrap(), 1);
+    assert!(interpret(&across, &input).is_err());
 }

@@ -209,6 +209,7 @@ fn fragment(program: &Program, env: &Env<'_>, planes: &[Plane; 256]) -> Quad<'st
         x: 0,
         y: 0,
         covered: [true; 4],
+        centroids: [[0.5; 2]; 4],
         front_facing: true,
         outputs: [FragmentOutput::default(); 4],
     };
@@ -224,6 +225,7 @@ fn fragment(program: &Program, env: &Env<'_>, planes: &[Plane; 256]) -> Quad<'st
         x: q.x,
         y: q.y,
         covered: q.covered,
+        centroids: q.centroids,
         front_facing: q.front_facing,
         outputs: q.outputs,
     }
@@ -473,6 +475,7 @@ fn ipa_multiply_sat_and_helper_output() {
         x: 0,
         y: 0,
         covered: [true, false, true, false],
+        centroids: [[0.5; 2]; 4],
         front_facing: true,
         outputs: [FragmentOutput::default(); 4],
     };

@@ -851,6 +851,10 @@ impl ThreeD {
                 "clear with a lower-left window origin",
             ));
         }
+        // A clear writes every sample of the pixels of the rectangle: the
+        // texels holding them (see `multisample`).
+        let samples = pipeline::sample_mode(r)?;
+        let texels = samples.texels(rect);
         let components = (argument >> 2) & 0xF;
         if components != 0 {
             let slot = (argument >> 6) & 0xF;
@@ -872,6 +876,7 @@ impl ThreeD {
                         memory,
                         &hooks.writes,
                         (surface, format),
+                        samples,
                         rect,
                         color,
                         components as u8,
@@ -879,6 +884,7 @@ impl ThreeD {
                 {
                     // Done on the GPU.
                 } else {
+                    let rect = texels;
                     let mut window = Window::load(memory, surface, rect)?;
                     let full = components == 0xF;
                     let mut packed = vec![0; surface.bytes_per_pixel as usize];
@@ -927,10 +933,18 @@ impl ThreeD {
                 }
             };
             if let Some(metal) = &hooks.metal
-                && metal.clear_depth(memory, &hooks.writes, (surface, format), rect, apply)?
+                && metal.clear_depth(
+                    memory,
+                    &hooks.writes,
+                    (surface, format),
+                    samples,
+                    rect,
+                    apply,
+                )?
             {
                 // Done on the GPU.
             } else {
+                let rect = texels;
                 let mut window = Window::load(memory, surface, rect)?;
                 for mut band in window.bands_mut() {
                     for y in band.y0.max(rect.y0)..(band.y0 + 8).min(rect.y1) {

@@ -90,6 +90,29 @@ const SLOTS: u32 = 18;
 /// Words per triangle of the triangle buffer (see [`Translated::source`]).
 pub const TRIANGLE_WORDS: usize = 10;
 
+/// The depth/stencil attachment a fragment function tests (see
+/// [`Translated::source`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DepthStage {
+    pub format: DepthFormat,
+    /// Whether passing fragments store their depth.
+    pub write: bool,
+    /// Whether the stencil test runs (the format has stencil).
+    pub stencil: bool,
+}
+
+/// How a fragment function draws into multisampled targets (see
+/// [`Translated::source`]); the sample positions are a draw-time value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MultisampleStage {
+    /// Samples per pixel, more than one.
+    pub samples: u32,
+    pub alpha_to_coverage: bool,
+    pub alpha_to_one: bool,
+    /// Depth at the pixel center rather than at each sample.
+    pub center_depth: bool,
+}
+
 /// A pixel program in MSL, and what a draw must supply for it.
 #[derive(Debug, Clone)]
 pub struct Translated {
@@ -399,6 +422,8 @@ impl Writer<'_> {
         }
         match op {
             Op::Ipa => self.ipa(),
+            Op::Shfl => self.shfl(),
+            Op::Fswzadd => self.fswzadd(),
             Op::Ldc => self.ldc(),
             Op::Texs => self.texs(),
             Op::Tex => self.tex(),
@@ -472,13 +497,18 @@ static inline float plane(const device float* planes, uint k, float x, float y) 
 static inline bool compare(uint f, float a, float b) {
     return f == 1u ? a < b : f == 2u ? a == b : f == 3u ? a <= b : f == 4u ? a > b : f == 5u ? a != b : f == 6u ? a >= b : f == 7u;
 }
-/// `raster::Triangle::covers`: whether the center of the pixel at window
-/// position (x, y) (a pixel center) is inside triangle `t` (see
-/// `Translated::source`), with the 1/256-pixel edge functions and the
-/// top-left rule of the software rasterizer.
-static inline bool covers(const device int* t, float x, float y) {
-    const long cx = (long(x - 0.5f) << 8) + 128;
-    const long cy = (long(y - 0.5f) << 8) + 128;
+/// `raster::StencilOp::apply` by the numbering of `Translated::source`.
+static inline uint stencil_op(uint op, uint s, uint ref) {
+    return op == 1u ? 0u : op == 2u ? ref : op == 3u ? min(s + 1u, 255u) : op == 4u ? (s == 0u ? 0u : s - 1u) : op == 5u ? (~s & 0xffu) : op == 6u ? ((s + 1u) & 0xffu) : op == 7u ? ((s - 1u) & 0xffu) : s;
+}
+/// `raster::Triangle::covers_at`: whether the point (sx, sy) / 16 from
+/// the corner of the pixel whose center is the window position (x, y)
+/// is inside triangle `t` (see `Translated::source`), with the
+/// 1/256-pixel edge functions and the top-left rule of the software
+/// rasterizer.
+static inline bool covers_at(const device int* t, float x, float y, uint sx, uint sy) {
+    const long cx = (long(x - 0.5f) << 8) + long(sx << 4);
+    const long cy = (long(y - 0.5f) << 8) + long(sy << 4);
     bool inside = true;
     for (uint e = 0u; e < 3u; e++) {
         const uint n = e == 2u ? 0u : e + 1u;
@@ -488,6 +518,15 @@ static inline bool covers(const device int* t, float x, float y) {
         inside = inside && o + bias >= 0;
     }
     return inside;
+}
+/// `raster::Triangle::covers`: the pixel center.
+static inline bool covers(const device int* t, float x, float y) {
+    return covers_at(t, x, y, 8u, 8u);
+}
+/// `raster::alpha_coverage` for `n` samples.
+static inline uint alpha_coverage(float alpha, uint n) {
+    const float a = isnan(alpha) ? 0.0f : clamp(alpha, 0.0f, 1.0f);
+    return (1u << uint(rint(a * float(n)))) - 1u;
 }
 /// `unorm_to_f32(v, n)` for n = 16 or 24: v / (2^n - 1) correctly
 /// rounded, which the interpreter's f64 quotient rounded to f32 is (a
@@ -529,6 +568,16 @@ vertex Vertex vertex_main(uint id [[vertex_id]], const device float4* positions 
     out.position = positions[id];
     return out;
 }
+
+/// Draws into layer `layer` (sample `layer` of multisampled targets).
+struct LayeredVertex { float4 position [[position]]; uint layer [[render_target_array_index]]; };
+
+vertex LayeredVertex vertex_layered(uint id [[vertex_id]], const device float4* positions [[buffer(0)]], constant uint& layer [[buffer(1)]]) {
+    LayeredVertex out;
+    out.position = positions[id];
+    out.layer = layer;
+    return out;
+}
 "#;
 
 /// The dispatch loop's "no block": lane finished.
@@ -563,8 +612,8 @@ impl Translated {
     /// `texture.rs`); buffer 24 [`TRIANGLE_WORDS`] words per triangle:
     /// the snapped vertices (x, y in 1/256 pixels, i32) in edge order,
     /// a word whose bit `e` marks edge `e` as not top-left
-    /// (`raster::Triangle::edges`), and the depth plane (dx, dy, base,
-    /// f32).
+    /// (`raster::Triangle::edges`) and whose bit 3 marks a back-facing
+    /// triangle, and the depth plane (dx, dy, base, f32).
     ///
     /// With `alpha_test`, buffer 22 holds the alpha test as two words: the
     /// comparison (0 never, 1 less, 2 equal, 3 less-or-equal, 4 greater, 5
@@ -583,46 +632,96 @@ impl Translated {
     /// it has one, else the depth plane at the pixel center), clamped, is
     /// compared with the stored depth as `raster::shade_quad` does, after
     /// the alpha test; a failing fragment is discarded, a passing one
-    /// stores its depth with the format's encoding, other bits kept (the
-    /// pipeline's write mask drops the store when depth writes are off).
+    /// stores its depth with the format's encoding when `write`, other
+    /// bits kept.
+    ///
+    /// With `stencil`, buffer 25 holds the stencil test as two faces
+    /// (front, then back) of seven words: the operations on stencil
+    /// failure, depth failure and pass (0 keep, 1 zero, 2 replace, 3
+    /// increment clamped, 4 decrement clamped, 5 invert, 6 increment
+    /// wrapping, 7 decrement wrapping), the comparison, the reference, the
+    /// compare mask and the write mask (8 bits each). The stencil test
+    /// comes before the depth test and the stencil bits are updated by the
+    /// operation the outcome selects, as `raster::shade_quad` does. A
+    /// failing fragment is discarded when there are color outputs (the
+    /// draw makes sure its stencil operations on failure keep the stored
+    /// value then), and otherwise stores the updated word.
+    ///
+    /// With `multisample` (more than one sample per pixel), the targets
+    /// are 2D arrays of one layer per sample at pixel size, drawn with
+    /// `vertex_layered` once per sample (its buffer 1 the layer): the
+    /// fragment function runs once per sample, for sample `layer`, each run
+    /// computing everything for the pixel as the software back end does
+    /// once (so quads and derivatives are those of whole pixels) and
+    /// keeping its own sample. Buffer 26 holds the sample positions, one
+    /// word per sample: x | y << 8 in 1/16 pixel. The pixel's coverage
+    /// mask (`raster::Triangle::coverage`) gives the centroid `IPA`
+    /// CENTROID reads (`raster::centroid`); with `alpha_to_coverage` it
+    /// is limited by output 0 alpha (`raster::alpha_coverage`) after the
+    /// alpha test; the depth plane is taken at the sample's position
+    /// unless `center_depth`; with `alpha_to_one` every output's alpha is
+    /// 1.
     pub fn source(
         &self,
         program: &Program,
         outputs: &[usize],
         alpha_test: bool,
-        depth: Option<DepthFormat>,
+        depth: Option<DepthStage>,
+        multisample: Option<MultisampleStage>,
     ) -> String {
         let mut s = String::from(PRELUDE);
-        // The depth attachment's words and how its depth is read and
-        // written (`DepthFormat::read_depth`, `write_depth`).
-        let depth = depth.map(|format| match format {
-            DepthFormat::Z32Float => ("uint", "as_type<float>(zin)", "as_type<uint>(z)"),
+        // The depth attachment's words, how its depth is read (from `zin`)
+        // and written (into `w`, the word being updated)
+        // (`DepthFormat::read_depth`, `write_depth`), and how its stencil
+        // is read and written (`s`) (`read_stencil`, `write_stencil`).
+        let formats = depth.map(|stage| match stage.format {
+            DepthFormat::Z32Float => ("uint", "as_type<float>(zin)", "as_type<uint>(z)", None),
             DepthFormat::Z32FloatX24S8 => (
                 "uint2",
                 "as_type<float>(zin.x)",
-                "uint2(as_type<uint>(z), zin.y)",
+                "uint2(as_type<uint>(z), w.y)",
+                Some(("(zin.y & 0xffu)", "uint2(w.x, (w.y & 0xffffff00u) | s)")),
             ),
             DepthFormat::Z16Unorm => (
                 "uint",
                 "unorm_to_float(zin & 0xffffu, 16u)",
                 "float_to_unorm(z, 16u)",
+                None,
             ),
             DepthFormat::Z24S8 => (
                 "uint",
                 "unorm_to_float(zin >> 8, 24u)",
-                "(zin & 0xffu) | (float_to_unorm(z, 24u) << 8)",
+                "(w & 0xffu) | (float_to_unorm(z, 24u) << 8)",
+                Some(("(zin & 0xffu)", "(w & 0xffffff00u) | s")),
             ),
-            DepthFormat::X8Z24 | DepthFormat::S8Z24 => (
+            DepthFormat::X8Z24 => (
                 "uint",
                 "unorm_to_float(zin & 0xffffffu, 24u)",
-                "(zin & 0xff000000u) | float_to_unorm(z, 24u)",
+                "(w & 0xff000000u) | float_to_unorm(z, 24u)",
+                None,
+            ),
+            DepthFormat::S8Z24 => (
+                "uint",
+                "unorm_to_float(zin & 0xffffffu, 24u)",
+                "(w & 0xff000000u) | float_to_unorm(z, 24u)",
+                Some(("(zin >> 24)", "(w & 0xffffffu) | (s << 24)")),
             ),
         });
+        let depth = depth
+            .zip(formats)
+            .map(|(stage, (words, read, write, stencil))| {
+                (
+                    words,
+                    read,
+                    stage.write.then_some(write),
+                    stencil.filter(|_| stage.stencil),
+                )
+            });
         let _ = writeln!(s, "struct Output {{");
         for (attachment, _) in outputs.iter().enumerate() {
             let _ = writeln!(s, "    float4 c{attachment} [[color({attachment})]];");
         }
-        if let Some((words, _, _)) = depth {
+        if let Some((words, ..)) = depth {
             let _ = writeln!(s, "    {words} z [[color({})]];", outputs.len());
         }
         let _ = writeln!(s, "}};");
@@ -658,9 +757,16 @@ impl Translated {
         if alpha_test {
             parameters.push("constant uint* alpha_test [[buffer(22)]]".to_string());
         }
-        if let Some((words, _, _)) = depth {
+        if let Some((words, _, _, stencil)) = depth {
             parameters.push("constant uint* depth_test [[buffer(23)]]".to_string());
             parameters.push(format!("{words} zin [[color({})]]", outputs.len()));
+            if stencil.is_some() {
+                parameters.push("constant uint* stencil_test [[buffer(25)]]".to_string());
+            }
+        }
+        if multisample.is_some() {
+            parameters.push("uint layer [[render_target_array_index]]".to_string());
+            parameters.push("constant uint* sample_positions [[buffer(26)]]".to_string());
         }
         let _ = writeln!(
             s,
@@ -672,34 +778,83 @@ impl Translated {
             "    const float px = position.x; const float py = position.y;\n    const uint plane_base = (primitive >> 1u) * {}u;\n    const device int* tri = triangles + (primitive >> 1u) * {TRIANGLE_WORDS}u;",
             self.ipa_words.len().max(1)
         );
+        // The centroid (cpx, cpy) `IPA` CENTROID evaluates at.
+        match multisample {
+            None => {
+                let _ = writeln!(s, "    const float cpx = px; const float cpy = py;");
+            }
+            Some(stage) => {
+                let _ = writeln!(
+                    s,
+                    "    uint coverage_mask = 0u;\n    for (uint k = 0u; k < {n}u; k++) {{ const uint p = sample_positions[k]; coverage_mask |= covers_at(tri, px, py, p & 0xffu, p >> 8) ? 1u << k : 0u; }}\n    float cpx = px; float cpy = py;\n    if (coverage_mask != 0u && coverage_mask != {all:#x}u) {{ const uint p = sample_positions[ctz(coverage_mask)]; cpx = (px - 0.5f) + float(p & 0xffu) / 16.0f; cpy = (py - 0.5f) + float(p >> 8) / 16.0f; }}",
+                    n = stage.samples,
+                    all = (1u32 << stage.samples) - 1,
+                );
+            }
+        }
         s.push_str(&self.body);
-        let _ = writeln!(
-            s,
-            "    if (killed || !covers(tri, px, py)) {{ discard_fragment(); }}"
-        );
+        let covered = if multisample.is_some() {
+            "((coverage_mask >> layer) & 1u) == 0u"
+        } else {
+            "!covers(tri, px, py)"
+        };
+        let _ = writeln!(s, "    if (killed || {covered}) {{ discard_fragment(); }}");
         let (registers, depth_register) = output_registers(program);
+        // Output 0 alpha (the draw refuses an alpha test or alpha to
+        // coverage that needs it when the program does not write it).
+        let alpha = match registers[0] {
+            Some((base, mask)) if mask & 8 != 0 => format!("as_type<float>(r{})", base + 3),
+            _ => "0.0f".into(),
+        };
         if alpha_test {
-            // Output 0 alpha (the draw refuses a test that needs it when
-            // the program does not write it).
-            let alpha = match registers[0] {
-                Some((base, mask)) if mask & 8 != 0 => format!("as_type<float>(r{})", base + 3),
-                _ => "0.0f".into(),
-            };
             let _ = writeln!(
                 s,
                 "    if (!compare(alpha_test[0], {alpha}, as_type<float>(alpha_test[1]))) {{ discard_fragment(); }}"
             );
         }
+        if let Some(stage) = multisample
+            && stage.alpha_to_coverage
+        {
+            let _ = writeln!(
+                s,
+                "    if (((alpha_coverage({alpha}, {}u) >> layer) & 1u) == 0u) {{ discard_fragment(); }}",
+                stage.samples
+            );
+        }
         let _ = writeln!(s, "    Output out;");
-        if let Some((_, read, write)) = depth {
-            let incoming = match depth_register {
-                Some(register) => format!("as_type<float>(r{register})"),
-                None => "(as_type<float>(tri[9]) + as_type<float>(tri[7]) * px) + as_type<float>(tri[8]) * py".into(),
+        if let Some((words, read, write, stencil)) = depth {
+            let incoming = match (depth_register, multisample) {
+                (Some(register), _) => format!("as_type<float>(r{register})"),
+                (None, Some(stage)) if !stage.center_depth => "(as_type<float>(tri[9]) + as_type<float>(tri[7]) * ((px - 0.5f) + float(sample_positions[layer] & 0xffu) / 16.0f)) + as_type<float>(tri[8]) * ((py - 0.5f) + float(sample_positions[layer] >> 8) / 16.0f)".into(),
+                (None, _) => "(as_type<float>(tri[9]) + as_type<float>(tri[7]) * px) + as_type<float>(tri[8]) * py".into(),
             };
             let _ = writeln!(
                 s,
-                "    {{ float z = {incoming};\n      const float lo = as_type<float>(depth_test[1]); const float hi = as_type<float>(depth_test[2]);\n      z = z < lo ? lo : (z > hi ? hi : z);\n      if (!compare(depth_test[0], z, {read})) {{ discard_fragment(); }}\n      out.z = {write}; }}"
+                "    {{ float z = {incoming};\n      const float lo = as_type<float>(depth_test[1]); const float hi = as_type<float>(depth_test[2]);\n      z = z < lo ? lo : (z > hi ? hi : z);\n      {words} w = zin;"
             );
+            match stencil {
+                Some((read_stencil, write_stencil)) => {
+                    let _ = writeln!(
+                        s,
+                        "      constant uint* st = stencil_test + (((uint(tri[6]) >> 3u) & 1u) != 0u ? 7u : 0u);\n      const uint s0 = {read_stencil};\n      const bool stencil_passed = compare(st[3], float(st[4] & st[5]), float(s0 & st[5]));\n      const bool passed = stencil_passed && compare(depth_test[0], z, {read});\n      const uint s = (s0 & ~st[6]) | (stencil_op(!stencil_passed ? st[0] : (!passed ? st[1] : st[2]), s0, st[4]) & st[6]);\n      w = {write_stencil};"
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        s,
+                        "      const bool passed = compare(depth_test[0], z, {read});"
+                    );
+                }
+            }
+            if let Some(write) = write {
+                let _ = writeln!(s, "      if (passed) {{ w = {write}; }}");
+            }
+            let failed = if stencil.is_some() && outputs.is_empty() {
+                "out.z = w; return out;"
+            } else {
+                "discard_fragment();"
+            };
+            let _ = writeln!(s, "      if (!passed) {{ {failed} }}\n      out.z = w; }}");
         }
         // Outputs as the interpreter gathers them: each target with a
         // component mask takes the next four registers from R0; depth is
@@ -719,6 +874,11 @@ impl Translated {
                     format!("float4({})", components.join(", "))
                 }
                 None => "float4(0.0f)".into(),
+            };
+            let value = if multisample.is_some_and(|stage| stage.alpha_to_one) {
+                format!("float4({value}.xyz, 1.0f)")
+            } else {
+                value
             };
             let _ = writeln!(s, "    out.c{attachment} = {value};");
         }

@@ -94,8 +94,9 @@
 //! `TLDS`, `TLD4`, `TLD4S`, `TXQ`, `TMML`, `TXD`, `LD`, `ST`, `STG`,
 //! `LOP3`, `SEL`, `PSETP`, `P2R`, `VADD`, `VSET`, `VABSDIFF`, `FSWZADD`,
 //! `SHFL`, `PCNT` or `CONT`; those are implemented from the public sources
-//! cited at each, except `VADD`/`VSET`/`VABSDIFF`/`FSWZADD`/`SHFL`,
-//! which are outside the executed firmware subset and return [`Unmodeled`].
+//! cited at each, except `VADD`/`VSET`/`VABSDIFF`, which are outside the
+//! executed firmware subset and return [`Unmodeled`]. (`SHFL` and
+//! `FSWZADD` first ran in Minecraft's programs.)
 //!
 //! # Execution
 //!
@@ -497,6 +498,10 @@ pub struct Quad<'a> {
     /// helpers (for derivatives) but produce no output and no memory
     /// writes.
     pub covered: [bool; 4],
+    /// Per lane, where `IPA` CENTROID evaluates: an offset from the
+    /// pixel's corner (`[0.5, 0.5]`, the center, for one sample per pixel
+    /// and for fully covered pixels; see `raster::centroid`).
+    pub centroids: [[f32; 2]; 4],
     pub front_facing: bool,
     pub outputs: [FragmentOutput; 4],
 }

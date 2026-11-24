@@ -37,6 +37,7 @@ pub mod inline;
 mod lru;
 pub mod metal;
 pub mod mme;
+pub mod multisample;
 pub mod pipeline;
 pub mod raster;
 pub mod resources;

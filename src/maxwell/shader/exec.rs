@@ -271,6 +271,7 @@ enum Io<'a> {
         x: u32,
         y: u32,
         covered: [bool; 4],
+        centroids: [[f32; 2]; 4],
     },
 }
 
@@ -459,6 +460,7 @@ pub(super) fn run_fragment(
             x: quad.x,
             y: quad.y,
             covered: quad.covered,
+            centroids: quad.centroids,
         },
         op: Op::Invalid,
         word: 0,
@@ -1023,6 +1025,8 @@ impl<'a, const L: usize> Machine<'a, L> {
             Op::Ald => self.ald(active),
             Op::Ast => self.ast(active),
             Op::Ipa => self.ipa(active),
+            Op::Shfl => self.shfl(active),
+            Op::Fswzadd => self.fswzadd(active),
             _ => self.fail("not modeled"),
         }
     }
@@ -1526,11 +1530,23 @@ impl<'a, const L: usize> Machine<'a, L> {
     /// PASS yields the plane value at the pixel center, MULTIPLY that value
     /// times the multiplier register (the compiler passes w, from
     /// `MUFU.RCP` of `IPA.PASS a[0x7c]`, for perspective inputs). Neither
-    /// public source defines CONSTANT or SC; they, indexed reads,
-    /// non-default sample modes and the predicate operand are not modeled.
+    /// public source defines CONSTANT or SC; they, indexed reads, the
+    /// OFFSET sample mode and the predicate operand are not modeled.
+    /// CENTROID (sample mode 1) evaluates at the lane's centroid
+    /// ([`Quad::centroids`](super::Quad::centroids)): the pixel center
+    /// with one sample per pixel or all samples covered, else a covered
+    /// sample's position (`raster::centroid`) [public: Ryujinx and eden
+    /// translate CENTROID to the API's `centroid` qualifier].
     fn ipa(&mut self, active: Mask) -> Result<(), Unmodeled> {
         let w = self.word;
-        let Io::Fragment { planes, x, y, .. } = self.io else {
+        let Io::Fragment {
+            planes,
+            x,
+            y,
+            centroids,
+            ..
+        } = self.io
+        else {
             return self.fail("outside a fragment program");
         };
         let mode = bits(w, 54, 2);
@@ -1539,7 +1555,7 @@ impl<'a, const L: usize> Machine<'a, L> {
             format_args!("mode {}", ["", "", "CONSTANT", "SC"][mode as usize]),
         )?;
         self.require(!bit(w, 38), "IDX")?;
-        self.require(bits(w, 52, 2) == 0, "sample mode")?;
+        self.require(bits(w, 52, 2) <= 1, "sample mode OFFSET")?;
         self.require(bits(w, 47, 4) == PT, "predicate operand")?;
         self.require(bits(w, 39, 8) == RZ, "sample-offset register")?;
         let attribute = bits(w, 28, 10);
@@ -1548,9 +1564,15 @@ impl<'a, const L: usize> Machine<'a, L> {
         let plane = planes[(attribute / 4) as usize];
         let (rd, rb) = (bits(w, 0, 8), bits(w, 20, 8));
         let sat = bit(w, 51);
+        let centroid = bits(w, 52, 2) == 1;
         self.each(active, |m, lane| {
-            let px = (x + (lane as u32 & 1)) as f32 + 0.5;
-            let py = (y + (lane as u32 >> 1)) as f32 + 0.5;
+            let [ox, oy] = if centroid {
+                centroids[lane]
+            } else {
+                [0.5, 0.5]
+            };
+            let px = (x + (lane as u32 & 1)) as f32 + ox;
+            let py = (y + (lane as u32 >> 1)) as f32 + oy;
             let mut value = plane.base + plane.dx * px + plane.dy * py;
             if mode == 1 {
                 value *= m.rf(lane, rb);
@@ -1562,12 +1584,145 @@ impl<'a, const L: usize> Machine<'a, L> {
             Ok(())
         })
     }
+
+    /// `SHFL`: dest 0-7, A 8-15, B register 20-27 or (bit 28) immediate
+    /// 20-24, C register 39-46 or (bit 29) immediate 34-46, mode 30-31
+    /// (IDX, UP, DOWN, BFLY), destination predicate 48-50 [public: Ryujinx
+    /// `Decoders/InstDecoders.cs` `InstShfl`, `InstEmitWarp.cs`]. Each
+    /// lane reads A of the lane [`shuffle_lane`] picks, or its own where
+    /// that lane is out of range, and sets the predicate to whether it was
+    /// in range. Compute warps are the hardware's warps (lane `i` of a
+    /// machine is lane `i` of its warp). A fragment quad is four lanes of
+    /// some warp at an unknown position (lane `4q + i` for quad lane `i`):
+    /// a shuffle is modeled when it stays inside the quad and picks the
+    /// same quad lane wherever the quad sits ([`quad_shuffle_lane`]),
+    /// which holds for the quad-wide segments compilers use for quad
+    /// operations. Reading a lane that does not run the instruction is
+    /// undefined on hardware; here it reads that lane's register.
+    fn shfl(&mut self, active: Mask) -> Result<(), Unmodeled> {
+        let w = self.word;
+        self.require(
+            self.is_compute() || self.is_fragment(),
+            "outside a compute or fragment program",
+        )?;
+        let (rd, ra, pd, mode) = (bits(w, 0, 8), bits(w, 8, 8), bits(w, 48, 3), bits(w, 30, 2));
+        let values: [u32; L] = std::array::from_fn(|lane| self.r(lane, ra));
+        let fragment = self.is_fragment();
+        self.each(active, |m, lane| {
+            let b = if bit(w, 28) {
+                bits(w, 20, 5)
+            } else {
+                m.r(lane, bits(w, 20, 8))
+            };
+            let c = if bit(w, 29) {
+                bits(w, 34, 13)
+            } else {
+                m.r(lane, bits(w, 39, 8))
+            };
+            let picked = if fragment {
+                quad_shuffle_lane(mode, lane as u32, b, c)
+                    .ok_or_else(|| m.unmodeled("across the quads of a warp"))?
+            } else {
+                shuffle_lane(mode, lane as u32, b, c)
+            };
+            let value = picked.map_or(values[lane], |source| values[source as usize]);
+            m.set(lane, rd, value);
+            m.set_pred(lane, pd, picked.is_some());
+            Ok(())
+        })
+    }
+
+    /// `FSWZADD`: dest 0-7, A 8-15, B 20-27, per-lane operation 28-35 (two
+    /// bits for each lane of the quad), NDV bit 38, rounding 39-40, FTZ
+    /// bit 44, CC bit 47 [public: Ryujinx `InstFswzadd`]. Quad lane `i`
+    /// computes `A * ka + B * kb` with (ka, kb) from its operation: (1, 1),
+    /// (-1, 1), (1, -1), (0, 1), the two products added with one rounding
+    /// (the products by ±1 and 0 are exact) [public: eden
+    /// `emit_spirv_floating_point.cpp` `EmitFSwizzleAdd`, `fswzadd_lut_a`
+    /// / `_b`; Ryujinx `SwizzleAdd`]. Compilers pair it with `SHFL.BFLY`
+    /// for fine derivatives (operations 0x99: the right lane minus the
+    /// left one). Only round-to-nearest without NDV or CC is modeled.
+    fn fswzadd(&mut self, active: Mask) -> Result<(), Unmodeled> {
+        let w = self.word;
+        self.require(self.is_fragment(), "outside a fragment program")?;
+        self.require(!bit(w, 38), "NDV")?;
+        self.require(bits(w, 39, 2) == 0, "rounding mode")?;
+        self.require(!bit(w, 47), "condition code write")?;
+        let ftz = bit(w, 44);
+        let (rd, ra, rb, operations) =
+            (bits(w, 0, 8), bits(w, 8, 8), bits(w, 20, 8), bits(w, 28, 8));
+        self.each(active, |m, lane| {
+            let a = alu::flush(m.rf(lane, ra), ftz);
+            let b = alu::flush(m.rf(lane, rb), ftz);
+            let (ka, kb) = fswzadd_factors((operations >> (2 * lane)) & 3);
+            m.setf(lane, rd, alu::flush(a * ka + b * kb, ftz));
+            Ok(())
+        })
+    }
 }
 
 /// Byte width of an `LDG`/`STG`/`LD`/`ST` size code (U8, S8, U16, S16,
 /// B32, B64, B128; 7 is not a valid size for all of them).
 fn global_width(size: u32) -> Option<usize> {
     [1, 1, 2, 2, 4, 8, 16].get(size as usize).copied()
+}
+
+/// The lane `SHFL` mode `mode` (0 IDX, 1 UP, 2 DOWN, 3 BFLY) makes warp
+/// lane `lane` read with operands `b` (lane or offset) and `c` (clamp in
+/// bits 0-4, segment mask in 8-12), or `None` where that lane is out of
+/// range: the lane arithmetic of PTX `shfl.sync` [public: NVIDIA PTX ISA,
+/// "shfl.sync"], `maxLane = (lane & segmask) | (clamp & ~segmask)`, with
+/// UP testing the lane against it as a lower bound.
+pub(super) fn shuffle_lane(mode: u32, lane: u32, b: u32, c: u32) -> Option<u32> {
+    let (b, clamp, segment) = (b & 0x1f, c & 0x1f, (c >> 8) & 0x1f);
+    let min = lane & segment;
+    let max = min | (clamp & !segment);
+    let (source, valid) = match mode {
+        0 => {
+            let source = min | (b & !segment);
+            (source as i32, source <= max)
+        }
+        1 => {
+            let source = lane as i32 - b as i32;
+            (source, source >= max as i32)
+        }
+        2 => {
+            let source = lane + b;
+            (source as i32, source <= max)
+        }
+        _ => {
+            let source = lane ^ b;
+            (source as i32, source <= max)
+        }
+    };
+    valid.then_some(source as u32)
+}
+
+/// [`shuffle_lane`] for quad lane `lane` (0-3) of a fragment quad at any
+/// of the eight positions of a warp: the quad lane read (`Some(None)` for
+/// out of range), if that is the same at every position and never a lane
+/// of another quad (`None` otherwise).
+pub(super) fn quad_shuffle_lane(mode: u32, lane: u32, b: u32, c: u32) -> Option<Option<u32>> {
+    let mut picked = None;
+    for quad in 0..(WARP as u32 / 4) {
+        let base = 4 * quad;
+        let local = match shuffle_lane(mode, base + lane, b, c) {
+            None => None,
+            Some(source) if (base..base + 4).contains(&source) => Some(source - base),
+            Some(_) => return None,
+        };
+        match picked {
+            None => picked = Some(local),
+            Some(previous) if previous != local => return None,
+            Some(_) => {}
+        }
+    }
+    picked
+}
+
+/// `FSWZADD` operation `operation`'s factors of A and B.
+pub(super) fn fswzadd_factors(operation: u32) -> (f32, f32) {
+    [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (0.0, 1.0)][operation as usize]
 }
 
 /// The sign-extended 20-bit immediate of `I` forms: bits 20-38 and the

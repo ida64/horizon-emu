@@ -7,14 +7,20 @@
 //! initial `SET_SNAP_GRID_NON_LINE` value 8 selects (`LOCATIONS_PER_PIXEL
 //! 256X256`, rounding `RTNE`; nvservices netlist region 7, field values
 //! [public: NVIDIA open-gpu-doc `classes/3d/clb197.h`]). Coverage is tested
-//! at pixel centers with integer edge functions and the top-left rule of the
-//! Direct3D 10+ rasterization rules [public: Direct3D 11 functional
-//! specification, 3.4.1 "Triangle Rasterization Rules"], which NVIDIA
-//! hardware implements; it is not pinned by the firmware. Coordinates here
-//! are physical: x to the right, y down in memory row order.
+//! at the sample positions (the pixel center with one sample per pixel; see
+//! `multisample` and `pipeline::multisample`) with integer edge functions
+//! and the top-left rule of the Direct3D 10+ rasterization rules [public:
+//! Direct3D 11 functional specification, 3.4.1 "Triangle Rasterization
+//! Rules"], which NVIDIA hardware implements; it is not pinned by the
+//! firmware. The pixel program runs once per pixel with any sample
+//! covered; depth, stencil and blending run per covered sample, into the
+//! texel holding it. Coordinates here are physical: x to the right, y down
+//! in memory row order.
 
 use super::Unmodeled;
 use super::blend::{Blend, Inputs};
+use super::multisample::Samples;
+use super::pipeline::Multisample;
 use super::shader::{Env, FragmentOutput, Plane, Program, Quad};
 use super::surface::{BAND_ROWS, Band, Rect};
 use super::texture::format::{ColorFormat, DepthFormat, linear_to_srgb, srgb_to_linear};
@@ -84,7 +90,140 @@ pub struct ColorOutput {
     pub srgb: bool,
 }
 
-/// The depth stage.
+/// A stencil operation (`SET_STENCIL_OP_FAIL` / `ZFAIL` / `ZPASS` and
+/// their `SET_BACK_STENCIL_OP_*` twins).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StencilOp {
+    Keep,
+    Zero,
+    Replace,
+    /// Increment, saturating at 255.
+    IncrementClamp,
+    /// Decrement, saturating at 0.
+    DecrementClamp,
+    Invert,
+    /// Increment, wrapping.
+    IncrementWrap,
+    /// Decrement, wrapping.
+    DecrementWrap,
+}
+
+impl StencilOp {
+    /// The OpenGL (`GL_KEEP` .. `GL_DECR_WRAP`) and Direct3D (1-8)
+    /// encodings [public: NVIDIA open-gpu-doc `clb197.h`,
+    /// `NVB197_SET_STENCIL_OP_FAIL_V_*`: OGL INCRSAT 0x1E02 and INCR
+    /// 0x8507 are OpenGL's `GL_INCR` (saturating) and `GL_INCR_WRAP`;
+    /// D3D INCRSAT 4, INCR 7 are `D3D11_STENCIL_OP_INCR_SAT`, `_INCR`].
+    pub fn from_raw(raw: u32) -> Option<Self> {
+        Some(match raw {
+            0x1E00 | 1 => StencilOp::Keep,
+            0x0000 | 2 => StencilOp::Zero,
+            0x1E01 | 3 => StencilOp::Replace,
+            0x1E02 | 4 => StencilOp::IncrementClamp,
+            0x1E03 | 5 => StencilOp::DecrementClamp,
+            0x150A | 6 => StencilOp::Invert,
+            0x8507 | 7 => StencilOp::IncrementWrap,
+            0x8508 | 8 => StencilOp::DecrementWrap,
+            _ => return None,
+        })
+    }
+
+    /// The new stencil value from the stored one, before the write mask.
+    #[inline]
+    pub fn apply(self, stored: u8, reference: u8) -> u8 {
+        match self {
+            StencilOp::Keep => stored,
+            StencilOp::Zero => 0,
+            StencilOp::Replace => reference,
+            StencilOp::IncrementClamp => stored.saturating_add(1),
+            StencilOp::DecrementClamp => stored.saturating_sub(1),
+            StencilOp::Invert => !stored,
+            StencilOp::IncrementWrap => stored.wrapping_add(1),
+            StencilOp::DecrementWrap => stored.wrapping_sub(1),
+        }
+    }
+}
+
+/// The stencil state of one face (OpenGL's `glStencilFuncSeparate`,
+/// `glStencilOpSeparate`, `glStencilMaskSeparate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StencilFace {
+    /// Applied where the stencil test fails.
+    pub fail: StencilOp,
+    /// Applied where the stencil test passes and the depth test fails.
+    pub depth_fail: StencilOp,
+    /// Applied where both pass.
+    pub pass: StencilOp,
+    pub compare: Compare,
+    pub reference: u8,
+    /// `FUNC_MASK`: ANDed with the reference and the stored value before
+    /// the comparison.
+    pub compare_mask: u8,
+    /// `MASK`: the stencil bits operations may change.
+    pub write_mask: u8,
+}
+
+impl StencilFace {
+    /// Whether the test passes for a stored value: (reference & mask)
+    /// `compare` (stored & mask), the reference on the left as in
+    /// OpenGL 4.6 core, 17.3.3 "Stencil Test" and Direct3D 11.3,
+    /// 17.12 "Stencil Test" [public].
+    #[inline]
+    pub fn test(&self, stored: u8) -> bool {
+        self.compare.test(
+            f32::from(self.reference & self.compare_mask),
+            f32::from(stored & self.compare_mask),
+        )
+    }
+
+    /// The stored value after `op`, with only the write mask's bits
+    /// changed.
+    #[inline]
+    pub fn update(&self, op: StencilOp, stored: u8) -> u8 {
+        let value = op.apply(stored, self.reference);
+        stored & !self.write_mask | value & self.write_mask
+    }
+
+    /// Whether a fragment failing the stencil test, or (with `depth_can_fail`)
+    /// the depth test, may change the stencil buffer.
+    pub fn writes_on_failure(&self, depth_can_fail: bool) -> bool {
+        self.write_mask != 0
+            && (self.fail != StencilOp::Keep
+                || (depth_can_fail && self.depth_fail != StencilOp::Keep))
+    }
+
+    /// Whether any fragment may change the stencil buffer.
+    pub fn writes(&self) -> bool {
+        self.write_mask != 0
+            && [self.fail, self.depth_fail, self.pass]
+                .iter()
+                .any(|&op| op != StencilOp::Keep)
+    }
+}
+
+/// The stencil test: front faces use `front`, back faces `back` (equal to
+/// `front` unless `SET_TWO_SIDED_STENCIL_TEST` is enabled). Points and
+/// lines are front-facing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stencil {
+    pub front: StencilFace,
+    pub back: StencilFace,
+}
+
+impl Stencil {
+    #[inline]
+    pub fn face(&self, front_facing: bool) -> &StencilFace {
+        if front_facing {
+            &self.front
+        } else {
+            &self.back
+        }
+    }
+}
+
+/// The depth/stencil stage. With the depth test disabled, `compare` is
+/// `Always` and `write` false (OpenGL 4.6 core, 17.3.4: a disabled depth
+/// test always passes and writes nothing).
 #[derive(Debug, Clone, Copy)]
 pub struct DepthOutput {
     pub format: DepthFormat,
@@ -92,6 +231,20 @@ pub struct DepthOutput {
     pub write: bool,
     /// Range the fragment depth is clamped to before the test.
     pub clamp: (f32, f32),
+    /// The stencil test, when enabled and the format has stencil (without
+    /// a stencil buffer the test passes and nothing is written: OpenGL 4.6
+    /// core, 17.3.3).
+    pub stencil: Option<Stencil>,
+}
+
+impl DepthOutput {
+    /// Whether a draw may change the buffer.
+    pub fn writes(&self) -> bool {
+        self.write
+            || self
+                .stencil
+                .is_some_and(|s| s.front.writes() || s.back.writes())
+    }
 }
 
 /// Everything fragment processing of one draw needs besides the bands.
@@ -107,6 +260,8 @@ pub struct Backend<'a> {
     pub blend_zero_rule: bool,
     /// Pixels that may be written (scissor, surface clip, targets).
     pub clip: Rect,
+    /// Samples per pixel, where they are and how they are stored.
+    pub multisample: Multisample,
 }
 
 /// A triangle in physical window space, ready to rasterize.
@@ -282,14 +437,14 @@ impl Triangle {
         }
         let min = |axis: usize| vertices.iter().map(|v| v[axis]).min().unwrap_or(0);
         let max = |axis: usize| vertices.iter().map(|v| v[axis]).max().unwrap_or(0);
-        // Pixel p is sampled at p + 0.5: the first candidate is the pixel
-        // whose center is at or after the minimum.
-        let first = |value: i64| ((value - (1 << (SUBPIXEL_BITS - 1))) as f64 / SUBPIXEL).ceil();
-        let last = |value: i64| ((value - (1 << (SUBPIXEL_BITS - 1))) as f64 / SUBPIXEL).floor();
+        // Candidates are the pixels the triangle's extent touches: with
+        // several samples per pixel a pixel whose center is outside may
+        // still have a sample inside (`Triangle::coverage`).
+        let first = |value: i64| (value as f64 / SUBPIXEL).floor();
         let x0 = first(min(0)).max(0.0);
         let y0 = first(min(1)).max(0.0);
-        let x1 = last(max(0)) + 1.0;
-        let y1 = last(max(1)) + 1.0;
+        let x1 = first(max(0)) + 1.0;
+        let y1 = first(max(1)) + 1.0;
         if x1 <= x0 || y1 <= y0 {
             return None;
         }
@@ -324,15 +479,73 @@ impl Triangle {
     /// Whether the center of pixel (`x`, `y`) is inside.
     #[inline]
     pub fn covers(&self, x: u32, y: u32) -> bool {
-        let half = 1i64 << (SUBPIXEL_BITS - 1);
+        self.covers_at(x, y, [8, 8])
+    }
+
+    /// Whether the point `position` (in 1/16 pixel from its corner) of
+    /// pixel (`x`, `y`) is inside.
+    #[inline]
+    pub fn covers_at(&self, x: u32, y: u32, position: [u8; 2]) -> bool {
         let p = [
-            (i64::from(x) << SUBPIXEL_BITS) + half,
-            (i64::from(y) << SUBPIXEL_BITS) + half,
+            (i64::from(x) << SUBPIXEL_BITS) + (i64::from(position[0]) << (SUBPIXEL_BITS - 4)),
+            (i64::from(y) << SUBPIXEL_BITS) + (i64::from(position[1]) << (SUBPIXEL_BITS - 4)),
         ];
         (0..3).all(|edge| {
             orient(self.vertices[edge], self.vertices[(edge + 1) % 3], p) + self.bias[edge] >= 0
         })
     }
+
+    /// The samples of pixel (`x`, `y`) inside: bit `s` for sample `s`.
+    #[inline]
+    pub fn coverage(&self, x: u32, y: u32, samples: &Samples) -> u16 {
+        (0..samples.count()).fold(0, |mask, s| {
+            mask | u16::from(self.covers_at(x, y, samples.positions[s])) << s
+        })
+    }
+
+    /// The largest magnitude of the depth plane at the snapped vertices.
+    pub fn max_depth(&self) -> f32 {
+        self.vertices
+            .iter()
+            .map(|&[x, y]| evaluate(&self.depth, x as f32 / 256.0, y as f32 / 256.0).abs())
+            .fold(0.0, f32::max)
+    }
+}
+
+/// The samples alpha to coverage leaves of a fragment whose output 0
+/// alpha is `alpha`: the first round(alpha × n) of the n samples (alpha
+/// clamped to [0, 1], NaN 0) [public: OpenGL 4.6 core, 17.3.1: a mask
+/// whose share of set bits is proportional to alpha, its pattern
+/// implementation-dependent. \[assumption: NVIDIA's pattern, and the
+/// dithering over 2x2 pixels `SET_ALPHA_TO_COVERAGE_DITHER_CONTROL`
+/// selects, are not public; no dithering is modeled\]].
+pub fn alpha_coverage(samples: &Samples, alpha: f32) -> u16 {
+    let n = samples.count() as f32;
+    let alpha = if alpha.is_nan() {
+        0.0
+    } else {
+        alpha.clamp(0.0, 1.0)
+    };
+    let k = (alpha * n).round_ties_even() as u32;
+    ((1u32 << k) - 1) as u16
+}
+
+/// Where `IPA` CENTROID evaluates in a pixel whose samples `mask` (bit
+/// `s`: sample `s`) a primitive covers, as an offset from the pixel's
+/// corner: the pixel center when all are covered (or none, a helper
+/// lane), else the position of the covered sample of lowest index.
+/// [public: OpenGL 4.6 core, 15.2.2: a centroid-sampled input is
+/// evaluated at "any location within the pixel and the primitive",
+/// the pixel center when the pixel is fully covered; which location the
+/// hardware picks is not public. \[assumption: a covered sample, the
+/// first; Direct3D 11's functional specification, 16.3.2, likewise
+/// allows any covered sample position\]]
+pub fn centroid(samples: &Samples, mask: u16) -> [f32; 2] {
+    let all = (1u32 << samples.count()) - 1;
+    if mask == 0 || u32::from(mask) == all {
+        return [0.5, 0.5];
+    }
+    samples.offset(mask.trailing_zeros() as usize)
 }
 
 /// A plane through three points: value(x, y) = base + dx x + dy y.
@@ -367,7 +580,9 @@ pub struct BandSet<'a> {
     pub depth: Option<Band<'a>>,
 }
 
-/// Rasterizes `triangles`, in order, into the rows of `bands`.
+/// Rasterizes `triangles`, in order, into the rows of `bands`. Bands
+/// are rows of texels; with several samples per pixel a band holds the
+/// samples of `BAND_ROWS >> ly` rows of pixels (see `multisample`).
 pub fn rasterize(
     backend: &Backend<'_>,
     env: &Env<'_>,
@@ -382,11 +597,13 @@ pub fn rasterize(
     else {
         return Ok(());
     };
+    let samples = &backend.multisample.samples;
+    let ly = samples.log2[1];
     let rows = Rect {
         x0: 0,
-        y0,
+        y0: y0 >> ly,
         x1: u32::MAX,
-        y1: y0 + BAND_ROWS,
+        y1: (y0 + BAND_ROWS) >> ly,
     };
     for triangle in triangles {
         let area = triangle.bounds.intersect(&backend.clip).intersect(&rows);
@@ -398,18 +615,16 @@ pub fn rasterize(
         while qy < area.y1 {
             let mut qx = area.x0 & !1;
             while qx < area.x1 {
-                let mut covered = [false; 4];
-                for (lane, covered) in covered.iter_mut().enumerate() {
+                let mut coverage = [0u16; 4];
+                for (lane, mask) in coverage.iter_mut().enumerate() {
                     let x = qx + (lane as u32 & 1);
                     let y = qy + (lane as u32 >> 1);
-                    *covered = x >= area.x0
-                        && x < area.x1
-                        && y >= area.y0
-                        && y < area.y1
-                        && triangle.covers(x, y);
+                    if x >= area.x0 && x < area.x1 && y >= area.y0 && y < area.y1 {
+                        *mask = triangle.coverage(x, y, samples);
+                    }
                 }
-                if covered.iter().any(|&c| c) {
-                    shade_quad(backend, env, triangle, qx, qy, covered, bands)?;
+                if coverage.iter().any(|&c| c != 0) {
+                    shade_quad(backend, env, triangle, qx, qy, coverage, bands)?;
                 }
                 qx += 2;
             }
@@ -419,26 +634,33 @@ pub fn rasterize(
     Ok(())
 }
 
+/// Shades the quad at (`x`, `y`) whose lanes have samples `coverage`
+/// inside the triangle, and runs each covered sample of each lane
+/// through the stencil and depth tests and blending into its texel.
 fn shade_quad(
     backend: &Backend<'_>,
     env: &Env<'_>,
     triangle: &Triangle,
     x: u32,
     y: u32,
-    covered: [bool; 4],
+    coverage: [u16; 4],
     bands: &mut BandSet<'_>,
 ) -> Result<(), Unmodeled> {
+    let samples = &backend.multisample.samples;
     let mut quad = Quad {
         planes: &triangle.planes,
         x,
         y,
-        covered,
+        covered: coverage.map(|mask| mask != 0),
+        centroids: coverage.map(|mask| centroid(samples, mask)),
         front_facing: triangle.front_facing,
         outputs: [FragmentOutput::default(); 4],
     };
     backend.program.run_fragment(env, &mut quad)?;
+    let [lx, ly] = samples.log2;
+    let multisample = &backend.multisample;
     for (lane, output) in quad.outputs.iter().enumerate() {
-        if !covered[lane] || output.discarded {
+        if coverage[lane] == 0 || output.discarded {
             continue;
         }
         if let Some((compare, reference)) = backend.alpha_test
@@ -446,25 +668,66 @@ fn shade_quad(
         {
             continue;
         }
-        let px = x + (lane as u32 & 1);
-        let py = y + (lane as u32 >> 1);
-        if let (Some(depth), Some(band)) = (backend.depth, bands.depth.as_mut()) {
-            let incoming = output
-                .depth
-                .unwrap_or_else(|| evaluate(&triangle.depth, px as f32 + 0.5, py as f32 + 0.5));
-            let incoming = incoming.clamp(depth.clamp.0, depth.clamp.1);
-            let texel = band.pixel_mut(px, py);
-            let stored = depth.format.read_depth(texel);
-            if !depth.compare.test(incoming, stored) {
-                continue;
-            }
-            if depth.write {
-                depth.format.write_depth(incoming, texel);
+        let mut mask = coverage[lane];
+        if multisample.alpha_to_coverage {
+            mask &= alpha_coverage(samples, output.colors[0][3]);
+        }
+        let mut output = *output;
+        if multisample.alpha_to_one {
+            for color in &mut output.colors {
+                color[3] = 1.0;
             }
         }
-        for color in backend.colors {
-            let band = &mut bands.colors[color.window];
-            write_color(color, backend, output, band, px, py);
+        let output = &output;
+        let px = x + (lane as u32 & 1);
+        let py = y + (lane as u32 >> 1);
+        for sample in (0..samples.count()).filter(|&s| mask & (1 << s) != 0) {
+            let [cx, cy] = samples.cell(sample);
+            let (tx, ty) = (px << lx | cx, py << ly | cy);
+            // The stencil test, then the depth test; the stencil buffer is
+            // updated by the operation the outcome selects, a fragment
+            // failing either test writes no color (OpenGL 4.6 core,
+            // 17.3.3-17.3.4).
+            if let (Some(depth), Some(band)) = (backend.depth, bands.depth.as_mut()) {
+                let [ox, oy] = if multisample.center_depth {
+                    [0.5, 0.5]
+                } else {
+                    samples.offset(sample)
+                };
+                let incoming = output
+                    .depth
+                    .unwrap_or_else(|| evaluate(&triangle.depth, px as f32 + ox, py as f32 + oy));
+                let incoming = incoming.clamp(depth.clamp.0, depth.clamp.1);
+                let texel = band.pixel_mut(tx, ty);
+                let stencil = depth.stencil.map(|stencil| {
+                    let face = *stencil.face(triangle.front_facing);
+                    let stored = depth.format.read_stencil(texel).unwrap_or(0);
+                    (face, stored, face.test(stored))
+                });
+                let stencil_passed = stencil.is_none_or(|(_, _, passed)| passed);
+                let depth_passed =
+                    stencil_passed && depth.compare.test(incoming, depth.format.read_depth(texel));
+                if let Some((face, stored, _)) = stencil {
+                    let op = if !stencil_passed {
+                        face.fail
+                    } else if !depth_passed {
+                        face.depth_fail
+                    } else {
+                        face.pass
+                    };
+                    depth.format.write_stencil(face.update(op, stored), texel);
+                }
+                if !depth_passed {
+                    continue;
+                }
+                if depth.write {
+                    depth.format.write_depth(incoming, texel);
+                }
+            }
+            for color in backend.colors {
+                let band = &mut bands.colors[color.window];
+                write_color(color, backend, output, band, tx, ty);
+            }
         }
     }
     Ok(())

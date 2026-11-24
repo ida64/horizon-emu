@@ -7,7 +7,7 @@ use super::*;
 pub(super) fn saturate(v: f32) -> f32 {
     if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) }
 }
-fn flush(v: f32, enabled: bool) -> f32 {
+pub(super) fn flush(v: f32, enabled: bool) -> f32 {
     if enabled && v.is_subnormal() {
         0.0f32.copysign(v)
     } else {

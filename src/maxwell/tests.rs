@@ -1173,6 +1173,257 @@ fn depth_test_matches_software() {
     }
 }
 
+/// The 64x64 frame drawn by `kind` with a block-linear depth buffer of
+/// `SET_ZT_FORMAT` `raw` holding `fill`, the depth test `depth_function`
+/// (with depth writes) or none, the stencil test enabled with the
+/// registers `stencil`, and color writes `color`: two full-target ui2d
+/// quads as in `depth_tested_frame`, the second one wound the other way
+/// (so it is back-facing). The color target and the depth buffer after a
+/// write-back, and the Metal renderer's counts.
+fn stencil_tested_frame(
+    kind: super::RendererKind,
+    raw: u32,
+    depth_function: Option<u32>,
+    stencil: &[(u32, u32)],
+    color: bool,
+    fill: &[u8],
+) -> (Vec<u8>, Vec<u8>, Option<(u64, Vec<(String, u64)>)>) {
+    let elf = std::fs::read(STARTER).expect("starter ELF (fw_elf) must be present");
+    let mut frame = Frame::sized_with(SIZE, SIZE, kind);
+    frame.program(1, 0, starter_program(&elf, 0x4c0e00));
+    frame.program(5, 0x800, starter_program(&elf, 0x4be400));
+    frame.constants(0, 3, 0x30_0000, &ui2d_vertex_constants(&[]));
+    frame.ram.put(DEPTH, fill);
+    for (offset, value) in [
+        (0x0fe0, (DEPTH >> 32) as u32),
+        (0x0fe4, DEPTH as u32),
+        (0x0fe8, raw),
+        (0x0fec, 0),
+        (0x1228, SIZE),
+        (0x122c, SIZE),
+        (0x1230, 1),
+        (0x1538, 1),
+        (0x12cc, u32::from(depth_function.is_some())),
+        (0x130c, depth_function.unwrap_or(0x207)),
+        (0x12e8, 1),
+        (0x1380, 1), // SET_STENCIL_TEST
+        (0x1a00, if color { 0x1111 } else { 0 }),
+    ] {
+        frame.method(offset, value);
+    }
+    for &(offset, value) in stencil {
+        frame.method(offset, value);
+    }
+    for (i, (color, depths)) in [
+        ([0.25, 0.5, 1.0, 1.0], [-0.9, 0.7, 0.1, -0.2]),
+        ([1.0, 0.25, 0.0, 1.0], [0.8, -0.6, -0.1, 0.3]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        frame.constants(4, 3, 0x30_1000 + 0x100 * i as u64, &floats(&color));
+        let mut corners = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
+        if i == 1 {
+            corners.reverse();
+        }
+        let quad: Vec<f32> = corners
+            .iter()
+            .zip(depths)
+            .flat_map(|(&[x, y], z)| [x, y, z])
+            .collect();
+        frame.vertices(0x40_0000 + 0x100 * i as u64, 12, &quad, &[(0, 0x02)]);
+        frame.method(0x1618, 7);
+        frame.method(0x0d74, 0);
+        frame.method(0x0d78, 4);
+        frame.method(0x1614, 0);
+    }
+    frame.channel.flush(&frame.ram).unwrap();
+    let counts = frame.channel.hooks.metal.as_ref().map(|m| m.fallbacks());
+    (
+        frame.ram.bytes(TARGET, (SIZE * SIZE * 4) as usize),
+        frame.ram.bytes(DEPTH, fill.len()),
+        counts,
+    )
+}
+
+/// Stencil operations: saturating and wrapping steps, the write mask and
+/// the masked comparison with the reference on the left.
+#[test]
+fn stencil_operations_and_masks() {
+    use super::raster::{Compare, StencilFace, StencilOp};
+    assert_eq!(StencilOp::IncrementClamp.apply(255, 0), 255);
+    assert_eq!(StencilOp::IncrementWrap.apply(255, 0), 0);
+    assert_eq!(StencilOp::DecrementClamp.apply(0, 0), 0);
+    assert_eq!(StencilOp::DecrementWrap.apply(0, 0), 255);
+    assert_eq!(StencilOp::Invert.apply(0x5a, 0), 0xa5);
+    assert_eq!(StencilOp::Replace.apply(0x12, 0x34), 0x34);
+    // OpenGL and Direct3D encodings.
+    assert_eq!(StencilOp::from_raw(0x1e02), Some(StencilOp::IncrementClamp));
+    assert_eq!(StencilOp::from_raw(0x8507), Some(StencilOp::IncrementWrap));
+    assert_eq!(StencilOp::from_raw(0), Some(StencilOp::Zero));
+    assert_eq!(StencilOp::from_raw(1), Some(StencilOp::Keep));
+    assert_eq!(StencilOp::from_raw(8), Some(StencilOp::DecrementWrap));
+    assert_eq!(StencilOp::from_raw(9), None);
+    let face = StencilFace {
+        fail: StencilOp::Keep,
+        depth_fail: StencilOp::Keep,
+        pass: StencilOp::Replace,
+        compare: Compare::Less,
+        reference: 0x13,
+        compare_mask: 0x0f,
+        write_mask: 0xf0,
+    };
+    // 0x3 < 0x4 (stored 0x24 masked); 0x3 < 0x3 fails.
+    assert!(face.test(0x24));
+    assert!(!face.test(0xf3));
+    // Only the upper nibble of the reference lands.
+    assert_eq!(face.update(StencilOp::Replace, 0xab), 0x1b);
+}
+
+/// The stencil test on Metal gives the software renderer's colors and
+/// depth/stencil buffer, bit for bit, for every format with stencil, one
+/// and two-sided, with and without the depth test, over random stored
+/// stencil bits; failing fragments that update the stencil buffer while
+/// colors are written are left to the software renderer.
+#[test]
+fn stencil_test_matches_software() {
+    use super::RendererKind::{Metal, Software};
+    use super::texture::format::DepthFormat;
+    let mut random = Random(0x1405_6f3c_9d2b_77e1);
+    // Front: fail, zfail, zpass, func, ref, func mask, mask (0x1384..).
+    let front = |ops: [u32; 3], func: u32, reference: u32, compare_mask: u32, mask: u32| {
+        let mut registers: Vec<(u32, u32)> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, &op)| (0x1384 + 4 * i as u32, op))
+            .collect();
+        registers.extend([
+            (0x1390, func),
+            (0x1394, reference),
+            (0x1398, compare_mask),
+            (0x139c, mask),
+        ]);
+        registers
+    };
+    // Back: two-sided, ops and func (0x1598..), ref, mask, func mask
+    // (0x0f54..).
+    let back = |ops: [u32; 3], func: u32, reference: u32, compare_mask: u32, mask: u32| {
+        let mut registers = vec![(0x1594, 1)];
+        registers.extend(
+            ops.iter()
+                .enumerate()
+                .map(|(i, &op)| (0x1598 + 4 * i as u32, op)),
+        );
+        registers.extend([
+            (0x15a4, func),
+            (0x0f54, reference),
+            (0x0f58, mask),
+            (0x0f5c, compare_mask),
+        ]);
+        registers
+    };
+    // OGL KEEP, INCR (wrap), INVERT, REPLACE, D3D DECRSAT, INCRSAT, ZERO.
+    let (keep, incr_wrap, invert, replace, decr_sat, incr_sat, zero) =
+        (0x1e00, 0x8507, 0x150a, 0x1e01, 5, 4, 0);
+    struct Case {
+        what: &'static str,
+        depth: Option<u32>,
+        registers: Vec<(u32, u32)>,
+        color: bool,
+        /// Whether Metal draws it.
+        metal: bool,
+    }
+    let cases = [
+        Case {
+            what: "one-sided, keep on failure",
+            depth: Some(0x201),
+            registers: front([keep, keep, incr_wrap], 0x203, 0x80, 0xff, 0xff),
+            color: true,
+            metal: true,
+        },
+        Case {
+            what: "two-sided, masked",
+            depth: Some(7),
+            registers: [
+                front([keep, keep, replace], 0x202, 0x35, 0x0f, 0x3c),
+                back([keep, keep, invert], 6, 0x40, 0xc0, 0xf0),
+            ]
+            .concat(),
+            color: true,
+            metal: true,
+        },
+        Case {
+            what: "no depth test, failure ops",
+            depth: None,
+            registers: [
+                front([decr_sat, zero, incr_sat], 0x204, 0x60, 0xff, 0xff),
+                back([replace, keep, incr_wrap], 2, 0x90, 0x7f, 0xff),
+            ]
+            .concat(),
+            color: true,
+            metal: false,
+        },
+        Case {
+            what: "stencil only, every op",
+            depth: Some(0x203),
+            registers: [
+                front([decr_sat, zero, incr_sat], 0x206, 0x70, 0xfe, 0xff),
+                back([replace, invert, incr_wrap], 5, 0x90, 0xff, 0x7f),
+            ]
+            .concat(),
+            color: false,
+            metal: true,
+        },
+    ];
+    for raw in [0x14, 0x16, 0x19] {
+        let format = DepthFormat::from_raw(raw).unwrap();
+        let bytes = format.bytes_per_pixel() as usize;
+        let mut fill = vec![0u8; (SIZE * SIZE) as usize * bytes];
+        for texel in fill.chunks_mut(bytes) {
+            for byte in texel.iter_mut() {
+                *byte = random.next() as u8;
+            }
+            if !format.is_unorm() {
+                texel[..4].copy_from_slice(&random.unit().max(1e-30).to_le_bytes());
+            }
+        }
+        for case in &cases {
+            let what = format!("{format:?} {}", case.what);
+            let run = |kind| {
+                stencil_tested_frame(kind, raw, case.depth, &case.registers, case.color, &fill)
+            };
+            let software = run(Software);
+            let metal = run(Metal);
+            let stencil = |buffer: &[u8]| -> Vec<u8> {
+                buffer
+                    .chunks(bytes)
+                    .map(|texel| format.read_stencil(texel).unwrap())
+                    .collect()
+            };
+            // The stencil test both passed and failed, and stencil bits
+            // changed.
+            if case.color {
+                let mut colors: Vec<&[u8]> = software.0.chunks(4).collect();
+                colors.sort();
+                colors.dedup();
+                assert!(colors.len() >= 2, "{what}: {colors:?}");
+            }
+            assert_ne!(stencil(&software.1), stencil(&fill), "{what}: stencil kept");
+            assert!(software.0 == metal.0, "{what}: colors differ");
+            assert!(
+                software.1 == metal.1,
+                "{what}: depth/stencil buffers differ"
+            );
+            let (draws, fallbacks) = metal.2.expect("Metal renderer");
+            if case.metal {
+                assert_eq!((draws, fallbacks), (2, vec![]), "{what}: Metal drew both");
+            } else {
+                assert_eq!(draws, 0, "{what}: left to the software renderer");
+            }
+        }
+    }
+}
+
 /// Triangles with vertices on pixel centers and pixel edges of a target
 /// whose size is no power of two (so window positions are not exact in
 /// Metal's normalized coordinates) cover the same pixels on Metal as in
@@ -1498,6 +1749,192 @@ fn empty_inline_transfer_completes_at_launch() {
     }
     call(&mut channel, &ram, 0, 0x1b0, 0x1011);
     call(&mut channel, &ram, 0, 0x2380, 0x7000);
+}
+
+/// The SIZE x SIZE frame of `SET_ANTI_ALIAS` `mode` drawn by `kind`:
+/// color target and depth buffer (`Z24S8`, holding `fill`) hold the
+/// samples as texels (`multisample`), the surface clip and viewport
+/// count pixels, samples at `positions` (`SET_ANTI_ALIAS_SAMPLE_POSITIONS`),
+/// `SET_ANTI_ALIAS_ALPHA_CONTROL` `alpha_control`. Each of `quads`
+/// (corners in normalized device coordinates with their depths, and an
+/// RGBA color) is drawn with the depth test LESS and depth writes. The
+/// color texels and the depth buffer after a write-back.
+fn multisampled_frame(
+    kind: super::RendererKind,
+    mode: u32,
+    positions: u32,
+    alpha_control: u32,
+    fill: &[u8],
+    quads: &[([[f32; 3]; 4], [f32; 4])],
+) -> (Vec<u8>, Vec<u8>) {
+    let elf = std::fs::read(STARTER).expect("starter ELF (fw_elf) must be present");
+    let samples = super::multisample::Samples::from_mode(mode).unwrap();
+    let [lx, ly] = samples.log2;
+    let mut frame = Frame::sized_with(SIZE << lx, SIZE << ly, kind);
+    frame.program(1, 0, starter_program(&elf, 0x4c0e00));
+    frame.program(5, 0x800, starter_program(&elf, 0x4be400));
+    frame.constants(0, 3, 0x30_0000, &ui2d_vertex_constants(&[]));
+    frame.ram.put(DEPTH, fill);
+    let half = (SIZE / 2) as f32;
+    for (offset, value) in [
+        (0x15d0, mode),
+        (0x1534, 1),
+        (0x11e0, positions),
+        (0x11e4, positions),
+        (0x11e8, positions),
+        (0x11ec, positions),
+        (0x153c, alpha_control),
+        (0x0754, 1),
+        (0x0ff4, SIZE << 16),
+        (0x0ff8, SIZE << 16),
+        (0x0a00, half.to_bits()),
+        (0x0a04, half.to_bits()),
+        (0x0a0c, half.to_bits()),
+        (0x0a10, half.to_bits()),
+        (0x0fe0, (DEPTH >> 32) as u32),
+        (0x0fe4, DEPTH as u32),
+        (0x0fe8, 0x14),
+        (0x0fec, 0),
+        (0x1228, SIZE << lx),
+        (0x122c, SIZE << ly),
+        (0x1230, 1),
+        (0x1538, 1),
+        (0x12cc, 1),
+        (0x130c, 0x201),
+        (0x12e8, 1),
+    ] {
+        frame.method(offset, value);
+    }
+    for (i, (corners, color)) in quads.iter().enumerate() {
+        frame.constants(4, 3, 0x30_1000 + 0x100 * i as u64, &floats(color));
+        let quad: Vec<f32> = corners.iter().flatten().copied().collect();
+        frame.vertices(0x40_0000 + 0x100 * i as u64, 12, &quad, &[(0, 0x02)]);
+        frame.method(0x1618, 7);
+        frame.method(0x0d74, 0);
+        frame.method(0x0d78, 4);
+        frame.method(0x1614, 0);
+    }
+    frame.channel.flush(&frame.ram).unwrap();
+    if let Some(metal) = &frame.channel.hooks.metal {
+        assert_eq!(
+            metal.fallbacks(),
+            (quads.len() as u64, vec![]),
+            "Metal drew every quad"
+        );
+    }
+    (
+        frame
+            .ram
+            .bytes(TARGET, ((SIZE * SIZE) << (lx + ly)) as usize * 4),
+        frame.ram.bytes(DEPTH, fill.len()),
+    )
+}
+
+/// Minecraft's 2X1_D3D sample positions: sample 0 at (12/16, 12/16),
+/// sample 1 at (4/16, 4/16).
+const D3D_2X1: u32 = 0x44cc_44cc;
+
+/// A 2X1 target holds pixel (x, y)'s sample s in texel (2x + s, y), and
+/// coverage is taken at the sample positions: a quad whose left edge
+/// runs between the two samples of pixel column 10 (at x = 10.5) covers
+/// sample 0 (x = 10.75) there, not sample 1 (x = 10.25); columns right
+/// of it are covered whole, columns left of it not at all.
+#[test]
+fn multisampled_target_holds_samples_side_by_side() {
+    let edge = 10.5 / (SIZE / 2) as f32 - 1.0;
+    let corners = [
+        [edge, -1.0, 0.5],
+        [1.0, -1.0, 0.5],
+        [1.0, 1.0, 0.5],
+        [edge, 1.0, 0.5],
+    ];
+    let fill = vec![0xFFu8; (2 * SIZE * SIZE * 4) as usize];
+    let (colors, _) = multisampled_frame(
+        super::RendererKind::Software,
+        5,
+        D3D_2X1,
+        0,
+        &fill,
+        &[(corners, [1.0, 0.0, 0.0, 1.0])],
+    );
+    let texel = |x: u32, y: u32| &colors[((y * 2 * SIZE + x) * 4) as usize..][..4];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let expected = [x >= 11 || x == 10, x >= 11];
+            for (sample, covered) in expected.into_iter().enumerate() {
+                // Uncovered samples keep what the frame starts with.
+                let want: &[u8] = if covered {
+                    &[255, 0, 0, 255]
+                } else {
+                    &[0, 0, 0, 255]
+                };
+                assert_eq!(
+                    texel(2 * x + sample as u32, y),
+                    want,
+                    "{x},{y} sample {sample}"
+                );
+            }
+        }
+    }
+}
+
+/// Multisampled drawing on Metal gives the software renderer's samples
+/// and depth buffer bit for bit, for 2X1_D3D and 2X2, with and without
+/// alpha to coverage: two overlapping quads with corners off the pixel
+/// grid, depth-tested against a buffer of random depths, leave pixels
+/// whose samples differ.
+#[test]
+fn multisampling_matches_software() {
+    use super::RendererKind::{Metal, Software};
+    let mut random = Random(0x9e37_79b9_7f4a_7c15);
+    let quads = [
+        (
+            [
+                [-0.83, -0.71, -0.9],
+                [0.77, -0.93, 0.6],
+                [0.91, 0.8, 0.1],
+                [-0.6, 0.66, -0.3],
+            ],
+            [0.25, 0.5, 1.0, 0.6],
+        ),
+        (
+            [
+                [-0.3, -0.97, 0.7],
+                [0.95, -0.2, -0.6],
+                [0.4, 0.93, -0.1],
+                [-0.97, 0.13, 0.4],
+            ],
+            [1.0, 0.25, 0.0, 0.3],
+        ),
+    ];
+    // 2X2 at Direct3D's standard 4x positions: (6, 2), (14, 6), (2, 10),
+    // (10, 14).
+    for (mode, positions) in [(5, D3D_2X1), (2, 0xeaa2_6e26_u32)] {
+        let samples = super::multisample::Samples::from_mode(mode).unwrap();
+        let texels = (SIZE * SIZE) as usize * samples.count();
+        let mut fill = vec![0u8; texels * 4];
+        for texel in fill.chunks_mut(4) {
+            texel.copy_from_slice(&random.next().to_le_bytes());
+        }
+        for alpha_control in [0, 1] {
+            let run =
+                |kind| multisampled_frame(kind, mode, positions, alpha_control, &fill, &quads);
+            let (software, metal) = (run(Software), run(Metal));
+            let what = format!("mode {mode} alpha control {alpha_control}");
+            assert!(software.0 == metal.0, "{what}: samples differ");
+            assert!(software.1 == metal.1, "{what}: depth buffers differ");
+            // Some pixel has samples of different colors.
+            let [lx, _] = samples.log2;
+            let row = (SIZE << lx) as usize * 4;
+            let split = (0..SIZE as usize).any(|y| {
+                (0..SIZE as usize).any(|x| {
+                    let at = |s: usize| &software.0[y * row + ((x << lx) + s) * 4..][..4];
+                    at(0) != at(1)
+                })
+            });
+            assert!(split, "{what}: no partly covered pixel");
+        }
+    }
 }
 
 mod lines;
