@@ -261,13 +261,14 @@ impl Writer<'_> {
     /// Records, before a sample of texture `slot`, that an unbound slot
     /// was sampled (see the module documentation). A vertex or compute
     /// program has no fault words: its work goes to the CPU when a slot
-    /// is unbound.
+    /// is unbound. The mark the draw sets is read as a plain word (no
+    /// fragment writes it), so that the compiler may load it once.
     fn note_sample(&mut self, slot: usize) {
         if self.stage != Stage::Pixel {
             return;
         }
         self.line(&format!(
-            "if (atomic_load_explicit(&texture_faults[{}], memory_order_relaxed) != 0u) {{ atomic_store_explicit(&texture_faults[{}], 1u, memory_order_relaxed); }}",
+            "if (((const device uint*)texture_faults)[{}] != 0u) {{ atomic_store_explicit(&texture_faults[{}], 1u, memory_order_relaxed); }}",
             2 * slot,
             2 * slot + 1
         ));
