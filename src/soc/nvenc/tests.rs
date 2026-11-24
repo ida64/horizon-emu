@@ -48,15 +48,19 @@ fn grcs_setup_reads_as_an_idr_picture_of_its_parameter_sets() {
     assert_eq!((setup.pic_struct(), setup.pic_type()), (0, 3));
     assert!(setup.reference() && setup.four_byte_start_codes());
     assert_eq!((setup.bitstream_size, setup.bitstream_start), (0x151800, 0));
-    let settings = setup.settings().unwrap();
     assert_eq!(
-        settings,
-        Settings {
+        setup.format(),
+        Format {
             width: 1280,
             height: 720,
             cabac: true,
+        }
+    );
+    assert_eq!(
+        setup.rate().unwrap(),
+        Rate {
             bit_rate: 5_000_000,
-            frame_rate: 30.0,
+            frame_rate: Some(30.0),
         }
     );
     let driver = setup.driver();
@@ -174,6 +178,13 @@ impl Bench {
         // References all: an IDR picture, an I picture every 15 (grc's
         // `gop_length`), P pictures between.
         words[pc + 56] = pic_type(index) << 2 | 0x90;
+        // grc's measured frame rate (8.8): 30, then 15, then none, as
+        // when pictures stop coming during world creation.
+        words[0x88 / 4] = match index {
+            0..15 => 0x1e00,
+            15..25 => 0xf00,
+            _ => 0,
+        };
         self.poke(SETUP, &setup_bytes(&words));
         (luma, chroma)
     }
@@ -293,6 +304,17 @@ fn encoded_pictures_decode_under_the_drivers_parameter_sets() {
         // As VideoToolbox takes it: each NAL unit after its length.
         let mut sample = Vec::new();
         let units: Vec<&[u8]> = split_start_codes(&stream);
+        // The stream goes on through the frame rate changes: P pictures
+        // stay P pictures (slice_type % 5 == 0 after first_mb_in_slice).
+        let rbsp = h264::rbsp(&units[0][1..]);
+        let mut slice = h264::Reader::new(&rbsp);
+        slice.ue().unwrap();
+        let slice_type = slice.ue().unwrap() % 5;
+        assert_eq!(
+            slice_type,
+            if index % 15 == 0 { 2 } else { 0 },
+            "picture {index}"
+        );
         assert_eq!(
             units.len(),
             usize::from(u16::from_le_bytes(

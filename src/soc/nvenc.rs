@@ -71,6 +71,22 @@
 //! buffers are NVENC's own between pictures and are not written: the host
 //! encoder keeps its own reference picture.
 //!
+//! # Rate control
+//!
+//! The rate control's frame rate is not fixed: grc's encoder measures it
+//! from the input pictures' timestamps (`CalculateDynamicFrameRate`,
+//! `0x1f8b90`: `(u32)(10000000.0 / average_delta + 0.5)`, timestamps in
+//! 100 ns) and hands each new value to the H.264 encoder, so the setup's
+//! frame rate follows the game's: 30 at first, 15 later, and 0 once
+//! pictures come more than 2 s apart (creating a world in Minecraft),
+//! with the per-picture rate `R` (+0x40 of `nvenc_h264_rc_s`) then
+//! 0x7FFFFFFF. Every picture is still encoded. The bit rate and frame
+//! rate are set on the running host session when they change (a new
+//! session would restart the stream at a key picture); a frame rate of 0
+//! gives the rate control no per-picture budget, which here leaves the
+//! session's last frame rate in place \[inference: VideoToolbox's frame
+//! rate is a hint, the bit rate target stays\].
+//!
 //! # Status
 //!
 //! The status record (SET_OUT_ENC_STATUS, `nvenc_pic_stat_s`, 128 bytes,
@@ -115,7 +131,7 @@ use crate::{
     maxwell::texture::layout::{BlockLinear, BlockLinearSurface},
     snapshot::{Snapshot, SnapshotError, decode, encode},
 };
-use videotoolbox::{Encoder, Settings};
+use videotoolbox::{Encoder, Format, Rate};
 
 /// Host1x class of NVENC (nvservices' engine configuration `0xee170`;
 /// Linux `include/linux/host1x.h` `HOST1X_CLASS_NVENC`).
@@ -316,11 +332,20 @@ impl Setup {
     }
 
     /// What the host encoder is made for: the picture in whole
-    /// macroblocks (NVENC encodes the padded input, `nvenc_drv.h` 2.1),
-    /// the driver's entropy coder, frame rate and bit rate.
-    fn settings(&self) -> Result<Settings, String> {
-        let frame_rate = f64::from(self.frame_rate) / 256.0;
-        if !(1.0..=240.0).contains(&frame_rate) {
+    /// macroblocks (NVENC encodes the padded input, `nvenc_drv.h` 2.1)
+    /// and the driver's entropy coder.
+    fn format(&self) -> Format {
+        Format {
+            width: self.input.width.next_multiple_of(16),
+            height: self.input.height.next_multiple_of(16),
+            cabac: self.pps[0] >> 8 & 1 != 0,
+        }
+    }
+
+    /// The rate control's bit rate and frame rate. A frame rate of 0 is
+    /// none: see "Rate control" in the module.
+    fn rate(&self) -> Result<Rate, String> {
+        if self.frame_rate < 0 {
             return Err(format!("frame rate {:#x}", self.frame_rate));
         }
         // `hrd_type`: VCL (1) or NAL (2) HRD, whose bit rate it is.
@@ -332,12 +357,9 @@ impl Setup {
         if bit_rate <= 0 {
             return Err(format!("bit rate {bit_rate}"));
         }
-        Ok(Settings {
-            width: self.input.width.next_multiple_of(16),
-            height: self.input.height.next_multiple_of(16),
-            cabac: self.pps[0] >> 8 & 1 != 0,
+        Ok(Rate {
             bit_rate: bit_rate as u32,
-            frame_rate,
+            frame_rate: (self.frame_rate > 0).then(|| f64::from(self.frame_rate) / 256.0),
         })
     }
 }
@@ -550,12 +572,13 @@ impl Shared {
         methods: &[u32; method::COUNT],
         setup: &Setup,
     ) -> Result<(), String> {
-        let settings = setup.settings()?;
-        let (luma, chroma) = self.picture(methods, setup, &settings)?;
-        if encoder.as_ref().is_none_or(|e| e.settings() != settings) {
-            *encoder = Some(Encoder::new(settings)?);
+        let (format, rate) = (setup.format(), setup.rate()?);
+        let (luma, chroma) = self.picture(methods, setup, &format)?;
+        if encoder.as_ref().is_none_or(|e| e.format() != format) {
+            *encoder = Some(Encoder::new(format)?);
         }
         let encoder = encoder.as_mut().unwrap();
+        encoder.set_rate(rate)?;
         let driver = setup.driver();
         let encoded = encoder.encode(&luma, &chroma, setup.pic_type() >= 2)?;
         let sps = h264::parse_sps(&h264::rbsp(encoded.sps.get(1..).unwrap_or_default()))?;
@@ -628,13 +651,13 @@ impl Shared {
         self.write(status, &record, "status record")
     }
 
-    /// The input picture as the host encoder takes it: `settings`' size,
+    /// The input picture as the host encoder takes it: `format`'s size,
     /// luma rows, then rows of Cb/Cr pairs.
     fn picture(
         &self,
         methods: &[u32; method::COUNT],
         setup: &Setup,
-        settings: &Settings,
+        format: &Format,
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
         let input = &setup.input;
         let layout = input.layout;
@@ -654,7 +677,7 @@ impl Shared {
         if input.transform != 0 {
             return Err(format!("input surface transform {}", input.transform));
         }
-        let (width, height) = (settings.width, settings.height);
+        let (width, height) = (format.width, format.height);
         if input.pitch < width || input.pitch_chroma < width {
             return Err(format!(
                 "input pitches {}/{} for {width} bytes a row",

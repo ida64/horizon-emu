@@ -176,16 +176,24 @@ const CF_NUMBER_FLOAT64: isize = 6;
 /// `kVTEncodeInfo_FrameDropped`.
 const FRAME_DROPPED: u32 = 1 << 1;
 
-/// What the session is made for.
+/// What the session is made for: changing it takes a new session.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Settings {
+pub struct Format {
     pub width: u32,
     pub height: u32,
     /// CABAC rather than CAVLC.
     pub cabac: bool,
+}
+
+/// The rate control's targets, set on the running session
+/// (`kVTCompressionPropertyKey_AverageBitRate`, `ExpectedFrameRate`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rate {
     /// Bits a second.
     pub bit_rate: u32,
-    pub frame_rate: f64,
+    /// Pictures a second; none when the driver gives none, which leaves
+    /// the session's last.
+    pub frame_rate: Option<f64>,
 }
 
 /// One encoded picture: its NAL units (header byte first, no start code,
@@ -275,11 +283,17 @@ unsafe fn unpack(sample: CMSampleBufferRef) -> Result<Encoded, String> {
 
 /// A compression session.
 pub struct Encoder {
-    settings: Settings,
+    format: Format,
+    rate: Option<Rate>,
     session: VTCompressionSessionRef,
-    /// Pictures given so far: the presentation time of the next.
-    count: i64,
+    /// Presentation time of the next picture, and how far each one moves
+    /// it, in microseconds (a picture at the last frame rate given).
+    time: i64,
+    duration: i64,
 }
+
+/// Presentation timestamps' units a second.
+const TIMESCALE: i32 = 1_000_000;
 
 // SAFETY: the session is a Core Foundation object, usable from any thread;
 // an `Encoder` is used by one at a time.
@@ -320,7 +334,7 @@ fn number_f64(value: f64) -> CFNumberRef {
 }
 
 impl Encoder {
-    pub fn new(settings: Settings) -> Result<Encoder, String> {
+    pub fn new(format: Format) -> Result<Encoder, String> {
         let mut session = std::ptr::null();
         // SAFETY: Core Foundation and VideoToolbox calls with valid
         // arguments; every object created here is released once.
@@ -333,8 +347,8 @@ impl Encoder {
             );
             for (key, value) in [
                 (kCVPixelBufferPixelFormatTypeKey, PIXEL_FORMAT_420V as i32),
-                (kCVPixelBufferWidthKey, settings.width as i32),
-                (kCVPixelBufferHeightKey, settings.height as i32),
+                (kCVPixelBufferWidthKey, format.width as i32),
+                (kCVPixelBufferHeightKey, format.height as i32),
             ] {
                 let number = number_i32(value);
                 CFDictionarySetValue(attributes, key, number);
@@ -342,8 +356,8 @@ impl Encoder {
             }
             let status = VTCompressionSessionCreate(
                 std::ptr::null(),
-                settings.width as i32,
-                settings.height as i32,
+                format.width as i32,
+                format.height as i32,
                 CODEC_H264,
                 std::ptr::null(),
                 attributes,
@@ -356,15 +370,17 @@ impl Encoder {
             if status != 0 {
                 return Err(format!(
                     "VideoToolbox: no compression session for {}x{} (OSStatus {status})",
-                    settings.width, settings.height
+                    format.width, format.height
                 ));
             }
             let encoder = Encoder {
-                settings,
+                format,
+                rate: None,
                 session,
-                count: 0,
+                time: 0,
+                duration: i64::from(TIMESCALE) / 30,
             };
-            let entropy = if settings.cabac {
+            let entropy = if format.cabac {
                 kVTH264EntropyMode_CABAC
             } else {
                 kVTH264EntropyMode_CAVLC
@@ -401,18 +417,6 @@ impl Encoder {
                     number_i32(i32::MAX),
                     true,
                 ),
-                (
-                    "AverageBitRate",
-                    kVTCompressionPropertyKey_AverageBitRate,
-                    number_i32(settings.bit_rate.min(i32::MAX as u32) as i32),
-                    true,
-                ),
-                (
-                    "ExpectedFrameRate",
-                    kVTCompressionPropertyKey_ExpectedFrameRate,
-                    number_f64(settings.frame_rate),
-                    true,
-                ),
             ] {
                 // Every value is released, whatever the session says.
                 let status = set(encoder.session, key, value, owned);
@@ -435,15 +439,53 @@ impl Encoder {
         }
     }
 
-    pub fn settings(&self) -> Settings {
-        self.settings
+    pub fn format(&self) -> Format {
+        self.format
+    }
+
+    /// Sets the rate control's targets, unless they are the session's.
+    pub fn set_rate(&mut self, rate: Rate) -> Result<(), String> {
+        if self.rate == Some(rate) {
+            return Ok(());
+        }
+        let bit_rate = number_i32(rate.bit_rate.min(i32::MAX as u32) as i32);
+        // SAFETY: a live session and a number released once.
+        let mut status = unsafe {
+            set(
+                self.session,
+                kVTCompressionPropertyKey_AverageBitRate,
+                bit_rate,
+                true,
+            )
+        };
+        if let Some(frame_rate) = rate.frame_rate
+            && status == 0
+        {
+            // SAFETY: as above.
+            status = unsafe {
+                set(
+                    self.session,
+                    kVTCompressionPropertyKey_ExpectedFrameRate,
+                    number_f64(frame_rate),
+                    true,
+                )
+            };
+            self.duration = (f64::from(TIMESCALE) / frame_rate).round().max(1.0) as i64;
+        }
+        if status != 0 {
+            return Err(format!(
+                "VideoToolbox: rate control {rate:?} refused (OSStatus {status})"
+            ));
+        }
+        self.rate = Some(rate);
+        Ok(())
     }
 
     /// Encodes one picture of the session's size: `luma` rows of `width`
     /// bytes, then `chroma` rows of `width` bytes of Cb/Cr pairs, half as
     /// many. `key` asks for a key (IDR) picture.
     pub fn encode(&mut self, luma: &[u8], chroma: &[u8], key: bool) -> Result<Encoded, String> {
-        let (width, height) = (self.settings.width as usize, self.settings.height as usize);
+        let (width, height) = (self.format.width as usize, self.format.height as usize);
         assert_eq!(luma.len(), width * height);
         assert_eq!(chroma.len(), width * height / 2);
         let mut out = Output::default();
@@ -488,12 +530,12 @@ impl Encoder {
                 std::ptr::null()
             };
             let time = CMTime {
-                value: self.count,
-                timescale: (self.settings.frame_rate.round() as i32).max(1),
+                value: self.time,
+                timescale: TIMESCALE,
                 flags: TIME_VALID,
                 epoch: 0,
             };
-            self.count += 1;
+            self.time += self.duration;
             let mut info = 0;
             let status = VTCompressionSessionEncodeFrame(
                 self.session,
