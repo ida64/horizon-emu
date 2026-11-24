@@ -713,10 +713,10 @@ enum Scope {
     All,
 }
 
-/// Arena chunks a channel's recorded work may fill without anything
-/// having waited for the GPU \[assumption: a frame's draw data is a chunk
-/// or two; work whose results nothing reads is still held to the GPU's
-/// pace\].
+/// Arena chunks the channel's work not yet done on the GPU may fill
+/// before a release waits for the GPU \[assumption: a frame's draw data
+/// is a chunk or two; work whose results nothing reads is still held to
+/// the GPU's pace\].
 const ARENA_UNWAITED: usize = 4;
 
 /// The Metal renderer of one channel.
@@ -2797,6 +2797,22 @@ impl Renderer {
             {
                 let mut state = self.state.lock().unwrap();
                 let globals = state.globals()?;
+                // Bytes inside a region programs may have stored to are
+                // read (and stored) in that region's copy, which holds what
+                // memory is to hold.
+                let inside = globals
+                    .regions
+                    .iter()
+                    .find(|(other, region)| {
+                        region.dirty && **other != key && {
+                            let outer = global_extent(**other);
+                            outer.0 <= extent.0 && extent.1 <= outer.1
+                        }
+                    })
+                    .map(|(other, region)| region.offset + (key.0 - other.0) as usize);
+                if let Some(offset) = inside {
+                    return Ok(Some(offset));
+                }
                 let conflict = globals.regions.iter().any(|(other, region)| {
                     region.dirty && *other != key && overlap(global_extent(*other), extent)
                 });
@@ -3028,8 +3044,29 @@ impl Renderer {
                     .residents
                     .iter()
                     .position(|r| !other(r, surface, format))
-                    .map(|i| (i, state.residents[i].current(writes)))
+                    .map(|i| (i, state.residents[i].current(writes), state.residents[i].stamp))
             };
+            // One the channel's epoch no longer vouches for may still be
+            // unwritten since its watch mark: current then, with a stamp
+            // of this epoch. (Asked without the state, as reads may flush.)
+            let found = found.map(|(index, current, stamp)| {
+                if current {
+                    return (index, true);
+                }
+                let (start, end) = extent(&surface);
+                match stamp.and_then(|stamp| writes.kept(memory, stamp, start, end)) {
+                    Some(now) => {
+                        let mut state = self.state.lock().unwrap();
+                        let resident = &mut state.residents[index];
+                        let same = resident.surface == surface && resident.stamp == stamp;
+                        if same {
+                            resident.stamp = Some(now);
+                        }
+                        (index, same)
+                    }
+                    None => (index, false),
+                }
+            });
             // The whole surface: its pixels, and the texels holding them.
             let full = layout.pixels(&surface);
             let texels = Rect {
@@ -3057,12 +3094,14 @@ impl Renderer {
                         &mut self.state.lock().unwrap().residents[index].mirror,
                         Window::empty(surface),
                     );
+                    let (start, end) = extent(&surface);
+                    let mark = memory.watch(start, (end - start) as usize);
                     let reloaded = match mirror.matches(memory) {
                         Ok(true) => None,
                         Ok(false) => Some(Window::load(memory, surface, texels)),
                         Err(refusal) => Some(Err(refusal)),
                     };
-                    let stamp = writes.stamp();
+                    let stamp = writes.stamp().watched(mark);
                     let mut state = self.state.lock().unwrap();
                     state.residents[index].mirror = mirror;
                     match reloaded {
@@ -3109,8 +3148,10 @@ impl Renderer {
                     let (window, stamp) = if overwrite && !on_demand {
                         (Window::blank(surface, texels), None)
                     } else {
+                        let (start, end) = extent(&surface);
+                        let mark = memory.watch(start, (end - start) as usize);
                         let mut window = Window::load(memory, surface, texels)?;
-                        let stamp = writes.stamp();
+                        let stamp = writes.stamp().watched(mark);
                         upload_surface(&texture, &mut window, full, log2);
                         (window, Some(stamp))
                     };
@@ -3438,6 +3479,7 @@ impl State {
                 encoder.endEncoding();
             }
             frame.command.commit();
+            self.arena.committed(frame.command.clone());
             self.submitted = Some(frame.command.clone());
         }
         self.pass_draws = 0;
@@ -4892,7 +4934,12 @@ fn finish(
             Some(r) if !r.mirror.data().is_empty() => {
                 r.store_packed(resident.packed, memory)?;
                 r.pending = r.pending.saturating_sub(1);
-                r.stamp = Some(writes.stamp());
+                // Memory now holds the mirror: watched from here on
+                // \[assumption: no other agent writes the surface while its
+                // write-back lands, so none slips in before the watch\].
+                let (start, end) = r.extent();
+                let mark = memory.watch(start, (end - start) as usize);
+                r.stamp = Some(writes.stamp().watched(mark));
             }
             // Dropped since, or its mirror out for a comparison with
             // memory (`Renderer::residents`, which finds memory changed
@@ -5480,17 +5527,28 @@ unsafe fn bind(
     Ok(())
 }
 
-/// Shared buffer space for the data of the draws one command buffer
-/// records (vertex streams, indices, large bindings), handed out in
-/// order and taken back whole once the command buffer completed
-/// ([`State::finish`]): allocating a Metal buffer per binding costs a
-/// kernel call each.
+/// Shared buffer space for the data of the draws command buffers record
+/// (vertex streams, indices, large bindings, staging), handed out in
+/// order a chunk at a time: allocating a Metal buffer per binding costs a
+/// kernel call each. A chunk is filled again once every command buffer
+/// that may read it completed, which the arena learns from the command
+/// buffers committed ([`Arena::committed`]); all of them at once after a
+/// wait ([`Arena::reset`]).
 #[derive(Default)]
 struct Arena {
-    chunks: Vec<Retained<MetalBuffer>>,
+    /// Chunks with the serial of the last command buffer that may read
+    /// them (see `committed`).
+    chunks: Vec<(Retained<MetalBuffer>, u64)>,
     /// The chunk being filled and the bytes used of it.
     current: usize,
     used: usize,
+    /// Command buffers committed so far: the one being recorded gets
+    /// serial `committed + 1`.
+    committed: u64,
+    /// Committed command buffers not known to have completed, by serial.
+    flight: std::collections::VecDeque<(u64, Retained<CommandBuffer>)>,
+    /// Every command buffer up to this serial completed.
+    done: u64,
 }
 
 impl Arena {
@@ -5505,47 +5563,109 @@ impl Arena {
     /// `data` copied into the arena: its buffer and offset.
     fn alloc(&mut self, data: &[u8]) -> Result<(Retained<MetalBuffer>, usize), Unmodeled> {
         let length = data.len().max(4);
+        let serial = self.committed + 1;
         loop {
-            if let Some(chunk) = self.chunks.get(self.current) {
+            if let Some((chunk, last)) = self.chunks.get_mut(self.current) {
                 let offset = self.used.next_multiple_of(Self::ALIGN);
                 if offset + length <= chunk.length() {
                     // SAFETY: the range is inside the shared buffer, which
-                    // no recorded GPU work uses (see `reset`).
+                    // no command buffer still to complete was given (see
+                    // `next_chunk`).
                     unsafe {
                         let base = chunk.contents().as_ptr().cast::<u8>().add(offset);
                         std::ptr::copy_nonoverlapping(data.as_ptr(), base, data.len());
                     }
                     self.used = offset + length;
+                    *last = serial;
                     return Ok((chunk.clone(), offset));
                 }
-                self.current += 1;
-                self.used = 0;
-                continue;
             }
-            let size = length.max(Self::CHUNK);
-            let chunk = Renderer::gpu()
-                .device
-                .newBufferWithLength_options(size, MTLResourceOptions::StorageModeShared)
-                .ok_or_else(|| Unmodeled("Metal: buffer allocation failed".into()))?;
-            // A chunk past the usual size is not kept for later frames.
-            self.chunks.insert(self.current, chunk);
+            self.next_chunk(length)?;
         }
     }
 
-    /// Every chunk free again; an oversized one is dropped.
+    /// Moves on to a chunk of at least `length` bytes no command buffer
+    /// still to complete reads: a free one, or a new one.
+    fn next_chunk(&mut self, length: usize) -> Result<(), Unmodeled> {
+        self.poll();
+        let done = self.done;
+        // An oversized chunk is not kept once done.
+        let mut index = 0;
+        while index < self.chunks.len() {
+            let (chunk, last) = &self.chunks[index];
+            if *last <= done && chunk.length() > Self::CHUNK && index != self.current {
+                self.chunks.remove(index);
+                if index < self.current {
+                    self.current -= 1;
+                }
+            } else {
+                index += 1;
+            }
+        }
+        let count = self.chunks.len();
+        let free = (1..=count)
+            .map(|step| (self.current + step) % count.max(1))
+            .find(|&i| {
+                i != self.current
+                    && self.chunks[i].1 <= done
+                    && self.chunks[i].0.length() >= length
+            });
+        self.current = match free {
+            Some(index) => index,
+            None => {
+                let chunk = Renderer::gpu()
+                    .device
+                    .newBufferWithLength_options(
+                        length.max(Self::CHUNK),
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or_else(|| Unmodeled("Metal: buffer allocation failed".into()))?;
+                let at = (self.current + 1).min(count);
+                self.chunks.insert(at, (chunk, 0));
+                at
+            }
+        };
+        self.used = 0;
+        Ok(())
+    }
+
+    /// `command`, the command buffer recorded since the last commit, was
+    /// committed.
+    fn committed(&mut self, command: Retained<CommandBuffer>) {
+        self.committed += 1;
+        self.flight.push_back((self.committed, command));
+    }
+
+    /// Notes the command buffers that completed, in commit order.
+    fn poll(&mut self) {
+        use objc2_metal::MTLCommandBufferStatus;
+        while let Some((serial, command)) = self.flight.front() {
+            let status = command.status();
+            if status != MTLCommandBufferStatus::Completed && status != MTLCommandBufferStatus::Error
+            {
+                break;
+            }
+            self.done = *serial;
+            self.flight.pop_front();
+        }
+    }
+
+    /// Every command buffer committed completed: every chunk is free;
+    /// an oversized one is dropped.
     fn reset(&mut self) {
-        self.chunks.retain(|chunk| chunk.length() <= Self::CHUNK);
+        self.flight.clear();
+        self.done = self.committed;
+        self.chunks.retain(|(chunk, _)| chunk.length() <= Self::CHUNK);
         self.current = 0;
         self.used = 0;
     }
 
-    /// Chunks holding data of work recorded since the last reset.
-    fn chunks_in_use(&self) -> usize {
-        if self.chunks.is_empty() {
-            0
-        } else {
-            self.current + 1
-        }
+    /// Chunks holding data of work recorded or running: of command buffers
+    /// not known to have completed.
+    fn chunks_in_use(&mut self) -> usize {
+        self.poll();
+        let done = self.done;
+        self.chunks.iter().filter(|(_, last)| *last > done).count()
     }
 }
 
