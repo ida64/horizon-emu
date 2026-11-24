@@ -2873,20 +2873,28 @@ impl Renderer {
             {
                 let mut state = self.state.lock().unwrap();
                 let globals = state.globals()?;
-                // Bytes inside a region programs may have stored to are
-                // read (and stored) in that region's copy, which holds what
-                // memory is to hold.
+                // Bytes inside a region programs may have stored to, or
+                // whose write-back is yet to reach memory, are read (and
+                // stored) in that region's copy, which holds what memory
+                // is to hold.
                 let inside = globals
                     .regions
-                    .iter()
+                    .iter_mut()
                     .find(|(other, region)| {
-                        region.dirty && **other != key && {
+                        (region.dirty || region.pending != 0) && **other != key && {
                             let outer = global_extent(**other);
                             outer.0 <= extent.0 && extent.1 <= outer.1
                         }
                     })
-                    .map(|(other, region)| region.offset + (key.0 - other.0) as usize);
-                if let Some(offset) = inside {
+                    .map(|(other, region)| {
+                        let newly = store && !region.dirty;
+                        region.dirty |= store;
+                        (region.offset + (key.0 - other.0) as usize, newly)
+                    });
+                if let Some((offset, newly)) = inside {
+                    if newly {
+                        self.dirtied(true);
+                    }
                     return Ok(Some(offset));
                 }
                 let conflict = globals.regions.iter().any(|(other, region)| {
