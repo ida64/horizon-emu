@@ -43,7 +43,7 @@
 
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering, fence},
 };
 
 use super::{
@@ -261,7 +261,7 @@ impl Mc {
         self.registers.get(SMMU_PTB_ASID).unwrap_or(0) as usize % ASID_COUNT
     }
 
-    /// What [`DeviceMemory`] caches for the client whose ASID register is at
+    /// What [`DeviceMemory`] keeps for the client whose ASID register is at
     /// `client`, as of `generation`.
     fn view(&self, client: u64, generation: u64) -> View {
         let exempt = KERNEL_CARVEOUT_CLIENTS.contains(&client);
@@ -280,10 +280,6 @@ impl Mc {
             } else {
                 *self.kernel_carveouts.lock().unwrap()
             },
-            tlb: vec![(0, 0); TLB_ENTRIES]
-                .into_boxed_slice()
-                .try_into()
-                .expect("TLB_ENTRIES entries"),
         }
     }
 
@@ -328,19 +324,21 @@ impl Mc {
     }
 }
 
-/// Translations a client keeps, by device page (4 MiB of device address
-/// space, direct-mapped).
+/// Translations a client keeps, by device page (4 KiB, direct-mapped).
 const TLB_ENTRIES: usize = 1024;
 
 /// What a client's accesses depend on in the memory controller, read at
-/// [`Mc::generation`] `generation`, and the translations made since.
+/// [`Mc::generation`] `generation`.
 ///
 /// The SMMU's own TLB and page table cache are flushed by software after
 /// it changes page tables (`MC_SMMU_TLB_FLUSH`, `MC_SMMU_PTC_FLUSH`, Linux
 /// `tegra-smmu.c`), and changing a page directory or a client's ASID
-/// register is a register write too. Every register write drops all of
-/// this, so a translation is never kept past a flush. Failed translations
-/// are not kept: a page mapped later is found by the next access.
+/// register is a register write too. Every register write moves the
+/// generation, and a [`DeviceMemory`] uses a view or a translation only at
+/// the generation it was read at, so a translation is never kept past a
+/// flush. Failed translations are not kept: a page mapped later is found
+/// by the next access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct View {
     generation: u64,
     /// The client's ASID register, if it enables translation.
@@ -350,8 +348,81 @@ struct View {
     /// The kernel carveouts that can block this client (none set for a
     /// client on the list).
     carveouts: [(u64, u64); KERNEL_CARVEOUT_COUNT],
-    /// `(device page + 1, physical page address)`; 0 is an empty entry.
-    tlb: Box<[(u64, u64); TLB_ENTRIES]>,
+}
+
+/// [`View`] as the words of a [`SeqLock`].
+const VIEW_WORDS: usize = 4 + 2 * KERNEL_CARVEOUT_COUNT;
+/// Bit of the packed ASID register word saying translation is enabled.
+const VIEW_ASIDS_SET: u64 = 1 << 32;
+
+impl View {
+    fn pack(&self) -> [u64; VIEW_WORDS] {
+        let mut words = [0; VIEW_WORDS];
+        words[0] = self.generation;
+        words[1] = self
+            .asids
+            .map_or(0, |asids| VIEW_ASIDS_SET | u64::from(asids));
+        (words[2], words[3]) = self.aperture;
+        for (index, (base, size)) in self.carveouts.into_iter().enumerate() {
+            (words[4 + 2 * index], words[5 + 2 * index]) = (base, size);
+        }
+        words
+    }
+
+    fn unpack(words: [u64; VIEW_WORDS]) -> View {
+        View {
+            generation: words[0],
+            asids: (words[1] & VIEW_ASIDS_SET != 0).then_some(words[1] as u32),
+            aperture: (words[2], words[3]),
+            carveouts: std::array::from_fn(|index| (words[4 + 2 * index], words[5 + 2 * index])),
+        }
+    }
+}
+
+/// `N` words read and written whole without a lock: a sequence count, odd
+/// while a write is under way. A read that sees it odd, or changed across
+/// the words, gets nothing (the caller works the value out afresh); a
+/// write that finds another under way leaves the words to that one. So a
+/// read gets the words some write stored, never a mix.
+struct SeqLock<const N: usize> {
+    sequence: AtomicU64,
+    words: [AtomicU64; N],
+}
+
+impl<const N: usize> SeqLock<N> {
+    fn new(words: [u64; N]) -> Self {
+        Self {
+            sequence: AtomicU64::new(0),
+            words: words.map(AtomicU64::new),
+        }
+    }
+
+    fn load(&self) -> Option<[u64; N]> {
+        let before = self.sequence.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            return None;
+        }
+        let words = std::array::from_fn(|index| self.words[index].load(Ordering::Relaxed));
+        fence(Ordering::Acquire);
+        (self.sequence.load(Ordering::Relaxed) == before).then_some(words)
+    }
+
+    fn store(&self, words: [u64; N]) {
+        let before = self.sequence.load(Ordering::Relaxed);
+        if before & 1 != 0
+            || self
+                .sequence
+                .compare_exchange(before, before + 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        fence(Ordering::Release);
+        for (slot, word) in self.words.iter().zip(words) {
+            slot.store(word, Ordering::Relaxed);
+        }
+        self.sequence.store(before + 2, Ordering::Release);
+    }
 }
 
 impl View {
@@ -401,26 +472,34 @@ fn frame_address(entry: u32) -> u64 {
 /// Guest memory as one memory client sees it: what a device that masters
 /// the bus reads and writes, through the SMMU if its ASID register enables
 /// translation, and through the AHB redirect aperture to IRAM.
+///
+/// Accesses take no lock: the client's [`View`] and its translations are
+/// kept in sequence locks ([`SeqLock`]), each with the generation it was
+/// read at, and used only at that generation.
 pub struct DeviceMemory {
     mc: Arc<Mc>,
     ram: Arc<GuestRam>,
     client: u64,
-    view: Mutex<View>,
+    view: SeqLock<VIEW_WORDS>,
+    /// By device page: the generation, device page + 1 (0: empty) and
+    /// physical page address of a translation.
+    tlb: Box<[SeqLock<3>]>,
 }
 
 impl DeviceMemory {
     /// `client` is the offset of the device's ASID register.
     pub fn new(mc: &Arc<Mc>, ram: &Arc<GuestRam>, client: u64) -> Self {
-        let view = Mutex::new(View {
+        let view = View {
             // Read before the first access.
             generation: u64::MAX,
             ..mc.view(client, 0)
-        });
+        };
         Self {
             mc: Arc::clone(mc),
             ram: Arc::clone(ram),
             client,
-            view,
+            view: SeqLock::new(view.pack()),
+            tlb: (0..TLB_ENTRIES).map(|_| SeqLock::new([0; 3])).collect(),
         }
     }
 
@@ -434,34 +513,47 @@ impl DeviceMemory {
         &self.mc
     }
 
-    /// The physical address of device address `address`; `None` if the
-    /// client translates and `address` is unmapped. Through the
-    /// client's [`View`], read again first if the block changed since.
-    fn physical(&self, view: &mut View, address: u64) -> Option<u64> {
-        let generation = self.mc.generation.load(Ordering::Acquire);
-        if view.generation != generation {
-            *view = self.mc.view(self.client, generation);
+    /// The client's [`View`] at `generation`: the one kept, or read from
+    /// the block and kept.
+    fn view(&self, generation: u64) -> View {
+        if let Some(words) = self.view.load()
+            && words[0] == generation
+        {
+            return View::unpack(words);
         }
+        let view = self.mc.view(self.client, generation);
+        self.view.store(view.pack());
+        view
+    }
+
+    /// The physical address of device address `address` through `view`;
+    /// `None` if the client translates and `address` is unmapped.
+    fn physical(&self, view: &View, address: u64) -> Option<u64> {
         let Some(asids) = view.asids else {
             return Some(address);
         };
         let page = address / PAGE_SIZE;
-        let entry = &mut view.tlb[page as usize % TLB_ENTRIES];
-        if entry.0 == page + 1 {
-            return Some(entry.1 + address % PAGE_SIZE);
+        let slot = &self.tlb[page as usize % TLB_ENTRIES];
+        if let Some([generation, kept, frame]) = slot.load()
+            && generation == view.generation
+            && kept == page + 1
+        {
+            return Some(frame + address % PAGE_SIZE);
         }
         let physical = self.mc.walk(asids, address, |table| {
             let mut word = [0; 4];
             self.ram.read(table, &mut word)?;
             Some(u32::from_le_bytes(word))
         })?;
-        *entry = (page + 1, physical - address % PAGE_SIZE);
+        slot.store([view.generation, page + 1, physical - address % PAGE_SIZE]);
         Some(physical)
     }
 
-    /// Splits `len` bytes at device address `address` into pieces within
-    /// a page each: `piece(place, offset, len)`. `None` at the first piece
-    /// that is unmapped or outside DRAM and IRAM.
+    /// Splits `len` bytes at device address `address` into pieces:
+    /// `piece(place, offset, len)`, a page each, but consecutive DRAM pages
+    /// that lie together physically in one piece. `None` at the first page
+    /// that is unmapped or outside DRAM and IRAM, the pieces before it
+    /// given.
     fn pieces(
         &self,
         address: u64,
@@ -469,27 +561,61 @@ impl DeviceMemory {
         is_write: bool,
         mut piece: impl FnMut(Place<'_>, usize, usize) -> Option<()>,
     ) -> Option<()> {
+        let view = self.view(self.mc.generation.load(Ordering::Acquire));
+        // DRAM pages not yet given: physical address, offset, length.
+        let mut run: Option<(u64, usize, usize)> = None;
         let mut done = 0;
         while done < len {
-            let at = address.checked_add(done as u64)?;
-            let in_page = (PAGE_SIZE - at % PAGE_SIZE) as usize;
-            let count = in_page.min(len - done);
-            let place = {
-                let mut view = self.view.lock().unwrap();
-                let physical = self.physical(&mut view, at)?;
-                match view.target(&self.mc, physical, count)? {
-                    Target::Iram(iram, offset) => Place::Iram(iram, offset),
-                    Target::Dram
-                        if view.may_block(physical, count)
-                            && self.mc.blocked(self.client, physical, count, is_write) =>
-                    {
-                        Place::Blocked
+            let place = address.checked_add(done as u64).and_then(|at| {
+                let count = ((PAGE_SIZE - at % PAGE_SIZE) as usize).min(len - done);
+                let physical = self.physical(&view, at)?;
+                Some((
+                    match view.target(&self.mc, physical, count)? {
+                        Target::Iram(iram, offset) => Place::Iram(iram, offset),
+                        Target::Dram
+                            if view.may_block(physical, count)
+                                && self.mc.blocked(self.client, physical, count, is_write) =>
+                        {
+                            Place::Blocked
+                        }
+                        Target::Dram => Place::Dram(physical),
+                    },
+                    count,
+                ))
+            });
+            let flush =
+                |run: &mut Option<(u64, usize, usize)>,
+                 piece: &mut dyn FnMut(Place<'_>, usize, usize) -> Option<()>| {
+                    match run.take() {
+                        Some((physical, offset, length)) => {
+                            piece(Place::Dram(physical), offset, length)
+                        }
+                        None => Some(()),
                     }
-                    Target::Dram => Place::Dram(physical),
-                }
+                };
+            let Some((place, count)) = place else {
+                flush(&mut run, &mut piece)?;
+                return None;
             };
-            piece(place, done, count)?;
+            match place {
+                Place::Dram(physical) => match &mut run {
+                    Some((start, _, length)) if *start + *length as u64 == physical => {
+                        *length += count
+                    }
+                    _ => {
+                        flush(&mut run, &mut piece)?;
+                        run = Some((physical, done, count));
+                    }
+                },
+                place => {
+                    flush(&mut run, &mut piece)?;
+                    piece(place, done, count)?;
+                }
+            }
             done += count;
+        }
+        if let Some((physical, offset, length)) = run {
+            piece(Place::Dram(physical), offset, length)?;
         }
         Some(())
     }
@@ -511,7 +637,7 @@ impl DeviceMemory {
     }
 
     /// `None` if any of the range is unmapped or outside DRAM and IRAM;
-    /// pieces before the failing one have been written. What a kernel
+    /// pages before the failing one have been written. What a kernel
     /// carveout keeps from this client is dropped.
     pub fn write(&self, address: u64, data: &[u8]) -> Option<()> {
         self.pieces(address, data.len(), true, |place, offset, len| {
@@ -519,7 +645,18 @@ impl DeviceMemory {
             match place {
                 Place::Iram(iram, at) => iram.load(at, piece),
                 Place::Blocked => Some(()),
-                Place::Dram(physical) => self.ram.write(physical, piece),
+                // A run that is not all RAM: its pages before the first
+                // outside it are written, as page by page.
+                Place::Dram(physical) => self.ram.write(physical, piece).or_else(|| {
+                    let mut at = 0;
+                    while at < piece.len() {
+                        let page = physical + at as u64;
+                        let count = ((PAGE_SIZE - page % PAGE_SIZE) as usize).min(piece.len() - at);
+                        self.ram.write(page, &piece[at..at + count])?;
+                        at += count;
+                    }
+                    Some(())
+                }),
             }
         })
     }
@@ -823,7 +960,7 @@ mod tests {
                 } else {
                     Some(at)
                 };
-                let cached = memory.physical(&mut memory.view.lock().unwrap(), at);
+                let cached = memory.physical(&memory.view(mc.generation()), at);
                 assert_eq!(cached, fresh, "device address {at:#x}");
                 let mut through = [0; 8];
                 let outcome = memory.read(at, &mut through);
@@ -868,5 +1005,190 @@ mod tests {
         ram.write(0x8000_2000, &[1, 2, 3, 4]).unwrap();
         memory.read(0x3000, &mut back).unwrap();
         assert_eq!(back, [1, 2, 3, 4]);
+    }
+
+    /// RAM of 4 MiB at 0x8000_0000 with ASID `asid`'s page directory at
+    /// `directory` (physical) pointing its first 4 MiB of device address at
+    /// the page table at `table`, and `client` translating through it.
+    fn address_space(mc: &Mc, ram: &GuestRam, client: u64, asid: u32, directory: u64, table: u64) {
+        ram.write(
+            directory,
+            &(0xC000_0000 | ENTRY_NEXT | (table >> 12) as u32).to_le_bytes(),
+        )
+        .unwrap();
+        write(mc, SMMU_PTB_ASID, asid);
+        write(mc, SMMU_PTB_DATA, 0xE000_0000 | (directory >> 12) as u32);
+        write(mc, client, ASID_ENABLE | asid);
+    }
+
+    /// Accesses over many pages, in one piece where pages lie together
+    /// physically, read and write what the pages do one by one: over
+    /// random runs of contiguous, scattered, unmapped and carveout-blocked
+    /// pages, pages outside RAM among them, and every access ending where
+    /// the first unmapped page stops it.
+    #[test]
+    fn bulk_accesses_are_page_by_page_accesses() {
+        let mc = Arc::new(Mc::new(DramSize::Gb4));
+        let ram = Arc::new(GuestRam::new(0x8000_0000, 0x40_0000).unwrap());
+        let memory = DeviceMemory::new(&mc, &ram, SMMU_GPU_ASID);
+        address_space(&mc, &ram, SMMU_GPU_ASID, 5, 0x8000_0000, 0x8000_1000);
+        // A carveout over physical pages 0x80380..0x80390.
+        mc.set_kernel_carveout(0, 0x8038_0000, 0x1_0000);
+        let mut rng = Xorshift(0x1234_5678_9ABC_DEF1);
+        let mut next = 0x80100u32;
+        let mut frames = Vec::new();
+        for page in 0..256u64 {
+            let frame = match rng.below(10) {
+                0..=4 => next,
+                5..=7 => 0x80100 + rng.below(0x2F0) as u32,
+                // Past the end of RAM.
+                8 if rng.below(3) == 0 => 0x80400 + rng.below(4) as u32,
+                _ => 0,
+            };
+            if frame != 0 {
+                ram.write(0x8000_1000 + page * 4, &(0xC000_0000 | frame).to_le_bytes())
+                    .unwrap();
+                next = frame + 1;
+            }
+            frames.push(frame);
+        }
+        // Distinct bytes everywhere.
+        let fill: Vec<u8> = (0..0x3E_0000).map(|i: u32| (i ^ i >> 9) as u8).collect();
+        ram.write(0x8002_0000, &fill).unwrap();
+        let carved = |physical: u64| (0x8038_0000..0x8039_0000).contains(&physical);
+        for case in 0..2000 {
+            let address = rng.below(255 * 0x1000);
+            let len = 1 + rng.below(0x6000).min(256 * 0x1000 - address - 1) as usize;
+            // Page by page: where each page goes, until the first unmapped.
+            let mut pages = Vec::new();
+            let mut done = 0;
+            let mut mapped = true;
+            while done < len {
+                let at = address + done as u64;
+                let count = ((PAGE_SIZE - at % PAGE_SIZE) as usize).min(len - done);
+                let frame = frames[(at / PAGE_SIZE) as usize];
+                if frame == 0 {
+                    mapped = false;
+                    break;
+                }
+                pages.push((u64::from(frame) << 12 | at % PAGE_SIZE, done, count));
+                done += count;
+            }
+            if rng.below(2) == 0 {
+                let mut through = vec![0; len];
+                let outcome = memory.read(address, &mut through);
+                let mut expected = vec![0; len];
+                let mut all = mapped;
+                for &(physical, offset, count) in &pages {
+                    let piece = &mut expected[offset..offset + count];
+                    if carved(physical) {
+                        piece.fill(0);
+                    } else {
+                        all &= ram.read(physical, piece).is_some();
+                    }
+                }
+                assert_eq!(
+                    outcome.is_some(),
+                    all,
+                    "case {case}: read {address:#x}+{len:#x}"
+                );
+                if all {
+                    assert!(
+                        through == expected,
+                        "case {case}: read {address:#x}+{len:#x}"
+                    );
+                }
+            } else {
+                let data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+                let before = {
+                    let mut bytes = vec![0; 0x40_0000];
+                    ram.read(0x8000_0000, &mut bytes).unwrap();
+                    bytes
+                };
+                let outcome = memory.write(address, &data);
+                let mut after = vec![0; 0x40_0000];
+                ram.read(0x8000_0000, &mut after).unwrap();
+                // The same writes page by page, on the copy from before.
+                let mut expected = before;
+                let mut all = mapped;
+                for &(physical, offset, count) in &pages {
+                    if carved(physical) {
+                        continue;
+                    }
+                    let Some(at) = physical.checked_sub(0x8000_0000).map(|at| at as usize) else {
+                        all = false;
+                        break;
+                    };
+                    if at + count > expected.len() {
+                        all = false;
+                        break;
+                    }
+                    expected[at..at + count].copy_from_slice(&data[offset..offset + count]);
+                }
+                assert_eq!(
+                    outcome.is_some(),
+                    all,
+                    "case {case}: write {address:#x}+{len:#x}"
+                );
+                assert!(
+                    after == expected,
+                    "case {case}: write {address:#x}+{len:#x}"
+                );
+            }
+        }
+    }
+
+    /// Threads reading through one client while another switches its
+    /// address space back and forth get each page whole from one space or
+    /// the other, and once the switching stops, from the last one.
+    #[test]
+    fn concurrent_accesses_see_whole_translations() {
+        let mc = Arc::new(Mc::new(DramSize::Gb4));
+        let ram = Arc::new(GuestRam::new(0x8000_0000, 0x40_0000).unwrap());
+        let memory = DeviceMemory::new(&mc, &ram, SMMU_GPU_ASID);
+        // ASID 5 maps 64 device pages to 0x8010_0000 on, ASID 6 to
+        // 0x8020_0000 on; their bytes are 0x55 and 0x66.
+        for (asid, directory, table, frames) in [
+            (5u32, 0x8000_0000u64, 0x8000_1000u64, 0x80100u32),
+            (6, 0x8000_2000, 0x8000_3000, 0x80200),
+        ] {
+            address_space(&mc, &ram, SMMU_GPU_ASID, asid, directory, table);
+            for page in 0..64u32 {
+                ram.write(
+                    table + u64::from(page) * 4,
+                    &(0xC000_0000 | (frames + page)).to_le_bytes(),
+                )
+                .unwrap();
+            }
+            ram.write(u64::from(frames) << 12, &[asid as u8 * 0x11; 64 * 0x1000])
+                .unwrap();
+        }
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for thread in 0..4u64 {
+                let (memory, stop) = (&memory, &stop);
+                scope.spawn(move || {
+                    let mut page = vec![0; 0x1000];
+                    let mut round = 0u64;
+                    while !stop.load(Ordering::Relaxed) || round < 1000 {
+                        let at = (round * 7 + thread) % 64 * 0x1000;
+                        memory.read(at, &mut page).unwrap();
+                        assert!(
+                            page.iter().all(|&b| b == page[0]) && [0x55, 0x66].contains(&page[0]),
+                            "page {at:#x} mixed"
+                        );
+                        round += 1;
+                    }
+                });
+            }
+            for flip in 0..2000u32 {
+                write(&mc, SMMU_GPU_ASID, ASID_ENABLE | 5 + flip % 2);
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        // The last write selected ASID 6.
+        let mut page = vec![0; 64 * 0x1000];
+        memory.read(0, &mut page).unwrap();
+        assert!(page.iter().all(|&b| b == 0x66));
     }
 }
