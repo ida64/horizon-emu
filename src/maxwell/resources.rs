@@ -142,6 +142,10 @@ impl GpuMemory for Tracked<'_> {
     fn probe(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
         self.memory.probe(address, buffer)
     }
+
+    fn equals(&self, address: u64, expected: &[u8]) -> Option<bool> {
+        self.memory.equals(address, expected)
+    }
 }
 
 fn read(memory: &dyn GpuMemory, address: u64, length: usize) -> Result<Vec<u8>, Unmodeled> {
@@ -190,37 +194,15 @@ fn read_unless_equal(
     let Some(expected) = expected.filter(|expected| expected.len() == length) else {
         return read(memory, address, length).map(Some);
     };
-    // Large pieces: every read of engine memory may look for pending
-    // write-backs over it (`metal::Coherent`).
-    const PIECE: usize = 256 << 10;
-    thread_local! {
-        static BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    // Compared in place, in one piece: every access of engine memory may
+    // look for pending write-backs over it (`metal::Coherent`).
+    if memory
+        .equals(address, expected)
+        .ok_or_else(|| unmapped(address, length))?
+    {
+        return Ok(None);
     }
-    BUFFER.with_borrow_mut(|buffer| {
-        buffer.resize(PIECE.min(length), 0);
-        let mut at = 0;
-        for chunk in expected.chunks(PIECE) {
-            let piece = &mut buffer[..chunk.len()];
-            memory
-                .read(address + at as u64, piece)
-                .ok_or_else(|| unmapped(address, length))?;
-            if piece != chunk {
-                let mut bytes = Vec::with_capacity(length);
-                bytes.extend_from_slice(&expected[..at]);
-                bytes.extend_from_slice(piece);
-                let done = bytes.len();
-                bytes.resize(length, 0);
-                if done < length {
-                    memory
-                        .read(address + done as u64, &mut bytes[done..])
-                        .ok_or_else(|| unmapped(address, length))?;
-                }
-                return Ok(Some(bytes));
-            }
-            at += chunk.len();
-        }
-        Ok(None)
-    })
+    read(memory, address, length).map(Some)
 }
 
 /// Host memory the decoded programs of one channel may take, with the

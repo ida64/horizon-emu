@@ -636,6 +636,30 @@ impl DeviceMemory {
         })
     }
 
+    /// Whether the range holds `expected` ([`DeviceMemory::read`] of it
+    /// would give it), compared in place where it is DRAM.
+    pub fn equals(&self, address: u64, expected: &[u8]) -> Option<bool> {
+        let mut same = true;
+        let mut scratch = Vec::new();
+        self.pieces(address, expected.len(), false, |place, offset, len| {
+            let piece = &expected[offset..offset + len];
+            if !same {
+                return Some(());
+            }
+            same = match place {
+                Place::Dram(physical) => self.ram.equals(physical, piece)?,
+                Place::Iram(iram, at) => {
+                    scratch.resize(len, 0);
+                    iram.copy_out(at, &mut scratch)?;
+                    scratch == piece
+                }
+                Place::Blocked => piece.iter().all(|&byte| byte == 0),
+            };
+            Some(())
+        })?;
+        Some(same)
+    }
+
     /// `None` if any of the range is unmapped or outside DRAM and IRAM;
     /// pages before the failing one have been written. What a kernel
     /// carveout keeps from this client is dropped.

@@ -349,6 +349,20 @@ impl Window {
         // A difference ends the walk early, through this marker.
         let differs = || Unmodeled(String::new());
         let result = in_runs(&self.pieces(None, None), |address, run| {
+            // A run whose bytes lie together in the window too is
+            // compared in place.
+            let first = &run[0].1;
+            let last = &run[run.len() - 1].1;
+            if run.windows(2).all(|pair| pair[0].1.end == pair[1].1.start) {
+                let held = memory
+                    .equals(address, &self.data[first.start..last.end])
+                    .ok_or_else(|| fault("surface", address))?;
+                if !held {
+                    same = false;
+                    return Err(differs());
+                }
+                return Ok(());
+            }
             scratch.resize(run.iter().map(|(_, range)| range.len()).sum(), 0);
             memory
                 .read(address, &mut scratch)

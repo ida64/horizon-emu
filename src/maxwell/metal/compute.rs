@@ -164,7 +164,7 @@ impl Renderer {
                 return self.fall_back("compute texture handle outside its buffer".into());
             };
             let (sampled, tic, tsc) =
-                match self.sampled(memory, writes, dispatch.textures, handle, kind)? {
+                match self.sampled(memory, writes, dispatch.textures, handle, kind, &[])? {
                     Ok(sampled) => sampled,
                     Err(_) => return self.fall_back("compute texture: a slot names none".into()),
                 };

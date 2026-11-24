@@ -1781,6 +1781,7 @@ impl Renderer {
             )
             .collect();
         let samples = draw.multisample.samples;
+        let target_surfaces: Vec<Surface> = targets.iter().map(|&(surface, _)| surface).collect();
         // Before the targets' residents are taken: resolving a texture may
         // drop residents (see [`Renderer::composite`]).
         // Textures and samplers. A handle that names no texture is bound to
@@ -1795,7 +1796,7 @@ impl Renderer {
         for (slot, &handle) in handles.iter().enumerate() {
             let kind = translated.kinds[slot];
             let (sampled, tic, tsc) =
-                match self.sampled(memory, writes, draw.textures, handle, kind)? {
+                match self.sampled(memory, writes, draw.textures, handle, kind, &target_surfaces)? {
                     Ok(sampled) => sampled,
                     Err(refusal) => {
                         unbound.push((slot, refusal));
@@ -1840,7 +1841,7 @@ impl Renderer {
                     .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("4 bytes")));
                 let sampled = match handle {
                     Some(handle) => {
-                        self.sampled(memory, writes, draw.textures, handle, kind)?
+                        self.sampled(memory, writes, draw.textures, handle, kind, &target_surfaces)?
                     }
                     None => Err("texture handle outside the constant buffer".into()),
                 };
@@ -3152,12 +3153,13 @@ impl Renderer {
         textures: &DrawTextures<'_>,
         handle: u32,
         kind: TextureKind,
+        targets: &[Surface],
     ) -> Result<Result<(Sampled, Tic, Tsc), String>, Unmodeled> {
         let (tic, tsc) = match textures.header(handle) {
             Ok(header) => header,
             Err(refusal) => return Ok(Err(refusal.0)),
         };
-        let composite = self.composite(memory, writes, &tic)?;
+        let composite = self.composite(memory, writes, &tic, targets)?;
         let sampled = match composite {
             Some(texture) => Ok(Sampled::Composite(texture)),
             None => match format::native_format(&tic, kind) {
@@ -3178,13 +3180,23 @@ impl Renderer {
     /// The Metal texture to sample for the texture `tic` describes when
     /// levels of it are render targets held on the GPU and current
     /// ([`Composite`]); `None` when none is, and the texture is taken
-    /// from memory as any other. A level the draw itself renders to is
-    /// sampled as the target was before the draw.
+    /// from memory as any other. A level the draw itself renders to (one
+    /// of `targets`) is sampled as the target was before the draw.
+    ///
+    /// A texture of one level that is a resident of the same size no
+    /// target of the draw is samples the resident itself, through a view
+    /// of it that reads the header's components (the resident's format,
+    /// or its sRGB form, a depth buffer's words as floats or UNORM, and
+    /// the header's swizzle): no copy is made. Metal filters the
+    /// resident's own format then, where a composite's is 32-bit floats
+    /// \[known difference: filtered samples of 8- and 16-bit formats may
+    /// differ in the last bits\].
     fn composite(
         &self,
         memory: &dyn GpuMemory,
         writes: &Writes,
         tic: &Tic,
+        targets: &[Surface],
     ) -> Result<Option<Retained<MetalTexture>>, Unmodeled> {
         // Most textures have no level at a resident's address.
         {
@@ -3240,6 +3252,63 @@ impl Renderer {
             .collect();
         if !unchecked.is_empty() {
             self.residents(memory, writes, &unchecked, [0, 0], false)?;
+        }
+        if let [(level, _)] = &levels[..]
+            && let [Some((surface, content, (components, read), _))] = candidates[..]
+            && surface == *level
+            && !targets.contains(&surface)
+        {
+            let state = self.state.lock().unwrap();
+            if let Some(resident) = state
+                .residents
+                .iter()
+                .find(|r| r.surface == surface && r.format == content && r.log2 == [0, 0])
+            {
+                let held = resident.texture.pixelFormat();
+                let view_format = match read {
+                    READ_PLAIN => Some(held),
+                    READ_SRGB => Some(format::srgb(held)),
+                    READ_FLOAT_BITS => Some(MTLPixelFormat::R32Float),
+                    READ_UNORM16 => Some(MTLPixelFormat::R16Unorm),
+                    _ => None,
+                };
+                let channel = |s: u8| match s {
+                    2..=5 => match components[usize::from(s - 2)] {
+                        0 => MTLTextureSwizzle::Red,
+                        1 => MTLTextureSwizzle::Green,
+                        2 => MTLTextureSwizzle::Blue,
+                        3 => MTLTextureSwizzle::Alpha,
+                        4 => MTLTextureSwizzle::Zero,
+                        _ => MTLTextureSwizzle::One,
+                    },
+                    6 | 7 => MTLTextureSwizzle::One,
+                    _ => MTLTextureSwizzle::Zero,
+                };
+                let swizzle = MTLTextureSwizzleChannels {
+                    red: channel(tic.swizzle[0]),
+                    green: channel(tic.swizzle[1]),
+                    blue: channel(tic.swizzle[2]),
+                    alpha: channel(tic.swizzle[3]),
+                };
+                if let Some(view_format) = view_format {
+                    // SAFETY: one level and slice of a 2D texture, in a
+                    // format of its size class.
+                    let view = unsafe {
+                        resident
+                            .texture
+                            .newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
+                                view_format,
+                                MTLTextureType::Type2D,
+                                NSRange::new(0, 1),
+                                NSRange::new(0, 1),
+                                swizzle,
+                            )
+                    };
+                    if view.is_some() {
+                        return Ok(view);
+                    }
+                }
+            }
         }
         // Whether a composite's levels come from where they do now.
         let same_sources = |composite: &Composite| {
@@ -5623,6 +5692,11 @@ impl GpuMemory for Coherent<'_> {
     fn probe(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
         self.before(address, buffer.len())?;
         self.memory.probe(address, buffer)
+    }
+
+    fn equals(&self, address: u64, expected: &[u8]) -> Option<bool> {
+        self.before(address, expected.len())?;
+        self.memory.equals(address, expected)
     }
 }
 

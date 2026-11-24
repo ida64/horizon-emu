@@ -83,6 +83,14 @@ pub trait BusMemory: Send + Sync {
     fn read(&self, address: u64, buffer: &mut [u8]) -> Option<()>;
     fn write(&self, address: u64, data: &[u8]) -> Option<()>;
 
+    /// Whether the bytes at `address` are `expected`: a read compared,
+    /// in place where the memory allows.
+    fn equals(&self, address: u64, expected: &[u8]) -> Option<bool> {
+        let mut held = vec![0; expected.len()];
+        self.read(address, &mut held)?;
+        Some(held == expected)
+    }
+
     /// The TLB walks through this bus may keep, if any, and the count of
     /// invalidations it is valid for (see [`Tlb`]).
     fn tlb(&self) -> Option<(&Tlb, u64)> {
@@ -152,6 +160,11 @@ impl BusMemory for SmmuBus {
 
     fn write(&self, address: u64, data: &[u8]) -> Option<()> {
         self.memory.write(smmu_address(address, data.len())?, data)
+    }
+
+    fn equals(&self, address: u64, expected: &[u8]) -> Option<bool> {
+        self.memory
+            .equals(smmu_address(address, expected.len())?, expected)
     }
 
     /// Both counts only grow, so their sum stays the same only while
@@ -513,6 +526,26 @@ impl AddressSpace {
                 .ok_or_else(|| unreachable_memory(at, len, true))
         })
     }
+
+    /// Whether the bytes at `address` are `expected` ([`AddressSpace::read`]
+    /// compared), page by page.
+    pub fn equals(
+        &self,
+        bus: &dyn BusMemory,
+        address: u64,
+        expected: &[u8],
+    ) -> Result<bool, Unmodeled> {
+        let mut same = true;
+        self.pieces(bus, address, expected.len(), false, |at, offset, len| {
+            if same {
+                same = bus
+                    .equals(at, &expected[offset..offset + len])
+                    .ok_or_else(|| unreachable_memory(at, len, false))?;
+            }
+            Ok(())
+        })?;
+        Ok(same)
+    }
 }
 
 /// One address space as the engines of a channel use it. A refused access
@@ -555,6 +588,16 @@ impl GpuMemory for ChannelMemory<'_> {
 
     fn probe(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
         self.space.read(self.bus, address, buffer).ok()
+    }
+
+    fn equals(&self, address: u64, expected: &[u8]) -> Option<bool> {
+        match self.space.equals(self.bus, address, expected) {
+            Ok(same) => Some(same),
+            Err(fault) => {
+                *self.last_fault.lock().unwrap() = Some(fault);
+                None
+            }
+        }
     }
 }
 

@@ -74,6 +74,16 @@ impl GuestRam {
         Some(())
     }
 
+    /// Whether guest memory holds `expected`, compared in place; `None` if
+    /// the range is not all RAM.
+    pub fn equals(&self, address: u64, expected: &[u8]) -> Option<bool> {
+        let source = self.locate(address, expected.len())?;
+        // SAFETY: as in `read`; the guest may write the bytes meanwhile,
+        // which a copy would race with alike.
+        let held = unsafe { std::slice::from_raw_parts(source.cast_const(), expected.len()) };
+        Some(held == expected)
+    }
+
     /// Copies `data` into guest memory; `None` if the range is not all RAM.
     pub fn write(&self, address: u64, data: &[u8]) -> Option<()> {
         let destination = self.locate(address, data.len())?;

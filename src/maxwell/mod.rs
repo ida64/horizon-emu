@@ -70,6 +70,15 @@ pub trait GpuMemory: Sync {
     fn probe(&self, address: u64, buffer: &mut [u8]) -> Option<()> {
         self.read(address, buffer)
     }
+    /// Whether the bytes at `address` are `expected` (a [`read`]
+    /// compared): in place where the memory allows, with no copy.
+    ///
+    /// [`read`]: GpuMemory::read
+    fn equals(&self, address: u64, expected: &[u8]) -> Option<bool> {
+        let mut held = vec![0; expected.len()];
+        self.read(address, &mut held)?;
+        Some(held == expected)
+    }
 }
 
 /// What a method did not model.

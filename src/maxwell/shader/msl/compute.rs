@@ -112,11 +112,19 @@ pub fn translate_compute(
             _ => {}
         }
     }
+    // A kernel with no jumps, barriers or shuffles runs straight through:
+    // its threads execute the same instructions in order, as in lockstep
+    // (a thread that exits leaves the others nothing to read).
+    let linear = flow.linear
+        && !barriers
+        && !flow.pcs.iter().any(|&pc| {
+            program.code[(pc / 8) as usize].expect("instruction").op == Op::Shfl
+        });
     for &pc in &flow.pcs {
-        if flow.labels.contains(&pc) {
+        if !linear && flow.labels.contains(&pc) {
             let _ = writeln!(writer.out, "    case {pc}u:");
         }
-        writer.step(pc, false)?;
+        writer.step(pc, linear)?;
     }
     let mut body = String::new();
     for index in &writer.registers {
@@ -137,8 +145,18 @@ pub fn translate_compute(
     }
     let _ = writeln!(
         body,
-        "    bool killed = false; (void)killed; bool parked = false;\n    uint pc = 8u; uint depth = 0u; uint stack[{STACK_DEPTH}];"
+        "    bool killed = false; (void)killed; bool parked = false; (void)parked;"
     );
+    if linear {
+        let _ = writeln!(body, "    do {{");
+        body.push_str(&writer.out);
+        let _ = writeln!(body, "    }} while (false);");
+    } else {
+        let _ = writeln!(
+            body,
+            "    uint pc = 8u; uint depth = 0u; uint stack[{STACK_DEPTH}];"
+        );
+    }
     if barriers {
         let _ = writeln!(
             body,
@@ -147,13 +165,15 @@ pub fn translate_compute(
     }
     // Each step the SIMD group runs its threads at the smallest program
     // counter, as the interpreter's warp lockstep.
-    let _ = writeln!(
-        body,
-        "    for (;;) {{\n    for (uint steps = 0u; steps < {}u; steps++) {{\n    const uint current = simd_min(parked ? {DONE} : pc);\n    if (current == {DONE}) {{ break; }}\n    if (parked || pc != current) {{ continue; }}\n    switch (pc) {{",
-        super::super::exec::STEP_LIMIT
-    );
-    body.push_str(&writer.out);
-    let _ = writeln!(body, "    default: pc = {DONE}; break;\n    }}\n    }}");
+    if !linear {
+        let _ = writeln!(
+            body,
+            "    for (;;) {{\n    for (uint steps = 0u; steps < {}u; steps++) {{\n    const uint current = simd_min(parked ? {DONE} : pc);\n    if (current == {DONE}) {{ break; }}\n    if (parked || pc != current) {{ continue; }}\n    switch (pc) {{",
+            super::super::exec::STEP_LIMIT
+        );
+        body.push_str(&writer.out);
+        let _ = writeln!(body, "    default: pc = {DONE}; break;\n    }}\n    }}");
+    }
     if barriers {
         // The count of a phase is reset two phases later, after a barrier
         // every thread passed once it read that count.
@@ -161,7 +181,7 @@ pub fn translate_compute(
             body,
             "    if (parked) {{ atomic_fetch_add_explicit(&parked_count[phase % 3u], 1u, memory_order_relaxed); }}\n    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);\n    const uint waiting = atomic_load_explicit(&parked_count[phase % 3u], memory_order_relaxed);\n    if (tindex == 0u) {{ atomic_store_explicit(&parked_count[(phase + 2u) % 3u], 0u, memory_order_relaxed); }}\n    if (waiting == 0u) {{ break; }}\n    parked = false; phase++;\n    }}"
         );
-    } else {
+    } else if !linear {
         let _ = writeln!(body, "    break;\n    }}");
     }
     Ok(TranslatedCompute {
